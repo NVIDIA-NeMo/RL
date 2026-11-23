@@ -55,12 +55,12 @@ from nemo_rl.algorithms.x_token.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -290,6 +290,32 @@ def setup(
                 f"({student_vocab}). A same-vocab teacher must share the "
                 "student tokenizer; set aligner.projection_matrix_path to run "
                 "it as a cross-tokenizer teacher."
+            )
+
+    # With context parallelism every forwarded sequence width must split
+    # evenly across the CP ranks, and batch widths follow the data.
+    student_div = policy_config["make_sequence_length_divisible_by"]
+    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
+    assert student_div % student_cp == 0, (
+        f"policy.make_sequence_length_divisible_by ({student_div}) must be a "
+        f"multiple of policy.automodel_cfg.context_parallel_size ({student_cp})."
+    )
+    for i, (teacher, tc) in enumerate(zip(teachers, teacher_configs)):
+        teacher_cp = tc["automodel_cfg"]["context_parallel_size"]
+        if teacher.aligner.projection_matrix_path is None:
+            # A same-vocab teacher forwards the student batch.
+            assert student_div % teacher_cp == 0, (
+                f"teachers.{i} is a same-vocab teacher, which forwards the "
+                f"student batch: policy.make_sequence_length_divisible_by "
+                f"({student_div}) must be a multiple of its "
+                f"automodel_cfg.context_parallel_size ({teacher_cp})."
+            )
+        else:
+            teacher_div = tc["make_sequence_length_divisible_by"]
+            assert teacher_div % teacher_cp == 0, (
+                f"teachers.{i}.make_sequence_length_divisible_by ({teacher_div}) "
+                f"must be a multiple of its automodel_cfg.context_parallel_size "
+                f"({teacher_cp})."
             )
 
     set_seed(distillation_config["seed"])
@@ -607,7 +633,7 @@ def xtoken_off_policy_distillation_train(
     """Off-policy CT distillation training loop."""
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -644,7 +670,7 @@ def xtoken_off_policy_distillation_train(
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(val_timings, total_steps, prefix="timing/validation")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
@@ -750,15 +776,14 @@ def xtoken_off_policy_distillation_train(
                 # ===== Checkpointing =====
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
                     )
                 )
                 should_save_by_timeout = timeout.check_save()
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     student_policy.prepare_for_training()
@@ -776,7 +801,7 @@ def xtoken_off_policy_distillation_train(
                     elif "val_loss" in off_policy_distillation_state:
                         del off_policy_distillation_state["val_loss"]
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         source = metrics if prefix == "train" else (val_metrics or {})

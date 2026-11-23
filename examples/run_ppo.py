@@ -110,13 +110,19 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     if config.ppo.async_ppo is None:
         raise ValueError(
             "ppo.async_ppo: null is only supported by run_grpo_single_controller.py; "
             "the legacy PPO entrypoint requires the block."
+        )
+    if config.ppo.value_training_mode != "whole_batch":
+        raise ValueError(
+            "ppo.value_training_mode=split is only supported by the "
+            "SingleController PPO entrypoint (run_grpo_single_controller.py); "
+            "the legacy PPO entrypoint requires whole_batch."
         )
 
     # Print config
@@ -126,10 +132,8 @@ def main() -> None:
     # Get the next experiment directory with incremented ID
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited

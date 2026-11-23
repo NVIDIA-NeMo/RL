@@ -14,8 +14,9 @@
 
 import gc
 import warnings
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
 import torch
@@ -75,6 +76,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    LoraRefitMode,
     enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
@@ -119,6 +121,102 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
+def _native_lora_trainable_names(
+    model: nn.Module, state_dict: Mapping[str, torch.Tensor]
+) -> frozenset[str]:
+    """Validate and return source tensors for native LoRA refit."""
+    dynamic_router_modules = sorted(
+        name
+        for name, module in model.named_modules()
+        if float(getattr(module, "bias_update_factor", 0.0)) > 0
+    )
+    if dynamic_router_modules:
+        raise RuntimeError(
+            "Native LoRA refit cannot synchronize dynamically updated MoE router "
+            "buffers; nonzero bias_update_factor found in modules: "
+            f"{dynamic_router_modules[:8]}. Use merged refit for this policy."
+        )
+
+    trainable_names = frozenset(
+        canonical_parameter_fqn(name)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    if not trainable_names:
+        raise RuntimeError("Native LoRA refit found no trainable LoRA tensors.")
+
+    missing_state = sorted(trainable_names - set(state_dict))
+    if missing_state:
+        raise RuntimeError(
+            "Native LoRA refit could not find trainable parameters in the model "
+            f"state dict: {missing_state[:8]}."
+        )
+    return trainable_names
+
+
+def automodel_lora_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield HF-adapted LoRA A/B tensors for vLLM's native adapter runtime."""
+    state_dict = model.state_dict()
+    trainable_names = _native_lora_trainable_names(model, state_dict)
+    factor_kinds_by_module: dict[str, set[str]] = {}
+    emitted_names: set[str] = set()
+
+    for name, tensor in state_dict.items():
+        if name not in trainable_names:
+            continue
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        # vLLM consumes conventional per-expert PEFT factors. Requesting the
+        # adapter's v4-compatible export also normalizes grouped-MoE factor
+        # orientation instead of emitting Transformers v5 ParamWrapper tensors
+        # whose A/B layout follows the grouped parameter storage.
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+            model, name, full_tensor, v4_compatible=True
+        )
+        if not adapted_fqn_tensors:
+            raise RuntimeError(
+                "Native LoRA refit state-dict adapter dropped trainable tensor "
+                f"{name!r}."
+            )
+
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            if adapted_fqn.endswith(".lora_A.weight"):
+                module_name = adapted_fqn.removesuffix(".lora_A.weight")
+                factor_kind = "A"
+            elif adapted_fqn.endswith(".lora_B.weight"):
+                module_name = adapted_fqn.removesuffix(".lora_B.weight")
+                factor_kind = "B"
+            else:
+                raise RuntimeError(
+                    "Native LoRA refit synchronizes only LoRA A/B tensors, but "
+                    f"trainable parameter {name!r} converted to {adapted_fqn!r}. "
+                    "Use merged refit for this policy."
+                )
+            if adapted_fqn in emitted_names:
+                raise RuntimeError(
+                    "Native LoRA refit state-dict adapter emitted duplicate tensor "
+                    f"name {adapted_fqn!r}."
+                )
+            emitted_names.add(adapted_fqn)
+            factor_kinds_by_module.setdefault(module_name, set()).add(factor_kind)
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+            )
+
+    incomplete_modules = sorted(
+        module_name
+        for module_name, factor_kinds in factor_kinds_by_module.items()
+        if factor_kinds != {"A", "B"}
+    )
+    if incomplete_modules:
+        raise RuntimeError(
+            "Native LoRA refit requires complete A/B pairs after HF state-dict "
+            f"adaptation; incomplete modules: {incomplete_modules[:8]}"
+        )
+
+
 def _module_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -147,7 +245,7 @@ def _module_params_generator(
     state_dict = model.state_dict()
     _assert_lora_modules_reachable(module_map, state_dict)
     for name, tensor in state_dict.items():
-        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+        if _is_lora_adapter_tensor(name):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
@@ -186,29 +284,68 @@ def automodel_params_generator(
 def _assert_lora_modules_reachable(
     module_map: dict[str, nn.Module], state_dict: dict[str, Any]
 ) -> None:
-    """Fail loudly if a ``LinearLoRA`` has no matching ``state_dict`` weight.
+    """Fail loudly if a LoRA module has no matching ``state_dict`` base weight.
 
     A LoRA module the merge cannot find reaches the inference engine as its
     bare base weight; nothing else reports it, and the only symptom is a
     slowly growing train/generation logprob mismatch many steps later.
-
-    Only ``LinearLoRA`` is covered because it is the only adapter this file
-    merges. When the grouped-expert LoRA merge lands (#3353), extend this
-    check to those adapter modules too so that path keeps the same loud
-    failure instead of silently refitting base expert weights.
     """
-    unreachable = sorted(
-        name
-        for name, module in module_map.items()
-        if isinstance(module, LinearLoRA) and f"{name}.weight" not in state_dict
-    )
+    unreachable = []
+    for name, module in module_map.items():
+        if isinstance(module, LinearLoRA):
+            base_names = (f"{name}.weight",)
+        elif hasattr(module, "lora_gate_and_up_A"):
+            base_names = tuple(
+                f"{name}.{leaf}" if name else leaf
+                for leaf in _GROUPED_EXPERT_BASE_WEIGHTS
+            )
+        else:
+            continue
+        unreachable.extend(fqn for fqn in base_names if fqn not in state_dict)
+    unreachable.sort()
     if unreachable:
         raise RuntimeError(
-            f"{len(unreachable)} LinearLoRA module(s) have no matching state_dict "
-            f"weight, so the refit would drop their LoRA update: {unreachable[:5]}. "
+            f"{len(unreachable)} LoRA base weight(s) have no matching state_dict "
+            f"entry, so the refit would drop their LoRA update: {unreachable[:5]}. "
             "A module wrapper is rewriting parameter names in a way "
             "canonical_parameter_fqn does not undo."
         )
+
+
+# Automodel's grouped-expert LoRA (GroupedExpertsLoRA / GroupedExpertsDeepEPLoRA) keeps its
+# adapters as bare parameters on the expert module rather than as LinearLoRA submodules, so
+# neither the skip filters nor the merge below recognise them without these helpers. Without
+# them the adapters are streamed to the inference engine as unknown keys and the base expert
+# weights are refit unmerged, i.e. generation silently uses an unadapted policy.
+_GROUPED_EXPERT_LORA_ADAPTERS = (
+    "lora_gate_and_up_A",
+    "lora_gate_and_up_B",
+    "lora_down_A",
+    "lora_down_B",
+)
+_GROUPED_EXPERT_BASE_WEIGHTS = ("gate_and_up_projs", "down_projs")
+
+
+def _is_lora_adapter_tensor(fqn: str) -> bool:
+    """True for adapter tensors to exclude from merged-weight refitting."""
+    if fqn.endswith(".lora_A.weight") or fqn.endswith(".lora_B.weight"):
+        return True
+    return fqn.rpartition(".")[2] in _GROUPED_EXPERT_LORA_ADAPTERS
+
+
+def _grouped_expert_lora_adapters(
+    module_map: dict[str, nn.Module], fqn: str
+) -> tuple[Optional[nn.Module], Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    """Return (module, (A, B)) when `fqn` is a grouped-expert base weight carrying LoRA."""
+    parent_name, _, leaf = fqn.rpartition(".")
+    if leaf not in _GROUPED_EXPERT_BASE_WEIGHTS:
+        return None, None
+    module = module_map.get(parent_name)
+    if module is None or not hasattr(module, "lora_gate_and_up_A"):
+        return None, None
+    if leaf == "gate_and_up_projs":
+        return module, (module.lora_gate_and_up_A, module.lora_gate_and_up_B)
+    return module, (module.lora_down_A, module.lora_down_B)
 
 
 @torch.no_grad()
@@ -217,6 +354,25 @@ def _maybe_merge_lora_weight(
     fqn: str,
     tensor: torch.Tensor,
 ) -> torch.Tensor:
+    expert_module, expert_adapters = _grouped_expert_lora_adapters(module_map, fqn)
+    if expert_module is not None and expert_adapters is not None:
+        # GroupedExperts(DeepEP)LoRA computes `x @ W + (x @ A @ B) * scale` per expert, so
+        # the merge is a per-expert batched matmul in the same orientation as W -- no
+        # transpose. A/B are sharded over the expert dimension exactly as W is under expert
+        # parallelism, so full_tensor() gathers them in the same expert order.
+        lora_a, lora_b = (
+            adapter.full_tensor() if isinstance(adapter, DTensor) else adapter
+            for adapter in expert_adapters
+        )
+        delta = torch.bmm(
+            lora_a.to(device=tensor.device, dtype=torch.float32),
+            lora_b.to(device=tensor.device, dtype=torch.float32),
+        )
+        # Match dense LoRA's single-rounded fp32 merge without mutating the base.
+        merged = tensor.to(torch.float32) + delta * expert_module.scale
+        del delta
+        return merged.to(tensor.dtype)
+
     if not fqn.endswith(".weight"):
         return tensor
     module_name = fqn[: -len(".weight")]
@@ -249,16 +405,21 @@ def _maybe_merge_lora_weight(
 
 
 def _maybe_adapt_tensor_to_hf(
-    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
+    model_part: nn.Module,
+    fqn: str,
+    tensor: torch.Tensor,
+    quantization: bool = False,
+    v4_compatible: bool = False,
 ) -> list[tuple[str, torch.Tensor]]:
     adapter = getattr(model_part, "state_dict_adapter", None)
     if adapter:
-        return adapter.convert_single_tensor_to_hf(
-            fqn,
-            tensor,
-            exclude_key_regex=r".*_extra_state.*",
-            quantization=quantization,
-        )
+        adapter_kwargs = {
+            "exclude_key_regex": r".*_extra_state.*",
+            "quantization": quantization,
+        }
+        if v4_compatible:
+            adapter_kwargs["v4_compatible"] = True
+        return adapter.convert_single_tensor_to_hf(fqn, tensor, **adapter_kwargs)
     return [(fqn, tensor)]
 
 
@@ -338,6 +499,10 @@ class AutomodelPolicyWorkerImpl(
         self.lora_enabled = (
             config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
+        generation_config = config.get("generation")
+        if self.lora_enabled and generation_config is not None:
+            generation_dict = cast(dict[str, Any], generation_config)
+            self.lora_refit_mode: LoraRefitMode = generation_dict["lora_refit_mode"]
 
         print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
 
@@ -557,6 +722,7 @@ class AutomodelPolicyWorkerImpl(
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
             draft_runtime=draft_runtime,
+            tp_mesh=self.tp_mesh,
         )
 
         # Setup cache clearing callback if configured
@@ -611,7 +777,6 @@ class AutomodelPolicyWorkerImpl(
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
-                    is_reward_model=self._is_reward_model,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
@@ -792,7 +957,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
@@ -864,7 +1028,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=True,
                     allow_flash_attn_args=False,
                 )
 
@@ -951,7 +1114,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
@@ -1047,7 +1209,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
                 with prepared.model_context_factory(), self._autocast_context():
@@ -1197,9 +1358,16 @@ class AutomodelPolicyWorkerImpl(
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        if self.lora_enabled and self.lora_refit_mode == "native":
+            return {
+                name: (tensor.shape, tensor.dtype)
+                for name, tensor in automodel_lora_params_generator(
+                    self.model, self.dtype
+                )
+            }
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
-            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            if _is_lora_adapter_tensor(name):
                 continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -1224,6 +1392,17 @@ class AutomodelPolicyWorkerImpl(
                 state_dict_info[f"draft.{fqn}"] = (tensor.shape, dtype)
 
         return state_dict_info
+
+    def _refit_params_generator(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield native A/B tensors or the unchanged merged full state."""
+        if self.lora_enabled and self.lora_refit_mode == "native":
+            yield from automodel_lora_params_generator(self.model, self.dtype)
+            return
+        yield from automodel_params_generator(
+            self.model, self.dtype, draft_model=self.draft_model
+        )
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1261,9 +1440,7 @@ class AutomodelPolicyWorkerImpl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=automodel_params_generator(
-                self.model, self.dtype, draft_model=self.draft_model
-            ),
+            params_generator=self._refit_params_generator(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1381,9 +1558,7 @@ class AutomodelPolicyWorkerImpl(
         automodel_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=automodel_params_generator(
-                self.model, self.dtype, draft_model=self.draft_model
-            ),
+            iterator=self._refit_params_generator(),
             group=self.model_update_group,
             src=0,
             post_iter_func=automodel_post_iter_func,

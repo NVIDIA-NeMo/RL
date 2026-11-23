@@ -101,6 +101,9 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 
 * `$DATA_DIR`: Path to the **final** `data` directory produced in [Download and prepare the data](#download-and-prepare-the-data).
 * `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
+* `$CODE_GEN_SANDBOX_IMAGE`: *(Stage 1 only)* The `code_gen` verifier image that OpenSandbox runs. Stage 1's `code_gen` environment grades in OpenSandbox, separately from the NeMo-Skills sandbox above; see [NeMo Gym Code Generation Sandbox](../../environments.md#nemo-gym-code-generation-sandbox), which also covers running without OpenSandbox.
+* `$OPENSANDBOX_DOMAIN`: *(Stage 1 only)* The OpenSandbox endpoint, for example `https://opensandbox.example.com`.
+* `$OPENSANDBOX_API_KEY`: *(Stage 1 only)* Your OpenSandbox access key.
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
 * `$SKIP_CODE_SNAPSHOT`: Optional. Set to `true` to run from the current checkout instead of creating or refreshing a code snapshot.
@@ -123,6 +126,9 @@ TRAIN_PATH=$DATA_DIR/rlvr1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr1/val-split.jsonl \
 CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
+CODE_GEN_SANDBOX_IMAGE=$CODE_GEN_SANDBOX_IMAGE \
+OPENSANDBOX_DOMAIN=$OPENSANDBOX_DOMAIN \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
@@ -140,6 +146,9 @@ TRAIN_PATH=$DATA_DIR/rlvr2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr2/val-split.jsonl \
 CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
+CODE_GEN_SANDBOX_IMAGE=$CODE_GEN_SANDBOX_IMAGE \
+OPENSANDBOX_DOMAIN=$OPENSANDBOX_DOMAIN \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
@@ -157,6 +166,9 @@ TRAIN_PATH=$DATA_DIR/rlvr3/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr3/val-split.jsonl \
 CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
+CODE_GEN_SANDBOX_IMAGE=$CODE_GEN_SANDBOX_IMAGE \
+OPENSANDBOX_DOMAIN=$OPENSANDBOX_DOMAIN \
+OPENSANDBOX_API_KEY=$OPENSANDBOX_API_KEY \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \

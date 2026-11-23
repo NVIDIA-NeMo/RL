@@ -43,8 +43,8 @@ loss_fn:
   gold_loss: false
   xtoken_loss: false
   temperature: 1.0
-  vocab_topk: 8192            # P-KL only; size of the microbatch-global
-                              # top-k derived inside the loss
+  vocab_topk: 8192            # P-KL and same-tokenizer teachers; size of the
+                              # microbatch-global top-k derived inside the loss
   uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
   reverse_kl: false
   exact_token_match_only: false

@@ -233,3 +233,24 @@ def test_fastokens_equivalent_to_huggingface():
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     )
     assert result.returncode == 0
+
+
+def test_check_fastokens_applied_names_the_concrete_backend(monkeypatch):
+    monkeypatch.delenv("NRL_USE_FASTOKENS", raising=False)
+    backend = types.SimpleNamespace()
+
+    assert (
+        fastokens_util.check_fastokens_applied(
+            types.SimpleNamespace(_tokenizer=backend)
+        )
+        == "types.SimpleNamespace"
+    )
+    # No ``_tokenizer`` attribute: falls back to the tokenizer itself.
+    assert fastokens_util.check_fastokens_applied(object()) == "builtins.object"
+
+
+def test_check_fastokens_applied_raises_when_the_patch_did_not_land(monkeypatch):
+    monkeypatch.setenv("NRL_USE_FASTOKENS", "1")
+
+    with pytest.raises(RuntimeError, match="did not take effect"):
+        fastokens_util.check_fastokens_applied(types.SimpleNamespace())

@@ -29,6 +29,7 @@ from nemo_rl.models.generation.trtllm.config import (
     resolve_disagg_layout,
     resolve_disagg_server_config,
     resolve_role_overrides,
+    role_engine_config,
 )
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
@@ -409,22 +410,10 @@ def test_ipc_refit_and_missing_worker_group():
 def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
     # Absent and present-but-empty must agree: every default lives on the model,
     # so no consumer has to re-derive one per key.
-    for raw in (None, {}):
-        cfg = _config(disaggregation=raw) if raw is not None else _config()
-        layout = resolve_disagg_layout(cfg)
-        assert layout.enabled is False
-        assert layout.num_prefill_engines == 1
-        assert layout.num_decode_engines == 1
-        assert layout.num_frontend_workers == 1
-        assert layout.frontend_tokenize is False
-        assert layout.frontend_base_port == 8300
-
-        server = resolve_disagg_server_config(cfg)
-        assert server.ctx_router == "conversation"
-        assert server.gen_router == "load_balancing"
-        assert server.gen_tokids_ctxbytes is False
-        assert server.gen_strip_message_history is False
-
+    absent, empty = _config(), _config(disaggregation={}, disagg_server={})
+    assert resolve_disagg_layout(absent) == resolve_disagg_layout(empty)
+    assert resolve_disagg_server_config(absent) == resolve_disagg_server_config(empty)
+    for cfg in (absent, empty):
         assert "prefill_engine" not in cfg["trtllm_cfg"]
 
 
@@ -644,3 +633,46 @@ def test_role_blocks_are_left_as_written_without_disaggregation(disaggregation):
     cfg = _config(disaggregation=disaggregation, prefill_engine={"precision": "x"})
 
     assert resolve_role_overrides(cfg) is cfg
+
+
+class _LoadFormatTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+
+def test_configure_generation_config_selects_trtllm_load_format() -> None:
+    """Training starts on dummy weights; the initial refit supplies the real ones."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    training = configure_generation_config(_config(), _LoadFormatTokenizer())
+    assert training["trtllm_cfg"]["load_format"] == "dummy"
+
+    evaluation = configure_generation_config(
+        _config(), _LoadFormatTokenizer(), is_eval=True
+    )
+    assert evaluation["trtllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_forces_dummy_for_fp8() -> None:
+    """An FP8 engine has no loadable checkpoint: the BF16 refit builds its weights."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    for is_eval in (False, True):
+        configured = configure_generation_config(
+            _config(precision="fp8"), _LoadFormatTokenizer(), is_eval=is_eval
+        )
+        assert configured["trtllm_cfg"]["load_format"] == "dummy"
+
+
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+def test_configure_generation_config_load_format_reaches_both_disagg_engines(
+    precision,
+) -> None:
+    """Both role blocks are copied from the shared block, so they must inherit it."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    configured = configure_generation_config(
+        _disagg_config(precision=precision), _LoadFormatTokenizer()
+    )
+    for role in ("prefill", "decode"):
+        assert role_engine_config(configured, role)["load_format"] == "dummy"

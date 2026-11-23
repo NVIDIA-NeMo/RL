@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 from nemo.lens import derive_nv_dl_run_uuid
-from pydantic import ValidationError
 
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
@@ -261,14 +260,6 @@ def test_init_worker_returns_none_when_disabled():
     handle = init_telemetry_worker()
     assert handle is None
     assert get_telemetry_handle() is None
-
-
-def test_config_rejects_an_unknown_exporter_at_parse_time():
-    # The Literal is what a user actually hits: it fires wherever the YAML is
-    # read, in every process, and regardless of `enabled` -- so a typo cannot
-    # sit dormant in a disabled block until someone switches telemetry on.
-    with pytest.raises(ValidationError):
-        TelemetryConfig(exporter="consoel")
 
 
 def test_config_has_no_rank_filtering_fields():

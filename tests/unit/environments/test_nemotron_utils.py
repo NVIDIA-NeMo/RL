@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 
 from nemo_rl.environments.nemotron_utils import (
+    NEMOTRON_VIDEO_PROCESSOR_NAMES,
     _resize_and_normalize_nemotron_video_frame,
 )
 
@@ -52,3 +53,14 @@ def test_policy_video_resize_matches_stock_vllm() -> None:
     ).squeeze(0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "processor_name",
+    [
+        "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
+    ],
+)
+def test_omni_processor_aliases_are_nemotron_video_processors(processor_name):
+    assert processor_name in NEMOTRON_VIDEO_PROCESSOR_NAMES

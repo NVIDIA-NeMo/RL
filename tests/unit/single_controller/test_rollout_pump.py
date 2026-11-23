@@ -22,7 +22,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -36,6 +36,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
+    ReadyFirstSampler,
     WeightFifoSampler,
     WindowedSampler,
     WindowedSamplerConfig,
@@ -43,19 +44,29 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
+    SingleControllerActor,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    ZeroVarianceGroup,
+)
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -74,6 +85,14 @@ from tests.unit.single_controller._dp_fakes import (
     _PARTITION_ID,
     _SyncDPAdapter,
     _TQActor,
+)
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _DataPlaneClient,
+    _request,
+    _signal_result,
 )
 
 
@@ -101,13 +120,28 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     this file needs all of them, and a field added to only some of the builders is a
     missing attribute rather than a wrong answer.
     """
-    ctrl._batch_shortfall = {}
+    if not hasattr(ctrl, "_rollout_runtime"):
+        ctrl._rollout_runtime = RolloutRuntimeState()
+    ctrl._rollout_runtime.batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._rollout_runtime.sampler_stamps_target_steps = False
+    # _step_assembler is a cached_property; leaving it unbuilt lets it seed from the
+    # controller once the builder has set the sampler, config and runtime it reads.
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
-    ctrl._replacement_reserve = deque()
+    ctrl._rollout_runtime.replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    # Dynamic sampling off: the filter never fires, so no test here draws on its
+    # budget unless it opts in.
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._is_ppo = False
+    ctrl._filtered_spares_claimed = 0
+    ctrl._filtered_prompt_budget = 0
+    ctrl._rollout_runtime.filtered_reserve = deque()
+    ctrl._filtered_prompts_by_step = {}
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._dataloader_exhausted = False
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
@@ -174,8 +208,9 @@ class _RecordingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        replacement_index: int = 0,
     ) -> None:
-        del prompt, inflight_registry
+        del prompt, inflight_registry, replacement_index
         self._buffer.reserve(target_step=target_step)
 
 
@@ -195,6 +230,7 @@ def test_rollout_pump_stamps_target_steps(
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
@@ -253,12 +289,14 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, Any] | None = None,
+            replacement_index: int = 0,
         ) -> RolloutOutcome:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             return outcome
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
     )
@@ -295,6 +333,7 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._rollout_manager = SimpleNamespace(
         mark_prompt_group_admitted=MagicMock(),
@@ -302,7 +341,6 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     )
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
-    ctrl._sampler_stamps_target_steps = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
     with pytest.raises(RuntimeError, match="already contains 1 group"):
@@ -318,9 +356,13 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
     ctrl._buffer = buffer
-    ctrl._replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_runtime.replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_runtime.filtered_reserve = deque()
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._dynamic_sampling_enabled = False
     ctrl._rollout_recovery_enabled = False
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
@@ -335,6 +377,56 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     assert launched == []
 
 
+class _NoMutationBarrier(DataPlaneCheckpointBarrier):
+    """Fail the test if dispatch takes a mutation slot."""
+
+    @asynccontextmanager
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        raise AssertionError(f"unrecorded dispatch took a {kind!r} mutation slot")
+        yield  # pragma: no cover
+
+
+def test_unrecorded_dispatch_takes_no_mutation_slot() -> None:
+    """Without ledger dispatch, reserving, admitting and discarding record nothing.
+
+    A run without recovery must not wait on a checkpoint to dispatch, and the
+    rollout manager mints the group IDs when it runs the groups.
+    """
+    buffer = _RecordingBuffer([])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState(
+        replacement_reserve=deque([{"idx": 0}, {"idx": 1}])
+    )
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+    ctrl._buffer = buffer
+    ctrl._rollout_recovery_enabled = False
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._data_plane_checkpoint_barrier = _NoMutationBarrier()
+    ctrl._rollout_manager = SimpleNamespace()  # any ledger call would fail
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    async def exercise() -> None:
+        await ctrl._drain_reserve_into_steps(launch)
+        async with ctrl._dispatch_reservation("group_removals") as cut:
+            assert cut is None
+            ctrl._discard_prompt_group(cut, None)
+
+    asyncio.run(exercise())
+
+    assert [(prompt["idx"], group_id) for prompt, _, group_id in launched] == [
+        (0, None),
+        (1, None),
+    ]
+
+
 class _SkippingRolloutManager:
     """Every prompt is given up on within budget, so nothing is ever committed."""
 
@@ -344,8 +436,9 @@ class _SkippingRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del prompt, target_step, inflight_registry
+        del prompt, target_step, inflight_registry, replacement_index
         return RolloutOutcome.SKIPPED
 
 
@@ -356,19 +449,25 @@ class _SkippingRolloutManager:
         # generated leaves that step permanently short. Without the credit the train
         # pump waits on it forever, turning a tolerated drop into a hung run.
         (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
-        # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
-        # a drop costs throughput and strands nothing. Crediting here would shrink an
-        # unrelated step.
-        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {}),
+        # The gated samplers stamp nothing, but their gate still waits on the trainer, so
+        # a step that never fills would hang the run. Both losses are charged to the
+        # step being assembled, which no train pump has moved past here.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {0: 2}),
+        (lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1), {0: 2}),
+        # windowed never stops producing, so later groups make up for a lost one and
+        # there is nothing to charge.
+        (lambda buf: WindowedSampler(buf, max_staleness_versions=1), {}),
     ],
+    ids=["in_order", "weight_fifo", "ready_first", "windowed"],
 )
-def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
+def test_rollout_pump_charges_shortfall_as_the_sampler_decides(
     make_sampler,
     expected_shortfall: dict[int, int],
 ) -> None:
     buffer = _RecordingBuffer()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
@@ -396,7 +495,7 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
 
     asyncio.run(ctrl._rollout_pump())
 
-    assert ctrl._batch_shortfall == expected_shortfall
+    assert ctrl._rollout_runtime.batch_shortfall == expected_shortfall
     # A dropped prompt commits nothing, so every permit comes back either way.
     assert ctrl._buffer_capacity._value == 2
 
@@ -414,8 +513,9 @@ class _ScriptedRolloutManager:
         *,
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del target_step, inflight_registry
+        del target_step, inflight_registry, replacement_index
         self.prompts_seen.append(prompt["message_log"][0]["content"])
         if self._outcomes:
             return self._outcomes.pop(0)
@@ -438,10 +538,17 @@ def _pump_controller(
     num_prompts_per_step: int = 1,
     buffer: _RecordingBuffer | None = None,
     trainer_version: int = 0,
+    dynamic_sampling_max_replacements: int | None = None,
 ):
+    """A hand-built controller for the rollout pump.
+
+    ``dynamic_sampling_max_replacements=None`` leaves dynamic sampling off; an int
+    sets the total generation-batch allowance, including the initial batch.
+    """
     buffer = _RecordingBuffer() if buffer is None else buffer
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
@@ -470,8 +577,277 @@ def _pump_controller(
     ctrl._trainer_version = trainer_version
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
-    ctrl._sampler_stamps_target_steps = False
+    ctrl._dynamic_sampling_enabled = dynamic_sampling_max_replacements is not None
+    # The budget includes the initial batch and all replacement prompts.
+    ctrl._filtered_prompt_budget = (
+        dynamic_sampling_max_replacements or 0
+    ) * num_prompts_per_step
+    ctrl._rollout_runtime.sampler_stamps_target_steps = False
     return ctrl
+
+
+def test_filtered_group_can_draw_from_the_next_epoch() -> None:
+    manager = _ScriptedRolloutManager(
+        [RolloutOutcome.FILTERED, RolloutOutcome.COMMITTED]
+    )
+    ctrl = _pump_controller(
+        manager, [_batch("prompt")], dynamic_sampling_max_replacements=2
+    )
+    ctrl._algo_cfg.max_num_epochs = 2
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=5))
+    assert manager.prompts_seen == ["prompt", "prompt"]
+    assert ctrl._current_epoch == 2
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+    assert ctrl._rollout_runtime.steps_allowed_short == set()
+    assert ctrl._filtered_prompts_by_step == {0: 1}
+
+
+@pytest.mark.parametrize("windowed", [False, True], ids=["ready_first", "windowed"])
+def test_streaming_sampler_filters_with_its_own_budget(windowed: bool) -> None:
+    manager = _ScriptedRolloutManager(
+        [RolloutOutcome.FILTERED, RolloutOutcome.COMMITTED]
+    )
+    ctrl = _pump_controller(
+        manager,
+        [_batch("uniform"), _batch("useful")],
+        on_dropped_prompt="shrink",
+        dynamic_sampling_max_replacements=2,
+    )
+    ctrl._sampler = (
+        WindowedSampler(ctrl._buffer, max_staleness_versions=1)
+        if windowed
+        else ReadyFirstSampler(ctrl._buffer, max_staleness_versions=1)
+    )
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=3))
+    assert manager.prompts_seen == ["uniform", "useful"]
+    assert ctrl._filtered_prompts_by_step == {0: 1}
+    assert not ctrl._rollout_runtime.batch_shortfall
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._batch_replacements == ({} if windowed else {0: 1})
+
+
+class TestDynamicSamplingReplacement:
+    """A filtered group draws on its own pool and its own budget."""
+
+    @pytest.mark.parametrize("pps", [1, 8])
+    def test_filter_pool_low_water_mark_tracks_prompts_per_step(self, pps: int) -> None:
+        ctrl = _pump_controller(
+            _ScriptedRolloutManager([]),
+            [],
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=pps,
+            dynamic_sampling_max_replacements=10,
+        )
+        ctrl._rollout_runtime.sampler_stamps_target_steps = True
+        ctrl._rollout_runtime.filtered_reserve.extend(
+            {"message_log": []} for _ in range(pps - 1)
+        )
+        batch = _batch(*(f"new{i}" for i in range(pps)))
+
+        async def exercise() -> None:
+            assert await ctrl._divert_batch_to_reserve(batch)
+            assert len(ctrl._rollout_runtime.filtered_reserve) == 2 * pps - 1
+            assert not await ctrl._divert_batch_to_reserve(batch)
+            assert not ctrl._rollout_runtime.replacement_reserve
+
+        asyncio.run(exercise())
+
+    def test_normal_topup_wakes_all_parked_filter_consumers(self) -> None:
+        async def exercise() -> None:
+            ctrl = _pump_controller(
+                _ScriptedRolloutManager([]),
+                [],
+                on_dropped_prompt="shrink",
+                num_prompts_per_step=2,
+                dynamic_sampling_max_replacements=10,
+            )
+            ctrl._rollout_runtime.sampler_stamps_target_steps = True
+
+            async def take_replacement(step: int) -> DatumSpec | None:
+                async with ctrl._replacement_mutation(filtered=True):
+                    return ctrl._pop_filtered_replacement(step)
+
+            waiters = [asyncio.create_task(take_replacement(step)) for step in range(2)]
+            try:
+                await asyncio.sleep(0)
+                assert all(not waiter.done() for waiter in waiters)
+                assert await ctrl._divert_batch_to_reserve(_batch("a", "b"))
+                prompts = await asyncio.wait_for(asyncio.gather(*waiters), timeout=1)
+                assert {prompt["message_log"][0]["content"] for prompt in prompts} == {
+                    "a",
+                    "b",
+                }
+                assert not ctrl._rollout_runtime.filtered_reserve
+            finally:
+                for waiter in waiters:
+                    waiter.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("recovery", [False, True])
+    def test_main_loop_eof_wakes_parked_filter_consumers(self, recovery: bool) -> None:
+        async def exercise() -> None:
+            ctrl = _pump_controller(
+                _ScriptedRolloutManager([]),
+                [],
+                on_dropped_prompt="shrink",
+                dynamic_sampling_max_replacements=10,
+            )
+            ctrl._rollout_recovery_enabled = recovery
+            ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+            ctrl._rollout_restorer = SimpleNamespace(redispatch_restored=AsyncMock())
+
+            async def take_replacement() -> DatumSpec | None:
+                async with ctrl._replacement_mutation(filtered=True):
+                    return ctrl._pop_filtered_replacement(0)
+
+            waiter = asyncio.create_task(take_replacement())
+            try:
+                await asyncio.sleep(0)
+                assert not waiter.done()
+                await asyncio.wait_for(ctrl._rollout_pump(), timeout=1)
+                assert await asyncio.wait_for(waiter, timeout=1) is None
+                assert ctrl._dataloader_exhausted
+                assert 0 in ctrl._rollout_runtime.steps_allowed_short
+            finally:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("filtered_attempts", [1, 5])
+    def test_dispatch_wait_services_filter_pool_refills(
+        self, filtered_attempts: int
+    ) -> None:
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED] * filtered_attempts)
+        candidates = [f"spare{i}" for i in range(filtered_attempts + 1)]
+        ctrl = _pump_controller(
+            manager,
+            [_batch("a", "b")]
+            + [_batch(*candidates[i : i + 2]) for i in range(0, len(candidates), 2)],
+            num_prompts_per_step=2,
+            dynamic_sampling_max_replacements=10,
+        )
+        # Dispatch must refill even before the first batch is fully launched.
+        ctrl._async_cfg.max_inflight_prompts = 1
+
+        async def run() -> None:
+            await asyncio.wait_for(ctrl._rollout_pump(), timeout=5)
+
+        asyncio.run(run())
+
+        assert manager.prompts_seen == ["a", *candidates[:filtered_attempts], "b"]
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert ctrl._rollout_exhausted.is_set()
+
+    def test_a_filtered_group_is_replaced_even_under_shrink(self):
+        # Filtering replaces groups independently of the rollout-failure policy.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            on_dropped_prompt="shrink",
+            dynamic_sampling_max_replacements=4,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert ctrl._batch_replacements == {0: 1}
+
+    def test_a_filtered_group_does_not_spend_the_failure_budget(self):
+        # max_replacement_attempts=0 bars every fault-tolerance substitution. The
+        # filtered group is still replaced, which is the whole point of the split.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            max_replacement_attempts=0,
+            dynamic_sampling_max_replacements=4,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0", "spare"]
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+
+    def test_a_failure_does_not_spend_the_filter_budget(self):
+        # The reverse direction: a generous filter budget must not rescue a slot whose
+        # fault-tolerance budget is spent, or an infra failure would never shrink.
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare")],
+            max_replacement_attempts=0,
+            dynamic_sampling_max_replacements=10,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert ctrl._batch_replacements == {}, "no substitution attempted"
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+
+    def test_exhausting_the_generation_batch_allowance_raises(self):
+        # v1 ends the run past dynamic_sampling_max_gen_batches. Shrinking instead
+        # would hide a mis-tuned filter behind min_step_batch_fraction.
+        manager = _ScriptedRolloutManager(
+            [RolloutOutcome.FILTERED, RolloutOutcome.FILTERED]
+        )
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0"), _batch("spare"), _batch("spare2")],
+            # One batch of allowance: the step may draw nothing beyond its own.
+            dynamic_sampling_max_replacements=1,
+        )
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            asyncio.run(ctrl._rollout_pump())
+
+        assert exc_info.value.subgroup(RuntimeError) is not None
+
+    @pytest.mark.parametrize("max_batches", [1, 10])
+    def test_the_last_step_closes_short_when_the_data_runs_out(self, max_batches):
+        # The dataloader running out is the end of the run, not a mis-tuned filter, so
+        # the step closes on what arrived instead of raising against the floor.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0")],
+            dynamic_sampling_max_replacements=max_batches,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0"]
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
+        assert 0 in ctrl._rollout_runtime.steps_allowed_short, (
+            "a step short because the data ran out must not fail the floor"
+        )
+
+        assert ctrl._filtered_prompts_by_step == {}
+
+    @pytest.mark.parametrize("max_batches", [1, 10])
+    def test_windowed_last_step_closes_short_without_failing_the_budget(
+        self, max_batches
+    ):
+        # windowed draws no spare pool, so a filtered group at EOF cannot be refilled
+        # by a later dispatch. The run must close the step short instead of charging a
+        # replacement it never drew against an exhausted generation allowance.
+        manager = _ScriptedRolloutManager([RolloutOutcome.FILTERED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("step0")],
+            dynamic_sampling_max_replacements=max_batches,
+        )
+        ctrl._sampler = WindowedSampler(ctrl._buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step0"]
+        # Recorded but never raised: the train pump closes the short final step.
+        assert ctrl._filtered_prompts_by_step == {0: 1}
 
 
 class TestReplaceDroppedPrompt:
@@ -486,7 +862,7 @@ class TestReplaceDroppedPrompt:
         asyncio.run(ctrl._rollout_pump())
 
         assert manager.prompts_seen == ["step0", "spare"]
-        assert ctrl._batch_shortfall == {}, (
+        assert ctrl._rollout_runtime.batch_shortfall == {}, (
             "a group that was replaced must not also shrink its step -- crediting both "
             "would drop a group the step is actually going to receive"
         )
@@ -508,13 +884,18 @@ class TestReplaceDroppedPrompt:
         assert manager.prompts_seen == ["step0", "spare"], (
             "budget of 1 was not exceeded"
         )
-        assert ctrl._batch_shortfall == {0: 1}
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}
         assert ctrl._batch_replacements == {}
         # Nothing committed, so the slot's permit must come back exactly once.
         assert ctrl._buffer_capacity._value == 4
 
-    def test_an_unstamped_sampler_never_diverts_a_batch_into_the_pool(self):
-        """No step can be stranded, so a pool would only cost prompts nothing draws on."""
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1)],
+        ids=["ready_first"],
+    )
+    def test_a_gated_sampler_that_stamps_nothing_still_substitutes(self, make_sampler):
+        """The pool does not depend on a stamp: the same slot just takes a new prompt."""
         buffer = _RecordingBuffer()
         manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
         ctrl = _pump_controller(
@@ -522,13 +903,38 @@ class TestReplaceDroppedPrompt:
             [_batch("p0"), _batch("p1")],
             buffer=buffer,
         )
-        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._sampler = make_sampler(buffer)
 
         asyncio.run(ctrl._rollout_pump())
 
-        assert manager.prompts_seen == ["p0", "p1"], "no substitution attempted"
-        assert len(ctrl._replacement_reserve) == 0, "no batch was spent on the pool"
-        assert ctrl._batch_shortfall == {}
+        assert manager.prompts_seen == ["p0", "p1"], "p1 stood in for p0"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 0
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert ctrl._batch_replacements == {0: 1}, (
+            "an unstamped group counts toward the step being assembled"
+        )
+
+    def test_windowed_uses_no_spare_pool_and_loses_the_group_quietly(self):
+        """Its rollout keeps producing, so a lost group is made up by later ones."""
+        buffer = _RecordingBuffer()
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("p0"), _batch("p1")],
+            buffer=buffer,
+        )
+        ctrl._sampler = WindowedSampler(buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["p0", "p1"], "both batches were admitted"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 0, (
+            "no batch was diverted to a pool"
+        )
+        assert ctrl._rollout_runtime.batch_shortfall == {}, (
+            "nothing is charged, so no step shrinks"
+        )
+        assert ctrl._batch_replacements == {}
 
     @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
     def test_a_clean_run_loses_neither_a_prompt_nor_a_step_to_the_pool(
@@ -555,7 +961,9 @@ class TestReplaceDroppedPrompt:
         asyncio.run(ctrl._rollout_pump())
 
         assert buffer.target_step_list == [0, 1], "both batches became training steps"
-        assert len(ctrl._replacement_reserve) == 0, "the pool was handed back"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 0, (
+            "the pool was handed back"
+        )
 
     def test_a_partial_pool_is_not_dispatched_as_a_short_step(self):
         """A step short by construction would trip the floor and fail a finished run."""
@@ -572,7 +980,9 @@ class TestReplaceDroppedPrompt:
 
         # s0 stood in for the dropped p0, which leaves the pool one short of a step.
         assert manager.prompts_seen == ["p0", "s0", "p1"]
-        assert len(ctrl._replacement_reserve) == 1, "s1 is left over, not a short step"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 1, (
+            "s1 is left over, not a short step"
+        )
 
 
 class TestBorrowFromALaterStep:
@@ -621,7 +1031,7 @@ class TestBorrowFromALaterStep:
         assert ctrl._batch_replacements == {1: 1}, (
             "the spare repays the lender, not the step that was dropped from"
         )
-        assert ctrl._batch_shortfall == {}, "neither step ends up short"
+        assert ctrl._rollout_runtime.batch_shortfall == {}, "neither step ends up short"
 
     def test_nothing_to_borrow_degrades_to_replacing_in_place(self):
         # The shape at max_lookahead_versions=0, where the next batch is not dispatched
@@ -633,7 +1043,7 @@ class TestBorrowFromALaterStep:
         assert manager.prompts_seen == ["step0", "spare"]
         assert ctrl._batch_promotions == {}
         assert ctrl._batch_replacements == {0: 1}, "the spare filled step 0 itself"
-        assert ctrl._batch_shortfall == {}
+        assert ctrl._rollout_runtime.batch_shortfall == {}
 
     def test_an_in_flight_group_is_not_borrowed(self):
         """Borrowing one would inherit its wait, which is the thing being avoided."""
@@ -675,7 +1085,7 @@ class TestBorrowFromALaterStep:
 
         assert buffer.target_step_list == [1], "no group was moved off the lender"
         assert ctrl._batch_promotions == {}
-        assert ctrl._batch_shortfall == {0: 1}, "step 0 shrinks instead"
+        assert ctrl._rollout_runtime.batch_shortfall == {0: 1}, "step 0 shrinks instead"
 
 
 class TestTakeReplacement:
@@ -687,41 +1097,212 @@ class TestTakeReplacement:
         on_dropped_prompt: str = "replace",
         max_replacement_attempts: int = 1,
         spares: int = 0,
+        windowed: bool = False,
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=_failure_cfg(
                 on_dropped_prompt=on_dropped_prompt,
                 max_replacement_attempts=max_replacement_attempts,
             )
         )
-        ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
+        ctrl._rollout_runtime.replacement_reserve = deque(
+            _batch(f"spare{i}") for i in range(spares)
+        )
+        buffer = _RecordingBuffer()
+        ctrl._sampler = (
+            WindowedSampler(buffer, max_staleness_versions=1)
+            if windowed
+            else InOrderSampler(buffer, max_lookahead_versions=1)
+        )
         return ctrl
 
     def test_a_spare_is_handed_out_and_leaves_the_pool(self):
         ctrl = self._controller(spares=2)
-        assert ctrl._take_replacement(0, 0) is not None
-        assert len(ctrl._replacement_reserve) == 1
+        assert ctrl._take_replacement(0) is not None
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 1
 
     def test_shrink_mode_never_substitutes(self):
         ctrl = self._controller(on_dropped_prompt="shrink", spares=2)
-        assert ctrl._take_replacement(0, 0) is None
-        assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
+        assert ctrl._take_replacement(0) is None
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 2, (
+            "pool left untouched"
+        )
 
-    def test_an_unstamped_prompt_has_no_short_step_to_repair(self):
-        ctrl = self._controller(spares=2)
-        assert ctrl._take_replacement(None, 0) is None
+    def test_a_sampler_without_a_pool_never_substitutes(self):
+        # The sampler's capability decides, not this call's target_step: windowed keeps
+        # producing, so even a valid target_step with spares on hand is not replaced.
+        ctrl = self._controller(spares=2, windowed=True)
+        assert ctrl._take_replacement(0) is None
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 2, (
+            "pool left untouched"
+        )
+
+    def test_the_last_spare_is_still_substituted(self):
+        """Take the last spare from the pool."""
+        ctrl = self._controller(spares=1)
+        assert ctrl._take_replacement(0) is not None
+
+    def test_a_custom_sampler_without_the_hooks_is_rejected(self):
+        """The capability is required and read directly, so a sampler that omits it
+        fails loudly rather than silently getting a gated default."""
+
+        class _PlainSampler:
+            pass
+
+        ctrl = self._controller(spares=1)
+        ctrl._sampler = _PlainSampler()
+        with pytest.raises(AttributeError, match="uses_pooled_replacements"):
+            ctrl._take_replacement(0)
 
     def test_the_per_slot_budget_stops_substituting(self):
         ctrl = self._controller(max_replacement_attempts=2, spares=5)
-        assert ctrl._take_replacement(0, 1) is not None
-        assert ctrl._take_replacement(0, 2) is None
+        assert ctrl._take_replacement(1) is not None
+        assert ctrl._take_replacement(2) is None
 
     def test_an_empty_pool_shrinks_instead_of_waiting(self):
         """At epoch end there is no more data; the step closes short, not never."""
         ctrl = self._controller(spares=0)
-        assert ctrl._take_replacement(0, 0) is None
+        assert ctrl._take_replacement(0) is None
+
+
+class TestChargeShortfall:
+    """Which step a permanently lost group is charged to, per sampler."""
+
+    @staticmethod
+    def _controller(sampler: Any, *, assembling_version: int = 5):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = sampler
+        ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=4)
+        ctrl._rollout_runtime = RolloutRuntimeState()
+        # _step_assembler (cached_property) reads the three fields above when first
+        # accessed, so build it only after they are set.
+        ctrl._step_assembler._assembling_version = assembling_version
+        ctrl._step_assembler._step_assembly = None
+        return ctrl
+
+    def test_a_stamped_group_is_charged_to_its_own_step(self):
+        sampler = InOrderSampler(_RecordingBuffer(), max_lookahead_versions=1)
+        ctrl = self._controller(sampler)
+        ctrl._step_assembler.credit_shortfall(3)
+        assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [
+            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1),
+            lambda buf: WeightFifoSampler(buf, max_staleness_versions=1),
+        ],
+        ids=["ready_first", "weight_fifo"],
+    )
+    def test_an_unstamped_group_is_charged_to_the_step_being_assembled(
+        self, make_sampler
+    ):
+        ctrl = self._controller(make_sampler(_RecordingBuffer()), assembling_version=5)
+        ctrl._step_assembler.credit_shortfall(None)
+        ctrl._step_assembler.credit_shortfall(None)
+        assert ctrl._rollout_runtime.batch_shortfall == {5: 2}
+
+    def test_windowed_charges_nothing(self):
+        sampler = WindowedSampler(_RecordingBuffer(), max_staleness_versions=1)
+        ctrl = self._controller(sampler)
+        ctrl._step_assembler.credit_shortfall(None)
+        ctrl._step_assembler.credit_shortfall(3)
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+
+    def test_a_custom_sampler_without_the_hooks_is_rejected(self):
+        """charge_step_for_lost_group is required and called directly, so a sampler
+        that omits it fails loudly instead of falling back to a gated default."""
+
+        class _PlainSampler:
+            pass
+
+        ctrl = self._controller(_PlainSampler(), assembling_version=2)
+        with pytest.raises(AttributeError, match="charge_step_for_lost_group"):
+            ctrl._step_assembler.credit_shortfall(None)
+
+    def test_a_loss_after_selection_closed_counts_toward_the_next_step(self):
+        """The train pump advances the version when it stops selecting for a step."""
+        ctrl = self._controller(
+            ReadyFirstSampler(_RecordingBuffer(), max_staleness_versions=1),
+            assembling_version=5,
+        )
+        ctrl._step_assembler.credit_shortfall(None)
+        ctrl._step_assembler._assembling_version = 6
+        ctrl._step_assembler.credit_shortfall(None)
+        assert ctrl._rollout_runtime.batch_shortfall == {5: 1, 6: 1}
+
+
+class TestALostGroupDoesNotStallTheGate:
+    """The hang a lost group used to cause under a gated sampler that stamps nothing.
+
+    With a zero staleness window the gate admits the next batch only once the trainer has
+    moved past the current one. A step that is waiting on a group nobody is generating
+    never ends, so the trainer never moves and the gate never opens.
+    """
+
+    @staticmethod
+    def _controller(sampler: Any) -> Any:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = sampler
+        ctrl._rollout_runtime = RolloutRuntimeState()
+        ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+        # _step_assembler (cached_property) reads sampler/config/runtime on first
+        # access, so build it only after they are set.
+        ctrl._step_assembler._assembling_version = 0
+        ctrl._step_assembler._step_assembly = None
+        ctrl._async_cfg = SimpleNamespace(
+            rollout_failure=SimpleNamespace(min_step_batch_fraction=0.5)
+        )
+        return ctrl
+
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [
+            lambda buf: WeightFifoSampler(buf, max_staleness_versions=0),
+            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=0),
+        ],
+        ids=["weight_fifo", "ready_first"],
+    )
+    def test_the_charged_step_closes_short_and_opens_the_gate(self, make_sampler):
+        async def exercise() -> None:
+            trainer = {"version": 0}
+            ctrl = self._controller(make_sampler(_RecordingBuffer()))
+            admit = lambda: ctrl._sampler.admit(  # noqa: E731
+                trainer_version_fn=lambda: trainer["version"]
+            )
+
+            await admit()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(admit(), timeout=0.05)
+
+            # One group of step 0 is given up on, so the step can only ever hold one.
+            ctrl._step_assembler.credit_shortfall(None)
+            assert ctrl._target_groups_for_step(0) == 1
+
+            # The train pump closes the step on what it has, and the version moves on.
+            trainer["version"] = 1
+            await asyncio.wait_for(admit(), timeout=1.0)
+
+        asyncio.run(exercise())
+
+    def test_windowed_never_gates_so_nothing_needs_charging(self):
+        async def exercise() -> None:
+            ctrl = self._controller(
+                WindowedSampler(_RecordingBuffer(), max_staleness_versions=0)
+            )
+            for _ in range(3):
+                await asyncio.wait_for(
+                    ctrl._sampler.admit(trainer_version_fn=lambda: 0), timeout=1.0
+                )
+            ctrl._step_assembler.credit_shortfall(None)
+            assert ctrl._target_groups_for_step(0) == 2, "the step keeps its size"
+
+        asyncio.run(exercise())
 
 
 class TestTargetGroupsForStep:
@@ -735,6 +1316,9 @@ class TestTargetGroupsForStep:
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
+        # No step is exempt: these cases are about the floor, not about data running out.
+        ctrl._rollout_runtime.steps_allowed_short = set()
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(
                 num_prompts_per_step=num_prompts_per_step,
@@ -744,7 +1328,8 @@ class TestTargetGroupsForStep:
         ctrl._async_cfg = SimpleNamespace(
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
-        ctrl._batch_shortfall = dict(shortfall)
+        ctrl._rollout_runtime.batch_shortfall = dict(shortfall)
+        ctrl._dynamic_sampling_enabled = False
         return ctrl
 
     def test_an_untouched_step_waits_for_the_configured_batch(self):
@@ -782,6 +1367,17 @@ class TestTargetGroupsForStep:
         ctrl = self._controller(128, {0: 1}, fraction=1.0)
         with pytest.raises(RuntimeError, match="below the floor of 128"):
             ctrl._target_groups_for_step(0)
+
+    @pytest.mark.parametrize("dynamic_sampling", [False, True])
+    def test_floor_error_does_not_recommend_the_fault_tolerance_pool(
+        self, dynamic_sampling
+    ):
+        ctrl = self._controller(128, {0: 128}, fraction=1.0)
+        ctrl._dynamic_sampling_enabled = dynamic_sampling
+        with pytest.raises(RuntimeError, match="below the floor of 128") as error:
+            ctrl._target_groups_for_step(0)
+        assert "replacement_reserve_prompts" not in str(error.value)
+        assert "spare pool" not in str(error.value)
 
 
 def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
@@ -976,8 +1572,9 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del target_step, inflight_registry
+            del target_step, inflight_registry, replacement_index
             self._started += 1
             if self._started == 2:
                 self._both_started.set()
@@ -997,6 +1594,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         manager = _FailingRolloutManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=2,
             diagnostics=False,
@@ -1052,8 +1650,9 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+            replacement_index: int = 0,
         ) -> None:
-            del prompt, target_step, inflight_registry
+            del prompt, target_step, inflight_registry, replacement_index
             raise AssertionError("cancelled child unexpectedly started")
 
     class _CancelBeforeStartTaskGroup:
@@ -1087,6 +1686,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
     async def _main() -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
             diagnostics=False,
@@ -1126,12 +1726,520 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
     asyncio.run(_main())
 
 
+@pytest.mark.parametrize("row_counts", [(3, 4), (7, 8), (3, 8)])
+@pytest.mark.parametrize("threshold", [None, 0.75, 0.8])
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_min_valid_fraction_counts_rollouts_independently_of_segments(
+    row_counts: tuple[int, int],
+    threshold: float | None,
+    forest_training: bool,
+) -> None:
+    valid_rows, total_rows = row_counts
+    # Three of four owners verified, regardless of how many rows they produced.
+    # Ordinary capture has one row per owner and needs no forest metrics.
+    finalized = FinalizedGroup(
+        meta=None,
+        group_min_wv=0,
+        group_max_wv=0,
+        staging_keys=[],
+        valid_row_count=valid_rows,
+        total_row_count=total_rows,
+        metrics=(
+            {
+                "finalize/logical_owner_count": 4.0,
+                "finalize/valid_logical_owner_count": 3.0,
+            }
+            if forest_training
+            else {}
+        ),
+    )
+    counts = (3, 4) if forest_training else row_counts
+    dropped = threshold is not None and counts[0] / counts[1] < threshold
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(
+            min_valid_fraction_per_group=threshold, forest_training=forest_training
+        ),
+    )
+
+    assert ctrl._valid_fraction_counts(finalized) == (counts if dropped else None)
+
+
+@pytest.mark.parametrize("has_spare", [False, True])
+def test_below_valid_fraction_outcome_substitutes_or_closes_short(
+    has_spare: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pump acts on the finalize cut's decision instead of re-deciding it."""
+    spare = {"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}
+    rejected = BelowValidFractionGroup(
+        replacement=spare if has_spare else None,
+        lineage_group_id="spare-group" if has_spare else None,
+        target_step=0,
+        reward_observations=[],
+        zero_variance=True,
+        valid_count=3,
+        total_count=4,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=0.8, forest_training=False
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
+            record_finalizer_dropped_prompt=MagicMock(),
+            # The capture path tallies every finalized group's rewards before deciding
+            # whether to keep it, so the fake needs this whatever the threshold does.
+            record_group_rewards=MagicMock(),
+            stats=SimpleNamespace(committed=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(side_effect=[rejected, committed])
+        # in_order stamps the batch for step 0, so the step the finalize cut
+        # replaces into (or credits short) is visible.
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # The finalize cut decides replacement and shortfall from these, so the
+        # pump must pass the stamped step and its replacement count.
+        assert [call.kwargs for call in ctrl._finalize_with_actor.await_args_list] == [
+            {"target_step": 0, "replacements_used": 0}
+        ] + ([{"target_step": 0, "replacements_used": 1}] if has_spare else [])
+        # The finalize cut owns the shortfall credit; the pump adds none.
+        assert ctrl._rollout_runtime.batch_shortfall == {}
+        assert ctrl._rollout_exhausted.is_set()
+        assert ctrl._rollout_manager.stats.committed == int(has_spare)
+        assert ctrl._buffer_capacity._value == int(not has_spare)
+        assert ctrl._inflight_rollouts == 0
+        generate = ctrl._rollout_manager.generate_for_finalization
+        if has_spare:
+            # The spare runs under the lineage reserved inside the finalize cut.
+            assert generate.await_count == 2
+            assert generate.await_args.args == (spare,)
+            assert generate.await_args.kwargs["lineage_group_id"] == "spare-group"
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+        else:
+            assert generate.await_count == 1
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_called_once()
+
+    asyncio.run(run())
+    assert "(3/4 < 0.8)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("has_spare", [False, True])
+def test_zero_variance_outcome_substitutes_from_the_filtered_pool_or_closes_short(
+    has_spare: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A filtered group draws only the dynamic-sampling budget, never a failure retry."""
+    spare = {"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}
+    # Step 1 lent the finished group that filled step 0, so the spare repays step 1.
+    rejected = ZeroVarianceGroup(
+        replacement=spare if has_spare else None,
+        lineage_group_id="spare-group" if has_spare else None,
+        target_step=1,
+        reward_observations=[],
+        zero_variance=True,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=None, forest_training=False
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
+            record_finalizer_dropped_prompt=MagicMock(),
+            record_group_rewards=MagicMock(),
+            stats=SimpleNamespace(committed=0, zero_variance_groups=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(side_effect=[rejected, committed])
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # The spare is generated for the step the finalize cut reserved it for, and
+        # it does not spend the fault-tolerance budget.
+        assert [call.kwargs for call in ctrl._finalize_with_actor.await_args_list] == [
+            {"target_step": 0, "replacements_used": 0}
+        ] + ([{"target_step": 1, "replacements_used": 0}] if has_spare else [])
+        assert ctrl._rollout_manager.stats.zero_variance_groups == 1
+        assert ctrl._rollout_manager.stats.committed == int(has_spare)
+        assert ctrl._buffer_capacity._value == int(not has_spare)
+        assert ctrl._inflight_rollouts == 0
+        # A filtered group is a healthy rollout, not an infrastructure drop.
+        ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+        generate = ctrl._rollout_manager.generate_for_finalization
+        if has_spare:
+            assert generate.await_count == 2
+            assert generate.await_args.args == (spare,)
+            assert generate.await_args.kwargs["lineage_group_id"] == "spare-group"
+            # Counted against the step that was repaid.
+            assert ctrl._batch_replacements == {1: 1}
+            tallies = ctrl._rollout_manager.record_group_rewards.call_args_list
+            assert [call.kwargs["replacement_index"] for call in tallies] == [0, 1]
+        else:
+            assert generate.await_count == 1
+
+    asyncio.run(run())
+    assert "its voting rewards carry no signal" in capsys.readouterr().out
+
+
+def test_a_group_rejected_for_both_reasons_tallies_each_attempt_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fault-tolerance and filtered replacements share one tally index sequence."""
+    below_valid = BelowValidFractionGroup(
+        replacement={"message_log": [[{"role": "user", "content": "a"}]], "idx": 1},
+        lineage_group_id=None,
+        target_step=0,
+        reward_observations=[],
+        zero_variance=False,
+        valid_count=3,
+        total_count=4,
+    )
+    zero_variance = ZeroVarianceGroup(
+        replacement={"message_log": [[{"role": "user", "content": "b"}]], "idx": 2},
+        lineage_group_id=None,
+        target_step=0,
+        reward_observations=[],
+        zero_variance=True,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=0.8, forest_training=False
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
+            record_finalizer_dropped_prompt=MagicMock(),
+            record_group_rewards=MagicMock(),
+            stats=SimpleNamespace(committed=0, zero_variance_groups=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(
+            side_effect=[below_valid, zero_variance, committed]
+        )
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # Only the fault-tolerance replacement spends that budget.
+        assert [
+            call.kwargs["replacements_used"]
+            for call in ctrl._finalize_with_actor.await_args_list
+        ] == [0, 1, 1]
+        tallies = ctrl._rollout_manager.record_group_rewards.call_args_list
+        assert [call.kwargs["replacement_index"] for call in tallies] == [0, 1, 2]
+        assert ctrl._rollout_manager.stats.zero_variance_groups == 1
+        assert ctrl._rollout_manager.stats.committed == 1
+
+    asyncio.run(run())
+    capsys.readouterr()
+
+
+def _claiming_controller(*, spares: int, exhausted: bool = False) -> Any:
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dynamic_sampling_enabled = True
+    # Claiming a filtered spare only applies to a sampler that pools replacements;
+    # a non-pooled sampler (windowed) refills from later dispatches and never waits.
+    ctrl._sampler = SimpleNamespace(uses_pooled_replacements=True)
+    ctrl._rollout_runtime = RolloutRuntimeState()
+    ctrl._rollout_runtime.filtered_reserve = deque({"idx": i} for i in range(spares))
+    ctrl._filtered_spares_claimed = 0
+    ctrl._dataloader_exhausted = exhausted
+    return ctrl
+
+
+def test_claiming_a_filtered_spare_waits_until_one_is_unclaimed() -> None:
+    """Two finalizing groups cannot both count on the pool's only spare."""
+
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=1)
+
+        async def second_claim() -> int:
+            async with ctrl._claim_filtered_spare():
+                return ctrl._filtered_spares_claimed
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 1
+            waiting = asyncio.create_task(second_claim())
+            await asyncio.sleep(0.25)
+            assert not waiting.done()
+            # The pump refilled the pool, so a second spare can be promised.
+            ctrl._rollout_runtime.filtered_reserve.append({"idx": 9})
+            assert await asyncio.wait_for(waiting, timeout=5) == 2
+        assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_a_claim_is_released_when_finalization_fails() -> None:
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=1)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async with ctrl._claim_filtered_spare():
+                raise RuntimeError("boom")
+
+        assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_no_claim_is_made_once_the_dataloader_is_exhausted() -> None:
+    """Nothing will refill an empty pool, so waiting for it would hang the group."""
+
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=0, exhausted=True)
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_claiming_does_nothing_without_dynamic_sampling() -> None:
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=0)
+        ctrl._dynamic_sampling_enabled = False
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_pump_claims_and_pops_a_filtered_spare_for_a_real_zero_variance_rejection() -> (
+    None
+):
+    """The pump drives a real finalize that classifies and pops the filtered spare.
+
+    This covers the ``_claim_filtered_spare`` wrapper around the real
+    ``_finalize_with_actor``: a finalized group whose voting rewards carry no signal
+    is classified (not mocked) inside the finalize cut, rejected, its spare popped
+    from the filtered pool, and the step refilled by the committed replacement.
+    """
+    # The first group is uniform (zero variance -> rejected); its filtered spare is
+    # the second group, which has reward spread and commits.
+    results = iter([_signal_result([1.0, 1.0]), _signal_result([1.0, 0.0])])
+
+    class _ClassifyingRolloutManager:
+        """Owns the voting settings and classifies finalized capture groups."""
+
+        def __init__(self) -> None:
+            self._masked_reward_policy = "include"
+            self._overlong_filtering = False
+            self.stats = SimpleNamespace(committed=0, zero_variance_groups=0)
+            self.record_group_rewards = MagicMock()
+            self.record_finalizer_dropped_prompt = MagicMock()
+            self.record_canonical_publication = MagicMock()
+            self.generated: list[Any] = []
+
+        def _is_zero_variance_finalized(self, finalized: FinalizedGroup) -> bool:
+            return RolloutManager._is_zero_variance_finalized(self, finalized)
+
+        async def generate_for_finalization(
+            self, prompt: Any, *, target_step: int | None = None, **kwargs: Any
+        ) -> Any:
+            del target_step, kwargs
+            self.generated.append(prompt)
+            return _request(), {}
+
+    manager = _ClassifyingRolloutManager()
+
+    class _ResultActor:
+        """Finalizer actor returning the next pre-built result each call."""
+
+        def __init__(self) -> None:
+            self.finalize = SimpleNamespace(remote=self._remote)
+
+        async def _remote(self, request: Any) -> FinalizedGroup:
+            del request
+            return next(results)
+
+    actor = _ResultActor()
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1, num_prompts_per_step=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=None,
+                forest_training=False,
+                staging_partition="staging",
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._is_ppo = False
+        ctrl._partition_id = "canonical"
+        ctrl._dp_client = _DataPlaneClient()
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+
+        # Run real controller finalization with fake actor and data-plane endpoints.
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._available_finalizers = asyncio.Queue()
+        ctrl._available_finalizers.put_nowait(actor)
+        ctrl._active_finalizers = 0
+        ctrl._finalizer_waiters = 0
+        ctrl._finalizer_unknown_outcomes = 0
+        ctrl._rollout_recovery_ledger = MagicMock()
+        ctrl._rollout_recovery_ledger.__contains__.return_value = False
+        ctrl._rollout_recovery_enabled = False
+        ctrl._refit_cuts = SimpleNamespace(tokens_by_version=lambda _: {})
+
+        # Dynamic sampling on, with one spare in the filtered pool for the
+        # zero-variance rejection to consume.
+        ctrl._dynamic_sampling_enabled = True
+        ctrl._dataloader_exhausted = False
+        ctrl._filtered_spares_claimed = 0
+        ctrl._filtered_prompt_budget = 10
+        ctrl._filtered_prompts_by_step = {}
+        ctrl._rollout_runtime.filtered_reserve = deque(
+            [{"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}]
+        )
+        ctrl._rollout_runtime.steps_allowed_short = set()
+
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._buffer.commit_finalized = AsyncMock()
+        ctrl._buffer.abort = MagicMock()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._finalizer_actors = [actor]
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        # The pump must claim the spare before the finalize cut pops it, so record
+        # the claim count held inside finalization.
+        claims_during_finalize: list[int] = []
+        finalize = ctrl._finalize_with_actor
+
+        async def finalize_with_claim(*args: Any, **kwargs: Any) -> Any:
+            claims_during_finalize.append(ctrl._filtered_spares_claimed)
+            return await finalize(*args, **kwargs)
+
+        ctrl._finalize_with_actor = finalize_with_claim
+
+        await ctrl._rollout_pump()
+
+        # The zero-variance group was classified and rejected, its spare popped
+        # from the filtered pool and charged, and the replacement committed.
+        assert manager.stats.zero_variance_groups == 1
+        assert manager.stats.committed == 1
+        assert not ctrl._rollout_runtime.filtered_reserve
+        assert ctrl._filtered_prompts_by_step == {0: 1}
+        # The pump held the spare's claim across finalization, then released it.
+        assert claims_during_finalize[0] == 1
+        assert ctrl._filtered_spares_claimed == 0
+        # Two generations: the rejected group and its filtered replacement.
+        assert len(manager.generated) == 2
+        # Both tallies recorded; the rejection carried the zero-variance verdict.
+        tallies = manager.record_group_rewards.call_args_list
+        assert [call.kwargs["zero_variance"] for call in tallies] == [True, False]
+
+    asyncio.run(run())
+
+
 def test_actor_path_releases_generation_permit_before_finalization() -> None:
     class _SplitRolloutManager:
         def __init__(self) -> None:
             self.generated = 0
             self.two_generated = asyncio.Event()
             self.stats = SimpleNamespace(committed=0)
+
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
 
         async def generate_for_finalization(
             self,
@@ -1144,7 +2252,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             self.generated += 1
             if self.generated == 2:
                 self.two_generated.set()
-            return SimpleNamespace(group_id=f"g{self.generated}")
+            return SimpleNamespace(group_id=f"g{self.generated}"), {}
 
     async def _main() -> None:
         manager = _SplitRolloutManager()
@@ -1153,17 +2261,27 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
 
         async def _delayed_finalize(
             request: Any,
+            rollout_metrics: dict[str, Any],
             *,
             target_step: int | None = None,
+            replacements_used: int = 0,
         ) -> bool:
             nonlocal finalizers_started
-            del request, target_step
+            del request, rollout_metrics, target_step
             finalizers_started += 1
             await release_finalizers.wait()
-            return True
+            return FinalizedGroup(
+                meta=None,
+                group_min_wv=0,
+                group_max_wv=0,
+                staging_keys=[],
+                valid_row_count=1,
+                total_row_count=1,
+            )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
             diagnostics=False,
@@ -1223,6 +2341,9 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
             self.recovery_ledger = RolloutRecoveryLedger()
             self.stats = SimpleNamespace(committed=0)
 
+        def record_group_rewards(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
         def reserve_prompt_group(
             self,
             cut: DataPlaneMutationCut,
@@ -1274,12 +2395,13 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ) -> Any:
             del prompt, target_step, inflight_registry
             assert self.recovery_ledger.get_group(lineage_group_id)
-            return SimpleNamespace(group_id=lineage_group_id)
+            return SimpleNamespace(group_id=lineage_group_id), {}
 
     async def _main() -> None:
         manager = _RecoveryCaptureManager()
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
+        ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._async_cfg = SimpleNamespace(
             max_inflight_prompts=1,
             diagnostics=False,
@@ -1310,7 +2432,6 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
-        ctrl._sampler_stamps_target_steps = False
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
@@ -1318,15 +2439,25 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
 
         async def _finalize(
             request: Any,
+            rollout_metrics: dict[str, Any],
+            **_: Any,
         ) -> Any:
             async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
                 manager.recovery_ledger.discard_group(cut, request.group_id)
             if not committed:
                 return None
-            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+            return FinalizedGroup(
+                meta=None,
+                group_min_wv=0,
+                group_max_wv=0,
+                staging_keys=[],
+                valid_row_count=1,
+                total_row_count=1,
+            )
 
         ctrl._finalize_with_actor = _finalize
 
+        attach_rollout_checkpointing(ctrl)
         await ctrl._rollout_pump()
 
         assert manager.recovery_ledger.groups() == []
@@ -1337,6 +2468,16 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
+
+
+class _SnapshotSinkTrainer:
+    """Picklable trainer stand-in: the controller registers snapshot sources on it."""
+
+    def add_data_plane_snapshot_source(self, actor) -> None:
+        pass
+
+    def add_data_plane_snapshot_fn(self, fn) -> None:
+        pass
 
 
 @pytest.mark.vllm
@@ -1394,16 +2535,16 @@ def test_rollout_pump_writes_expected_tq_data(
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         # Actor __init__ builds a CheckpointManager + TimeoutChecker from
         # this block; enabled=False keeps the run write-free.
-        checkpointing={
-            "enabled": False,
-            "checkpoint_dir": str(tmp_path / "checkpoints"),
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10_000,
-            "save_optimizer": False,
-            "checkpoint_must_save_by": None,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=False,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            metric_name=None,
+            higher_is_better=False,
+            keep_top_k=None,
+            save_period=10_000,
+            save_optimizer=False,
+            checkpoint_must_save_by=None,
+        ),
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
@@ -1428,7 +2569,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     actor_args = SingleControllerActorArgs(
         gen_handle=vllm_generation,
-        trainer_handle=object(),
+        trainer_handle=_SnapshotSinkTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]  # unused by _rollout_pump
         inference_cluster=None,  # type: ignore[arg-type]
@@ -1527,3 +2668,12 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_assistant_messages",
             "num_routed_experts_backfilled",
         }
+
+
+def test_dynamic_sampling_off_keeps_the_original_admission_wait() -> None:
+    ctrl = _pump_controller(_ScriptedRolloutManager([]), [_batch("a"), _batch("b")])
+    wait = AsyncMock(wraps=ctrl._sampler.wait_until_admissible)
+    ctrl._sampler.wait_until_admissible = wait
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=2))
+    assert wait.await_count == 2
+    assert not ctrl._rollout_runtime.filtered_reserve
