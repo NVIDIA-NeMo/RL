@@ -60,14 +60,29 @@ overrides=(
     logger.wandb_enabled=false
     "$@"
 )
+save_overrides=(
+    "${overrides[@]}"
+    "grpo.max_num_steps=${total_steps}"
+    checkpointing.checkpoint_must_save_by=00:00:00:01
+    "logger.log_dir=${output}/save"
+)
+resume_overrides=(
+    "${overrides[@]}"
+    "grpo.max_num_steps=${total_steps}"
+    checkpointing.checkpoint_must_save_by=null
+    "logger.log_dir=${output}/resume"
+)
+# Phase settings can change interpolated paths; check both before training.
 uv run --extra nemo_gym python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
-    --mode "${mode}" --config "${recipe}" "${overrides[@]}" \
+    --mode "${mode}" --config "${recipe}" "${save_overrides[@]}" \
     --expected-checkpoint-dir "${checkpoint_dir}" > "${output}/runtime-check.json"
-common=(examples/run_grpo_single_controller.py --config "${recipe}" "${overrides[@]}")
+uv run --extra nemo_gym python examples/nemo_gym/mm_coding/check_mm_coding_runtime.py \
+    --mode "${mode}" --config "${recipe}" "${resume_overrides[@]}" \
+    --expected-checkpoint-dir "${checkpoint_dir}" > "${output}/runtime-check-resume.json"
+common=(examples/run_grpo_single_controller.py --config "${recipe}")
 # These are separate interpreter/driver processes. Both phases use the same split and checkpoint root.
-uv run --no-sync python "${common[@]}" \
-    "grpo.max_num_steps=${total_steps}" checkpointing.checkpoint_must_save_by=00:00:00:01 \
-    "logger.log_dir=${output}/save" > "${output}/save.log" 2>&1
+uv run --no-sync python "${common[@]}" "${save_overrides[@]}" \
+    > "${output}/save.log" 2>&1
 if ! grep -q "Timeout has been reached, stopping training early" "${output}/save.log"; then
     echo "Run 1 did not stop after its first saved step" >&2
     exit 1
@@ -80,9 +95,8 @@ weights, optimizer = CheckpointManager.get_resume_paths(sys.argv[1])
 assert weights is not None and weights.is_dir(), "Missing policy weights"
 assert optimizer is not None, "Missing native optimizer state"
 CHECKPOINT
-uv run --no-sync python "${common[@]}" \
-    "grpo.max_num_steps=${total_steps}" checkpointing.checkpoint_must_save_by=null \
-    "logger.log_dir=${output}/resume" > "${output}/resume.log" 2>&1
+uv run --no-sync python "${common[@]}" "${resume_overrides[@]}" \
+    > "${output}/resume.log" 2>&1
 if ! grep -q "Restoring dataloader state from checkpoint" "${output}/resume.log"; then
     echo "Run 2 did not restore the step_1 checkpoint" >&2
     exit 1
