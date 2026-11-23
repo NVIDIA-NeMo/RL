@@ -79,6 +79,42 @@ A rollout snapshot attempt runs in this order:
 
 Every attempt logs its outcome under `rollout/checkpoint_outcome`, and every saved snapshot its timings under `timing/rollout_checkpoint`.
 
+## Pipelined Generation-Prefix Writes
+
+Generation-prefix cut rows always go through a write pipeline, which overlaps
+preparing cut rows with one bounded write stream. With `data_plane.impl:
+transfer_queue` (any backend), the PUTs run in a colocated CPU writer actor on
+the generation node; it needs one free Ray CPU there, and on `mooncake_cpu` its
+client owns no memory segment, like the worker's capture client. A local data
+plane lives inside each process, so there the worker writes itself.
+Router-replay tensors and media capture are supported: a media call's cut rows
+carry its media digests and placeholder media columns. Terminal writes and
+restore reads use the worker's own client. Checkpoint records and digests are
+unchanged. A merged write holds at most `rollout_recovery.prefix_write_max_rows`
+rows and `rollout_recovery.prefix_write_max_tokens` tokens.
+
+The pipeline's bounds are fixed (`PREFIX_WRITE_LIMITS` in
+`nemo_rl/models/generation/prefix_recovery/write_pipeline.py`):
+
+| Bound | Value | Purpose |
+|---|---|---|
+| `max_pending_inventories` | `128` | Reject admission beyond this many pending inventories. |
+| `max_buffered_payload_bytes` | 512 MiB | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
+| `max_batch_payload_bytes` | 128 MiB | Bound one merged write; a larger single row is written alone. |
+| `coalesce_wait_seconds` | `0.01` | Coalescing window for compatible prepared rows. |
+
+The buffer must hold at least two maximum batches. A single row above
+`max_batch_payload_bytes` is written alone, as a row above
+`prefix_write_max_tokens` is; its estimated size may take the buffer past
+`max_buffered_payload_bytes`, and while it does no further batch is prepared.
+The buffer does not bound total RSS:
+live token histories, Python records, temporary encoding buffers and transport
+copies occupy additional memory. Preparation retains each call's lifecycle until
+its write is acknowledged and the cut seals, so at most one write
+(`prefix_write_max_rows` rows) is prepared ahead of the write in flight. Duplicate in-flight inventories
+share a result; inventories sharing calls serialize. Closing an HTTP waiter does
+not cancel an admitted write. No receipt advertises a prefix before TQ durability.
+
 ## Restoring
 
 `restore()` runs once, after the weights are in sync and before the pumps start. It restores, in order:

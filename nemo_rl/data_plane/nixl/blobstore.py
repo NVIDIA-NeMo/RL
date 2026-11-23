@@ -111,8 +111,8 @@ class UnitSlabStore:
         self.ep = ep
         # SSD tier on the units: a put that RAM cannot take spills to disk.
         self.ssd = ssd
-        # The caller's lock (TimedLock), released while a put sleeps on Busy or
-        # a pending commit, so the process's other ops do not wait on a disk write.
+        # The caller's lock (TimedLock), released while a put sleeps on Busy,
+        # so the process's other ops do not wait on a disk write.
         self.idle = lock.released if lock is not None else contextlib.nullcontext
         self.directory = directory
         self.namespace = namespace
@@ -263,14 +263,13 @@ class UnitSlabStore:
     ) -> bool:
         """Awaited commit: the blob's rows are published once it returns True.
 
-        A blob the unit spilled to disk answers ``"pending"`` while its file is
-        written: ask again, inside the put deadline. Commit is idempotent on the
-        unit, so a call whose reply was lost is asked again too. On failure the
+        A unit answers ``"done"`` or ``"lost"``, never ``"pending"``.
+        Commit is safe to repeat on the unit, so a call whose reply
+        was lost is asked again. On failure the
         client aborts, which the unit ignores for a blob it did publish.
         """
         ok = False
         try:
-            backoff = PENDING_POLL_S
             while True:
                 try:
                     status = self.ctl.call(
@@ -283,10 +282,7 @@ class UnitSlabStore:
                     if deadline is None:
                         raise
                     continue  # no reply: ask again until the deadline
-                if status != "pending":
-                    break
-                with self.idle():  # the WRITE is done
-                    backoff = busy_wait(deadline, backoff)
+                break
             ok = status == "done"
             if not ok:
                 errs.append(TransferError(f"unit {u['unit_id']} lost the blob"))
@@ -380,7 +376,7 @@ class UnitSlabStore:
         stored: set[str] = set()
         for u in written:
             blob_id = by_unit[u][4]
-            # Not "done" in the round (a spill still pending, no reply): commit's own polling.
+            # No reply in the round: commit's own retry.
             if status.get(u) == "done" or self._commit(infos[u], blob_id, deadline, []):
                 stored.add(blob_id)
         return stored

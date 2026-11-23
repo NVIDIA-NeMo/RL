@@ -53,9 +53,8 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
     get_gdpo_reward_component_keys,
-    masked_mean,
-    masked_var,
 )
+from nemo_rl.utils.tensor_ops import masked_mean, masked_var
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -127,7 +126,15 @@ class GRPOAdvantageEstimator(AdvantageEstimator):
     def requires_global_batch(self) -> bool:
         return False
 
-    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        valid_mask=None,
+        normalize_rows=None,
+        **kwargs,
+    ):
         """Compute GRPO advantages.
 
         Args:
@@ -141,6 +148,10 @@ class GRPOAdvantageEstimator(AdvantageEstimator):
                   placeholder rows carry 0.0 (their sample_mask already excludes them
                   from the loss; excluding them here keeps siblings' baselines unbiased).
                   None keeps the legacy all-valid behavior.
+            normalize_rows: Optional bool tensor of shape [batch_size] that
+                  replaces ``normalize_rewards`` row by row: True divides that
+                  row's advantage by its group's reward std (grpo.agent_overrides).
+                  None applies ``normalize_rewards`` to every row.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -158,10 +169,20 @@ class GRPOAdvantageEstimator(AdvantageEstimator):
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 
-        if self.normalize_rewards:
+        if normalize_rows is not None or self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
             normalize_mask = (std > 0) & ~is_trivial_distribution
+            if normalize_rows is not None:
+                normalize_rows = normalize_rows.reshape(-1).to(
+                    device=normalize_mask.device, dtype=torch.bool
+                )
+                if normalize_rows.numel() != normalize_mask.numel():
+                    raise ValueError(
+                        f"normalize_rows has {normalize_rows.numel()} rows; "
+                        f"expected {normalize_mask.numel()}"
+                    )
+                normalize_mask = normalize_mask & normalize_rows
             advantages[normalize_mask] = advantages[normalize_mask] / (
                 std.unsqueeze(-1)[normalize_mask] + epsilon
             )

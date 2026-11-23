@@ -26,6 +26,10 @@ async_rl:
     name: in_order
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
+  # Run the weight synchronizer in its own CPU Ray actor instead of the controller's
+  # process. Requires non-colocated generation and an NCCL refit transport.
+  refit_actor:
+    enabled: false
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
@@ -56,6 +60,17 @@ async_rl:
   # process, which both holds a whole cohort's advantage inputs in the
   # controller's heap and blocks its event loop while the stage runs.
   num_advantage_workers: 0
+  # Build the trainer while setup reserves the vLLM workers (NeMo-Gym runs with
+  # non-colocated vLLM, cluster.segment_size and no resume). Adds load on the Ray GCS.
+  early_trainer_build: false
+  # Synthetic first training pass on a Megatron trainer, run while it waits for
+  # generation or the first rollouts (non-colocated generation). Setups it does not
+  # cover skip it and log why.
+  trainer_warmup:
+    enabled: false
+    # Lengths of the synthetic sequences; null fills two microbatches near the
+    # microbatch token budget.
+    seqlens: null
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
@@ -281,6 +296,13 @@ rollout_recovery:
   # rollouts start over after a crash.
   # Set true to accept that with a warning; only valid with target_level: turn or prefix.
   allow_restart_only_gym_servers: false
+  # Per-generation-owner TQ I/O limits for saved partial responses with
+  # target_level: prefix. Rows per TQ write at a checkpoint cut.
+  prefix_write_max_rows: 256
+  # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
+  prefix_write_max_tokens: 4194304
+  # Rows per TQ read at restore. 1 = each restore reads on its own.
+  prefix_read_max_rows: 256
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

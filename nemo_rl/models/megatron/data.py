@@ -1693,10 +1693,10 @@ def _router_valid_lengths(
 
 
 def _router_cu_seqlens(
-    cu_seqlens: torch.Tensor, data_dict: BatchedDataDict[Any]
-) -> torch.Tensor:
+    cu_seqlens: torch.Tensor | None, data_dict: BatchedDataDict[Any]
+) -> torch.Tensor | None:
     """Packed counterpart of ``_router_valid_lengths``; padded offsets are unchanged."""
-    if ROUTER_EXCLUDED_ROWS not in data_dict:
+    if cu_seqlens is None or ROUTER_EXCLUDED_ROWS not in data_dict:
         return cu_seqlens
     lengths = _router_valid_lengths(cu_seqlens[1:] - cu_seqlens[:-1], data_dict)
     offsets = cu_seqlens[:1] + lengths.cumsum(0).to(cu_seqlens.dtype)
