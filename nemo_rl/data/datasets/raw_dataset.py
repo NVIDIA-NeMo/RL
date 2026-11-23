@@ -54,7 +54,7 @@ class RawDataset:
         processor_name = "default"
         if "processor" in self.data_config:
             processor_name = self.data_config[
-                "processor"  # pyrefly: ignore[typed-dict-key-error]  `processor` is only required for response datasets and will be removed after data processor is refactored
+                "processor"  # pyrefly: ignore[bad-typed-dict-key]  `processor` is only required for response datasets and will be removed after data processor is refactored
             ]
         assert processor_name in PROCESSOR_REGISTRY, (
             f"Processor {processor_name} not found in PROCESSOR_REGISTRY. Please call nemo_rl.data.processors.register_processor() to register the processor."

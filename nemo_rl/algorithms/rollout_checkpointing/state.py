@@ -113,6 +113,10 @@ class CapturedRolloutState:
     rolled_back_train_group_count: int
     mutation_version: int
     tq_save_seconds: float
+    replay_inventory_seconds: float
+    recovery_state_build_seconds: float
+    recovery_state_serialize_seconds: float
+    staging_inventory_seconds: float
 
 
 @dataclass(frozen=True)
