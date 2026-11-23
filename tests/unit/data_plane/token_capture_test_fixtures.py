@@ -95,6 +95,56 @@ def _manifest(record: StagedCallRecord) -> CallRecord:
     )
 
 
+def build_zero_token_terminal_fixture(
+    *, rollout_id: str
+) -> tuple[list[StagedCallRecord], RolloutReceipt]:
+    """Two-call receipt whose terminal call staged no new tokens.
+
+    The context-exhausted final turn returned an empty length-cut
+    completion, so the terminal call carries only its input prefix
+    (mask 0) with ``finish_reason="length"``. Gym's verifier rejects
+    the chain (``empty_generation``), so the finalizer must publish a
+    masked placeholder instead of a trainable row.
+    """
+    root = _record(
+        rollout_id=rollout_id,
+        model_call_id="c1",
+        parent_call_id=None,
+        prev_len=0,
+        token_ids=[10, 11, 12, 13],
+        token_mask=[0.0, 0.0, 1.0, 1.0],
+        logprobs=[0.0, 0.0, -0.1, -0.2],
+        weight_version=4,
+    )
+    terminal = _record(
+        rollout_id=rollout_id,
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=root.cum_len,
+        token_ids=[20],
+        token_mask=[0.0],
+        logprobs=[0.0],
+        weight_version=4,
+        parent_chain_hash=root.chain_hash,
+        cumulative_prefix=root.token_ids_delta,
+    )
+    receipt = RolloutReceipt(
+        capture_key=rollout_id,
+        terminal_model_call_id=terminal.model_call_id,
+        manifest=[
+            _manifest(root),
+            _manifest(terminal).model_copy(
+                update={
+                    "finish_reason": "length",
+                    "response_status": "incomplete",
+                }
+            ),
+        ],
+        terminal_selection="declared",
+    )
+    return [root, terminal], receipt
+
+
 def fixture_names() -> tuple[str, ...]:
     return ("worked_example", "single_call", "mixed_weight_versions")
 
