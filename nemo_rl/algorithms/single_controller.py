@@ -3676,8 +3676,6 @@ class SingleControllerActor:
                         max_seq_len=self._max_total_sequence_length,
                     )
                 )
-                # After the per-group aggregate, so the step-pooled
-                # mask_rules/<name>_reward_mean is the value that is logged.
                 step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
                 self._masking_stats_acc = new_masking_stats_accumulator()
                 self._rollout_stats_acc = new_rollout_stats_accumulator()

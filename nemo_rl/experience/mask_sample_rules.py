@@ -208,14 +208,12 @@ def mask_rule_metrics(
     rules: Sequence[MaskSampleRule],
     num_results: int,
     *,
-    reward_sums: Mapping[str, float] | None = None,
     any_count: int = 0,
 ) -> dict[str, float]:
     """Per-group rule metrics attached to the group's rollout_metrics.
 
-    ``mask_rules/<name>_rate`` for every configured rule (0.0 when unmatched),
-    ``mask_rules/<name>_reward_mean`` when the rule matched (mean reward of the
-    rows it masked), and ``mask_rules/any_rate`` (rows masked by at least one rule).
+    ``mask_rules/<name>_rate`` for every configured rule (0.0 when unmatched) and
+    ``mask_rules/any_rate`` (rows masked by at least one rule).
     """
     if not rules or num_results <= 0:
         return {}
@@ -223,7 +221,5 @@ def mask_rule_metrics(
     for rule in rules:
         count = counts.get(rule.name, 0)
         out[rule.metric_key] = count / num_results
-        if count and reward_sums is not None and rule.name in reward_sums:
-            out[f"mask_rules/{rule.name}_reward_mean"] = reward_sums[rule.name] / count
     out["mask_rules/any_rate"] = any_count / num_results
     return out

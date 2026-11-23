@@ -1881,15 +1881,12 @@ class AsyncNemoGymRolloutImpl:
                     sum("receipt" not in result for result in completed_results),
                 )
             )
-            mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count = (
-                mask_rule_stats
-            )
+            mask_rule_counts, mask_rule_any_count = mask_rule_stats
             rollout_metrics.update(
                 mask_rule_metrics(
                     mask_rule_counts,
                     self._mask_sample_rules,
                     len(completed_results),
-                    reward_sums=mask_rule_reward_sums,
                     any_count=mask_rule_any_count,
                 )
             )
@@ -1913,9 +1910,7 @@ class AsyncNemoGymRolloutImpl:
 
     def _results_to_completions(
         self, results: list[dict], *, record_rule_hits: bool = False
-    ) -> tuple[
-        list[Completion], dict[str, int], tuple[dict[str, int], dict[str, float], int]
-    ]:
+    ) -> tuple[list[Completion], dict[str, int], tuple[dict[str, int], int]]:
         """Apply configured penalties and convert a Gym result batch.
 
         Receipt-mode (token-capture) results are token-free — the message_log
@@ -1974,7 +1969,7 @@ class AsyncNemoGymRolloutImpl:
                 mask_rule_reward_sums[rule_name] = (
                     mask_rule_reward_sums.get(rule_name, 0.0) + reward
                 )
-        mask_rule_stats = (mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count)
+        mask_rule_stats = (mask_rule_counts, mask_rule_any_count)
         if record_rule_hits and self._mask_sample_rules:
             # Only the group-level conversion records, so the streamed per-row
             # conversion of the same result does not double count.

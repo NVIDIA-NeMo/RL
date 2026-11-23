@@ -3810,9 +3810,8 @@ def test_train_pump_logs_row_stats_once_per_step_and_resets_them(
                 sample_ids=sample_ids,
                 fields=[],
                 sequence_lengths=[3] * len(members),
-                # The per-group value the step-pooled metric must replace.
                 extra_info={
-                    ROLLOUT_METRICS: [{"mask_rules/eval_incomplete_reward_mean": 9.0}]
+                    ROLLOUT_METRICS: [{"mask_rules/eval_incomplete_rate": 0.5}]
                 },
                 tags=[
                     {"weight_version": 0, GROUP_ID_TAG: f"group-{group}"}
@@ -3867,7 +3866,8 @@ def test_train_pump_logs_row_stats_once_per_step_and_resets_them(
     assert step_1["gen_tokens/mean"] == 2.0
     # Only the 30-token row is above 90 % of max_total_sequence_length (32).
     assert step_1["seq_len/frac_above_90pct_ctx"] == pytest.approx(1 / 3)
-    # The step-pooled rule metrics replace the per-group aggregate.
+    # Both rule-metric families reach the step: per-group rates and step totals.
+    assert step_1["mask_rules/eval_incomplete_rate"] == 0.5
     assert step_1["mask_rules/rollouts_seen"] == 4.0
     assert step_1["mask_rules/eval_incomplete_reward_mean"] == 0.0
     # Step 2 starts from empty accumulators: nothing is carried over from step 1.

@@ -1213,6 +1213,60 @@ def test_mask_sample_rules_survive_gate_and_count_group_hits_once():
     assert impl.pop_mask_rule_metrics() == {}
 
 
+def test_run_rollouts_records_rule_hits_for_the_step_and_only_rates_per_group():
+    """The group path feeds pop_mask_rule_metrics; reward_mean is a step metric only."""
+    from nemo_rl.utils.timer import Timer
+
+    rules = parse_mask_sample_rules(
+        {
+            "mask_sample_rules": [
+                {
+                    "name": "eval_incomplete",
+                    "field": "evaluation_completed",
+                    "equals": False,
+                }
+            ]
+        }
+    )
+
+    class Remote:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, pending, *args, **kwargs):
+            async def value(row):
+                index = row["_rowidx"]
+                result = _mask_gate_result()
+                result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+                # Row 0 matches the rule.
+                result["full_result"]["evaluation_completed"] = index == 1
+                result["full_result"]["reward"] = 0.25 if index == 0 else 1.0
+                return index, {"name": "agent"}, result, None
+
+            async def stream():
+                for row in pending:
+                    yield value(row)
+
+            return stream()
+
+    impl = _nemo_gym_impl(False, mask_sample_rules=rules)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": SimpleNamespace(run_rollouts=Remote())}
+    inputs = [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(2)]
+    _, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+
+    assert metrics["mask_rules/eval_incomplete_rate"] == 0.5
+    assert "mask_rules/eval_incomplete_reward_mean" not in metrics
+    assert impl.pop_mask_rule_metrics() == {
+        "mask_rules/rollouts_seen": 2.0,
+        "mask_rules/eval_incomplete_count": 1.0,
+        "mask_rules/eval_incomplete_frac": 0.5,
+        "mask_rules/eval_incomplete_reward_mean": 0.25,
+        "mask_rules/any_count": 1.0,
+        "mask_rules/any_frac": 0.5,
+    }
+
+
 def _mask_gate_receipt_result():
     return {
         "message_log": [],
