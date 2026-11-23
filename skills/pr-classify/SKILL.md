@@ -14,7 +14,7 @@ Read both references before grading:
 
 ## Inputs
 
-- The change from the merge base to the PR head: changed paths, the diff, and source lines changed (not tests, docs, lockfiles or generated files such as `pyrefly-baseline.json`).
+- The change from the merge base to the PR head: changed paths, the diff, and source lines changed: lines added plus lines removed in source files, comment lines included, but not tests, docs, lockfiles or generated files such as `pyrefly-baseline.json`.
 - The PR title and description, for intent only.
 - The PR's current labels and their label timeline, to find labels a human set.
 
@@ -57,6 +57,8 @@ Until the comment can be posted, the agent sets a check named `Autobot PR classi
 complexity:high · convergence-risk:high · proof:functionality+convergence · 1 unknown
 ```
 
+When nothing is unknown, leave out the last segment.
+
 ### Comment (step 2 of the rollout)
 
 One comment per PR, edited in place on every new head. Visible part:
@@ -76,7 +78,7 @@ One comment per PR, edited in place on every new head. Visible part:
 Categories: **<main>**, **<main>** · aux: <aux>, <aux>
 ```
 
-Leave out the callout when nothing is `unknown`. Then the hidden block, exactly this shape:
+Leave out the callout when nothing is `unknown`, and leave out `· aux: …` when there are no aux categories. Then the hidden block, exactly this shape:
 
 ````markdown
 <!-- pr-classify v1
@@ -104,4 +106,4 @@ Leave out the callout when nothing is `unknown`. Then the hidden block, exactly 
 
 ## Local use
 
-A maintainer can run this skill by hand on any PR: `gh pr diff <N> -R NVIDIA-NeMo/RL` and `gh pr view <N> -R NVIDIA-NeMo/RL --json title,body,labels`, then follow the steps and print the comment instead of posting it.
+A maintainer can run this skill by hand on any PR: `gh pr diff <N> -R NVIDIA-NeMo/RL` and `gh pr view <N> -R NVIDIA-NeMo/RL --json title,body,labels`, plus `gh api repos/NVIDIA-NeMo/RL/issues/<N>/timeline` for who set each label, then follow the steps and print the comment instead of posting it.
