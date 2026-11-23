@@ -69,6 +69,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
+    move_optimizer_main_params,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -1280,6 +1281,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                         state[k] = v.to("cpu")
                     elif device == "cuda" and not v.is_cuda:
                         state[k] = v.to("cuda")
+        move_optimizer_main_params(self.optimizer, device)
 
     def save_checkpoint(
         self,

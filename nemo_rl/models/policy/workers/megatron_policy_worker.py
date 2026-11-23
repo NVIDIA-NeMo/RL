@@ -104,6 +104,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
+    move_optimizer_main_params,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -5350,6 +5351,7 @@ class MegatronPolicyWorkerImpl(
                         raise ValueError(
                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
                         )
+        move_optimizer_main_params(self.optimizer, device)
 
     def save_checkpoint(
         self,
