@@ -46,17 +46,19 @@ def _patch_transformers_tokenizer_class_set():
     (via nemo_rl.algorithms.grpo) and every policy worker (Megatron and Automodel
     both import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
+
+    The mcore (5.16.1) and automodel (5.12.1) environments still ship both
+    registry entries, so the patch is load-bearing there. The vllm environment
+    runs 5.22.0, which no longer registers deepseek_v3 in either table.
+
+    TODO: remove this patch and its version assert once every environment is on
+    a transformers without the entries.
+    https://github.com/NVIDIA-NeMo/RL/issues/2764
     """
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # The mcore (5.16.1) and automodel (5.12.1) environments still ship both
-    # registry entries, so the patch remains load-bearing there. The vllm
-    # environment runs 5.22.0, which no longer registers deepseek_v3 in either
-    # table; the discard/pop below are no-ops on it.
-    # TODO: remove this patch (and the assert below) once every environment is
-    # on a transformers without the entries.
-    # https://github.com/NVIDIA-NeMo/RL/issues/2764
+    # Keep the fallback for mcore/automodel; the vLLM environment no longer needs it.
     assert PkgVersion(transformers.__version__) < PkgVersion("5.23.0"), (
         f"transformers {transformers.__version__} detected. "
         "The deepseek_v3 tokenizer-blocklist patch was verified against <5.23. "

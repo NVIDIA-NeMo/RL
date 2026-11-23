@@ -195,7 +195,8 @@ vllm = [
   # flashinfer-jit-cache 0.7.3 is a meta package over one wheel per GPU arch. They only
   # exist on the flashinfer cu130 index, and [tool.uv.sources] index pins only apply to
   # direct requirements, so each one is named here.
-  # sm110a and sm121a ship aarch64 wheels only (see the matching override-dependencies).
+  # sm110a and sm121a ship aarch64 wheels only (see the flashinfer-jit-cache
+  # [[tool.uv.dependency-metadata]] entries).
   "flashinfer-jit-cache-sm80==0.7.3",
   "flashinfer-jit-cache-sm89==0.7.3",
   "flashinfer-jit-cache-sm90a==0.7.3",
@@ -507,10 +508,6 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
-  # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
-  "flashinfer-jit-cache-sm110a; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm121a; platform_machine == 'aarch64'",
   # Preserve TRT-LLM's existing frontend and TVM-FFI overrides without constraining Megatron.
   { package = { name = "tensorrt-llm" }, dependencies = [
     "nvidia-cudnn-frontend==1.25.0",
@@ -722,6 +719,40 @@ name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
+
+# flashinfer-jit-cache is a meta package whose requirements differ per wheel: only
+# the aarch64 wheel lists sm110a and sm121a, which have no x86_64 wheels. uv reads
+# one wheel's metadata for every platform, so the lists are restated here with the
+# architecture marker. One entry per version in use (vllm extra, mcore extra).
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.3+cu130"
+requires-python = ">=3.9"
+requires-dist = [
+  "flashinfer-jit-cache-sm100a==0.7.3+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.3+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.3+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.3+cu130",
+  "flashinfer-jit-cache-sm121a==0.7.3+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.3+cu130",
+  "flashinfer-jit-cache-sm89==0.7.3+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.3+cu130",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = [
+  "flashinfer-jit-cache-sm100a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm89==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130",
+]
 
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds

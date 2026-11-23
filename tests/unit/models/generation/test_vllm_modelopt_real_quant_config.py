@@ -2852,6 +2852,9 @@ def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(
 
 
 def test_registered_w4a16_moe_preserves_kernel_during_reload(monkeypatch):
+    monkeypatch.setattr(
+        vllm_modelopt, "_vllm_retires_unused_input_scales", lambda: False
+    )
     fake_vllm = _install_fake_registered_vllm_modelopt(monkeypatch)
     monkeypatch.setattr(vllm_modelopt, "_registered", False)
     register_nemo_modelopt_nvfp4()
