@@ -785,7 +785,10 @@ def test_response_id_witness_resolves_a_final_call_retry() -> None:
     assert receipt["capture_poisoned"] is False
 
 
-def test_unattributed_scored_response_falls_back_to_the_heuristic() -> None:
+def test_unattributed_scored_response_masks_instead_of_the_heuristic() -> None:
+    """A returned response no witness joins to a captured completion names no
+    attempt, so the receipt masks with an explicit attribution failure
+    instead of authorizing a chain on structure/admission order (#4317)."""
     env = _capture_env()
     records = [
         _manifest_record("c1"),
@@ -799,9 +802,90 @@ def test_unattributed_scored_response_falls_back_to_the_heuristic() -> None:
         scored_response={"id": "resp-unknown", "output": []},
         reward=1.0,
     )
-    assert receipt["terminal_model_call_id"] == "c2"
-    assert receipt["terminal_selection"] == "heuristic"
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "terminal_attribution_failed"
+    assert receipt["terminal_selection"] is None
     assert "response_id_no_match" in (receipt["terminal_attribution_reason"] or "")
+    assert receipt["reward"] == 1.0
+    assert [r["model_call_id"] for r in receipt["manifest"]] == ["c1", "c2"]
+
+
+def test_unattributed_result_over_two_attempts_masks_discarded_chain() -> None:
+    """Regression test for #4317: two sequential attempts under one capture
+    rollout ID (A->B discarded by the harness, C->D accepted from the
+    original prompt). The wrapper returns a synthetic response id and
+    rewritten display text, so no returned id/content witness matches a
+    captured completion. The receipt must mask with an explicit attribution
+    failure; the heuristic would otherwise select the earlier discarded
+    attempt (earliest root) and train on its tokens with the retry's reward."""
+    env = _capture_env()
+    records = [
+        _manifest_record("A", cumulative_hash="a" * 64),
+        _manifest_record("B", parent="A", cumulative_hash="b" * 64),
+        _manifest_record("C", cumulative_hash="c" * 64),
+        _manifest_record("D", parent="C", cumulative_hash="d" * 64),
+    ]
+    for record, admitted_at in zip(records, [1.0, 2.0, 3.0, 4.0], strict=True):
+        record["admitted_at"] = admitted_at
+    manifest = {"capture_key": "r0", "records": records, "failures": []}
+    scored_response = {
+        "id": "wrapper-result",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Task passed."}],
+            }
+        ],
+    }
+    receipt = env._assemble_receipt(
+        "r0",
+        manifest,
+        terminal_response_id=None,
+        scored_response=scored_response,
+        reward=1.0,
+    )
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "terminal_attribution_failed"
+    assert receipt["terminal_selection"] is None
+    assert "response_id_no_match" in (receipt["terminal_attribution_reason"] or "")
+    assert receipt["reward"] == 1.0
+    # The manifest still ships every row so the finalizer can clean them.
+    assert [r["model_call_id"] for r in receipt["manifest"]] == ["A", "B", "C", "D"]
+
+
+def test_declared_terminal_recovers_accepted_second_attempt() -> None:
+    """Control for #4317: with an explicit terminal id the accepted second
+    attempt is recoverable from the same two-attempt manifest."""
+    env = _capture_env()
+    records = [
+        _manifest_record("A", cumulative_hash="a" * 64),
+        _manifest_record("B", parent="A", cumulative_hash="b" * 64),
+        _manifest_record("C", cumulative_hash="c" * 64),
+        _manifest_record("D", parent="C", cumulative_hash="d" * 64),
+    ]
+    manifest = {"capture_key": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0",
+        manifest,
+        terminal_response_id="resp-D",
+        scored_response={
+            "id": "wrapper-result",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Task passed."}],
+                }
+            ],
+        },
+        reward=1.0,
+    )
+    assert receipt["terminal_model_call_id"] == "D"
+    assert receipt["terminal_selection"] == "declared"
+    assert receipt["capture_poisoned"] is False
 
 
 def test_receipt_assembly_leaves_terminal_selection_unset_on_invalid_row() -> None:
