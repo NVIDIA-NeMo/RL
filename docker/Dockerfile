@@ -745,6 +745,15 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+# Opt-in, off by default: packages to install over the locked ones in every worker venv
+# that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
+# toolkit than the one uv.lock pins:
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES="torch==2.15.0+cu134 torchvision==0.29.2+cu134 triton==3.9.0 nvidia-cublas==13.7.0.27"
+# uv.lock cannot express this per extra: the base project also requires torch, so a second
+# torch index for the vllm extra conflicts with it in the same resolution fork. The venvs
+# then no longer match uv.lock, so a later `uv sync` or `uv run --extra vllm` reverts them.
+ARG VLLM_VENV_PACKAGE_OVERRIDES=
+ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install and
@@ -779,6 +788,24 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
 # and a full FQN matches only itself.
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
+if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
+    # --no-config: pyproject.toml's override-dependencies would pin these back.
+    # unsafe-best-match: the override index mirrors only some NVIDIA wheels, so each
+    # package must be free to come from whichever index has the requested version.
+    while IFS=$'\t' read -r venv_name stage extras; do
+        if [[ " $extras " != *" vllm "* ]]; then
+            continue
+        fi
+        UV_LINK_MODE=hardlink uv pip install --no-config \
+            --python "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" \
+            --default-index https://pypi.org/simple \
+            --index "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}" \
+            --index-strategy unsafe-best-match \
+            ${VLLM_VENV_PACKAGE_OVERRIDES}
+        "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" -c \
+            'import torch, vllm; print("vllm venv override:", vllm.__version__, torch.__version__, torch.version.cuda)'
+    done < /opt/actor_venvs.tsv
+fi
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
 # this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
 # unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
