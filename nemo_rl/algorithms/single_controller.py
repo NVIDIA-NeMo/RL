@@ -3873,8 +3873,7 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            lag = max(sample_lags, default=0)
-            step_metrics["weight_version_lag_max"] = lag
+            lag = step_metrics["weight_version_lag_max"] = max(sample_lags, default=0)
             if sample_lags:
                 step_metrics["weight_version_lag_mean"] = statistics.fmean(sample_lags)
                 percentiles = (
