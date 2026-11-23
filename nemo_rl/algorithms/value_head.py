@@ -50,6 +50,14 @@ class ValueHeadConfig(BaseModel, extra="forbid"):
     # Width of the Gaussian that smooths each return over the bins. None: 0.75 bin widths
     # (the paper's 0.009 on the default support; it beat 1 and 2 bin widths).
     sigma: Optional[float] = Field(default=None, gt=0)
+    # HL-Gauss only. A bias-free head must have the backbone produce the constant
+    # two-peak shape of the targets; set prior_success to give the head a bias
+    # initialized to log(p * q(1) + (1 - p) * q(0)), the marginal prediction for a
+    # success rate p, so the shape is in place from step 0. None: no bias.
+    prior_success: Optional[float] = Field(default=None, gt=0, lt=1)
+    # HL-Gauss only. Scales the random weight init; < 1 shrinks the initial
+    # input-dependent logits, which the backbone would otherwise have to cancel.
+    weight_init_scale: float = Field(default=1.0, gt=0)
 
     @model_validator(mode="after")
     def _check_support(self) -> "ValueHeadConfig":
@@ -57,6 +65,12 @@ class ValueHeadConfig(BaseModel, extra="forbid"):
             raise ValueError(
                 f"value.head needs v_min < v_max, got v_min={self.v_min}, "
                 f"v_max={self.v_max}"
+            )
+        if not self.categorical and (
+            self.prior_success is not None or self.weight_init_scale != 1.0
+        ):
+            raise ValueError(
+                "value.head.prior_success and weight_init_scale apply to hl_gauss only"
             )
         return self
 
@@ -91,7 +105,9 @@ class ValueHeadConfig(BaseModel, extra="forbid"):
         """What trained head weights depend on. sigma only shapes the targets."""
         if not self.categorical:
             return ("scalar",)
-        return ("hl_gauss", self.num_bins, self.v_min, self.v_max)
+        signature = ("hl_gauss", self.num_bins, self.v_min, self.v_max)
+        # A biased head has an extra parameter; its init value does not matter.
+        return signature + ("bias",) if self.prior_success is not None else signature
 
 
 def resolve_value_head(value_config: Optional[Mapping[str, Any]]) -> ValueHeadConfig:
@@ -135,6 +151,17 @@ def hl_gauss_targets(returns: torch.Tensor, head: ValueHeadConfig) -> torch.Tens
     # Far above the return both CDFs round to 1 in fp32; keep their difference >= 0.
     mass = (cdf[..., 1:] - cdf[..., :-1]).clamp_min(0.0)
     return mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def prior_bias(head: ValueHeadConfig) -> torch.Tensor:
+    """fp32 ``[num_bins]`` log of the marginal target for success rate ``prior_success``.
+
+    Bins the targets never reach are floored at log(1e-6), so the bias stays finite.
+    """
+    p = head.prior_success
+    targets = hl_gauss_targets(torch.tensor([1.0, 0.0]), head)
+    marginal = p * targets[0] + (1.0 - p) * targets[1]
+    return marginal.clamp_min(1e-6).log()
 
 
 def check_warm_start_value_head(

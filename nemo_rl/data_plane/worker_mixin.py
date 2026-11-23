@@ -902,6 +902,7 @@ class TQWorkerMixin:
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
+        sample_mask_override: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate.
 
@@ -910,6 +911,14 @@ class TQWorkerMixin:
         per-token targets are shifted past each row's reference-block prefix.
         """
         data = self._fetch(meta)
+        if sample_mask_override is not None:
+            # Override locally before train() computes DP/CP-global token counts.
+            # No shared data-plane field is changed, so the actor keeps its mask.
+            original = data["sample_mask"]
+            data["sample_mask"] = torch.as_tensor(
+                [sample_mask_override[sid] for sid in meta.sample_ids],
+                dtype=original.dtype, device=original.device,
+            ).reshape_as(original)
         if privilege_prefixes is not None:
             from nemo_rl.algorithms.swe_privileged_critic import (
                 prepend_privilege_prefix,

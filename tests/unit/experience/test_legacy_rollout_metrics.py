@@ -26,6 +26,7 @@ import math
 import pytest
 import torch
 
+
 from nemo_rl.algorithms.multi_trace_metrics import finalize_sum_count_metrics
 from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, Completion
 from nemo_rl.experience.legacy_rollout_metrics import (
@@ -1119,3 +1120,32 @@ class TestCaptureGenerationSizeMetrics:
 
     def test_no_sizes_leaves_metrics_alone(self):
         assert capture_generation_size_metrics([], []) == {}
+
+
+@pytest.mark.parametrize("sandboxed", [False, True])
+def test_reward_audit_distinguishes_original_score_from_post_penalty_reward(sandboxed):
+    from nemo_rl.experience.legacy_rollout_metrics import rollout_debug_info
+
+    result = {
+        "reward": 0.0,
+        "reward_before_penalties": 1.0,
+        "reward_before_loop_penalties": 1.0,
+        "loop_reward_zeroed": True,
+        "loop_penalties": {"tool_call_loop": False, "reasoning_loop": True},
+    }
+    if sandboxed:
+        result["opencode_finished"] = True
+    info = rollout_debug_info(result)
+    assert info["reward"] == 0.0
+    assert info["reward_before_penalties"] == 1.0
+    assert info["reward_before_loop_penalties"] == 1.0
+    assert info["loop_reward_zeroed"] is True
+    assert info["loop_penalties"]["reasoning_loop"] is True
+
+
+def test_missing_original_reward_audit_is_unknown_not_zero():
+    from nemo_rl.experience.legacy_rollout_metrics import rollout_debug_info
+
+    info = rollout_debug_info({"reward": 0.0})
+    assert info["reward_before_penalties"] is None
+    assert info["reward_before_loop_penalties"] is None

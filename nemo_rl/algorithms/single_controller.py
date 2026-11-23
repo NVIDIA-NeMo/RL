@@ -73,6 +73,7 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.critic_training_mask import CRITIC_SAMPLE_MASK, build_critic_sample_mask
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
@@ -3409,6 +3410,7 @@ class SingleControllerActor:
                         self._is_ppo
                         and not self._collect
                         and not has_valid_training_tokens
+                        and not train_meta.extra_info.get("critic_has_valid_training_tokens", False)
                     ):
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -6137,6 +6139,33 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
+        critic_sample_mask = None
+        critic_has_valid_training_tokens = False
+        if self._is_ppo and (
+            self._algo_cfg.critic_train_on_env_masked
+            or self._algo_cfg.critic_train_on_truncated
+        ):
+            seq_keep = None
+            if seq_logprob_error_threshold is not None and seq_error_tensors:
+                seq_keep = seq_error_tensors["seq_mult_prob_error"] <= seq_logprob_error_threshold
+            critic_sample_mask = build_critic_sample_mask(
+                sample_mask, final_sample_mask, mask_sample, truncated,
+                overlong_filtering=self._algo_cfg.overlong_filtering,
+                train_on_env_masked=self._algo_cfg.critic_train_on_env_masked,
+                train_on_truncated=self._algo_cfg.critic_train_on_truncated,
+                seq_error_keep=seq_keep,
+            )
+            critic_has_valid_training_tokens = bool(
+                (token_mask[:, 1:] * critic_sample_mask[:, None]).bool().any()
+            )
+            # Control metadata is consumed only by TQValue; the data-plane mask
+            # remains the actor mask throughout policy training.
+            meta = replace(meta, extra_info={
+                **meta.extra_info,
+                CRITIC_SAMPLE_MASK: dict(zip(meta.sample_ids, critic_sample_mask.tolist())),
+                "critic_has_valid_training_tokens": critic_has_valid_training_tokens,
+            })
+
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
@@ -6245,7 +6274,7 @@ class SingleControllerActor:
             advantages = broadcast_rollout_advantages(
                 canonical_advantages, identity.row_to_canonical
             )
-        elif has_valid_training_tokens:
+        elif has_valid_training_tokens or critic_has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -6400,6 +6429,7 @@ class SingleControllerActor:
                 token_mask=token_mask,
                 mask_sample=mask_sample,
                 final_sample_mask=final_sample_mask,
+                critic_sample_mask=critic_sample_mask,
                 seq_error_tensors=seq_error_tensors,
                 generation_logprobs=(
                     tensor_field(data, adv_cfg.generation_logprobs_field)

@@ -188,6 +188,10 @@ class PPOConfig(BaseModel, extra="allow"):
     skip_reference_policy_logprobs_calculation: bool = True
     seed: int = 42
     overlong_filtering: bool = False
+    # SingleController PPO only: critic may retain rows the actor filters.
+    # Original finalizer/padding and sequence-logprob gates remain in force.
+    critic_train_on_env_masked: bool = False
+    critic_train_on_truncated: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -255,6 +259,11 @@ class PPOConfig(BaseModel, extra="allow"):
             raise ValueError("ppo.ppo_epochs must be at least 1")
         if self.critic_ppo_epochs < 1:
             raise ValueError("ppo.critic_ppo_epochs must be at least 1")
+        if (self.critic_train_on_env_masked or self.critic_train_on_truncated) and (
+            self.adv_estimator.name != "gae"
+            or self.adv_estimator.normalize_over != "all_rows"
+        ):
+            raise ValueError("Independent critic masks require GAE normalize_over=all_rows")
         return self
 
     @model_validator(mode="after")

@@ -111,6 +111,14 @@ def test_heldout_split_keys_on_the_task_so_repeats_stay_together():
     assert cp.split_heldout(refs, heldout_mod=0) == (refs, [])
 
 
+def test_heldout_task_keys_hold_out_whole_tasks_without_a_hash():
+    refs = [_ref(f"g{i}", instance_id=f"repo__{i % 4}", prompt_idx=i) for i in range(8)]
+    keys = frozenset({refs[1].task_key})
+    train, heldout = cp.split_heldout(refs, heldout_mod=0, heldout_task_keys=keys)
+    assert {r.task_key for r in heldout} == keys
+    assert len(heldout) == 2 and len(train) == 6
+
+
 def test_step_layout_matches_the_legacy_tiling():
     # Legacy stage B: gpp 32, GBS 1024, K 8, 4 donors -> 29 full groups.
     assert cp.step_layout(1024, 32, 8, 4) == (4, 29)
@@ -556,7 +564,11 @@ def test_train_step_skips_the_redundant_scoring_pass_without_changing_the_update
     for sid, returns in kept.trained["returns"].items():
         seen = kept.trained["token_mask"][sid].bool()
         torch.testing.assert_close(skipped.trained["returns"][sid][seen], returns[seen])
-    assert skip_metrics == keep_metrics
+    auc_keys = {k for k in keep_metrics if "auc" in k or k == "critic/n_mixed_groups"}
+    assert keep_metrics["critic/terminal_auc"] == pytest.approx(0.5)
+    assert keep_metrics["critic/n_mixed_groups"] == 1
+    assert all(k not in skip_metrics for k in auc_keys)  # no AUC from zero placeholders
+    assert skip_metrics == {k: v for k, v in keep_metrics.items() if k not in auc_keys}
     # No v_old: zero placeholder values, an unclipped training loss, and the
     # configured loss left alone.
     assert not any(v.any() for v in skipped.trained["values"].values())

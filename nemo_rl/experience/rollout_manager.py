@@ -137,6 +137,8 @@ def _with_forced_mask(env_extras: dict[str, Any], forced: bool) -> dict[str, Any
 _ROLLOUT_SCOPED_PENALTIES = (
     "penalize_duplicated_reasoning",
     "penalize_empty_final_answer",
+    "penalize_tool_call_loops",
+    "penalize_reasoning_loops",
 )
 _TRACE_SCOPED_PENALTIES = ("penalize_unwanted_tokens", "penalize_malformed_think_tag")
 

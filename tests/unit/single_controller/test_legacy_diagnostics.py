@@ -534,3 +534,42 @@ def test_timer_kwargs_only_for_callees_that_take_a_timer():
     assert timer_kwargs(with_kwargs, timer) == {}
     assert timer_kwargs(without, timer) == {}
     assert timer_kwargs(len, timer) in ({}, {"timer": timer})  # builtins: no crash
+
+
+def test_training_auc_excludes_subagents_masked_rollouts_and_padding(monkeypatch):
+    from nemo_rl.algorithms.single_controller_utils import (
+        legacy_diagnostics as diagnostics,
+    )
+
+    # Isolate AUC from the unrelated leave-one-out baseline/model stack.
+    monkeypatch.setattr(
+        diagnostics,
+        "residual_baseline_diagnostics",
+        lambda groups, rewards, returns, *_: (
+            {},
+            torch.zeros_like(rewards),
+            torch.ones_like(rewards),
+        ),
+    )
+    batch = _batch()
+    # Only canonical trained rows 0 (positive) and 3 (negative) count.
+    # Give the positive subagent/pad and masked negative adversarial scores.
+    # Four response tokens ensure every quarter contains both reward classes.
+    batch["token_mask"][0] = torch.tensor([0, 1, 1, 1, 1, 0])
+    batch["values"][1] = 10.0
+    batch["values"][2] = -10.0
+    batch["values"][5] = 10.0
+    diag = _diag()
+    diag.on_advantage_stage(**batch)
+    metrics = diag.step_metrics(value_result=None, buffer_size=0, sc_reward=0.0)
+    assert metrics["critic/terminal_auc"] == 0.0
+    assert metrics["critic/n_mixed_groups"] == 0.0
+    for q in range(1, 5):
+        assert metrics[f"critic/auc_q{q}"] == 0.0
+        assert metrics[f"critic/auc_q{q}_num_rollouts"] == 2
+    for q in range(1, 5):
+        assert torch.isnan(torch.tensor(metrics[f"critic/within_group_auc_q{q}"]))
+    # Per-step state is consumed, so a later step cannot repeat this AUC.
+    assert "critic/terminal_auc" not in diag.step_metrics(
+        value_result=None, buffer_size=0, sc_reward=0.0
+    )

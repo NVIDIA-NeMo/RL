@@ -1,0 +1,23 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fresh actor and pinned pretrained critic, with simple three-cycle penalties.
+defaults: ppo_nano_v3_5_swe_sandbox_capture_priv.yaml
+
+# Keep false for the original third-run recipe. New experiments can enable
+# either independently; actor masks and actual reward labels are unchanged.
+ppo:
+  critic_train_on_env_masked: false
+  critic_train_on_truncated: false
+
+reward_penalties:
+  penalize_tool_call_loops: true
+  penalize_reasoning_loops: true
+  # AAA, ABABAB, ABCABCABC or ABCDABCDABCD, using full exact arguments.
+  tool_call_loop_min_calls: 3
+  tool_call_loop_max_period: 4
+  tool_call_loop_min_cycles: 3
+  # Within one thought; fenced code and explicit block quotes are excluded.
+  reasoning_loop_min_repeats: 3
+  reasoning_loop_min_line_chars: 60
+  reasoning_loop_min_distinct_lines: 2

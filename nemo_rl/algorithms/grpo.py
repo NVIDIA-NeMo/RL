@@ -29,6 +29,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.experience.loop_penalties import LoopPenaltyConfig
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
@@ -293,7 +294,7 @@ class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     think_close: int | None = None
 
 
-class RewardPenaltyConfig(BaseModel, extra="allow"):
+class RewardPenaltyConfig(LoopPenaltyConfig, extra="allow"):
     """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
 
     penalize_duplicated_reasoning: bool = False
@@ -327,6 +328,8 @@ _REWARD_PENALTY_FLAGS = (
     "penalize_empty_final_answer",
     "penalize_unwanted_tokens",
     "penalize_malformed_think_tag",
+    "penalize_tool_call_loops",
+    "penalize_reasoning_loops",
 )
 
 

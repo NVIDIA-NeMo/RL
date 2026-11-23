@@ -55,6 +55,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.value_head import (
     ValueHeadConfig,
     decode_values,
+    prior_bias,
     resolve_value_head,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -140,6 +141,25 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
     chunk.hide_loss_modules = hide_loss_modules
 
 
+def _init_categorical_head(layer: LinearForLastLayer, head: ValueHeadConfig) -> None:
+    """Apply ``head.weight_init_scale`` and add the ``head.prior_success`` bias.
+
+    Bridge builds the value head without a bias; LinearForLastLayer.forward is
+    nn.Linear's, so a bias registered here is used, and like the weight it is marked
+    sequence-parallel so its gradient is all-reduced across TP.
+    """
+    if not head.categorical:
+        return
+    with torch.no_grad():
+        if head.weight_init_scale != 1.0:
+            layer.weight.mul_(head.weight_init_scale)
+        if head.prior_success is not None:
+            bias = torch.nn.Parameter(prior_bias(head).to(layer.weight))
+            if layer.sequence_parallel:
+                setattr(bias, "sequence_parallel", True)
+            layer.bias = bias
+
+
 def make_value_head_hook(
     hidden_size: int,
     sequence_parallel: bool,
@@ -161,12 +181,11 @@ def make_value_head_hook(
         for chunk in model if isinstance(model, list) else [model]:
             output_layer = getattr(chunk, "output_layer", None)
             if isinstance(output_layer, LinearForLastLayer):
-                if head.categorical:
-                    # Zero logits: a uniform distribution, so every token starts at
-                    # (v_min + v_max) / 2, the same on every TP replica. Kept as the
-                    # init method, so meta-device materialization reapplies it.
-                    output_layer._init_method = torch.nn.init.zeros_
-                    output_layer.reset_parameters()
+                # The categorical head keeps the default random init, like the scalar
+                # head. A zero-init head passes the backbone no gradient (dL/dh = W^T
+                # dL/dlogits), and with Adam at a small constant lr W grows by ~lr per
+                # step: a 60-step stage-B run learned only the marginal (EV ~0).
+                _init_categorical_head(output_layer, head)
                 _install_value_head_load_skip(chunk)
         return model
 

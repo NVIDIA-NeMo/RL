@@ -1,0 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Same actor / pretrained privileged HL-Gauss critic initialization as the
+# original run. These penalties change the shared rollout reward, not masks.
+defaults: ppo_nano_v3_5_swe_sandbox_capture_priv.yaml
+
+reward_penalties:
+  penalize_tool_call_loops: true
+  penalize_reasoning_loops: true
+  # Contiguous repeated tool-call sequences: exact name and full arguments.
+  tool_call_loop_min_calls: 12
+  tool_call_loop_max_period: 4
+  tool_call_loop_min_cycles: 3
+  # Per reasoning output: two different natural-language lines >=60 chars,
+  # each occurring at least20 times. Counts do not accumulate across turns.
+  reasoning_loop_min_repeats: 20
+  reasoning_loop_min_line_chars: 60
+  reasoning_loop_min_distinct_lines: 2

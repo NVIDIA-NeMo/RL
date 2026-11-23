@@ -54,6 +54,7 @@ import torch
 
 from nemo_rl.algorithms.legacy_ppo_diagnostics import (
     critic_gnorm_metrics,
+    critic_reward_auc_metrics,
     mixed_group_value_metrics,
     multi_trace_composition_metrics,
     pooled_explained_var,
@@ -185,6 +186,7 @@ class LegacyPPODiagnostics:
         input_ids: Optional[torch.Tensor] = None,
         reference_logprobs: Optional[torch.Tensor] = None,
         truncated: Optional[torch.Tensor] = None,
+        critic_sample_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Compute this step's advantage-stage diagnostics (see module doc)."""
         # A failure part-way must not leak a previous step's numbers.
@@ -361,6 +363,25 @@ class LegacyPPODiagnostics:
                     values_f, returns_f, token_mask, returns_to_res=to_res
                 )
             )
+            # Count one trained canonical row per rollout, excluding subagents,
+            # padding and rejected/masked samples. Use pre-update predictions.
+            canonical = torch.tensor(
+                [
+                    idx == 0 and not empty
+                    for idx, empty in zip(trace_in_rollout_idx, is_empty_rollout)
+                ],
+                dtype=torch.bool,
+            )
+            auc_mask = (
+                _real(token_mask).bool()
+                & (_real(final_sample_mask).unsqueeze(-1) > 0)
+                & canonical.unsqueeze(-1)
+            )
+            metrics.update(
+                critic_reward_auc_metrics(
+                    _real(values_f), _real(rewards), auc_mask, trace_group_ids
+                )
+            )
             mixed = 1.0 - homogeneous if homogeneous.numel() else None
             metrics.update(
                 mixed_group_value_metrics(
@@ -369,6 +390,28 @@ class LegacyPPODiagnostics:
             )
 
         self._metrics = metrics
+
+        if critic_sample_mask is not None and values is not None and returns is not None:
+            from nemo_rl.algorithms.critic_training_mask import critic_mask_counts
+            roots = torch.tensor(
+                [idx == 0 and not empty for idx, empty in zip(trace_in_rollout_idx, is_empty_rollout)],
+                dtype=torch.bool,
+            )
+            metrics.update(critic_mask_counts(
+                _real(final_sample_mask), _real(critic_sample_mask), _real(token_mask),
+                _real(rewards), roots, _real(mask_sample),
+                _real(truncated) if truncated is not None else torch.zeros(n, dtype=torch.bool),
+            ))
+            metrics["critic/train_mask/explained_var"] = pooled_explained_var(
+                values.float(), returns.float(), token_mask, critic_sample_mask
+            )[0]
+            wider_auc = critic_reward_auc_metrics(
+                _real(values.float()), _real(rewards),
+                _real(token_mask).bool() & (_real(critic_sample_mask)[:, None] > 0) & roots[:, None],
+                trace_group_ids,
+            )
+            metrics.update({key.replace("critic/", "critic/train_mask/", 1): value
+                            for key, value in wider_auc.items()})
 
         # ---- packed per-token rollout dump (ppo.log_rollout_dump steps only).
         if input_ids is not None and n > 0:
@@ -399,6 +442,8 @@ class LegacyPPODiagnostics:
                 idx=[(tags[i] or {}).get("prompt_idx") for i in real_rows],
                 truncated=_real(truncated),
             )
+            if critic_sample_mask is not None:
+                self._dump["critic_sample_loss_mask"] = _real(critic_sample_mask).detach().float().cpu()
 
         # ---- rollout_debug rows (written once the step closes).
         if self.log_rollout_debug and n > 0:
@@ -418,6 +463,8 @@ class LegacyPPODiagnostics:
                 values=_real(values),
                 total_tokens=real_lengths if real_lengths is not None else [None] * n,
             )
+            if critic_sample_mask is not None:
+                self._rollout_debug["critic_sample_loss_mask"] = _real(critic_sample_mask).tolist()
 
     @staticmethod
     def _build_rollout_debug(
@@ -515,7 +562,10 @@ class LegacyPPODiagnostics:
             from nemo_rl.algorithms.ppo import _compute_critic_metrics
 
             post = _compute_critic_metrics(dict(self.post_value_result))
-            out["critic/explained_var_post_update"] = post["critic/explained_var"]
+            ev_key = ("critic/train_mask/explained_var_post_update"
+                      if "critic/train_mask/explained_var" in out
+                      else "critic/explained_var_post_update")
+            out[ev_key] = post["critic/explained_var"]
             out["critic/loss_post_update"] = float(np.mean(post["critic/loss"]))
         if buffer_size is not None:
             out["buffer_size"] = buffer_size

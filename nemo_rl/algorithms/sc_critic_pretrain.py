@@ -107,6 +107,9 @@ class CriticPretrainConfig(BaseModel, extra="forbid"):
     max_steps: Optional[int] = Field(default=None, gt=0)
     # Hold out whole tasks whose key hashes to 0 mod this; 0 disables it.
     heldout_mod: int = Field(default=16, ge=0)
+    # Banks (or collection roots) whose tasks are held out whole, on top of
+    # heldout_mod: e.g. an out-of-domain task set that never trains.
+    heldout_bank_dirs: list[str] = Field(default_factory=list)
     # Held-out groups scored per evaluation (a fixed prefix); None scores all.
     heldout_max_groups: Optional[int] = Field(default=None, ge=0)
     # Evaluate every this many steps (and after the last); 0: only after the last.
@@ -430,13 +433,22 @@ def is_heldout(task_key: str, heldout_mod: int) -> bool:
 
 
 def split_heldout(
-    refs: Sequence[BankGroupRef], heldout_mod: int
+    refs: Sequence[BankGroupRef],
+    heldout_mod: int,
+    heldout_task_keys: frozenset[str] = frozenset(),
 ) -> tuple[list[BankGroupRef], list[BankGroupRef]]:
-    """(train, held-out) groups, split by task so repeats never straddle the split."""
+    """(train, held-out) groups, split by task so repeats never straddle the split.
+
+    A task is held out if its key hashes into ``heldout_mod`` or is one of
+    ``heldout_task_keys`` (the tasks of ``heldout_bank_dirs``).
+    """
     train: list[BankGroupRef] = []
     heldout: list[BankGroupRef] = []
     for ref in refs:
-        (heldout if is_heldout(ref.task_key, heldout_mod) else train).append(ref)
+        held = ref.task_key in heldout_task_keys or is_heldout(
+            ref.task_key, heldout_mod
+        )
+        (heldout if held else train).append(ref)
     return train, heldout
 
 
@@ -1123,7 +1135,10 @@ class _CriticPretrainer:
             if offload:
                 self.value.finish_training()
             # Deferred: ppo pulls in the legacy training stack.
-            from nemo_rl.algorithms.legacy_ppo_diagnostics import critic_gnorm_metrics
+            from nemo_rl.algorithms.legacy_ppo_diagnostics import (
+                critic_gnorm_metrics,
+                critic_reward_auc_metrics,
+            )
             from nemo_rl.algorithms.ppo import _compute_critic_metrics
 
             metrics = {
@@ -1139,6 +1154,20 @@ class _CriticPretrainer:
             real = staged.real_rows()
             canonical = staged.canonical_rows()
             valid = real & (scored["finalizer_mask"] > 0)
+            if not self.skip_train_scoring:
+                auc_mask = (
+                    scored["token_mask"].bool()
+                    & (scored["sample_mask"].unsqueeze(-1) > 0)
+                    & canonical.unsqueeze(-1)
+                )
+                metrics.update(
+                    critic_reward_auc_metrics(
+                        scored["values"],
+                        scored["rewards"],
+                        auc_mask,
+                        staged.group_of_row,
+                    )
+                )
             metrics["reward"] = float(scored["rewards"][canonical].mean())
             metrics["num_samples"] = float(real.sum())
             metrics["num_rollouts"] = float(canonical.sum())
@@ -1218,6 +1247,7 @@ def _plan(
     rollouts_per_step: int,
     gpp: int,
     last_checkpoint_path: Optional[str],
+    heldout_task_keys: frozenset[str] = frozenset(),
 ) -> tuple[_Plan, dict[str, Any]]:
     """Split, donors and the multi-epoch stream; frozen at step 0, replayed on resume."""
     k = cfg.heldout_responses_per_group
@@ -1227,6 +1257,7 @@ def _plan(
     settings = {
         "seed": cfg.seed,
         "heldout_mod": cfg.heldout_mod,
+        "heldout_bank_dirs": list(cfg.heldout_bank_dirs),
         "heldout_responses_per_group": k,
         "donors_per_step": a,
         "full_per_step": b,
@@ -1258,7 +1289,9 @@ def _plan(
                 flush=True,
             )
     else:
-        train_refs, heldout_refs = split_heldout(refs, cfg.heldout_mod)
+        train_refs, heldout_refs = split_heldout(
+            refs, cfg.heldout_mod, heldout_task_keys
+        )
         if not train_refs:
             raise ValueError("every banked task fell in the held-out split")
         base = [str(ref.path) for ref in train_refs]
@@ -1368,8 +1401,13 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             "cannot be rebuilt; set loss_fn.use_kl_in_reward=false"
         )
     banks = find_banks(cfg.bank_dirs)
-    gpp = _bank_settings(banks, master_config)
-    refs = list_bank_groups(banks)
+    heldout_banks = find_banks(cfg.heldout_bank_dirs) if cfg.heldout_bank_dirs else []
+    gpp = _bank_settings(banks + heldout_banks, master_config)
+    heldout_bank_refs = list_bank_groups(heldout_banks)
+    if cfg.heldout_bank_dirs and not heldout_bank_refs:
+        raise ValueError(f"no committed groups in {cfg.heldout_bank_dirs}")
+    heldout_task_keys = frozenset(ref.task_key for ref in heldout_bank_refs)
+    refs = list_bank_groups(banks) + heldout_bank_refs
     if not refs:
         raise ValueError(f"no committed groups in {cfg.bank_dirs}")
     rollouts_per_step = int(value_config["train_global_batch_size"])
@@ -1406,6 +1444,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         rollouts_per_step=rollouts_per_step,
         gpp=gpp,
         last_checkpoint_path=last_checkpoint_path,
+        heldout_task_keys=heldout_task_keys,
     )
     gps = plan.groups_per_step
     planned_steps = len(plan.stream) // gps

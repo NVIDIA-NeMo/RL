@@ -71,6 +71,10 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
+from nemo_rl.experience.loop_penalties import (
+    LoopPenaltyConfig,
+    apply_loop_reward_penalties,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -103,6 +107,8 @@ _REWARD_PENALTY_METRICS = {
         "penalize_malformed_think_tag",
         "malformed_think_tag_rate",
     ),
+    "tool_call_loop": ("penalize_tool_call_loops", "tool_call_loop_rate"),
+    "reasoning_loop": ("penalize_reasoning_loops", "reasoning_loop_rate"),
 }
 
 
@@ -1975,11 +1981,19 @@ def compute_reward_penalty_metrics(
     if reward_penalty_config is None or not num_results:
         return {}
 
-    return {
-        metric_name: penalty_counts[count_key] / num_results
+    metrics = {
+        metric_name: penalty_counts.get(count_key, 0) / num_results
         for count_key, (flag, metric_name) in _REWARD_PENALTY_METRICS.items()
         if _get_reward_penalty_config_value(reward_penalty_config, flag)
     }
+    if any(
+        _get_reward_penalty_config_value(reward_penalty_config, flag)
+        for flag in ("penalize_tool_call_loops", "penalize_reasoning_loops")
+    ):
+        metrics["loop_reward_zeroed_rate"] = (
+            penalty_counts.get("loop_reward_zeroed", 0) / num_results
+        )
+    return metrics
 
 
 def _get_reward_penalty_token_id(
@@ -2049,6 +2063,10 @@ def resolve_reward_penalty_config(
         return None
 
     resolved: dict[str, Any] = {}
+    for key in LoopPenaltyConfig.model_fields:
+        value = _get_reward_penalty_config_value(reward_penalty_config, key)
+        if value is not None:
+            resolved[key] = value
     for flag in (
         "penalize_duplicated_reasoning",
         "penalize_empty_final_answer",
@@ -2182,10 +2200,15 @@ def apply_reward_penalties(
             "penalize_empty_final_answer",
             "penalize_unwanted_tokens",
             "penalize_malformed_think_tag",
+            "penalize_tool_call_loops",
+            "penalize_reasoning_loops",
         )
     )
     if any_penalty_enabled:
         for result in results:
+            result["full_result"].setdefault(
+                "reward_before_penalties", result["full_result"].get("reward")
+            )
             roles = {msg.get("role") for msg in result["message_log"]}
             assert roles <= {"user", "assistant"}, (
                 f"apply_reward_penalties requires Gym-path message_log with only 'user' and 'assistant' roles, "
@@ -2356,6 +2379,15 @@ def apply_reward_penalties(
 
                 counts["malformed_think_tag"] += 1
 
+    # Root response checks also work on capture receipts (no token message_log).
+    # Existing penalties run first so loop_reward_zeroed counts newly changed
+    # rewards, not already-zero failures or formatting penalties.
+    loop_config = LoopPenaltyConfig.model_validate(
+        reward_penalty_config.model_dump()
+        if isinstance(reward_penalty_config, BaseModel)
+        else reward_penalty_config
+    )
+    counts.update(apply_loop_reward_penalties(results, loop_config))
     return counts
 
 
