@@ -1923,6 +1923,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        if "logprobs" not in reference_logprobs:
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2998,6 +3000,10 @@ class MegatronPolicyWorkerImpl(
 
         if keep_on_gpu:
             return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        # Only the model-parallel replica leader is consumed by the driver.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
+
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
