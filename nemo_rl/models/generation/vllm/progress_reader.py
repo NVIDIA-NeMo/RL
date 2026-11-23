@@ -149,7 +149,11 @@ class VllmProgressReader:
             self._finished_requests.pop(request_id, None)
 
     def read(
-        self, calls: Sequence[tuple[str, int]], *, timeout_s: float | None
+        self,
+        calls: Sequence[tuple[str, int]],
+        *,
+        timeout_s: float | None,
+        route_calls: frozenset[str] = frozenset(),
     ) -> ProgressRead:
         """Copy each captured call's generated token IDs past ``start``, at one boundary.
 
@@ -158,6 +162,9 @@ class VllmProgressReader:
                 number of generated tokens the call has already recorded.
             timeout_s: How long to wait for vLLM to finish its current output
                 chunk; ``None`` waits indefinitely.
+            route_calls: Model call IDs whose router-replay route pieces are
+                copied too, from the same request state at the same boundary,
+                so a cut needs no route read of its own.
 
         Raises:
             TimeoutError: vLLM held the lock past ``timeout_s``.
@@ -179,7 +186,9 @@ class VllmProgressReader:
                 request_id = engine_request_ids.get(model_call_id)
                 if request_id is None:
                     continue
-                one = self._read_one_request(processor, request_id, start)
+                one = self._read_one_request(
+                    processor, request_id, start, routes=model_call_id in route_calls
+                )
                 if one is not None:
                     progress[model_call_id] = one
         finally:
@@ -194,7 +203,7 @@ class VllmProgressReader:
         return extract_generation_logprobs(token_ids, logprobs, start=start)
 
     def _read_one_request(
-        self, processor: Any, request_id: str, start: int
+        self, processor: Any, request_id: str, start: int, *, routes: bool = False
     ) -> GenerationProgress | None:
         if request_id in self._finished_requests:
             finished = self._finished_requests[request_id]
@@ -213,6 +222,8 @@ class VllmProgressReader:
         if request_state.detokenizer is None:
             return None
         logprobs_processor = request_state.logprobs_processor
+        # A shallow copy: vLLM appends route pieces but never rewrites one.
+        route_pieces = request_state.routed_experts_chunks if routes else None
         return GenerationProgress(
             token_ids=list(request_state.detokenizer.output_token_ids[start:]),
             logprobs=None
@@ -220,4 +231,5 @@ class VllmProgressReader:
             else logprobs_processor.logprobs,
             finish_reason=finish_reason,
             stop_reason=stop_reason,
+            route_pieces=None if route_pieces is None else list(route_pieces),
         )

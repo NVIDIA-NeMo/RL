@@ -69,6 +69,7 @@ from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.prefix_recovery import PrefixRecovery
+from nemo_rl.models.generation.prefix_recovery.recovery import _ResolvedGenerationCut
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -826,11 +827,10 @@ def _stage_media_prefix(dp, tokens, prompt):
             worker, SimpleNamespace(media=media)
         ),
     )
-    staged = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=0
+    [staged_key] = sink.stage_generation_prefix_batch(
+        [record], checkpoint_id="checkpoint-1", chunk_sequences=[0]
     )
-    assert staged.ok
-    return worker, media, staged.staging_key
+    return worker, media, staged_key
 
 
 @pytest.mark.parametrize(
@@ -931,11 +931,7 @@ def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
     _, chunk = _media_prefix_chunk(dp)
     later = replace(chunk, extras={MEDIA_SPANS_FIELD: []})
     recovery = SimpleNamespace(
-        _parts=SimpleNamespace(
-            staging_source=SimpleNamespace(
-                fetch_for_finalization=lambda keys: [chunk, later]
-            )
-        )
+        _parts=SimpleNamespace(router_replay=False, sampler_top_k=0)
     )
     admission = SimpleNamespace(
         generation_cut=SimpleNamespace(staging_keys=("chunk-0", "chunk-1"))
@@ -943,7 +939,7 @@ def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
 
     # The check runs before the admission or recovery state is consulted.
     with pytest.raises(RuntimeError, match="only the first generation-cut chunk"):
-        PrefixRecovery._rebuild_prefix(recovery, admission, [])
+        PrefixRecovery._rebuild_prefix(recovery, admission, [], [chunk, later])
 
 
 def _image_media() -> CapturedMedia:
@@ -1778,12 +1774,12 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     restored_request = chat_request(
         restored_capture, max_tokens=8, max_completion_tokens=None, min_tokens=None
     )
-    # resolve_restore's verified snapshot, as on main.
-    monkeypatch.setattr(
-        worker._prefix_recovery,
-        "resolve_restore",
-        lambda admission, prefix_token_ids: (admission, cut),
-    )
+
+    # resolve_restore's verified prefix.
+    async def resolve_restore(admission, prefix_token_ids):
+        return admission, _ResolvedGenerationCut(snapshot=cut)
+
+    monkeypatch.setattr(worker._prefix_recovery, "resolve_restore", resolve_restore)
     monkeypatch.setattr(
         renderer, "model_config", SimpleNamespace(max_model_len=64), raising=False
     )

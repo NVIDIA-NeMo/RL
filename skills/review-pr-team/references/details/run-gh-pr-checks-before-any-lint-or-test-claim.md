@@ -1,12 +1,14 @@
 # run-gh-pr-checks-before-any-lint-or-test-claim
 
-> Run `gh pr checks` early — a local tool run is not the CI job, and NeMo-RL's Lint job also runs pyrefly plus a whitelist rule that a passing local ruff will never show you
+> Run `gh pr checks` early — a local tool run is not the CI job, and NeMo-RL's Lint job also runs pyrefly, which a passing local ruff will never show you
+
+> The whitelist step this note describes was removed when `pyrefly` moved to a baseline file (`pyrefly-baseline.json`): every file is checked now and only new errors fail. The incident below is kept as the reason for the rule.
 
 **Run `gh pr checks <n> --repo NVIDIA-NeMo/RL` in the setup phase, before saying anything about lint or tests.** It costs one call and it is the only thing that tells you what the repo's own gates think.
 
-A local tool run is **not** the CI job. NeMo-RL's `Lint check` runs `pre-commit` (ruff x3) **and** `pyrefly`, **and** a third step with no local equivalent at all — `.github/workflows/cicd-main.yml` "Check if any files with zero errors not in whitelist", which lists every file `pyrefly` reports zero errors for and fails if one is missing from `pyrefly.toml`'s `project-includes`.
+A local tool run is **not** the CI job. NeMo-RL's `Lint check` runs `pre-commit` (ruff x3) **and** `pyrefly`, **and** it ran a third step with no local equivalent at all — `.github/workflows/cicd-main.yml` "Check if any files with zero errors not in whitelist", which listed every file `pyrefly` reported zero errors for and failed if one was missing from `pyrefly.toml`'s `project-includes`.
 
-That inverse rule is the trap. Everyone checks the forward direction — *are the new source files whitelisted?* — because that is what the contributor skills talk about. CI enforces the other direction, and a change that makes an **unrelated, untouched** file type-clean turns the build red.
+That inverse rule was the trap. Everyone checked the forward direction — *are the new source files whitelisted?* — because that is what the contributor skills talked about. CI enforced the other direction, and a change that made an **unrelated, untouched** file type-clean turned the build red.
 
 **Why:** on PR #3837 a seven-lane review with two adversarial rounds reported "linters are clean" and "pyrefly.toml: no gaps", and the `Lint check` was red the whole time. The PR added `"nemo_gym.*"` to `replace-imports-with-any`, which made `examples/nemo_gym/__init__.py` — not in the diff, not touched by the author — resolve its imports to `Any`, drop to zero errors, and therefore require a whitelist entry it did not have. The lane that owned `pyrefly.toml` checked the five new source files were listed (they were) and stopped. Nobody ran `gh pr checks`. The failure was visible in three seconds.
 
