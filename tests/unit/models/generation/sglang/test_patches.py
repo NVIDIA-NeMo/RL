@@ -14,32 +14,18 @@
 
 """Compatibility patches must target mutations present in the pinned Megatron."""
 
-import importlib.util
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
 
+from nemo_rl.models.generation.sglang.utils import patches
+
 pytestmark = pytest.mark.sglang
 
 
-@pytest.fixture
-def patches() -> ModuleType:
-    # These stdlib-only helpers do not need optional SGLang or Torch imports.
-    path = (
-        Path(__file__).resolve().parents[5]
-        / "nemo_rl/models/generation/sglang/utils/patches.py"
-    )
-    spec = importlib.util.spec_from_file_location("sglang_compat_patches", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_bootstrap_only_patches_dynamic_context(
-    patches: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context = tmp_path / "dynamic_context.py"
     context.write_text(
