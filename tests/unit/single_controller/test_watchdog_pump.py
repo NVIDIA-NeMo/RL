@@ -118,6 +118,26 @@ async def _run_ticks(ctrl, ticks: int):
     return await _run_pump(ctrl._stall_watchdog_pump(), ticks)
 
 
+async def _run_full_ticks(ctrl, ticks: int):
+    """Run the watchdog until ``ticks`` ticks have finished, then cancel it.
+
+    A tick logs its metrics first, so the metrics of the tick after ``ticks`` mean
+    that tick ``ticks`` ran to its end. Unlike ``_run_ticks``, the result does not
+    depend on how soon the process is scheduled.
+    """
+    task = asyncio.ensure_future(ctrl._stall_watchdog_pump())
+    # The bound only ends a pump that stopped ticking.
+    async with asyncio.timeout(5.0):
+        while len(ctrl._logger.metrics) <= ticks and not task.done():
+            await asyncio.sleep(0.001)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return task
+
+
 async def _run_probe_ticks(ctrl, ticks: int):
     """Run the fleet probe pump for a bounded number of ticks, then cancel it."""
     return await _run_pump(ctrl._gen_fleet_probe_pump(), ticks)
@@ -591,7 +611,7 @@ class TestEnvHealthCheck:
             gym_subprocess_check=True,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
         assert calls, "health_check should have been polled"
 
     def test_an_unhealthy_environment_is_named_in_the_error(self):
@@ -638,7 +658,7 @@ class TestEnvHealthCheck:
             env_handles={"nemo_gym": _Handle()},
         )
         # Must complete its ticks rather than blowing up.
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
         out = capsys.readouterr().out
         assert "environment health" in out
         assert "nemo_gym" in out
@@ -668,7 +688,7 @@ class TestEnvHealthCheck:
             gym_subprocess_check=True,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 4))
+        asyncio.run(_run_full_ticks(ctrl, 4))
         # The pump kept ticking despite the environment never answering.
         assert len(ctrl._logger.metrics) >= 2, (
             "watchdog stopped ticking while an environment was wedged"
@@ -723,9 +743,34 @@ class TestEnvHealthCheck:
         with pytest.raises(
             RuntimeError, match="'nemo_gym' instance 'search' reported unhealthy"
         ) as raised:
-            asyncio.run(_run_ticks(ctrl, 2))
+            asyncio.run(_run_full_ticks(ctrl, 2))
         assert "instance 'tools'" not in str(raised.value)
         assert asked == ["tools"], "the healthy actor should have been asked too"
+
+    def test_a_dead_gym_server_is_reported_in_one_line(self):
+        """Ray's task error holds the remote traceback and the dead server's output."""
+        cause = RuntimeError(
+            "Process `search` finished unexpectedly!\n"
+            "Process `search` stderr:\n" + "last output of the server\n" * 100
+        )
+        task_error = ray.exceptions.RayTaskError(
+            "health_check", "Traceback (most recent call last): ...", cause
+        ).as_instanceof_cause()
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"search": [_gym_actor(lambda: _failed(task_error))]}
+                )
+            },
+        )
+        assert asyncio.run(ctrl._check_env_health(timeout_s=5.0)) == [
+            "environment 'nemo_gym' instance 'search' reported unhealthy: "
+            "Process `search` finished unexpectedly!"
+        ]
 
     def test_a_shard_set_of_healthy_actors_reports_nothing(self):
         asked = []
@@ -744,7 +789,7 @@ class TestEnvHealthCheck:
                 )
             },
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
         assert set(asked) == {"tools", "search"}, (
             "every actor of the shard set should have been asked"
         )
@@ -774,7 +819,7 @@ class TestEnvHealthCheck:
                 "nemo_gym": NemoGymShardSet(handles={"tools": [silent, answering]})
             },
         )
-        asyncio.run(_run_ticks(ctrl, 4))
+        asyncio.run(_run_full_ticks(ctrl, 4))
         out = capsys.readouterr().out
         assert "'nemo_gym' instance 'tools/0' did not answer its health check" in out
         assert "tools/1" not in out
@@ -783,6 +828,37 @@ class TestEnvHealthCheck:
         assert len(ctrl._logger.metrics) >= 2, (
             "watchdog stopped ticking while an actor of the shard set was silent"
         )
+
+    def test_every_unhealthy_actor_of_a_shard_set_is_reported(self):
+        """One unhealthy actor does not hide the problem of another one.
+
+        The problems are listed in the order of the shard set. The order of the answers
+        is the opposite here: the second actor fails at once, and the first one only
+        runs into its timeout.
+        """
+        silent = _gym_actor(lambda: asyncio.get_event_loop().create_future())
+        failed = _gym_actor(
+            lambda: _failed(RuntimeError("Process `search` finished unexpectedly!"))
+        )
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"tools": [silent], "search": [failed]}
+                )
+            },
+        )
+        # The outer bound fails the test instead of hanging it if the check ever
+        # waits for the silent actor without a timeout.
+        problems = asyncio.run(
+            asyncio.wait_for(ctrl._check_env_health(timeout_s=0.01), timeout=10.0)
+        )
+        assert len(problems) == 2, problems
+        assert "instance 'tools' did not answer its health check" in problems[0]
+        assert "instance 'search' reported unhealthy" in problems[1]
 
     def test_the_actors_of_a_shard_set_are_asked_concurrently(self):
         """Every actor is asked before the timeout of a silent one runs out.

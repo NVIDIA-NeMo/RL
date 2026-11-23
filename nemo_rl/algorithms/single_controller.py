@@ -51,7 +51,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace
 from functools import cached_property, partial
 from pathlib import Path
@@ -66,7 +66,7 @@ from typing import (
 )
 
 import ray
-from ray.exceptions import RayActorError
+from ray.exceptions import RayActorError, RayTaskError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
@@ -186,8 +186,11 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
-from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import NemoGymShardSet, should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    as_nemo_gym_shard_set,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -4501,7 +4504,7 @@ class SingleControllerActor:
                 )
 
     async def _check_env_health(self, timeout_s: float) -> list[str]:
-        """Ask each environment actor that exposes a health check whether it is whole.
+        """Ask every NeMo-Gym actor whether its servers are alive.
 
         Returns the problems found, empty when everything is well. It *reports* rather
         than raises so the caller can route the verdict through ``stall_action``, the
@@ -4517,39 +4520,17 @@ class SingleControllerActor:
         it was needed. A probe that does not answer within one tick IS the unhealthy
         signal; it is not a reason to stop watching.
 
-        A ``NemoGymShardSet`` groups the NeMo-Gym actors and is not an actor itself, so
-        every actor it holds is asked; see ``_check_shard_set_health``.
-
-        Environments without the method are skipped rather than treated as unhealthy;
-        only NeMo-Gym has subprocess servers to lose.
+        The NeMo-Gym entry of the environment handles is read with
+        ``as_nemo_gym_shard_set``, the way the rollout code reads it, and every actor
+        of the set is asked; see ``_check_shard_set_health``. Other environments are
+        not asked: only NeMo-Gym has subprocess servers to lose.
         """
-        problems: list[str] = []
-        # Setup stores the NeMo-Gym shard set among the handles, which their annotation
-        # does not say.
-        handles: Mapping[str, EnvironmentInterface | NemoGymShardSet] = (
-            self._env_handles
+        nemo_gym = self._env_handles.get("nemo_gym")
+        if nemo_gym is None:
+            return []
+        return await self._check_shard_set_health(
+            "nemo_gym", as_nemo_gym_shard_set(nemo_gym), timeout_s
         )
-        for env_name, handle in handles.items():
-            if isinstance(handle, NemoGymShardSet):
-                problems.extend(
-                    await self._check_shard_set_health(env_name, handle, timeout_s)
-                )
-                continue
-            health_check = getattr(handle, "health_check", None)
-            if health_check is None:
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._ray_get(health_check.remote()), timeout=timeout_s
-                )
-            except asyncio.TimeoutError:
-                problems.append(
-                    f"environment {env_name!r} did not answer its health check within "
-                    f"{timeout_s}s"
-                )
-            except Exception as error:
-                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
-        return problems
 
     async def _check_shard_set_health(
         self, env_name: str, shard_set: NemoGymShardSet, timeout_s: float
@@ -4585,9 +4566,16 @@ class SingleControllerActor:
                     f"health check within {timeout_s}s"
                 )
             except Exception as error:
+                reason = str(error)
+                if isinstance(error, RayTaskError) and isinstance(
+                    error.cause, BaseException
+                ):
+                    # Ray's text is the remote traceback, and Gym's poll() error ends
+                    # with up to 64 KiB of the dead server's output. Keep one line.
+                    reason = str(error.cause).partition("\n")[0]
                 return (
                     f"environment {env_name!r} instance {label!r} reported unhealthy: "
-                    f"{error}"
+                    f"{reason}"
                 )
             return None
 
