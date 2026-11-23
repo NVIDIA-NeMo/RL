@@ -39,6 +39,12 @@ GROUP_ID_TAG = "group_id"
 # Per-response inverse valid-token mass for equal prompt-group loss reduction.
 GROUP_TOKEN_MEAN_WEIGHT = "group_token_mean_inverse_tokens"
 
+# Per-row key in `KVBatchMeta.tags` holding the row's attribution key (the
+# NeMo-Gym agent name for flat rows, the task_id.taskset for task rows). The
+# token-capture finalizer stamps it when grpo.agent_overrides is set; the
+# SingleController advantage stage reads it to pick the row's settings.
+AGENT_NAME_TAG = "agent_name"
+
 # The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
 # `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
 # here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
@@ -161,6 +167,15 @@ ROUTE_ENCODING_NONE = 0
 ROUTE_ENCODING_ENVELOPE = 1
 ROUTE_ENCODING_LIST = 2
 ROUTE_ENCODING_TENSOR = 3
+
+# Wire codes for a staged row's ``capture_mode`` column, shared by the sink's
+# per-row and direct batch encoders and the source that decodes them.
+CAPTURE_MODE_TO_CODE = {"text": 0, "token_in": 1}
+CAPTURE_CODE_TO_MODE = {code: mode for mode, code in CAPTURE_MODE_TO_CODE.items()}
+
+# Staging-key prefix of generation-cut chunk rows; the prefix writer accepts
+# only these keys.
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
 
 # Deferred route storage. Canonical rows carry one strict encoded route plan
 # per tag; policy workers omit the absent canonical route column and assemble
