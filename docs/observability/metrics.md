@@ -34,9 +34,11 @@ Each row uses the same key constant as its logging site, so a rename cannot leav
 | --- | --- | --- | --- |
 | `rl.flops.per_gpu` | TFLOP/s | `train_flops_per_gpu` | GRPO, GRPO-sync and PPO via `print_performance_metrics`; SFT, DPO and distillation inline |
 | `rl.flops.utilization` | ratio, 0–1 | `train_fp_utilization` | the same six loops, when the device's peak is known |
-| `rl.flops.per_step` | FLOP | `total_flops` | SFT v2 and the Single-Controller, which forward the worker's raw per-step count rather than deriving a rate |
+| `rl.flops.per_step` | FLOP | `total_flops` | SFT v2 and the Single-Controller, which forward the raw per-step count rather than deriving a rate |
 
-The first two are rates over an elapsed time, so they need a denominator, and the loops do not agree on which one. GRPO, GRPO-sync and PPO prefer the CUDA-synchronized `train_elapsed_seconds` and fall back to the driver-side `policy_training` timer; SFT, DPO and distillation always divide by `policy_training`. Only the Megatron worker reports `train_elapsed_seconds`, so every loop falls back on the other backends. `policy_training` is measured on the driver around the blocking dispatch, so it also covers submission and result collection. Read either as a trend, but do not compare the two series across loops or backends as though they shared a denominator.
+The first two are rates over an elapsed time, so they need a denominator, and in practice that denominator is almost always the driver-side `policy_training` timer. Only GRPO, GRPO-sync and PPO even look for the CUDA-synchronized `train_elapsed_seconds`, and it reaches them only when the FLOP tracker could not be built for the model: `Policy.train` takes `total_flops` from the tracker whenever it supports the architecture, and that path never forwards the worker's elapsed time. So for every supported model, every loop divides by `policy_training`, which is measured on the driver around the blocking dispatch and so also covers submission and result collection.
+
+One consequence is worth knowing before you read a PPO chart: `policy_training` is summed over `ppo_epochs`, while `total_flops` is reset per `Policy.train` call and so covers one epoch. PPO's rate therefore reads about 1/`ppo_epochs` of the true value whenever the tracker supplies the count.
 
 `rl.flops.utilization` is the model FLOP utilization: achieved TFLOPS over `get_theoretical_tflops()` for the device and dtype. TF32 and the various reduced precisions have different peaks, so the denominator follows the run's dtype.
 
@@ -46,8 +48,8 @@ The first two are rates over an elapsed time, so they need a denominator, and th
 
 None of the three is a counter, and a step that produced no number reports nothing rather than zero. Three reasons a step is absent:
 
-- The backend does not track FLOPs, so `total_flops` never reaches the results dict.
-- Sequence packing is on. The formula bills padded sequence length, which packing exists to eliminate, so the figure would be wrong rather than merely approximate. Two independent guards drop it: `print_performance_metrics` gates on `not packing_enabled` for GRPO, GRPO-sync and PPO, and the Megatron worker skips its FLOP estimate outright, which is the only reason SFT, DPO and distillation stay silent — they carry no gate of their own. The `FLOPTracker` path has no packing check either; no shipped recipe pairs the two today, so nothing guards that combination.
+- The tracker does not support the model's architecture, so `FLOPTracker.from_config` raises and no count is produced. The condition is the model, not the backend — but the backend decides whether anything covers for it, since the Megatron worker is the only one that estimates FLOPs on its own.
+- Sequence packing is on **and** the loop is GRPO, GRPO-sync or PPO, which drop the block on `print_performance_metrics`' `not packing_enabled` gate. SFT, DPO and distillation carry no such gate and do report a rate for packed runs — including shipped recipes such as `sft-llama3.1-8b-1n8g-megatron-seqpack.yaml` and `distillation_math_megatron.yaml`. That is defensible: the tracker bills each sample's actual `input_lengths`, so its count survives packing. What packing does invalidate is the Megatron worker's own estimate, which bills `max_total_sequence_length` per sample; the worker skips it itself, so an unsupported model under packing reports nothing anywhere.
 - The device's theoretical peak is unknown, which drops `rl.flops.utilization` but keeps `rl.flops.per_gpu`.
 
 Treat a gap as "not measured". A dashboard that fills forward or sums across the gap is reading something the run did not claim.
