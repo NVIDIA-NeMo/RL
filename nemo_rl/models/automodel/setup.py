@@ -19,7 +19,7 @@ import inspect
 import json
 import os
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import torch
 from hydra.utils import get_class
@@ -310,6 +310,7 @@ def validate_and_prepare_config(
     is_generation_colocated = None
     rollout_backend = None
     sampling_params = None
+    generation_cfg = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
@@ -332,16 +333,24 @@ def validate_and_prepare_config(
         # in nemo_rl/models/megatron/setup.py.
         peer_env: dict[str, str] = {}
         if rollout_backend == "vllm":
-            from nemo_rl.models.generation.vllm.config import vllm_refit_peer_env
+            from nemo_rl.models.generation.vllm.config import (
+                VllmConfig,
+                vllm_refit_peer_env,
+            )
 
-            peer_env = vllm_refit_peer_env(config["generation"])
+            peer_env = vllm_refit_peer_env(cast(VllmConfig, generation_cfg))
         elif rollout_backend == "sglang":
             from nemo_rl.models.generation.sglang.config import (
+                SGLangConfig,
                 sglang_refit_peer_env,
             )
 
-            peer_env = sglang_refit_peer_env(config["generation"], os.environ)
-        trainer_env = (config.get("automodel_cfg") or {}).get("env_vars") or {}
+            peer_env = sglang_refit_peer_env(
+                cast(SGLangConfig, generation_cfg), os.environ
+            )
+        trainer_env = cast(
+            dict[str, str], (config.get("automodel_cfg") or {}).get("env_vars") or {}
+        )
         for key, value in peer_env.items():
             if key not in trainer_env:
                 os.environ[key] = value

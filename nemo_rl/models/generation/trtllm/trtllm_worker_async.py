@@ -128,6 +128,11 @@ class TrtllmAsyncGenerationWorkerImpl:
         engine_roles = self.cfg["trtllm_cfg"].get("_engine_roles")
         if not engine_roles or self._bundle_indices is None:
             return {}
+        if self._bundle_pg_idx is None:
+            raise RuntimeError(
+                "trtllm_cfg._engine_roles is set but the worker received no "
+                "bundle_pg_idx; TrtllmGeneration and this worker are out of sync."
+            )
         key = engine_key(self._bundle_pg_idx, self._bundle_indices)
         entry = engine_roles.get(key)
         if entry is None:
