@@ -150,7 +150,13 @@ def test_generated_spans_only_including_each_terminal(ids, expected):
 
 
 THINK_OPEN, THINK_CLOSE = 1, 2
-_THINK_VOCAB = {THINK_OPEN: "<think>", THINK_CLOSE: "</think>"}
+# 30/31 are ordinary tokens that spell out a close tag in pieces.
+_THINK_VOCAB = {
+    THINK_OPEN: "<think>",
+    THINK_CLOSE: "</think>",
+    30: "</th",
+    31: "ink>",
+}
 
 
 def _decode(token_ids) -> str:
@@ -171,13 +177,15 @@ THINK_TURNS = [
     ([10, 1], [11], [13], [14]),
     # unexpected prompt pattern
     ([1, 1, 10], [11, 2], [13], [14]),
+    # thinking off, but a spelled-out close tag in the generation (#5008)
+    ([10, 1, 2], [11], [13, 1, 2], [14, 30, 31]),
 ]
 
 
 @pytest.mark.parametrize("with_ids", [True, False])
 @pytest.mark.parametrize("turns", THINK_TURNS)
 def test_malformed_think_tag_parity(turns, with_ids):
-    """Capture spans hit the echo path's per-turn ID and string checks."""
+    """Both paths run the same per-turn predicate, so their verdicts agree."""
     prompt_1, gen_1, prompt_2, gen_2 = turns
     penalties: dict = {
         "penalize_malformed_think_tag": True,
@@ -232,6 +240,51 @@ def test_malformed_think_tag_string_check_catches_spelled_out_tags():
             vocab.get(token, _THINK_VOCAB.get(token, "x")) for token in ids
         ),
     )
+
+
+def test_malformed_think_tag_spelled_out_close_tag_in_thinking_off_turn():
+    """A spelled-out close tag in a thinking-off turn is malformed (#5008).
+
+    The ID check expects 0 close tags and passes (no tag token present), so
+    only the text check can catch it: with the IDs known, one spelled-out
+    close tag already exceeds the expected 0.
+    """
+    assert has_malformed_think_tag(
+        [10, THINK_OPEN, THINK_CLOSE],
+        [11, 30, 31],
+        think_tag_ids=(THINK_OPEN, THINK_CLOSE),
+        thinking_tags=["<think>", "</think>"],
+        decode=_decode,
+    )
+
+
+def test_apply_reward_penalties_flags_spelled_out_close_tag_in_thinking_off_turn():
+    """Echo path: the same spelled-out close tag is penalized (#5008)."""
+    penalties: dict = {
+        "penalize_malformed_think_tag": True,
+        "thinking_tags": ["<think>", "</think>"],
+        "token_ids": {"think_open": THINK_OPEN, "think_close": THINK_CLOSE},
+    }
+    result = {
+        "full_result": {
+            "reward": 1.0,
+            "response": {
+                "output": [
+                    {"type": "message", "generation_str": _decode([11])},
+                    {"type": "message", "generation_str": _decode([14, 30, 31])},
+                ]
+            },
+        },
+        "message_log": [
+            {"role": "user", "token_ids": torch.tensor([10, 1, 2])},
+            {"role": "assistant", "token_ids": torch.tensor([11])},
+            {"role": "user", "token_ids": torch.tensor([13, 1, 2])},
+            {"role": "assistant", "token_ids": torch.tensor([14, 30, 31])},
+        ],
+    }
+    counts = apply_reward_penalties([result], penalties)
+    assert counts["malformed_think_tag"] == 1
+    assert result["full_result"]["reward"] == 0.0
 
 
 def test_malformed_think_tag_requires_decode():
