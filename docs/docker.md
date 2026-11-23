@@ -82,12 +82,12 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 ```sh
 docker buildx build -f docker/Dockerfile \
-    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
+    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
 
-The value is a comma-separated list of exact pins. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX` (default: the PyTorch cu134 index).
+The value is a comma-separated list of exact pins. Override torch together with its companion packages (torchvision, torchaudio): torchaudio refuses to import next to a torch built for a different CUDA version. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX` (default: the PyTorch cu134 index).
 
 The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.
 
