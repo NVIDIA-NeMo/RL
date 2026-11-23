@@ -15,6 +15,8 @@ Never skip or reorder these steps. Do not wait for the user to name the right sk
 
 Any task that writes or changes code also loads the `contributing` skill and reads every `skills/contributing/references/*.md` file. A rule's `Contributing Details:` link has step-by-step instructions; read it when the rule applies. A rule's `Review Details:` link points to the review lesson it came from; reading it is not needed to write code.
 
+**Never tick the "I, the PR author, have personally reviewed every line of this PR." box in a PR description; only the human author may.** Writing or editing a PR description follows the `pr-description` skill.
+
 ## Code Review
 
 For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR. See CONTRIBUTING.md for service integration prerequisites. The existing repository review guidance and local interactive commands below are unchanged.

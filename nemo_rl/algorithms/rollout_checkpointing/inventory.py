@@ -100,17 +100,36 @@ async def validate_replay_inventory(
     )
 
 
+async def list_staging_keys(dp_client: Any, staging_partition: str) -> frozenset[str]:
+    """List the token-capture staging rows TQ holds.
+
+    List once per cut and pass the result to every check under that cut.
+    """
+    return frozenset(
+        await call_data_plane(
+            dp_client,
+            "list_sample_ids",
+            offload_sync=True,
+            partition_id=staging_partition,
+        )
+    )
+
+
 async def validate_rollout_recovery_inventory(
     cut: DataPlaneMutationCut,
     *,
     dp_client: Any,
     recovery_ledger: RolloutRecoveryLedger,
     staging_partition: str,
+    actual_staging_keys: frozenset[str],
     replay_metadata: Optional[TQReplayMetadataState],
     clear_unreferenced: bool,
     additional_expected_staging_keys: Optional[set[str]] = None,
 ) -> int:
-    """Validate staging ownership while the caller holds a stable cut."""
+    """Validate staging ownership while the caller holds a stable cut.
+
+    ``actual_staging_keys`` must be listed under the same cut.
+    """
     cut.require_live()
     expected_staging_keys = recovery_ledger.expected_staging_keys()
     required_staging_keys = recovery_ledger.expected_staging_keys(required_only=True)
@@ -126,14 +145,6 @@ async def validate_rollout_recovery_inventory(
                     expected_staging_keys.update(route_keys)
                     required_staging_keys.update(route_keys)
 
-    actual_staging_keys = set(
-        await call_data_plane(
-            dp_client,
-            "list_sample_ids",
-            offload_sync=True,
-            partition_id=staging_partition,
-        )
-    )
     missing = sorted(required_staging_keys - actual_staging_keys)
     if missing:
         raise RuntimeError(
@@ -141,8 +152,12 @@ async def validate_rollout_recovery_inventory(
             f"from live TQ state: missing={missing[:10]!r} "
             f"(total={len(missing)})"
         )
-    unreferenced = sorted(actual_staging_keys - expected_staging_keys)
-    if clear_unreferenced and unreferenced:
+    unreferenced = (
+        sorted(actual_staging_keys - expected_staging_keys)
+        if clear_unreferenced
+        else []
+    )
+    if unreferenced:
         await call_data_plane(
             dp_client,
             "clear_samples",
