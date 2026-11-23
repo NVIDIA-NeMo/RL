@@ -748,7 +748,8 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # Opt-in, off by default: packages to install over the locked ones in every worker venv
 # that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
 # toolkit than the one uv.lock pins:
-#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES="torch==2.15.0+cu134 torchvision==0.29.2+cu134 triton==3.9.0 nvidia-cublas==13.7.0.27"
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
+# Comma-separated exact pins, so the value survives build systems that pass it unquoted.
 # uv.lock cannot express this per extra: the base project also requires torch, so a second
 # torch index for the vllm extra conflicts with it in the same resolution fork. The venvs
 # then no longer match uv.lock, so a later `uv sync` or `uv run --extra vllm` reverts them.
@@ -801,7 +802,7 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
             --default-index https://pypi.org/simple \
             --index "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}" \
             --index-strategy unsafe-best-match \
-            ${VLLM_VENV_PACKAGE_OVERRIDES}
+            ${VLLM_VENV_PACKAGE_OVERRIDES//,/ }
         "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" -c \
             'import torch, vllm; print("vllm venv override:", vllm.__version__, torch.__version__, torch.version.cuda)'
     done < /opt/actor_venvs.tsv
