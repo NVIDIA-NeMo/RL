@@ -63,6 +63,7 @@ from nemo_rl.algorithms.legacy_ppo_diagnostics import (
     return_space_stats,
     trajectory_age_metrics,
 )
+from nemo_rl.algorithms import branch_replay
 from nemo_rl.algorithms.multi_trace_metrics import compute_multi_trace_diagnostics
 from nemo_rl.experience.legacy_rollout_metrics import iter_rollout_debug_rows
 
@@ -465,6 +466,20 @@ class LegacyPPODiagnostics:
             )
             if critic_sample_mask is not None:
                 self._rollout_debug["critic_sample_loss_mask"] = _real(critic_sample_mask).tolist()
+        # ---- branch replay: screen this step's normal rollouts, account for its replays.
+        branch_runtime = branch_replay.runtime()
+        if branch_runtime is not None and values is not None and n > 0:
+            self._metrics.update(
+                branch_runtime.observe_step(
+                    step=int(trainer_version),
+                    sample_ids=[str(sample_ids[i]) for i in real_rows],
+                    debug_rows=debug_rows,
+                    rewards=_real(rewards).detach().float().cpu().numpy(),
+                    trained=_real(final_sample_mask).detach().float().cpu().numpy(),
+                    token_mask=_real(token_mask).detach().float().cpu().numpy(),
+                    values=_real(values).detach().float().cpu().numpy(),
+                )
+            )
 
     @staticmethod
     def _build_rollout_debug(

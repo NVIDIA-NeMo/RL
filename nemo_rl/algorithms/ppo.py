@@ -233,6 +233,10 @@ class PPOConfig(BaseModel, extra="allow"):
     # (nemo_rl/algorithms/single_controller_utils/legacy_diagnostics.py).
     # Per-trace rollout_debug_step{N}.jsonl in the logger's log_dir every step.
     log_rollout_debug: bool = True
+    # Branch replay (nemo_rl/algorithms/branch_replay.py): restart rollouts from the turn whose critic value moved
+    # most while the model wrote it. Keys of BranchReplayConfig; {"enabled": true} turns it on and needs
+    # NEMO_GYM_BRANCH_REPLAY_DIR. SingleController only.
+    branch_replay: dict[str, Any] = Field(default_factory=dict)
     # Driver-side critic / advantage diagnostics: pooled pre-update EV
     # (critic/explained_var, critic/ev_res), early/mid/late critic/ev_*, ece,
     # bias, mixed-group EV, abs/res return stats, residual/* (B_LOO, metrics

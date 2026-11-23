@@ -31,6 +31,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
+from nemo_rl.algorithms import branch_replay
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
@@ -1234,6 +1235,11 @@ class AsyncNemoGymRolloutImpl:
                 # derives the id from the run body and stamps /ng-rollout/<id>
                 # on every model call, so the TQ sample id IS the capture key.
                 row["_ng_rollout_id"] = rollout_ids[i]
+                # Branch replay: a task with a pending branch point restarts from it (plan file for the model
+                # server, keyed by this rollout id). No effect when branch replay is off.
+                branch_runtime = branch_replay.runtime()
+                if branch_runtime is not None:
+                    branch_runtime.on_dispatch(template_row.get("instance_id"), rollout_ids[i], input_sample)
             rows.append(row)
         return rows
 

@@ -72,6 +72,7 @@ import ray
 import torch
 from ray.exceptions import RayActorError
 
+from nemo_rl.algorithms import branch_replay as branch_replay_module
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.critic_training_mask import CRITIC_SAMPLE_MASK, build_critic_sample_mask
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
@@ -623,6 +624,14 @@ class SingleControllerActor:
             if self._is_ppo
             else None
         )
+        # Branch replay: selection of restart turns in the training step, replay plans at dispatch.
+        self._branch_replay = (
+            branch_replay_module.install_runtime(
+                branch_replay_module.BranchReplayConfig(**dict(getattr(self._algo_cfg, "branch_replay", None) or {}))
+            )
+            if self._is_ppo
+            else None
+        )
         self._legacy_efficiency = LegacyEfficiencyClock()
         if self._variable_rows:
             shard_multiples = [
@@ -937,6 +946,14 @@ class SingleControllerActor:
         if self._async_cfg.checkpoint_replay_buffer:
             await self._maybe_restore_rollout_recovery(
                 restored_replay_groups=restored_replay_groups
+            )
+        # Branch replay state rides with every checkpoint, independent of the replay-buffer setting.
+        if self._branch_replay is not None and self._last_checkpoint_path is not None:
+            restored_branch_state = self._branch_replay.load_if_present(str(self._last_checkpoint_path))
+            print(
+                f"[branch replay] state {'restored from' if restored_branch_state else 'not found in'} "
+                f"{self._last_checkpoint_path}",
+                flush=True,
             )
         await self._maybe_restore_replacement_reserve()
         await self._maybe_restore_pending_prompts()
@@ -5474,6 +5491,8 @@ class SingleControllerActor:
                 ).write_bytes,
                 rollout_recovery_payload,
             )
+        if self._branch_replay is not None:
+            await asyncio.to_thread(self._branch_replay.save, str(checkpoint_path))
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
