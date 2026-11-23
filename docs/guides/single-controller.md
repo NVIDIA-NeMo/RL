@@ -493,7 +493,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: vLLM, Megatron and SGLang generation are supported.
   - vLLM: non-colocated only. It can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md).
   - Megatron: both non-colocated and colocated modes.
-  - SGLang: non-colocated, native rollout path only, without fault tolerance (`sglang_fault_tolerance_config.use_fault_tolerance` must be `false`).
+  - SGLang: non-colocated, native rollout path only. Setup requires `sglang_fault_tolerance_config.use_fault_tolerance: false`, `async_rl.generation_fleet_health.enabled: false` and `async_rl.generation_fleet_health.refit_timeout_s: null`; see [grpo_math_1B_sglang_single_controller.yaml](../../examples/configs/grpo_math_1B_sglang_single_controller.yaml).
   - TRT-LLM has not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.

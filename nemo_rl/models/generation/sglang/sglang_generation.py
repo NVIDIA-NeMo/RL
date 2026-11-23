@@ -78,6 +78,10 @@ class SGLangGeneration(GenerationInterface):
     router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
     """
 
+    # The instance built here owns the engines, router and lock; a copy unpickled in
+    # another process does not (see ``__getstate__``). Class default for shutdown().
+    _owns_engines: bool = True
+
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject SingleController settings SGLang cannot honor.
@@ -99,7 +103,7 @@ class SGLangGeneration(GenerationInterface):
                 "https://github.com/NVIDIA-NeMo/RL/issues/5354."
             )
         if master_config.async_rl.generation_fleet_health.enabled:
-            raise ValueError(
+            raise NotImplementedError(
                 "async_rl.generation_fleet_health.enabled=true is not supported with "
                 "policy.generation.backend='sglang'. Set "
                 "async_rl.generation_fleet_health.enabled=false."
@@ -118,9 +122,6 @@ class SGLangGeneration(GenerationInterface):
         # __del__ also runs when validation or resource allocation fails.
         # Establish inert cleanup state before either can raise.
         self._health_monitor: RolloutHealthMonitor | None = None
-        # The instance built here owns the engines, router and lock; a copy
-        # unpickled in another process (see ``__getstate__``) does not.
-        self._owns_engines: bool = True
         # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
         self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = None

@@ -396,7 +396,7 @@ def test_setup_rejects_sglang_fleet_health_before_anything_builds(
     master_config = _make_master_config(backend="sglang")
     master_config.async_rl.generation_fleet_health.enabled = True
 
-    with pytest.raises(ValueError, match="fleet_health.*backend='sglang'"):
+    with pytest.raises(NotImplementedError, match="fleet_health.*backend='sglang'"):
         setup_single_controller(master_config, MagicMock(pad_token_id=0))
 
     patched_factories["_build_clusters"].assert_not_called()

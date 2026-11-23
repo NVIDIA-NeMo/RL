@@ -1,5 +1,6 @@
-# SingleController twin of grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated.yaml
-# on one node: 4 trainer GPUs, and two tp_size 2 SGLang engines on the other 4.
+# SingleController counterpart of grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated.yaml
+# on one node: 4 trainer GPUs, and two tp_size 2 SGLang engines on the other 4. Unlike that
+# synchronous recipe, generation runs one version ahead (max_lookahead_versions: 1 from the SC exemplar).
 defaults: ../../grpo_math_1B_sglang_single_controller.yaml
 grpo:
   max_num_steps: 450
