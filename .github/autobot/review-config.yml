@@ -11,3 +11,18 @@ approval:
   eligible_teams:
     - automation
     - rl_autobot_approvers
+
+# First-pass PR grading by the autobot pr-risk-label workflow (opt-in per repo).
+# The agent follows the instructions file and answers only with labels from the families below.
+pr-grade:
+  instructions: skills/pr-classify/SKILL.md
+  labels:
+    complexity: [low, medium, high, unknown]
+    convergence-risk: [none, low, medium, high, unknown]
+    proof:
+      values: [functionality, convergence, perf, none, unknown]
+      multi: true
+  check: "Autobot PR classify #{number}"
+  human_labels_win: true
+  # Temporary: only PRs with this label are graded while we test.
+  required_label: classify-test
