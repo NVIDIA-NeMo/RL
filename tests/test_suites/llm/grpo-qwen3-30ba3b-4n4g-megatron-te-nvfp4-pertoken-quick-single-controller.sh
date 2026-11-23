@@ -75,10 +75,11 @@ uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'all_finite(data["train/grad_norm"])' \
     'mean(data["train/grad_norm"], 2, 0) > 0.0'
 
-mapfile -t TRAIN_DATA_FILES < <(
-    find "$LOG_DIR" -type f -name 'train_data_step*.jsonl' -print | sort -V
+# The Parquet writer publishes one manifest per completed optimizer step.
+mapfile -t TRAIN_DATA_STEPS < <(
+    find "$LOG_DIR" -type f -path '*/train_data_parquet/step-*/_manifest.json' -print | sort -V
 )
-if [[ ${#TRAIN_DATA_FILES[@]} -ne $MAX_STEPS ]]; then
-    echo "[FAIL] Expected $MAX_STEPS rollout JSONL files, found ${#TRAIN_DATA_FILES[@]}"
+if [[ ${#TRAIN_DATA_STEPS[@]} -ne $MAX_STEPS ]]; then
+    echo "[FAIL] Expected $MAX_STEPS published rollout dumps, found ${#TRAIN_DATA_STEPS[@]}"
     exit 1
 fi

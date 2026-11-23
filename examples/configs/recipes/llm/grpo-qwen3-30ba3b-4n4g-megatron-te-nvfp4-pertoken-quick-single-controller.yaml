@@ -24,7 +24,7 @@ async_rl:
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   max_buffered_rollouts: ${grpo.num_prompts_per_step}
-  # The test checks one train_data_step*.jsonl per step.
+  # The test checks one published training dump per step.
   log_full_train_data: true
 
 policy:
