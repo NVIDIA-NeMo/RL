@@ -165,6 +165,11 @@ automodel = [
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
+  # flash-linear-attention LOOKS redundant (nemo-automodel[moe] pulls it in),
+  # but do not remove it: Qwen3.5 on the DTensor backend silently falls back
+  # to ~2x slower PyTorch kernels without it, so it must stay a direct
+  # requirement of the container's automodel extra (#2722).
+  "flash-linear-attention",
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",

@@ -103,6 +103,16 @@ def test_mcore_energon_floor_is_within_megatron_lm_range(
     )
 
 
+@pytest.mark.parametrize("package", ["flash-linear-attention", "causal-conv1d"])
+def test_automodel_qwen3_5_kernels_are_direct_dependencies(package: str) -> None:
+    """Trip-wire for #2722: Qwen3.5 on the DTensor (AutoModel) backend silently
+    falls back to ~2x slower PyTorch kernels when `flash-linear-attention` or
+    `causal-conv1d` is missing. Both must stay direct requirements of the
+    `automodel` extra so the container keeps installing them even if
+    `nemo-automodel[moe]` stops pulling them in transitively."""
+    _requirement(REPO_ROOT / "pyproject.toml", "automodel", package)
+
+
 @pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
 def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
