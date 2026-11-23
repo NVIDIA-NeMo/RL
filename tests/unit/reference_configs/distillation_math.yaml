@@ -294,6 +294,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    log_train_data_jsonl: true  # Write per-step train_data_step*.jsonl dumps; set false for low-storage runs
     extra_backends: []
     wandb_enabled: true
     tensorboard_enabled: true

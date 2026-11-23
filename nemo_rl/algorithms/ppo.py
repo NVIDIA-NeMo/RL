@@ -3121,21 +3121,22 @@ def async_ppo_train(
                         )
 
             # ---- Logging ----
-            log_data = {
-                "content": flat_messages_content,
-                "rewards": rewards.tolist(),
-                "input_lengths": input_lengths.tolist(),
-                "token_ids": train_data["input_ids"].tolist(),
-                "token_loss_mask": train_data["token_mask"].tolist(),
-                "sample_loss_mask": train_data["sample_mask"].tolist(),
-                "advantages": train_data["advantages"].tolist(),
-                "generation_logprobs": train_data["generation_logprobs"].tolist(),
-                "prev_logprobs": train_data["prev_logprobs"].tolist(),
-            }
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
-            del log_data
+            if master_config.logger.log_train_data_jsonl:
+                log_data = {
+                    "content": flat_messages_content,
+                    "rewards": rewards.tolist(),
+                    "input_lengths": input_lengths.tolist(),
+                    "token_ids": train_data["input_ids"].tolist(),
+                    "token_loss_mask": train_data["token_mask"].tolist(),
+                    "sample_loss_mask": train_data["sample_mask"].tolist(),
+                    "advantages": train_data["advantages"].tolist(),
+                    "generation_logprobs": train_data["generation_logprobs"].tolist(),
+                    "prev_logprobs": train_data["prev_logprobs"].tolist(),
+                }
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(

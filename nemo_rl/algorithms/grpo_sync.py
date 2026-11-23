@@ -60,7 +60,7 @@ from nemo_rl.algorithms.grpo import (
     _policy_dtype,
     _resolve_logprob_skip_flags,
     _save_adaptive_loss_state,
-    _should_log_nemo_gym_responses,
+    _should_log_train_data_jsonl,
     _update_adaptive_loss_state,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
@@ -1192,7 +1192,7 @@ def grpo_train_sync(
                 # the NonTensorStack wire field via materialize.
                 _log_input_ids: Optional[torch.Tensor] = None
                 _log_content: Optional[np.ndarray] = None
-                if not _should_log_nemo_gym_responses(master_config):
+                if _should_log_train_data_jsonl(master_config):
                     _log_select = ["input_ids"]
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
@@ -1441,7 +1441,7 @@ def grpo_train_sync(
             # ``token_ids`` we fetch the small ``input_ids`` column from
             # TQ at log time — same data-driven slice pattern as masking
             # / KV calibration.
-            if not _should_log_nemo_gym_responses(master_config):
+            if _should_log_train_data_jsonl(master_config):
                 log_data: dict = {}
                 for key in ("agent_ref", "attribution_key"):
                     if driver_carry is not None and key in driver_carry:
@@ -1463,8 +1463,8 @@ def grpo_train_sync(
                 log_data["prev_logprobs"] = prev_logprobs.tolist()
                 # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
-                # is None when nemo_gym-responses logging path skipped the
-                # outer ``if not _should_log_nemo_gym_responses`` branch.
+                # is None when the train-data logging path skipped the stash
+                # above (see _should_log_train_data_jsonl).
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
                 # ``content`` (raw assistant text) is fetched from TQ as

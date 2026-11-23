@@ -1154,11 +1154,12 @@ def _distillation_train_impl(
 
             # Logging
             # Log training data
-            log_data = {"content": flat_messages["content"]}
-            log_data["input_lengths"] = input_lengths.tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{total_steps + 1}.jsonl"
-            )
+            if master_config.logger.log_train_data_jsonl:
+                log_data = {"content": flat_messages["content"]}
+                log_data["input_lengths"] = input_lengths.tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{total_steps + 1}.jsonl"
+                )
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"

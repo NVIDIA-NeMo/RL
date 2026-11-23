@@ -65,6 +65,7 @@ from nemo_rl.algorithms.grpo import (
     _restore_adaptive_loss_state,
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
+    _should_log_train_data_jsonl,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
@@ -1193,6 +1194,34 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
+
+
+@pytest.mark.parametrize(
+    "log_train_data_jsonl, should_log_nemo_gym_responses, expected",
+    [
+        (True, False, True),  # default behavior: the dump is written
+        (True, True, False),  # Gym owns response logging: dump skipped
+        (False, False, False),  # new switch disables the dump
+        (False, True, False),  # both off: dump skipped
+    ],
+)
+def test_should_log_train_data_jsonl(
+    log_train_data_jsonl, should_log_nemo_gym_responses, expected
+):
+    master_config = MasterConfig.model_construct(
+        logger=LoggerConfig(log_dir="logs", log_train_data_jsonl=log_train_data_jsonl),
+        env={"should_log_nemo_gym_responses": should_log_nemo_gym_responses},
+    )
+    assert _should_log_train_data_jsonl(master_config) is expected
+
+
+def test_should_log_train_data_jsonl_defaults_to_writing_dump():
+    # Omitting both keys preserves existing behavior: the dump is written.
+    master_config = MasterConfig.model_construct(
+        logger=LoggerConfig(log_dir="logs"),
+        env={},
+    )
+    assert _should_log_train_data_jsonl(master_config) is True
 
 
 def test_grpo_save_state_checkpoint_round_trip():
