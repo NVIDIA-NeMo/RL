@@ -21,6 +21,7 @@ may run after that barrier opens. Publication remains the caller's responsibilit
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Callable, Self, TypeVar
 
@@ -56,8 +57,14 @@ class CheckpointCapture(ABC):
         self.release()
 
     @abstractmethod
-    def persist(self) -> None:
-        """Write the captured view, without reading mutable live state."""
+    def persist(self, *, extra_metadata: Mapping[str, Any] | None = None) -> None:
+        """Write the captured view, without reading mutable live state.
+
+        Args:
+            extra_metadata: Metadata known only after capture, such as the digest
+                of state serialized once the barrier opened. It is added to the
+                capture's metadata and must not repeat any of its keys.
+        """
 
     @abstractmethod
     def release(self) -> None:

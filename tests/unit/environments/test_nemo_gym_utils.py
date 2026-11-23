@@ -413,6 +413,8 @@ def _stub_gym_spinup(run_helper):
     cli = types.ModuleType("nemo_gym.cli")
     cli.GlobalConfigDictParserConfig = MagicMock
     cli.RunHelper = lambda: run_helper
+    config = types.ModuleType("nemo_gym.config")
+    config.MODEL_CALL_SAMPLING_BLOCK = "model_call_sampling"
     rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
     rollout_collection.RolloutCollectionHelper = MagicMock
     server_utils = types.ModuleType("nemo_gym.server_utils")
@@ -425,6 +427,7 @@ def _stub_gym_spinup(run_helper):
             {
                 "nemo_gym": types.ModuleType("nemo_gym"),
                 "nemo_gym.cli": cli,
+                "nemo_gym.config": config,
                 "nemo_gym.rollout_collection": rollout_collection,
                 "nemo_gym.server_utils": server_utils,
             },
@@ -1325,6 +1328,77 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
     assert cluster.actor_configs
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
+
+
+def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
+    detected_uv_dirs,
+):
+    """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
+
+    The dialect is not a policy_model overlay, which a sharded plan would reject
+    as unowned. The frontend applies the native default template kwargs, so only
+    a shard's own kwargs reach Gym.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = MasterConfig.model_construct(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {"enable_thinking": True}
+                    }
+                },
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://frontend-0", "http://frontend-1"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+
+    template_kwargs = [
+        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ].get("chat_template_kwargs")
+        for cfg in cluster.actor_configs
+    ]
+    # judged, then the tools shard's two replicas with their own override.
+    assert template_kwargs == [
+        None,
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+    ]
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["dynamo_frontend"] is True
+        assert vllm_model["reasoning_field"] == "reasoning_content"
+        # Several frontends: Gym moves the sessions of one that stops answering.
+        assert vllm_model["route_around_failing_endpoints"] is True
+        assert vllm_model["endpoint_connection_retry_timeout_s"] == 60.0
+        assert "dynamo_dialect" not in gym_config
 
 
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
@@ -2436,6 +2510,54 @@ def test_same_size_source_replacement_falls_back_to_loaded_rows(tmp_path):
         nemo_gym_mod.validate_dataset_agent_coverage(
             _sharded_set({"alpha": "left"}), {"train": wrapper}
         )
+
+
+def test_route_names_are_collected_per_split_without_a_shard_set():
+    names = nemo_gym_mod.collect_dataset_agent_names(
+        {"train": _gym_dataset("alpha", "beta", "alpha"), "validation": None}
+    )
+
+    assert names == {"train": {"alpha", "beta"}, "validation": set()}
+
+
+def test_prescanned_route_names_are_checked_without_rescanning():
+    dataset = MagicMock()
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="ghost"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}),
+            {"train": dataset},
+            agent_names={"train": {"alpha", "ghost"}},
+        )
+
+    dataset.__iter__.assert_not_called()
+
+
+def test_a_split_missing_from_the_prescan_is_scanned_at_check_time():
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="validation"):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            _sharded_set({"alpha": "left"}),
+            {"train": _gym_dataset("alpha"), "validation": _gym_dataset("ghost")},
+            agent_names={"train": {"alpha"}},
+        )
+
+
+def test_a_taskset_split_is_left_for_the_check_to_scan_with_the_routes():
+    raw_row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "1"},
+        "task_input": {},
+    }
+    datasets = {
+        "train": _gym_dataset("alpha"),
+        "validation": [{"extra_env_info": json.dumps(raw_row)}],
+    }
+    shard_set = _sharded_set({"alpha": "left", "workplace_environment": "left"})
+    shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
+
+    names = nemo_gym_mod.collect_dataset_agent_names(datasets)
+
+    assert names == {"train": {"alpha"}}
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, datasets, agent_names=names)
 
 
 def test_shard_set_shutdown_releases_the_placement_group_once():
