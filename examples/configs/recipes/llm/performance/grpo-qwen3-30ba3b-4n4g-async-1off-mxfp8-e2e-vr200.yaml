@@ -24,7 +24,6 @@ policy:
   generation:
     stop_token_ids: [151645]
     vllm_kwargs:
-      max_num_seqs: 256
       kernel_config:
         enable_jit_warmup: false
 checkpointing:
