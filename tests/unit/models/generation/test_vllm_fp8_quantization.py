@@ -1139,6 +1139,8 @@ def test_create_mxfp8_moe_initializes_dummy_scales(fp8_module, monkeypatch):
         vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
     )
     layer = torch.nn.Module()
+    layer.hidden_size = 32
+    layer.intermediate_size_per_partition = 32
     method = types.SimpleNamespace(moe=types.SimpleNamespace(is_act_and_mul=True))
 
     fp8_module.create_weights_mxfp8_moe(
