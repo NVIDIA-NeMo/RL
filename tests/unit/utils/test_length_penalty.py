@@ -1699,3 +1699,84 @@ def test_capture_metadata_reads_materialized_task_profiles(
     )
     assert sample.agent_name == "dataset"
     assert adjusted == [expected_reward]
+
+
+class TestCorrectRewardThreshold:
+    """correct_reward_threshold: graded (non-binary) rewards opt in to the length settings."""
+
+    @staticmethod
+    def graded_group(rewards):
+        # Total lengths (chars): 10, 30, 10, 30.
+        texts = [("12345", "12345"), ("1234567890123456789012345", "12345")] * 2
+        return [make_result(r, a, w) for (r, a), w in zip(texts, rewards)]
+
+    @staticmethod
+    def cfg(threshold=None, **settings):
+        cfg = make_config(default={"enabled": True, **settings}, num_gens=4)
+        if threshold is not None:
+            cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+                AGENT: {"correct_reward_threshold": threshold}
+            }
+        return cfg
+
+    def test_default_still_skips_graded_groups(self, monkeypatch):
+        monkeypatch.setattr(length_penalty_mod, "_NON_BINARY_WARNED_AGENTS", set())
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        metrics = apply(results, self.cfg(group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == [1.0, 1.0, 0.4, 0.2]
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    def test_threshold_compares_only_correct_rollouts(self):
+        # Rewards above 0.5 count as correct: the two 1.0 rollouts are compared
+        # (short +0.05, long -0.05, as for binary rewards); the graded rollouts
+        # below the threshold keep their env reward.
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        metrics = apply(
+            results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1)
+        )
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, 0.4, 0.2])
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 0.0
+
+    def test_adjustment_is_added_to_the_graded_reward(self):
+        # Correct rollouts with different graded rewards keep their own reward
+        # plus the length adjustment (not a 0/1 reward).
+        results = self.graded_group([0.9, 0.7, 0.1, 0.3])
+        apply(results, self.cfg(threshold=0.5, longest_total_penalty=0.2))
+        assert rewards_of(results) == pytest.approx([0.9, 0.5, 0.1, 0.3])
+
+    def test_binary_rewards_unchanged_by_threshold(self):
+        settings = {
+            "group_total_length_penalty_coeff": 0.1,
+            "longest_total_penalty": 0.2,
+        }
+        plain = self.graded_group([1.0, 1.0, 0.0, 1.0])
+        thresholded = self.graded_group([1.0, 1.0, 0.0, 1.0])
+        apply(plain, self.cfg(**settings))
+        apply(thresholded, self.cfg(threshold=0.5, **settings))
+        assert rewards_of(thresholded) == pytest.approx(rewards_of(plain))
+
+    def test_negative_reward_is_not_raised_to_zero(self):
+        # A graded env may score below 0 (e.g. an env-side penalty); the clamp
+        # that keeps adjusted rewards >= 0 must not lift it.
+        results = self.graded_group([1.0, 1.0, -0.1, 0.3])
+        apply(results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, -0.1, 0.3])
+
+    def test_reward_components_still_skipped(self):
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        for r in results:
+            r["full_result"]["reward_components"] = {"a": r["full_result"]["reward"]}
+        metrics = apply(
+            results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1)
+        )
+        assert rewards_of(results) == [1.0, 1.0, 0.4, 0.2]
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    def test_pass_rate_penalty_uses_the_threshold(self):
+        # Pass rate = share of rollouts above the threshold (2 of 4 = 0.5);
+        # only those take -w * rho * len / l_max.
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        apply(results, self.cfg(threshold=0.5, pass_rate_length_penalty_weight=0.2))
+        assert rewards_of(results) == pytest.approx(
+            [1.0 - 0.2 * 0.5 * 10 / 30, 1.0 - 0.2 * 0.5, 0.4, 0.2]
+        )

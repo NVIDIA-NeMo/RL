@@ -17,6 +17,16 @@ Every algorithm and the final clamp assume it, and a multi-reward verifier must 
 
 The one exception is the `zero_over_max` profiled cap: with `profiled_length_allow_non_binary_rewards: true` it also caps groups with graded (non-negative) scalar rewards instead of skipping them, and a negative reward is then an error rather than a skip. Independently of that option, `zero_over_max` raises on `reward_components` instead of skipping the group. See [Profiled Length Penalty](#5-profiled-length-penalty).
 
+Graded single-reward environments can opt in with `correct_reward_threshold` (default `null`, off), set under `default` or per agent. With it set, an agent's groups are not skipped for graded rewards: a rollout counts as correct when its reward is strictly greater than the threshold, every setting selects, compares and pass-rates rollouts by that 0/1 cut exactly as it does binary rewards, and the resulting adjustment is added to the environment's own graded reward. Rollouts at or below the threshold keep their reward (apart from the profiled penalty, which acts on every rollout by length, as for binary rewards). Groups with `reward_components` are still skipped. A reward that is already negative is not raised by the clamp. Binary rewards give the same result with or without the threshold when it lies in [0, 1). Example: a rubric environment whose `reward` is `0.5 * criteria_fraction + 0.5 * all_pass` scores 1.0 only when every criterion passes and below 0.5 otherwise, so `correct_reward_threshold: 0.5` makes "correct" mean all-pass:
+
+```yaml
+grpo:
+  length_penalty:
+    agent_overrides:
+      rubric_judge_agent:
+        correct_reward_threshold: 0.5
+```
+
 Consequences of binariness worth knowing:
 
 - The adjusted reward is clamped at 0, so penalties can wipe a correct rollout's reward out but never flip its sign — and an all-wrong group stays all-zero (no within-group variance, hence no GRPO gradient, matching vanilla behavior on groups with no correctness signal).
@@ -53,6 +63,7 @@ grpo:
       profiled_length_min_samples: 2
       profiled_reward_correct_threshold: 0.0
       profiled_length_allow_non_binary_rewards: false
+      correct_reward_threshold: null
       profile_band_total: false
       profile_band_reasoning: false
       profile_band_answer: false
@@ -129,6 +140,7 @@ A materialized Gym task row carries no agent, so key its entry in `agent_overrid
 | `profiled_length_min_samples` | Minimum PASSING profiled rollouts required; below this no profiled penalty of either type is applied. |
 | `profiled_reward_correct_threshold` | A profiled rollout is PASSING (correct) when its `profiled_rewards` entry is strictly greater than this; default `0.0` (i.e. `r > 0`). |
 | `profiled_length_allow_non_binary_rewards` | `zero_over_max` only: also cap groups with graded (non-negative) scalar rewards instead of skipping them; a negative reward then raises. Default `false`. |
+| `correct_reward_threshold` | Opt-in for graded (non-binary) single-reward environments: a rollout is correct when its reward is strictly greater than this, and the length settings act on that 0/1 cut while adjusting the graded reward. `null` (default): graded groups are skipped. See Binary Rewards Requirement. |
 | `pass_rate_length_penalty_weight` | Weight of the pass-rate-scaled (MAI-style) dense length penalty; 0 disables. |
 | `profile_band_total` | Enables per-prompt `{a,b,f}` multiplier on total length for correct rollouts. |
 | `profile_band_reasoning` | Enables per-prompt `{a,b,f}` multiplier on reasoning length for correct rollouts. |
@@ -580,7 +592,7 @@ its stored `total_reward` and training advantages use the adjusted reward.
 ## Practical Notes
 
 - Most length algorithms act only on positive rollouts (`reward > 0`).
-- Additive penalties can wipe a rollout's reward out but never flip its sign: the adjusted reward is clamped at 0 (stacked flat penalties exceeding the reward produce 0, not a negative value). Non-binary rewards reach the clamp only through the `zero_over_max` cap with `profiled_length_allow_non_binary_rewards`, which rejects negative rewards; otherwise their groups are skipped wholesale (see Binary Rewards Requirement).
+- Additive penalties can wipe a rollout's reward out but never flip its sign: the adjusted reward is clamped at 0 (stacked flat penalties exceeding the reward produce 0, not a negative value). Non-binary rewards reach the clamp only through the `zero_over_max` cap with `profiled_length_allow_non_binary_rewards`, which rejects negative rewards, or through `correct_reward_threshold`, under which an already negative reward is left as it is; otherwise their groups are skipped wholesale (see Binary Rewards Requirement).
 - `profile_band_*` multipliers also apply only to originally correct rollouts.
 - `profiled_length_penalty_type: zero_over_max` is the one adjustment that overrides all others: a capped rollout's reward is exactly 0. Capped correct rollouts show up in `length_penalty/wiped_correct_frac`.
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group pressure.

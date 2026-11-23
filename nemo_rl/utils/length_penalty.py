@@ -94,6 +94,12 @@ class LengthPenaltyParams(BaseModel, extra="forbid"):
     profiled_length_min_samples: int = 2
     profiled_reward_correct_threshold: float = 0.0
     profiled_length_allow_non_binary_rewards: bool = False
+    # Opt-in for non-binary rewards: a rollout counts as correct when its
+    # reward is > this threshold, and every length setting compares and
+    # adjusts the correct rollouts as it does 0/1 rewards. The adjustment is
+    # added to the env's own reward. None (default): non-binary groups are
+    # skipped, as before.
+    correct_reward_threshold: Optional[float] = None
     pass_rate_length_penalty_weight: float = 0.0
     profile_band_total: bool = False
     profile_band_reasoning: bool = False
@@ -541,6 +547,9 @@ def apply_group_length_penalties(
     if lengths is not None and len(lengths) != n:
         raise ValueError("precomputed lengths must cover every rollout")
     original_rewards = [r["full_result"]["reward"] for r in results]
+    # The rewards that decide which rollouts are correct: the env reward, or
+    # its 0/1 cut at an agent's correct_reward_threshold.
+    selection_rewards = list(original_rewards)
     agent_names: list[str] = []
     for result in results:
         attribution_key = get_nemo_gym_attribution_key(result)
@@ -602,8 +611,18 @@ def apply_group_length_penalties(
                 "grpo.length_penalty.agent_overrides."
             )
         # Adjustments assume binary single-reward rows; see docs/guides/length-penalty.md for the zero_over_max exception.
-        is_binary = not has_reward_components and all(
-            _is_binary_reward(original_rewards[g + k]) for k in range(group_size)
+        threshold = params.get("correct_reward_threshold")
+        thresholded = threshold is not None and not has_reward_components
+        if thresholded:
+            for k in range(group_size):
+                selection_rewards[g + k] = (
+                    1.0 if original_rewards[g + k] > threshold else 0.0
+                )
+        is_binary = thresholded or (
+            not has_reward_components
+            and all(
+                _is_binary_reward(original_rewards[g + k]) for k in range(group_size)
+            )
         )
         cap_only = (
             not is_binary
@@ -666,7 +685,7 @@ def apply_group_length_penalties(
         group_reasoning = reasoning_lengths[g : g + num_gens]
         group_answer = answer_lengths[g : g + num_gens]
         group_total = total_lengths[g : g + num_gens]
-        group_rewards = original_rewards[g : g + num_gens]
+        group_rewards = selection_rewards[g : g + num_gens]
         gate_info = _group_length_profile_gate_info(
             band=_merged_profile_band(results[g].get("profile_band"), global_band),
             params=params,
@@ -731,7 +750,7 @@ def apply_group_length_penalties(
         prlp_w = params.get("pass_rate_length_penalty_weight", 0.0)
         if prlp_w > 0.0:
             pass_rate = sum(
-                1 for k in range(group_size) if original_rewards[g + k] > 0
+                1 for k in range(group_size) if selection_rewards[g + k] > 0
             ) / float(group_size)
             if pass_rate > 0.0:
                 # l_max is the longest CORRECT rollout, so the penalty is
@@ -743,13 +762,13 @@ def apply_group_length_penalties(
                     max(
                         total_lengths[g + k]
                         for k in range(group_size)
-                        if original_rewards[g + k] > 0
+                        if selection_rewards[g + k] > 0
                     )
                 )
                 if l_max > 0.0:
                     for k in range(group_size):
                         idx = g + k
-                        if original_rewards[idx] <= 0:
+                        if selection_rewards[idx] <= 0:
                             continue
                         all_pass_rate_len_adj[idx] = (
                             -prlp_w * pass_rate * total_lengths[idx] / l_max
@@ -886,14 +905,17 @@ def apply_group_length_penalties(
         additive_delta = all_adjustments[i] + profiled_adj + all_pass_rate_len_adj[i]
         additive_base_rewards[i] = original_rewards[i] + additive_delta
         # Never flip a reward's sign (all-wrong groups stay variance-free); a capped (-inf) rollout lands at exactly 0.
-        if additive_base_rewards[i] < 0:
+        # A reward that was already negative (only possible under correct_reward_threshold) is not raised to 0.
+        if additive_base_rewards[i] < 0 and (
+            original_rewards[i] >= 0 or additive_delta == -math.inf
+        ):
             additive_base_rewards[i] = 0.0
         r["full_result"]["reward"] = additive_base_rewards[i]
 
     # Phase 4: apply per-prompt profile_band multipliers (correct rollouts only).
     _apply_profile_band_multipliers(
         results=results,
-        original_rewards=original_rewards,
+        original_rewards=selection_rewards,
         base_rewards=additive_base_rewards,
         total_lengths=total_lengths,
         reasoning_lengths=reasoning_lengths,
