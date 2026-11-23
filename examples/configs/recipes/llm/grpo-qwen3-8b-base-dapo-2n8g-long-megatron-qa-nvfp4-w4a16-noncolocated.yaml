@@ -1,0 +1,19 @@
+# Non-colocated sibling of grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16: vLLM runs on its own node and
+# receives the GPU-resident real-quant export over collective refit
+# (real_quant_export_cpu_offload: false, inherited).
+defaults: grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+checkpointing:
+  checkpoint_dir: checkpoints/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16-noncolocated
+logger:
+  log_dir: logs/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16-noncolocated
+  wandb:
+    name: grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16-noncolocated
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16-noncolocated
