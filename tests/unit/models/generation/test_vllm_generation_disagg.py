@@ -485,6 +485,21 @@ def test_disagg_cache_reset_reports_an_engine_whose_reset_failed(monkeypatch):
     assert gen.invalidate_kv_cache() is False
 
 
+def test_a_disagg_cache_reset_that_raises_reaches_the_caller(monkeypatch):
+    gen = _bare_generation(_config(_DISAGG), world_size=6)
+    _cache_reset_harness(gen, monkeypatch)
+
+    def still_pinned() -> list[bool]:
+        raise RuntimeError("vLLM still holds KV blocks")
+
+    monkeypatch.setattr(gen, "_reset_disagg_caches", still_pinned)
+    # Swallowing this would let the next step reuse KV from the old weights.
+    with pytest.raises(RuntimeError, match="still holds KV blocks"):
+        gen.finish_generation()
+    with pytest.raises(RuntimeError, match="still holds KV blocks"):
+        gen.invalidate_kv_cache()
+
+
 def test_finish_generation_without_disaggregation_keeps_the_grid_reset(monkeypatch):
     gen = _bare_generation(_config(), world_size=8)
     monkeypatch.setattr(vg.ray, "get", lambda refs, **kw: [True] * len(refs))

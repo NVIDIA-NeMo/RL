@@ -2510,6 +2510,11 @@ class VllmGeneration(GenerationInterface):
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
+        if self._disagg_cfg.enabled:
+            # Not inside the try below: a failed reset must stop the step, or the
+            # next one reuses KV computed under the previous weights.
+            results = self._reset_disagg_caches()
+            return all(result for result in results if result is not None)
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
@@ -2518,8 +2523,6 @@ class VllmGeneration(GenerationInterface):
                     "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
                 )
                 results = ray.get(self._fan_out(method_name))
-            elif self._disagg_cfg.enabled:
-                results = self._reset_disagg_caches()
             else:
                 method_name = (
                     "reset_prefix_cache_async"
@@ -2895,16 +2898,17 @@ class VllmGeneration(GenerationInterface):
         Under disaggregation see ``_reset_disagg_caches``.
         Returns True if all workers report success.
         """
+        if self._disagg_cfg.enabled:
+            # Not inside the try below, for the same reason as in finish_generation.
+            results = self._reset_disagg_caches()
+            return all(result for result in results if result is not None)
         try:
-            if self._disagg_cfg.enabled:
-                results = self._reset_disagg_caches()
-            else:
-                method_name = (
-                    "reset_prefix_cache_async"
-                    if self.cfg["vllm_cfg"]["async_engine"]
-                    else "reset_prefix_cache"
-                )
-                results = ray.get(self._fan_out(method_name))
+            method_name = (
+                "reset_prefix_cache_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "reset_prefix_cache"
+            )
+            results = ray.get(self._fan_out(method_name))
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")

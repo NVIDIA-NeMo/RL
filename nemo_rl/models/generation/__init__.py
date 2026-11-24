@@ -260,11 +260,8 @@ def configure_generation_config(
                     flush=True,
                 )
                 config["vllm_cfg"]["async_engine"] = True
-        # PD disaggregation: resolve the per-role engine blocks once, here, so
-        # everything downstream reads complete engine configs; a no-op (the
-        # same object) without disaggregation. The architecture-dependent
-        # check (hybrid SSM needs equal TP) runs in VllmGeneration, which
-        # loads the HF config.
+        # PD disaggregation: resolve the per-role engine blocks once, so everything
+        # downstream reads complete engine configs (a no-op without disaggregation).
         config = resolve_vllm_role_overrides(config)
         validate_vllm_disaggregation(config)
         validate_vllm_quantization_config(config)

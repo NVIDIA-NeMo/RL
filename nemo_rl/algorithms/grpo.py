@@ -6480,9 +6480,14 @@ def async_grpo_train(
                         # Save-bound steps need the GPUs for checkpointing,
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
-                        policy_generation.finish_generation(
-                            release_gpu=saving_this_step
-                        )
+                        # Under vLLM PD this reset needs every engine idle, but
+                        # rollouts are still in flight here, so it would stall and fail.
+                        if not uses_vllm_disagg_frontends(
+                            master_config.policy["generation"]
+                        ):
+                            policy_generation.finish_generation(
+                                release_gpu=saving_this_step
+                            )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

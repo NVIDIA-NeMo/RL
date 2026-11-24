@@ -76,6 +76,15 @@ assert_not_grep \
     "PD disaggregation is only wired for the HTTP/NeMo-Gym rollout" \
     "$RUN_LOG" \
     "Rollouts took the direct engine path instead of the disagg frontends"
+# The metric gates below read the same with or without disaggregation, so
+# grep for the frontend paths degrading silently. The SHADOW check only
+# samples while NRL_TOKENIZE_SHADOW_RATE > 0 (the recipe sets 0.1).
+assert_not_grep "frontend-tokenize SHADOW MISMATCH" "$RUN_LOG" \
+    "Frontend-rendered prompt ids differ from the engine's own render"
+assert_not_grep "frontend tokenize failed" "$RUN_LOG" \
+    "Frontend rendering failed and fell back to the prefill engine"
+assert_not_grep "reach the disaggregation frontend without" "$RUN_LOG" \
+    "Gym sent no conversation_id; prefill routing fell back to the first message"
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 

@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CHAT_PATH",
-    "COMPLETIONS_PATH",
     "BlockHashIndex",
     "ConversationKVCache",
     "ConversationRouter",
@@ -89,7 +88,6 @@ __all__ = [
 ]
 
 CHAT_PATH = "/v1/chat/completions"
-COMPLETIONS_PATH = "/v1/completions"
 
 # Request fields that must not reach the prefill leg. The leg generates one
 # token nobody reads, so logprob plumbing is waste; ``ng_capture`` is Gym's
@@ -342,9 +340,6 @@ def build_decode_leg(
             # The relayed ids carry the whole prefix; the decode engine only
             # reads the last message (tool parsing, continue_final_message).
             leg["messages"] = messages[-1:]
-    elif prompt_ids is not None:
-        # /v1/completions: a token prompt is the native way to hand over ids.
-        leg["prompt"] = prompt_ids
     return leg
 
 
@@ -657,13 +652,12 @@ class KvCacheAwareRouter(ConversationRouter):
         return idx
 
 
-def make_router(
-    kind: str,
-    num_engines: int,
-    *,
-    table_size: int,
-    hasher: Optional[RequestBlockHasher] = None,
-) -> RoundRobinRouter:
+def make_router(kind: str, num_engines: int, *, table_size: int) -> RoundRobinRouter:
+    """The router ``kind`` names, over ``num_engines`` engines.
+
+    A ``kv_cache_aware`` router starts without a hasher and falls back to the
+    conversation router until ``engines_ready`` installs one.
+    """
     if kind == "round_robin":
         return RoundRobinRouter(num_engines)
     if kind == "load_balancing":
@@ -671,7 +665,7 @@ def make_router(
     if kind == "conversation":
         return ConversationRouter(num_engines, table_size=table_size)
     if kind == "kv_cache_aware":
-        return KvCacheAwareRouter(num_engines, hasher=hasher, table_size=table_size)
+        return KvCacheAwareRouter(num_engines, table_size=table_size)
     raise ValueError(f"unknown router {kind!r}")
 
 
@@ -1062,32 +1056,12 @@ class FrontendRelay:
             return e.status, _error_body(e.message, e.status), False
 
         d_idx = self.decode_router.pick(key)
-        self.decode_router.acquire(d_idx)
         if body.get("stream"):
             # Streamed through as-is; nothing is read off the stream, so
             # bidirectional state is not updated for streamed turns (Gym does
-            # not stream). The engine's status is checked before the stream is
-            # handed back, so an engine error is still an error to the client.
-            session = await self._client()
-            try:
-                resp = await session.post(
-                    self.decode[d_idx].base_url + path, json=decode_leg, headers=headers
-                )
-            except (OSError, asyncio.TimeoutError, aiohttp.ClientError) as e:
-                self.decode_router.release(d_idx)
-                self.stats["decode_errors"] += 1
-                return (
-                    502,
-                    _error_body(f"decode engine {d_idx} unreachable: {e}", 502),
-                    False,
-                )
-            if resp.status >= 400:
-                raw = await resp.read()
-                resp.release()
-                self.decode_router.release(d_idx)
-                self.stats["decode_errors"] += 1
-                return resp.status, _parse_engine_body(raw, resp.status), False
-            return 200, self._stream_decode(d_idx, resp), True
+            # not stream).
+            return 200, self._stream_decode(d_idx, path, decode_leg, headers), True
+        self.decode_router.acquire(d_idx)
         try:
             d_status, d_body = await self._post_json(
                 self.decode[d_idx], path, decode_leg, headers
@@ -1115,14 +1089,43 @@ class FrontendRelay:
             self.conversation_cache.put(cache_key, decode_params)
         return 200, d_body, False
 
-    async def _stream_decode(self, d_idx: int, resp: aiohttp.ClientResponse) -> Any:
-        # The engine slot and the response are held until the stream is
-        # drained; a response the client never reads keeps both.
+    async def _stream_decode(
+        self,
+        d_idx: int,
+        path: str,
+        decode_leg: dict[str, Any],
+        headers: Optional[dict[str, str]],
+    ) -> Any:
+        """Post the decode leg and yield the engine's stream.
+
+        The engine slot and the response are taken and given back inside this
+        frame, so a stream the client drops before reading it holds neither.
+        The response status is already sent by then: an engine error arrives
+        as the stream's only event.
+        """
+        self.decode_router.acquire(d_idx)
         try:
-            async for chunk in resp.content.iter_any():
-                yield chunk
+            session = await self._client()
+            try:
+                resp = await session.post(
+                    self.decode[d_idx].base_url + path, json=decode_leg, headers=headers
+                )
+            except (OSError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                self.stats["decode_errors"] += 1
+                yield _sse_error(
+                    _error_body(f"decode engine {d_idx} unreachable: {e}", 502)
+                )
+                return
+            try:
+                if resp.status >= 400:
+                    self.stats["decode_errors"] += 1
+                    yield _sse_error(_parse_engine_body(await resp.read(), resp.status))
+                    return
+                async for chunk in resp.content.iter_any():
+                    yield chunk
+            finally:
+                resp.release()
         finally:
-            resp.release()
             self.decode_router.release(d_idx)
 
 
@@ -1139,6 +1142,11 @@ def _parse_engine_body(raw: bytes, status: int) -> dict[str, Any]:
 
 def _error_body(message: str, code: int) -> dict[str, Any]:
     return {"error": {"message": message, "type": "server_error", "code": code}}
+
+
+def _sse_error(body: dict[str, Any]) -> bytes:
+    """``body`` as one server-sent event, for an error on an open stream."""
+    return f"data: {json.dumps(body)}\n\n".encode()
 
 
 # --------------------------------------------------------------------------- #
@@ -1245,10 +1253,6 @@ def create_frontend_app(relay: FrontendRelay) -> Any:
     async def chat_completions(request: Request) -> Any:
         return await _relay_route(CHAT_PATH, request)
 
-    @app.post(COMPLETIONS_PATH)
-    async def completions(request: Request) -> Any:
-        return await _relay_route(COMPLETIONS_PATH, request)
-
     return app
 
 
@@ -1320,9 +1324,9 @@ def engines_answer(
 ) -> bool:
     """Whether every engine HTTP server at ``addrs`` serves requests right now.
 
-    ``/tokenize`` is the cheapest route NeMo RL's engine server exposes (it has
-    no ``/health``); a port that is reserved but not yet serving refuses the
-    connection, and a loading engine's server is not up at all.
+    ``/tokenize`` is a cheap route NeMo RL's engine server exposes; a port that
+    is reserved but not yet serving refuses the connection, and a loading
+    engine's server is not up at all.
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
     for host, port in addrs:

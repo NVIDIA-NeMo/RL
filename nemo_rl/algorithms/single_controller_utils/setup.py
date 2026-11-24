@@ -158,6 +158,7 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     uses_vllm_disagg_frontends,
+    vllm_replica_width,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -611,9 +612,10 @@ def _build_clusters(
                 }
             generation_config_dict = cast(dict[str, Any], generation_config)
             if backend == "vllm":
-                vllm_cfg = generation_config_dict["vllm_cfg"]
-                gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                    "pipeline_parallel_size", 1
+                # Under PD disaggregation the unit to keep inside one NVLink
+                # domain is the whole replica, not one engine.
+                gpus_per_instance = vllm_replica_width(
+                    cast(VllmConfig, generation_config)
                 )
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
