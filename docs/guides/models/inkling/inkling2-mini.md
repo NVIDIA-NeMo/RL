@@ -1,4 +1,4 @@
-# Inkling 2 Mini GRPO with AutoModel
+# Inkling 2 Mini GRPO with AutoModel and SGLang
 
 This guide covers GRPO for Inkling 2 Mini, a looped MoE (24 stored layers,
 128 routed experts, about 27B parameters) with NeMo AutoModel training and
