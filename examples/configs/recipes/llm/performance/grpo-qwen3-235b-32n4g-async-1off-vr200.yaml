@@ -1,20 +1,40 @@
 defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
+grpo:
+  async_grpo:
+    recompute_kv_cache_after_weight_updates: true
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200-eagle3-k1
 policy:
   megatron_cfg:
     tensor_model_parallel_size: 2
     # Recompute the attention core and retain other activations.
     recompute_granularity: selective
     recompute_modules: [core_attn]
+    model_overrides:
+      moe_hybridep_pad_uneven_dispatch_inputs: true
     env_vars:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
   generation:
-    refit_transport: nccl_reshard
+    # The packed collective refits the verifier while the external drafter stays fixed.
+    refit_transport: null
     vllm_cfg:
+      # K1 reserves two engine positions beyond the 8,192-token request budget.
+      max_model_len: 8194
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+      speculative_config:
+        method: eagle3
+        model: RedHatAI/Qwen3-235B-A22B-speculator.eagle3
+        revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe
+        num_speculative_tokens: 1
+        draft_sample_method: greedy
+        draft_load_config:
+          load_format: safetensors
+      compilation_config:
+        cudagraph_capture_sizes: [2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
+  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200-eagle3-k1
   wandb:
-    name: grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
+    name: grpo-qwen3-235b-32n4g-async-1off-vr200-eagle3-k1

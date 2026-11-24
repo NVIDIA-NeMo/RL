@@ -15,8 +15,8 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 # ===== BEGIN CONFIG =====
-# A new transport needs its own code snapshot, checkpoints and metrics.
-PERF_RUN_SUFFIX=-nccl-reshard
+# Keep the ordinary rollout snapshots, checkpoints and metrics separate.
+PERF_RUN_SUFFIX=-eagle3-k1
 NUM_NODES=32
 GPUS_PER_NODE=4
 SEGMENT_SIZE=16     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.
