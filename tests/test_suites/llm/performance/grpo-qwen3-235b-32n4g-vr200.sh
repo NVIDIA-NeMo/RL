@@ -14,11 +14,9 @@
 # limitations under the License.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-source "$SCRIPT_DIR/common.env"
-# disable NVLS to avoid OOM issue
-export NCCL_NVLS_ENABLE=0
-
 # ===== BEGIN CONFIG =====
+# Keep the ordinary rollout snapshots, checkpoints and metrics separate.
+PERF_RUN_SUFFIX=-eagle3-k3
 NUM_NODES=32
 GPUS_PER_NODE=4
 SEGMENT_SIZE=16
@@ -27,6 +25,10 @@ MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=100
 # ===== END CONFIG =====
+
+source "$SCRIPT_DIR/common.env"
+# disable NVLS to avoid OOM issue
+export NCCL_NVLS_ENABLE=0
 
 run_grpo_if_needed "$@"
 check_completed_grpo_run

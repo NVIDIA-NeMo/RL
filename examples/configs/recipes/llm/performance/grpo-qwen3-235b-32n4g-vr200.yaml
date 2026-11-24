@@ -1,12 +1,28 @@
 defaults: ./grpo-qwen3-235b-32n4g.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200-eagle3-k3
 policy:
   megatron_cfg:
     # Recompute the attention core and retain other activations.
     recompute_granularity: selective
     recompute_modules: [core_attn]
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      # K3 reserves four engine positions beyond the 8,192-token request budget.
+      max_model_len: 8196
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_capture_sizes: [4, 8, 16, 32, 64, 128]
+      speculative_config:
+        method: eagle3
+        model: RedHatAI/Qwen3-235B-A22B-speculator.eagle3
+        revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe  # pragma: allowlist secret
+        num_speculative_tokens: 3
+        draft_load_config:
+          load_format: safetensors
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-vr200
+  log_dir: logs/grpo-qwen3-235b-32n4g-vr200-eagle3-k3
   wandb:
-    name: grpo-qwen3-235b-32n4g-vr200
+    name: grpo-qwen3-235b-32n4g-vr200-eagle3-k3

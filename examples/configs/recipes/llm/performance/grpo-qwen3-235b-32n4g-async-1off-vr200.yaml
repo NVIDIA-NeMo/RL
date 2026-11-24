@@ -27,7 +27,7 @@ policy:
       speculative_config:
         method: eagle3
         model: RedHatAI/Qwen3-235B-A22B-speculator.eagle3
-        revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe
+        revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe  # pragma: allowlist secret
         num_speculative_tokens: 1
         draft_sample_method: greedy
         draft_load_config:
