@@ -2309,7 +2309,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
-        # PPO rejects ppo.length_penalty below for every SingleController run.
+        # _validate_algo_settings already rejects ppo.length_penalty on every SingleController PPO run.
         if (
             master_config.grpo is not None
             and master_config.grpo.length_penalty is not None
