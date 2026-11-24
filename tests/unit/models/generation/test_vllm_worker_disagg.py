@@ -81,7 +81,7 @@ def test_apply_disagg_engine_identity_exports_the_drivers_ports_and_host(
     }
 
     # The driver's seed replaces configure_worker's bundle-derived one.
-    assert worker._apply_disagg_engine_identity(seed=99) == 4
+    assert worker._apply_disagg_engine_identity() == 4
     assert os.environ["VLLM_PORT"] == "7100"
     assert os.environ["VLLM_NIXL_SIDE_CHANNEL_PORT"] == "8557"
     # The connector advertises this host; "localhost" would send the peer to itself.
@@ -104,7 +104,7 @@ def test_apply_disagg_engine_identity_without_a_side_channel_sets_no_host(
         "side_channel_host_env": None,
     }
 
-    assert worker._apply_disagg_engine_identity(seed=None) == 0
+    assert worker._apply_disagg_engine_identity() == 0
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in os.environ
     assert os.environ["VLLM_CACHE_ROOT"].endswith("/.cache/vllm_pd0")
 

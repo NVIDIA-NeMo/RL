@@ -90,7 +90,6 @@ __all__ = [
 
 CHAT_PATH = "/v1/chat/completions"
 COMPLETIONS_PATH = "/v1/completions"
-_RELAYED_PATHS = frozenset({CHAT_PATH, COMPLETIONS_PATH})
 
 # Request fields that must not reach the prefill leg. The leg generates one
 # token nobody reads, so logprob plumbing is waste; ``ng_capture`` is Gym's
@@ -421,9 +420,6 @@ class ConversationRouter(LoadBalancingRouter):
         self._table.move_to_end(key)
         while len(self._table) > self._table_size:
             self._table.popitem(last=False)
-
-    def forget_all(self) -> None:
-        self._table.clear()
 
 
 class BlockHashIndex:

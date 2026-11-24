@@ -190,7 +190,7 @@ inference GPUs = num_replicas * replica width
 
 `num_frontend_workers` does not appear here: frontends are CPU-only actors (`num_cpus=1, num_gpus=0`), so F never changes the GPU budget or the engine layout.
 
-`TrtllmGeneration._plan_engines()` turns this into a per-engine `(role, width)` list — the single source of truth everything else derives from:
+`disagg_layout.plan_engines()`, which both backends call, turns this into a per-engine `(role, width)` list — the single source of truth everything else derives from:
 
 ```
 [prefill_width × M, decode_width × K,   prefill_width × M, ...]
