@@ -4971,8 +4971,8 @@ class MegatronPolicyWorkerImpl(
 
             MXFP8 overlap aliases the parameter all-gather buffer to grad
             storage. That allocation remains resident even when
-            ``keep_train_buffers`` is false because the one-time parameter
-            gather below writes into it.
+            ``keep_train_buffers`` is false because logprob forward pre-hooks
+            may need it for parameter all-gather.
         """
         # First worker call after the controller's select() wait returns, so this
         # is also the "idle wait end" marker. Whether the offload was suppressed
@@ -4988,14 +4988,15 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cuda", move_grads=uses_mxfp8_shared_buffer
         )
+        if (
+            uses_mxfp8_shared_buffer
+            and not keep_train_buffers
+            and self.optimizer is not None
+        ):
+            # Reloading the shared storage zeros it; restore optimizer masters
+            # before forward pre-hooks gather the parameters.
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.eval()
-
-        # Packed logprob shards run uneven forward counts per DP rank, so gather
-        # parameters once here instead of in per-forward DP collectives.
-        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
-            self._disable_forward_pre_hook_until_next_train_step(
-                param_sync=not keep_train_buffers
-            )
 
         if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
