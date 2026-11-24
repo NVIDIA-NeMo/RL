@@ -37,8 +37,9 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    replica_width,
+    engine_widths,
     validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -77,11 +78,13 @@ class MegatronGeneration(GenerationInterface):
         """Largest GPU group requiring full NVLink connectivity.
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
-        Behind Dynamo the unit is one prefill/decode replica: its engines' widths
-        summed, as for TRT-LLM disaggregation.
+        Behind Dynamo the unit is the widest engine: the router picks a request's
+        prefill and decode engine independently across the whole fleet, so the KV
+        handoff is not kept inside a replica and only an engine's own ranks need
+        NVLink.
         """
         if dynamo_enabled(config["generation"]):
-            return replica_width(config)
+            return max(engine_widths(config).values())
         if config["generation"]["colocated"]["enabled"]:
             # Placement must satisfy both the resident training layout and any
             # dedicated inference layout built on those same ranks.
@@ -257,6 +260,16 @@ class MegatronGeneration(GenerationInterface):
             )
         if dynamo_enabled(policy_config["generation"]):
             cls._validate_dynamo_settings(master_config)
+        elif resolve_disagg_layout(policy_config["generation"]).enabled:
+            # Only the Dynamo engine fleet reads the disaggregation block; without
+            # it the run would train plain aggregated engines.
+            raise ValueError(
+                "policy.generation.disaggregation.enabled=true with "
+                "policy.generation.backend='megatron' requires "
+                "policy.generation.dynamo=true: Megatron prefill/decode engines are "
+                "served only behind Dynamo. Set dynamo to true, or set "
+                "disaggregation.enabled to false."
+            )
 
     @classmethod
     def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:

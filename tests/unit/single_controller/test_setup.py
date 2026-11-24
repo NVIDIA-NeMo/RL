@@ -588,24 +588,26 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
 @pytest.mark.parametrize(
     ("shared_tp", "prefill", "decode", "segment_size"),
     [
-        # Every engine TP 4: a 1-prefill + 2-decode replica spans 12 GPUs, two nodes.
-        (4, {}, {}, 2),
-        # 1 prefill at TP 4 next to 2 decode at TP 2: an 8-GPU replica, one node.
-        (2, {"tensor_model_parallel_size": 4}, {}, 1),
-        # Per-role widths, not the shared TP 2, size the replica: 8 + 4 + 4 = 16.
+        # Every engine TP 4: the 12-GPU replica spans two nodes, but only one
+        # engine needs NVLink, so a segment is one node.
+        (4, {}, {}, 1),
+        # Per-role widths, not the shared TP 2, size the segment: a TP 8 prefill
+        # engine fills one node.
         (
             2,
             {"tensor_model_parallel_size": 8},
             {"tensor_model_parallel_size": 4},
-            2,
+            1,
         ),
+        # A TP 16 prefill engine spans two 8-GPU nodes, so a segment is two.
+        (2, {"tensor_model_parallel_size": 16}, {}, 2),
     ],
-    ids=["uniform_tp4", "prefill_tp4_decode_tp2", "prefill_tp8_decode_tp4"],
+    ids=["uniform_tp4", "prefill_tp8_decode_tp4", "prefill_tp16"],
 )
 def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
     monkeypatch, shared_tp, prefill, decode, segment_size
 ):
-    """A P/D replica of Megatron engines spans the sum of its engines' TP x PP."""
+    """Behind Dynamo the NVLink segment is the widest engine, not the replica."""
     from tests.unit.models.generation.test_megatron_dynamo_config import (
         MEGATRON_POLICY,
         _megatron_config,
