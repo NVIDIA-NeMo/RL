@@ -759,6 +759,8 @@ def _make_mtp_refit_extension(
     Returns:
         (ext, drafter_model): drafter_model is None when has_drafter is False.
     """
+    from vllm.config import LoadConfig
+
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
     )
@@ -776,9 +778,37 @@ def _make_mtp_refit_extension(
     assert runner in ("legacy", "v2")
     owner_attr = "drafter" if runner == "legacy" else "speculator"
     ext.model_runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(speculative_config=spec_config),
+        vllm_config=SimpleNamespace(
+            speculative_config=spec_config,
+            load_config=LoadConfig(),
+            model_config=SimpleNamespace(quantization=None),
+        ),
         **{owner_attr: SimpleNamespace(model=drafter_model) if has_drafter else None},
     )
+    return ext, drafter_model
+
+
+class _MtpDrafter(torch.nn.Module):
+    """A drafter whose ``load_weights`` reports the names it loaded, as vLLM's do."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = torch.nn.Parameter(torch.zeros(2))
+        self.second = torch.nn.Parameter(torch.zeros(2))
+
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        params = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            params[name].data.copy_(loaded_weight)
+        return {name for name, _ in weights}
+
+
+def _make_mtp_refit_extension_with_module_drafter(draft_model_config=None):
+    ext, _ = _make_mtp_refit_extension(
+        method="mtp", from_disk=False, draft_model_config=draft_model_config
+    )
+    drafter_model = _MtpDrafter()
+    ext.model_runner.drafter = SimpleNamespace(model=drafter_model)
     return ext, drafter_model
 
 
@@ -2426,11 +2456,13 @@ def test_weight_update_lifecycle_uses_native_reload_for_dsv4(monkeypatch):
 
 @pytest.mark.vllm
 def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatch):
+    from vllm.config import LoadConfig
+
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
     process_calls = []
-    draft_model = torch.nn.Module()
+    draft_model = _MtpDrafter()
     draft_model_config = object()
 
     def process_weights_after_loading(model, model_config, device):
@@ -2447,7 +2479,9 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
     ext.model_runner.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
             method="mtp", draft_model_config=draft_model_config
-        )
+        ),
+        load_config=LoadConfig(),
+        model_config=SimpleNamespace(quantization=None),
     )
 
     @contextlib.contextmanager
@@ -2464,6 +2498,10 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
     def load_weights(weights):
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
+        # _load_weights feeds the co-trained MTP drafter from the same batch.
+        ext._maybe_refit_mtp_drafter(
+            [("first", torch.ones(2)), ("second", torch.ones(2))]
+        )
 
     def packed_broadcast_consumer(
         iterator, group, src, post_unpack_func, num_buffers=None
@@ -4192,18 +4230,52 @@ def test_maybe_refit_mtp_drafter_noop_when_gated(method, from_disk):
 
 @pytest.mark.vllm
 def test_maybe_process_mtp_drafter_after_loading_when_enabled(monkeypatch):
-    """The refit MTP drafter is finalized against its own draft_model_config."""
+    """The refit MTP drafter is finalized against its own draft_model_config.
+
+    A refit arrives in batches; a parameter filled by any batch counts as filled.
+    """
     draft_model_config = object()
-    ext, drafter_model = _make_mtp_refit_extension(
-        method="mtp", from_disk=False, draft_model_config=draft_model_config
+    ext, drafter_model = _make_mtp_refit_extension_with_module_drafter(
+        draft_model_config
     )
     process_weights = _patch_vllm_postload(monkeypatch)
 
+    ext._maybe_refit_mtp_drafter([("first", torch.ones(2))])
+    ext._maybe_refit_mtp_drafter([("second", torch.ones(2))])
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_called_once_with(
         drafter_model, draft_model_config, ext.device
     )
+    assert ext._mtp_drafter_refit_loaded is None
+
+
+@pytest.mark.vllm
+def test_maybe_process_mtp_drafter_after_loading_rejects_unfilled_parameter(
+    monkeypatch,
+):
+    """A drafter parameter the refit never filled would keep its dummy weights."""
+    ext, _ = _make_mtp_refit_extension_with_module_drafter()
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    ext._maybe_refit_mtp_drafter([("first", torch.ones(2))])
+    with pytest.raises(ValueError, match="second"):
+        ext._maybe_process_mtp_drafter_after_loading()
+
+    process_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_maybe_process_mtp_drafter_after_loading_rejects_refit_without_drafter_weights(
+    monkeypatch,
+):
+    ext, _ = _make_mtp_refit_extension_with_module_drafter()
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="loaded no weights into the MTP drafter"):
+        ext._maybe_process_mtp_drafter_after_loading()
+
+    process_weights.assert_not_called()
 
 
 @pytest.mark.vllm

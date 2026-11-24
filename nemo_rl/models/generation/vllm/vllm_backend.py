@@ -674,6 +674,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     _mtp_drafter_weights_from_refit: bool = True
     # Each worker reports a missing drafter for a co-trained MTP head at most once.
     _warned_missing_mtp_drafter: bool = False
+    # Names a co-trained MTP drafter loaded in the current refit, or None
+    # before the refit fed it its first batch.
+    _mtp_drafter_refit_loaded: Optional[set[str]] = None
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
@@ -1315,7 +1318,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if draft_model is None:
             return
         weights = self._trim_vocab_padding(draft_model, weights)
-        draft_model.load_weights(weights=weights)
+        loaded = draft_model.load_weights(weights=weights)
+        # A refit arrives in batches, so the names are checked once after the
+        # last one, in _maybe_process_mtp_drafter_after_loading.
+        if self._mtp_drafter_refit_loaded is None:
+            self._mtp_drafter_refit_loaded = set()
+        self._mtp_drafter_refit_loaded.update(loaded)
 
     def _maybe_process_mtp_drafter_after_loading(self) -> None:
         """Finalize MTP drafter weights after a refit (e.g. MoE grouped-GEMM layout).
@@ -1323,6 +1331,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Mirrors the main-model post-processing so the freshly refit MTP layers
         are converted to their runtime layout. Skipped for the disk-load path,
         which already processes its weights once at startup.
+
+        Raises:
+            RuntimeError: If the refit fed the drafter no weights.
+            ValueError: If a drafter parameter was not filled by any batch of
+                the refit (raised by vLLM's ``track_weights_loading``).
         """
         if not self._mtp_drafter_refit_enabled():
             return
@@ -1331,10 +1344,25 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
 
         from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
 
+        # A drafter refit from the policy starts from dummy weights, so a
+        # parameter no batch of the refit filled would only lower acceptance.
+        # Check the names of every batch as vLLM checks a load from disk.
+        loaded, self._mtp_drafter_refit_loaded = self._mtp_drafter_refit_loaded, None
+        if loaded is None:
+            raise RuntimeError(
+                "The refit loaded no weights into the MTP drafter co-trained with the policy"
+            )
+        vllm_config = self.model_runner.vllm_config
+        DefaultModelLoader(vllm_config.load_config).track_weights_loading(
+            draft_model,
+            loaded,
+            quantized=vllm_config.model_config.quantization is not None,
+        )
         draft_model_config = (
             self.model_runner.vllm_config.speculative_config.draft_model_config
         )
@@ -1811,6 +1839,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Native reload initialization invalidates the old runtime layout. Any
         subsequent exception therefore marks this worker permanently unusable.
         """
+        self._mtp_drafter_refit_loaded = None
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit(transport)
             use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
