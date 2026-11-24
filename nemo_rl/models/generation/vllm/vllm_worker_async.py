@@ -66,6 +66,7 @@ from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
+    GenerationSamplingParams,
     verify_right_padding,
 )
 from nemo_rl.models.generation.openai_server_utils import (
@@ -1846,6 +1847,7 @@ class VllmAsyncGenerationWorkerImpl(
         stop_strings: Optional[list[str]],
         request_id: str,
         device: torch.device,
+        sampling_params: GenerationSamplingParams | None = None,
     ) -> tuple[RolloutResult, Optional[Any]]:
         """Serve one rollout from this engine: its budget, sampling, generation and result.
 
@@ -1872,6 +1874,7 @@ class VllmAsyncGenerationWorkerImpl(
                 [stop_strings] if stop_strings else None
             ),
             max_new_tokens=max_new_tokens,
+            sampling_params=sampling_params,
         )
         final_output = None
         async for output in self.llm.generate(
@@ -1933,6 +1936,9 @@ class VllmAsyncGenerationWorkerImpl(
             stop_strings=(data.get("stop_strings") or [None])[0],
             request_id=str(uuid.uuid4()),
             device=input_ids.device,
+            sampling_params=data["sampling_params"][0]
+            if "sampling_params" in data
+            else None,
         )
         yield 0, rollout_output(result, input_ids=input_ids, input_length=input_length)
 

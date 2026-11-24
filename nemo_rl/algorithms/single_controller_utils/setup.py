@@ -200,6 +200,8 @@ class SingleControllerActorArgs:
     finalizer_actors: list[Any]
     advantage_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
+    val_dataloader: StatefulDataLoader | None = None
+    val_env_handles: dict[str, EnvironmentInterface] | None = None
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
@@ -1367,11 +1369,6 @@ def setup_single_controller(
 
         check_nccl_reshard_refit_support(master_config)
 
-    if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
-        raise NotImplementedError(
-            "SingleController doesn't support validation now, will support "
-            "later. Set val_period=0, val_at_start=false, val_at_end=false."
-        )
     if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
             "single_controller_utils.setup requires "
@@ -1833,8 +1830,16 @@ def setup_single_controller(
     # Backend settings checks are pure config: run them before anything builds.
     resolve_generation_class(generation_config).validate_settings(master_config)
 
+    validation_enabled = (
+        algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end
+    )
+
     def _load_training_data() -> tuple[
-        Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader
+        Any,
+        Any,
+        dict[str, EnvironmentInterface],
+        StatefulDataLoader,
+        dict[str, EnvironmentInterface],
     ]:
         """Load the datasets, build the dataloader, and clamp max_num_steps to it.
 
@@ -1843,8 +1848,9 @@ def setup_single_controller(
 
         Returns:
             A tuple of (training dataset, validation dataset, env handles,
-            training dataloader).
+            training dataloader, validation environment handles).
         """
+        val_env_handles: dict[str, EnvironmentInterface] = {}
         if use_nemo_gym:
             # NeMo-Gym creates the env actor outside setup_response_data; we wire
             # it in after generation is up (it needs the OpenAI server URLs).
@@ -1862,7 +1868,7 @@ def setup_single_controller(
                 is_vlm=is_vlm,
             )
             assert len(response_data) == 4
-            train_dataset, val_dataset, train_env_handles, _val_env_handles = (
+            train_dataset, val_dataset, train_env_handles, val_env_handles = (
                 response_data
             )
         train_dataloader = StatefulDataLoader(
@@ -1887,7 +1893,17 @@ def setup_single_controller(
                 )
 
         _clamp_max_num_steps(master_config, train_dataloader)
-        return train_dataset, val_dataset, train_env_handles, train_dataloader
+        if validation_enabled and (val_dataset is None or len(val_dataset) == 0):
+            raise ValueError(
+                "SingleController validation requires a nonempty validation dataset"
+            )
+        return (
+            train_dataset,
+            val_dataset,
+            train_env_handles,
+            train_dataloader,
+            val_env_handles,
+        )
 
     # Loading a large dataset is minutes of single-threaded parsing on the driver,
     # and on the NeMo-Gym + vLLM + non-colocated path no worker build needs it:
@@ -1907,7 +1923,13 @@ def setup_single_controller(
         and trainer_checkpoint_path is None
     )
     preloaded_training_data: Optional[
-        tuple[Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader]
+        tuple[
+            Any,
+            Any,
+            dict[str, EnvironmentInterface],
+            StatefulDataLoader,
+            dict[str, EnvironmentInterface],
+        ]
     ] = None
     speculative_train_iters: Optional[tuple[Optional[int], Optional[int]]] = None
     if overlap_dataset_load:
@@ -2320,7 +2342,9 @@ def setup_single_controller(
             if early_trainer_future is not None:
                 submitted["trainer"] = early_trainer_future
             if preloaded_training_data is not None:
-                dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
+                dataset, _val_dataset, env_handles, dataloader, val_env_handles = (
+                    preloaded_training_data
+                )
             else:
                 # Generation and Gym build meanwhile; the load does not write train_iters,
                 # which a trainer already building would be reading.
@@ -2349,7 +2373,7 @@ def setup_single_controller(
                                 flush=True,
                             )
                         submitted["trainer"] = executor.submit(build_tasks["trainer"])
-                    dataset, _val_dataset, env_handles, dataloader = (
+                    dataset, _val_dataset, env_handles, dataloader, val_env_handles = (
                         load_future.result()
                     )
                 print(
@@ -2784,11 +2808,23 @@ def setup_single_controller(
             weight_synchronizer, generation
         )
 
+    val_dataloader = None
+    if validation_enabled:
+        val_dataloader = StatefulDataLoader(
+            _val_dataset,
+            batch_size=algo_cfg.val_batch_size,
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            num_workers=data_config["num_workers"],
+        )
+
     # Build actor args and return
     actor_args = SingleControllerActorArgs(
         gen_handle=generation,
         trainer_handle=trainer,
         env_handles=env_handles,
+        val_env_handles=val_env_handles,
+        val_dataloader=val_dataloader,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         dp_client=dp_client,

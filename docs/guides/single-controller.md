@@ -491,7 +491,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
-- Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
+- [Training-time validation](#training-time-validation) is supported for GRPO with native environments and direct, non-colocated vLLM generation.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
   - `reward_scaling` — supported. The advantage stage applies it ahead of the baseline and the logged `reward`, as v1 does. Configuration rejects non-finite bounds and requires `source_min < source_max`.
@@ -501,7 +501,21 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   - Environment-flagged sample masking — supported. A step in which every completion is filtered is rejected rather than skipped.
   - `use_dynamic_sampling` — supported for GRPO under the constraints in [Dynamic sampling](#dynamic-sampling).
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
-- The drain gate in refit is not yet supported.
+- On validation steps, SingleController drains admitted training rollouts before refit and resumes dispatch after validation.
+
+### Training-time validation
+
+Enable validation with a separate `data.validation` dataset or a dataset-provided validation split. The supported path uses GRPO, native environments, and direct, non-colocated vLLM generation. Validation runs on the refitted generator and uses its own rollouts.
+
+| Setting | Behavior |
+| --- | --- |
+| `grpo.val_at_start`, `grpo.val_period`, `grpo.val_start_at`, `grpo.val_at_end` | Evaluate at step zero, on absolute multiples of the period at or above the start step, or at the final step. |
+| `grpo.max_val_samples`, `grpo.val_batch_size`, `grpo.val_num_generations_per_prompt` | Set the prompt cap, evaluation batch size, and completions per prompt. |
+| `policy.generation.val_temperature`, `val_top_p`, `val_top_k` | Set validation sampling. Use temperature zero and one completion for greedy evaluation. With multiple sampled completions, `validation/pass_k` reports the fraction of prompts with a positive reward among their completions. |
+| `grpo.stop_at_validation_metric`, `grpo.stop_at_validation_threshold` | Stop when the selected validation metric meets or exceeds the threshold. If checkpointing is enabled, a stop after a training update saves that step. |
+| `checkpointing.metric_name` | Set `val:accuracy` or `val:pass_k` to rank checkpoints by validation. A checkpoint records the score from its own step. Align the save and validation periods to rank periodic checkpoints. |
+
+Validation logs its metrics under `validation/` and writes completion records to `val_data_step{N}.jsonl`.
 
 ### Full training-data dumps
 

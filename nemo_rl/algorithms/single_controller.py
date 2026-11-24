@@ -88,6 +88,8 @@ from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _save_adaptive_loss_state,
     _update_adaptive_loss_state,
+    _validation_early_stop_message,
+    aggregate_validation_metrics,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
@@ -160,6 +162,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     reduce_advantage_pump_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import (
     KVBatchMeta,
@@ -195,11 +198,13 @@ from nemo_rl.experience.reward_penalties import (
     capture_reward_result_tables,
 )
 from nemo_rl.experience.rollout_manager import (
+    NativeValidationRollout,
     RolloutOutcome,
 )
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
+from nemo_rl.models.generation.interfaces import GenerationSamplingParams
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -233,6 +238,7 @@ from nemo_rl.utils.checkpoint import (
 )
 from nemo_rl.utils.logger import (
     Logger,
+    print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -535,6 +541,9 @@ class SingleControllerActor:
         # exists to remove. A missing field should break loudly at construction, where
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
+        self._val_dataloader = actor_args.val_dataloader
+        self._val_env_handles = actor_args.val_env_handles
+        self._validation_completed_prompts = 0
         # Rollout state the environment backend holds between turns. Only
         # turn- and prefix-level recovery keep any; otherwise this is a no-op.
         self._environment_checkpoint: EnvironmentCheckpoint = (
@@ -863,62 +872,68 @@ class SingleControllerActor:
 
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
-        await self._environment_checkpoint.check_startup()
-        # Synchronize weights before starting the pumps, unless setup already delivered them.
-        # The RefitActor proxy answers is_stale with blocking calls to the actor.
-        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
-            await self._sync_weights()
-        self._rollout_manager.set_weight_version(self._trainer_version)
-        self._rollout_manager.set_tally_step_provider(
-            lambda: self._step_assembler.assembling_version
-        )
-
-        if await self._rollout_restorer.restore():
-            self._rollout_recovery_enabled = True
-
-        # Capture the baseline before either pump can dispatch generation.
+        tasks: list[asyncio.Task[Any]] = []
         try:
-            await asyncio.to_thread(self._gen.snapshot_step_metrics)
-        except RayActorError as error:
-            log.warning("Skipping generation snapshot metrics: %s", error)
+            await self._environment_checkpoint.check_startup()
+            # Synchronize weights before starting the pumps, unless setup already delivered them.
+            # The RefitActor proxy answers is_stale with blocking calls to the actor.
+            if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
+                await self._sync_weights()
+            self._rollout_manager.set_weight_version(self._trainer_version)
+            self._rollout_manager.set_tally_step_provider(
+                lambda: self._step_assembler.assembling_version
+            )
 
-        self._maybe_start_trainer_warmup()
+            if self._algo_cfg.val_at_start and self._train_steps == 0:
+                metrics = await self._run_validation()
+                if self._validation_should_stop(metrics, initial=True):
+                    return {"train_steps": 0, "trainer_version": self._trainer_version}
 
-        # Start the rollout and train pumps, plus the watchdog
-        rollout_task = asyncio.create_task(self._rollout_pump())
-        train_task = asyncio.create_task(self._train_pump())
-        watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
-        tasks = [rollout_task, train_task, watchdog_task]
-        telemetry_interval_s = (
-            self._master_config.rollout_checkpointing.telemetry_interval_s
-        )
-        if telemetry_interval_s is not None:
-            await self._log_rollout_throughput_metrics(emit=False)
-        rollout_checkpoint_task = (
-            asyncio.create_task(self._rollout_snapshots.run())
-            if rollout_snapshots_enabled(self._master_config)
-            else None
-        )
-        if rollout_checkpoint_task is not None:
-            tasks.append(rollout_checkpoint_task)
-        rollout_telemetry_task = (
-            asyncio.create_task(self._rollout_telemetry_pump())
-            if telemetry_interval_s is not None
-            else None
-        )
-        if rollout_telemetry_task is not None:
-            tasks.append(rollout_telemetry_task)
-        # Only with fleet health on. Created unconditionally it would be a timer firing
-        # every probe_interval_s for every run that does not use the feature, which is
-        # the default.
-        probe_task = (
-            asyncio.create_task(self._gen_fleet_probe_pump())
-            if self._gen_fleet is not None
-            else None
-        )
-        if probe_task is not None:
-            tasks.append(probe_task)
-        try:
+            if await self._rollout_restorer.restore():
+                self._rollout_recovery_enabled = True
+
+            # Capture the baseline before either pump can dispatch generation.
+            try:
+                await asyncio.to_thread(self._gen.snapshot_step_metrics)
+            except RayActorError as error:
+                log.warning("Skipping generation snapshot metrics: %s", error)
+
+            self._maybe_start_trainer_warmup()
+
+            # Start the rollout and train pumps, plus the watchdog
+            rollout_task = asyncio.create_task(self._rollout_pump())
+            train_task = asyncio.create_task(self._train_pump())
+            watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
+            tasks = [rollout_task, train_task, watchdog_task]
+            telemetry_interval_s = (
+                self._master_config.rollout_checkpointing.telemetry_interval_s
+            )
+            if telemetry_interval_s is not None:
+                await self._log_rollout_throughput_metrics(emit=False)
+            rollout_checkpoint_task = (
+                asyncio.create_task(self._rollout_snapshots.run())
+                if rollout_snapshots_enabled(self._master_config)
+                else None
+            )
+            if rollout_checkpoint_task is not None:
+                tasks.append(rollout_checkpoint_task)
+            rollout_telemetry_task = (
+                asyncio.create_task(self._rollout_telemetry_pump())
+                if telemetry_interval_s is not None
+                else None
+            )
+            if rollout_telemetry_task is not None:
+                tasks.append(rollout_telemetry_task)
+            # Only with fleet health on. Created unconditionally it would be a timer firing
+            # every probe_interval_s for every run that does not use the feature, which is
+            # the default.
+            probe_task = (
+                asyncio.create_task(self._gen_fleet_probe_pump())
+                if self._gen_fleet is not None
+                else None
+            )
+            if probe_task is not None:
+                tasks.append(probe_task)
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
@@ -1008,6 +1023,113 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    def _should_validate(self, *, is_last_step: bool) -> bool:
+        cfg = self._algo_cfg
+        return (
+            cfg.val_period > 0
+            and self._train_steps >= cfg.val_start_at
+            and self._train_steps % cfg.val_period == 0
+        ) or (cfg.val_at_end and is_last_step)
+
+    def _validation_should_stop(
+        self, metrics: dict[str, Any], *, initial: bool = False
+    ) -> bool:
+        cfg = cast(GRPOConfig, self._algo_cfg)
+        message = _validation_early_stop_message(
+            metrics,
+            cfg.stop_at_validation_threshold,
+            cfg.stop_at_validation_metric,
+            initial=initial,
+        )
+        if message is not None:
+            print(message, flush=True)
+        return message is not None
+
+    async def _run_validation(self) -> dict[str, Any]:
+        """Evaluate the current generator without admitting training samples."""
+        if self._val_dataloader is None or self._val_env_handles is None:
+            raise RuntimeError(
+                "SingleController validation data and environments are required"
+            )
+        cfg = cast(GRPOConfig, self._algo_cfg)
+        generation = self._master_config.policy["generation"]
+        validation = NativeValidationRollout(
+            task_to_env=self._val_env_handles,
+            num_generations_per_prompt=cfg.val_num_generations_per_prompt,
+            sampling_params=GenerationSamplingParams(
+                temperature=generation["val_temperature"],
+                top_p=generation["val_top_p"],
+                top_k=generation["val_top_k"],
+            ),
+        )
+        rewards: list[float] = []
+        message_logs = []
+        total_length = 0.0
+        prompts_seen = 0
+        max_inflight = self._async_cfg.max_inflight_prompts
+        started_at = time.monotonic()
+        for batch in self._val_dataloader:
+            count = batch.size
+            if cfg.max_val_samples is not None:
+                count = min(count, cfg.max_val_samples - prompts_seen)
+            for start in range(0, count, max_inflight):
+                async with asyncio.TaskGroup() as tasks:
+                    rollouts = [
+                        tasks.create_task(
+                            self._rollout_manager.run_rollout(
+                                cast(
+                                    DatumSpec,
+                                    {key: value[row] for key, value in batch.items()},
+                                ),
+                                validation=validation,
+                            )
+                        )
+                        for row in range(start, min(count, start + max_inflight))
+                    ]
+                for rollout in rollouts:
+                    record = rollout.result()
+                    rewards.extend(
+                        float(completion.reward) for completion in record.completions
+                    )
+                    total_length += record.rollout_metrics[
+                        "mean_gen_tokens_per_sample"
+                    ] * len(record.completions)
+                    message_logs.extend(
+                        get_keys_from_message_log(
+                            completion.message_log, ["role", "content"]
+                        )
+                        for completion in record.completions
+                    )
+            prompts_seen += count
+            self._validation_completed_prompts += count
+            if prompts_seen == cfg.max_val_samples:
+                break
+
+        metrics = {
+            **aggregate_validation_metrics(
+                rewards, total_length, cfg.val_num_generations_per_prompt
+            ),
+            "num_samples": len(rewards),
+        }
+        step = self._train_steps
+        print(f"Validation step {step}: {metrics}", flush=True)
+        samples_to_print = self._master_config.logger.num_val_samples_to_print
+        if samples_to_print:
+            print_message_log_samples(
+                message_logs, rewards, num_samples=samples_to_print, step=step
+            )
+        self._logger.log_batched_dict_as_jsonl(
+            {"content": message_logs, "rewards": rewards}, f"val_data_step{step}.jsonl"
+        )
+        self._logger.log_metrics(metrics, step=step, prefix="validation")
+        self._logger.log_metrics(
+            {"total_validation_time": time.monotonic() - started_at},
+            step=step,
+            prefix="timing/validation",
+            step_finished=step == 0,
+        )
+        return metrics
 
     def _maybe_start_trainer_warmup(self) -> None:
         """Run the warm-up beside the first rollouts if setup chose it and did not run it."""
@@ -3749,6 +3871,14 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
+                should_validate = self._should_validate(is_last_step=is_last_step)
+                val_metrics = None
+                early_stop = False
+                if should_validate:
+                    self._rollout_permitted.clear()
+                    with self._timer.time("validation_rollout_drain"):
+                        await asyncio.gather(*tuple(self._dispatched_rollouts))
+
                 ft_save_period = self._master_config.checkpointing.ft_save_period
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
@@ -3805,6 +3935,7 @@ class SingleControllerActor:
                             )
                             aborted_stale_inflight_groups = await self._sync_weights(
                                 calibration_data=calibration_data,
+                                reopen_rollouts=not should_validate,
                             )
                 if not early_refit_done:
                     self._retune_lookahead_versions()
@@ -3837,6 +3968,15 @@ class SingleControllerActor:
                 )
                 step_metrics.update(reward_metrics)
 
+                if should_validate:
+                    val_metrics = await self._run_validation()
+                    early_stop = self._validation_should_stop(val_metrics)
+                    will_save_checkpoint |= (
+                        early_stop and self._master_config.checkpointing.enabled
+                    )
+                    if not (early_stop or is_last_step or should_save_by_timeout):
+                        self._rollout_permitted.set()
+
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
                     with (
@@ -3850,8 +3990,9 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
-                            is_final_checkpoint=is_last_step,
+                            is_final_checkpoint=is_last_step or early_stop,
                             publish_now=should_save_by_timeout,
+                            val_metrics=val_metrics,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
@@ -3944,14 +4085,15 @@ class SingleControllerActor:
                     await self._rollout_snapshots.save_at_deadline()
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
+            if early_stop:
+                break
         await self._finish_pending_save(blocking=True)
 
     async def _stall_watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
 
-        Progress is the pair (committed groups, completed train steps) rather than a
-        timestamp: both counters already exist, and "neither has moved" is the property
-        that actually matters.
+        Track progress through committed rollout groups, training steps, and
+        evaluated prompts so a long validation pass can report progress in batches.
 
         Deliberately *not* conditioned on rollouts being in flight. An earlier version
         required that, on the reasoning that an idle controller has legitimately no
@@ -3966,7 +4108,7 @@ class SingleControllerActor:
         """
         watchdog_cfg = self._async_cfg.stall_watchdog
         max_num_steps = self._algo_cfg.max_num_steps
-        last_progress = (-1, -1)
+        last_progress = (-1, -1, -1)
         last_progress_at = time.monotonic()
 
         while True:
@@ -3974,7 +4116,11 @@ class SingleControllerActor:
             now = time.monotonic()
 
             stats = self._rollout_manager.stats
-            progress = (stats.committed, self._train_steps)
+            progress = (
+                stats.committed,
+                self._train_steps,
+                self._validation_completed_prompts,
+            )
             if progress != last_progress:
                 last_progress = progress
                 last_progress_at = now
@@ -4030,7 +4176,7 @@ class SingleControllerActor:
             work_remains = self._train_steps < max_num_steps
             if work_remains and idle_s > watchdog_cfg.stall_timeout_s:
                 message = (
-                    f"no rollout committed and no train step completed in "
+                    f"no rollout, train step, or validation progress in "
                     f"{idle_s:.0f}s ({self._inflight_rollouts} rollouts in flight, "
                     f"{stats.committed} groups committed, step "
                     f"{self._train_steps}/{max_num_steps}, "
@@ -4786,6 +4932,7 @@ class SingleControllerActor:
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
         publish_now: bool = False,
+        val_metrics: dict[str, Any] | None = None,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication.
 
@@ -4800,6 +4947,7 @@ class SingleControllerActor:
                 is_policy_training_step=is_policy_training_step,
                 is_final_checkpoint=is_final_checkpoint,
                 publish_now=publish_now,
+                val_metrics=val_metrics,
             )
 
     async def _save_checkpoint_impl(
@@ -4809,6 +4957,7 @@ class SingleControllerActor:
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
         publish_now: bool = False,
+        val_metrics: dict[str, Any] | None = None,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -4819,17 +4968,21 @@ class SingleControllerActor:
         The policy optimizer is skipped during critic warmup: it has never stepped.
         """
         save_state = self._save_state
-        # SC has no validation loop yet; drop the default sentinel instead of
-        # persisting a bogus val_reward.
-        if hasattr(save_state, "val_reward"):
+        if val_metrics is not None:
+            save_state.val_reward = val_metrics["accuracy"]
+        elif hasattr(save_state, "val_reward"):
             delattr(save_state, "val_reward")
 
-        # validate_single_controller_config already rejected anything but a
-        # "train:" prefix, so step_metrics is the only source to consult.
         full_metric_name = self._master_config.checkpointing.metric_name
         if full_metric_name is not None:
-            metric_name = full_metric_name.split(":", 1)[1]
-            if not is_policy_training_step or step_metrics.get("skipped_step", 0):
+            prefix, metric_name = full_metric_name.split(":", 1)
+            if prefix == "val":
+                if val_metrics is None:
+                    if hasattr(save_state, full_metric_name):
+                        delattr(save_state, full_metric_name)
+                else:
+                    setattr(save_state, full_metric_name, val_metrics[metric_name])
+            elif not is_policy_training_step or step_metrics.get("skipped_step", 0):
                 reason = (
                     "a skipped data-exhausted step"
                     if step_metrics.get("skipped_step", 0)
@@ -5112,6 +5265,7 @@ class SingleControllerActor:
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
+        reopen_rollouts: bool = True,
     ) -> int:
         """Pause rollout dispatch and generation, synchronize weights, resume.
 
@@ -5134,6 +5288,7 @@ class SingleControllerActor:
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
+            reopen_rollouts: Whether to resume training dispatch after refit.
 
         Returns:
             The number of stale in-flight rollout groups aborted before the
@@ -5320,7 +5475,8 @@ class SingleControllerActor:
                     self._trainer_version - self._sampler.eviction_window
                 )
         self._rollout_trace.emit("weights_synced", weight_version=self._trainer_version)
-        self._rollout_permitted.set()
+        if reopen_rollouts:
+            self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 

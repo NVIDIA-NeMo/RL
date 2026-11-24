@@ -108,6 +108,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
+    GenerationSamplingParams,
 )
 from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
@@ -596,6 +597,15 @@ class _Deadline:
         self._remaining = None
 
 
+@dataclass(frozen=True)
+class NativeValidationRollout:
+    """Per-request settings for an out-of-band native validation rollout."""
+
+    task_to_env: dict[str, EnvironmentInterface]
+    num_generations_per_prompt: int
+    sampling_params: GenerationSamplingParams
+
+
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
@@ -634,6 +644,7 @@ class AsyncRolloutImpl:
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
+        validation: NativeValidationRollout | None = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -669,8 +680,18 @@ class AsyncRolloutImpl:
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results = await _gather_cancelling_siblings(
                 [
-                    self._run_single_rollout(input_sample, traj_idx)
-                    for traj_idx in range(self._num_generations_per_prompt)
+                    (
+                        self._run_single_rollout(input_sample, traj_idx)
+                        if validation is None
+                        else self._run_single_rollout(
+                            input_sample, traj_idx, validation=validation
+                        )
+                    )
+                    for traj_idx in range(
+                        self._num_generations_per_prompt
+                        if validation is None
+                        else validation.num_generations_per_prompt
+                    )
                 ]
             )
             completions = [c for c, _ in results]
@@ -695,7 +716,11 @@ class AsyncRolloutImpl:
         )
 
     async def _run_single_rollout(
-        self, input_sample: DatumSpec, traj_idx: int
+        self,
+        input_sample: DatumSpec,
+        traj_idx: int,
+        *,
+        validation: NativeValidationRollout | None = None,
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
@@ -751,6 +776,11 @@ class AsyncRolloutImpl:
                     current_message_log,
                     current_stop_strings,
                     native_generation_data=turn_native_generation_data,
+                    **(
+                        {"sampling_params": validation.sampling_params}
+                        if validation is not None
+                        else {}
+                    ),
                 )
             except Exception as e:
                 raise _classify_generation_failure(
@@ -799,7 +829,9 @@ class AsyncRolloutImpl:
             # matters -- otherwise it holds a max_inflight_prompts permit forever.
             async with _Deadline(self._timeouts.env_s, "environment step"):
                 env_output = await asyncio.to_thread(
-                    calculate_rewards, sample_batch, self._task_to_env
+                    calculate_rewards,
+                    sample_batch,
+                    self._task_to_env if validation is None else validation.task_to_env,
                 )
 
             # Update reward and termination statistics
@@ -879,6 +911,7 @@ class AsyncRolloutImpl:
         stop_strings: list[str] | None,
         *,
         native_generation_data: dict[str, Any] | None = None,
+        sampling_params: GenerationSamplingParams | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
 
@@ -909,6 +942,9 @@ class AsyncRolloutImpl:
             generation_input_data.update(
                 {key: [value] for key, value in native_generation_data.items()}
             )
+
+        if sampling_params is not None:
+            generation_input_data["sampling_params"] = [sampling_params]
 
         # Generate response
         # TODO: update generate_async to return a single item directly
@@ -2535,6 +2571,7 @@ class RolloutManager:
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
+        validation: NativeValidationRollout | None = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
@@ -2542,6 +2579,12 @@ class RolloutManager:
             assert recovery_granularity is RecoveryGranularity.SIBLING
             assert environment_instance_id is None
             assert dispatch_recorder is None
+            if validation is not None:
+                if not isinstance(self._impl, AsyncRolloutImpl):
+                    raise ValueError(
+                        "Native validation requires a native rollout manager"
+                    )
+                return await self._impl.run_rollout(input_sample, validation=validation)
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
         return await self._impl.run_rollout(

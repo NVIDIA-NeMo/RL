@@ -35,6 +35,7 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_validation_single_controller.sh
 # Same non-colocated vLLM SingleController smoke, but install refitted weights
 # through vLLM's native reload_weights API.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh

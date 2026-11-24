@@ -89,6 +89,7 @@ def _make_controller(
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps
+    ctrl._validation_completed_prompts = 0
     ctrl._logger = _RecordingLogger()
     ctrl._env_handles = env_handles if env_handles is not None else {}
     # These tests cover stall detection, not fleet health or gym routing.

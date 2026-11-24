@@ -4988,6 +4988,33 @@ def grpo_train(
         shutdown_environments(task_to_env, val_task_to_env)
 
 
+def aggregate_validation_metrics(
+    rewards: list[float], total_length_tokens: float, generations_per_prompt: int
+) -> dict[str, float]:
+    """Compute rollout-weighted means and the fraction of prompts solved at K."""
+    num_samples = len(rewards)
+    if num_samples == 0:
+        return {"accuracy": 0.0, "avg_length": 0.0}
+
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    metrics = {
+        "accuracy": rewards_tensor.mean().item(),
+        "avg_length": total_length_tokens / num_samples,
+    }
+    if generations_per_prompt > 1:
+        assert num_samples % generations_per_prompt == 0, (
+            "Validation rewards must be divisible by grpo.val_num_generations_per_prompt"
+        )
+        metrics["pass_k"] = (
+            (rewards_tensor.view(-1, generations_per_prompt) > 0)
+            .any(dim=1)
+            .float()
+            .mean()
+            .item()
+        )
+    return metrics
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -5133,36 +5160,13 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics. accuracy is the mean reward over all
-        # rollouts; grouped validation (val_num_generations_per_prompt > 1)
-        # additionally reports pass@k over each prompt's k rollouts as pass_k.
-        num_samples = len(total_rewards)
-        pass_k = None
-        if num_samples > 0:
-            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            accuracy = rewards_t.mean().item()
-            if val_num_generations_per_prompt > 1:
-                assert num_samples % val_num_generations_per_prompt == 0, (
-                    "Validation rewards must be divisible by "
-                    "grpo.val_num_generations_per_prompt"
-                )
-                pass_k = (
-                    (rewards_t.view(-1, val_num_generations_per_prompt) > 0)
-                    .any(dim=1)
-                    .float()
-                    .mean()
-                    .item()
-                )
-        else:
-            accuracy = 0.0
-
-        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
-
-        val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
-            **additional_metrics_to_report,
-        }
+        val_metrics = aggregate_validation_metrics(
+            total_rewards, total_length_tokens, val_num_generations_per_prompt
+        )
+        accuracy = val_metrics["accuracy"]
+        avg_length = val_metrics["avg_length"]
+        pass_k = val_metrics.get("pass_k")
+        val_metrics.update(additional_metrics_to_report)
         if pass_k is not None:
             val_metrics["pass_k"] = pass_k
 
