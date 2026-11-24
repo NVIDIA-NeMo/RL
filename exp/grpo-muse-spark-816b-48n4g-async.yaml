@@ -1,0 +1,180 @@
+# Muse-Spark-Open-816B-A42B async GRPO on 48 GB200 nodes x 4 GPUs (185 GB/GPU): AutoModel training
+# on 32 nodes + BF16 vLLM rollouts on 16 dedicated nodes (non-colocated). Model, optimizer, loss and
+# vLLM settings follow grpo-muse-spark-816b-32n8g-pp4.yaml (H100, colocated).
+#
+# Validated for 31 steps (one resume) with the NeMo RL Inkling2 GB200 image (vLLM with
+# vllm-project/vllm#67325, AutoModel main), not with this branch's pinned dependencies.
+#
+# Rollouts: BF16 weights are ~1527 GiB. An engine is TP4 x PP8 = 32 GPUs (TP inside a node, PP
+# across nodes, EP == TP), ~50 GiB/GPU of weights; 16 generation nodes = 2 engines. On Blackwell
+# the BF16 experts run on FlashInfer's TRT-LLM MoE, so refit goes through vLLM's layerwise reload,
+# which holds a whole layer's received (unsharded, ~48 GiB) weights next to the layer's new local
+# params. TP4 x PP4 engines (~95-100 GiB/GPU of weights) ran out of memory in the first refit at
+# gpu_memory_utilization 0.85; PP8 at 0.55 leaves ~80 GiB for the refit with ~50 GiB of KV cache.
+#
+# Training: FusedAdam master weights (BF16 params + int16 remainders) with BF16 moments are
+# ~10 B/param, ~64 GB/GPU over 128 GPUs; GPU memory peaks at ~185 GB, so fewer training nodes do
+# not fit. EP64 (4 experts per GPU) with 2-way FSDP of the experts; no pipeline parallelism
+# (non-colocated generation does not support it). cluster.segment_size keeps each EP64 group inside
+# one 16-node NVL72 rack; submit with `sbatch --segment=16`.
+#
+# Generation is the bottleneck: ~320-375 s/step with 2 engines (training ~30 s, refit ~32 s).
+defaults: ../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  # 32 x 8 = 256 samples per step (the H100 recipe uses the default 16 generations: 512).
+  num_generations_per_prompt: 8
+  max_num_epochs: 10
+  max_num_steps: 500
+  use_leave_one_out_baseline: false
+  # reference_policy_kl_penalty is 0, so reference logprobs are unused: skip that full-model forward.
+  skip_reference_policy_logprobs_calculation: true
+  val_period: 10
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 240
+  val_batch_size: 240
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  # Required for async GRPO: trajectories may come from the previous policy.
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  force_on_policy_ratio: false
+
+checkpointing:
+  # A checkpoint (BF16 weights + FP32-master remainders + BF16 moments) is ~9 TB. Save once, when
+  # checkpoint_must_save_by (DD:HH:MM:SS from job start; set it ~10 min before the time limit) is
+  # reached, then exit. Leave room for two checkpoints in the filesystem quota.
+  enabled: true
+  checkpoint_dir: results/grpo-muse-spark-816b-48n4g-async
+  save_period: 1000000
+  checkpoint_must_save_by: "00:03:50:00"
+  metric_name: null # Keep the latest checkpoint instead of the best metric.
+  keep_top_k: 1
+
+policy:
+  model_name: /path/to/Muse-Spark-Open-816B-A42B
+  precision: bfloat16
+  # Fixed refit staging buffer: the default (30% of free memory) stays allocated while a 16 GiB
+  # grouped-expert tensor is gathered.
+  refit_buffer_size_gb: 2
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 1024
+  make_sequence_length_divisible_by: 64
+  offload_optimizer_for_logprob: true
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 1.0e-08
+        end_factor: 1.0
+        total_iters: 10
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones:
+        - 10
+  automodel_cfg:
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    env_vars:
+      # Never splitting cached blocks > 512 MB keeps large segments whole and releasable;
+      # expandable_segments slows CUDA-IPC refit.
+      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      # Keep params sharded between forward and backward; there is no spare memory for unsharded copies.
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: 2048
+    vllm_kwargs:
+      language_model_only: true
+      mm_encoder_tp_mode: data
+    vllm_cfg:
+      precision: bfloat16
+      # Engine = 32 GPUs: TP4 (inside a node) x PP8 (across nodes), EP = TP. TP must divide the
+      # 16 KV heads.
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 8
+      expert_parallel_size: 4
+      # NeMo RL requires the async engine when vLLM PP > 1.
+      async_engine: true
+      # ~50 GiB/GPU of weights + ~50 GiB KV cache; the rest is refit headroom (see the header).
+      gpu_memory_utilization: 0.55
+      enforce_eager: true
+      max_model_len: 3072
+      env_vars:
+        # TP4 stays inside a node: skip FlashInfer all-reduce and its first-forward JIT compile.
+        VLLM_ALLREDUCE_USE_FLASHINFER: "0"
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "3600"
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        # 16 generation nodes = 2 engines; training gets the remaining 32 nodes.
+        num_nodes: 16
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemorl-muse
+    name: grpo-muse-spark-816b-48n4g-async
+cluster:
+  gpus_per_node: 4
+  num_nodes: 48
+  segment_size: 16

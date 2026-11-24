@@ -6,14 +6,17 @@ AutoModel training backend and BF16 vLLM generation.
 > [!IMPORTANT]
 > **Status: Functionally Ready.** The reference configuration has been
 > validated with a colocated GRPO run using PP4 and EP64 on a 32-node H100
-> allocation. Long-run convergence has not been established; see
+> allocation. A non-colocated async GRPO configuration has also run for 31
+> steps on 48 GB200 nodes; see [GB200 Async Configuration](#gb200-async-configuration).
+> Long-run convergence has not been established; see
 > [Known Limitations](#known-limitations) for validation coverage.
 
 ## Support Status
 
-| Model | Training backend | Validated training parallelism | Generation backend | Status |
-| --- | --- | --- | --- | --- |
-| `meta-models/Muse-Spark-Open-816B-A42B` | AutoModel | PP4 + EP64 (DP64) | vLLM with TP8 + PP8 + EP8 | Functionally Ready |
+| Model | Hardware | Training backend | Validated training parallelism | Generation backend | Status |
+| --- | --- | --- | --- | --- | --- |
+| `meta-models/Muse-Spark-Open-816B-A42B` | 32 x 8 H100, colocated | AutoModel | PP4 + EP64 (DP64) | vLLM with TP8 + PP8 + EP8 | Functionally Ready |
+| `meta-models/Muse-Spark-Open-816B-A42B` | 48 x 4 GB200, non-colocated async | AutoModel | EP64 (DP128) | vLLM with TP4 + PP8 + EP4 on 16 dedicated nodes | Functionally Ready |
 
 ## Validated Scope
 
@@ -82,6 +85,7 @@ pass `logger.wandb_enabled=false` when launching.
 | Model | Algorithm | Backend | Scale | Config |
 | --- | --- | --- | --- | --- |
 | Muse-Spark-Open-816B-A42B | GRPO | AutoModel | 32n8g | [`grpo-muse-spark-816b-32n8g-pp4.yaml`](../../../../exp/grpo-muse-spark-816b-32n8g-pp4.yaml) |
+| Muse-Spark-Open-816B-A42B | Async GRPO | AutoModel | 48n4g GB200 | [`grpo-muse-spark-816b-48n4g-async.yaml`](../../../../exp/grpo-muse-spark-816b-48n4g-async.yaml) |
 
 ### 3. Launch
 
@@ -162,6 +166,55 @@ so that refitted (unfolded) router weights are scaled correctly. Without it, the
 router weights end up `sqrt(32)` times too large after the first refit, and the
 generation KL error rises from about `1e-3` to about `0.25`.
 
+## GB200 Async Configuration
+
+[`grpo-muse-spark-816b-48n4g-async.yaml`](../../../../exp/grpo-muse-spark-816b-48n4g-async.yaml)
+runs async GRPO on 48 GB200 NVL72 nodes with 4 GPUs each. Training and
+generation use separate GPUs:
+
+- **Training**: 32 nodes (128 GPUs) with EP64 and no pipeline parallelism, so
+  the data-parallel size is 128. Pipeline parallelism is not supported with
+  non-colocated generation, and with 185 GB per GPU it is not needed. The
+  optimizer state is about 64 GB per GPU, and GPU memory peaks at about 185 GB,
+  so fewer training nodes do not fit.
+- **Generation**: 16 nodes as two vLLM engines of TP4 x PP8 (32 GPUs each),
+  with `gpu_memory_utilization: 0.55`. On Blackwell the BF16 experts run on
+  FlashInfer's TRT-LLM MoE kernels, so each refit goes through vLLM's
+  layer-by-layer weight reload, which holds a whole layer's unsharded weights
+  (about 48 GiB) at once. TP4 x PP4 engines at a utilization of 0.85 ran out of
+  memory in the first refit; PP8 halves the weights per GPU and leaves room for
+  the reload.
+- **Batch size**: 256 samples per step (32 prompts x 8 generations), half of the
+  H100 configuration's 512 (32 x 16).
+- **Async rollouts**: `max_trajectory_age_steps: 1` with in-flight weight
+  updates, and a truncated importance sampling ratio of 5 (2 on H100).
+- **Placement**: `cluster.segment_size: 16` keeps each EP64 group inside one
+  16-node NVL72 rack. Submit the Slurm job with `--segment=16`.
+- **Checkpoints**: a checkpoint is about 9 TB. The configuration saves once,
+  when `checkpointing.checkpoint_must_save_by` is reached; set it about 10
+  minutes before the job's time limit, and leave room for two checkpoints in
+  the filesystem quota.
+
+The run used the NeMo RL GB200 image built for Inkling2 (vLLM with
+[vllm-project/vllm#67325](https://github.com/vllm-project/vllm/pull/67325) and
+AutoModel `main`), not this branch's pinned dependencies. Two issues in that
+stack needed workarounds:
+
+- The flashinfer-python 0.7.3 and 0.7.4 wheels ship the
+  `cake_muse_spark_norm_backend` and `cake_tp_moe_finalize_rmsnorm_backend`
+  packages without their `build.json` and CUDA sources, so vLLM fails in its
+  profiling run. Mount the two directories from the FlashInfer `v0.7.3` Git tag
+  over the vLLM worker environment's copies; FlashInfer then JIT-compiles them.
+  [`tools/muse/fetch_flashinfer_cake_fix.sh`](../../../../tools/muse/fetch_flashinfer_cake_fix.sh)
+  fetches the two directories.
+- Resuming with the optimizer staged in host memory must still load the model
+  weights on GPU: the Muse Spark state-dict adapter redistributes the rotary
+  embedding rows, which fails on CPU tensors with NCCL-only process groups.
+
+Generation is the bottleneck: steady-state steps take about 320-375 seconds,
+of which training takes about 30 seconds and the refit about 32 seconds. Model
+loading and engine startup take about 30 minutes.
+
 ## Reference Training Curves
 
 The following curves were produced with the reference PP4/EP64 configuration on
@@ -181,13 +234,40 @@ gradient norm, and approximate entropy over the first 30 steps.
 
 ![Muse-Spark-Open-816B-A42B GRPO training reward, validation accuracy, mean generated tokens per sample, generation KL error, gradient norm, and approximate entropy over 30 steps](../../../assets/muse-spark/grpo-muse-spark-open-816b-automodel.png)
 
+### GB200 Compared with H100
+
+The following plot overlays the GB200 async configuration on the H100 curves
+above for the first 30 steps. The GB200 run resumed from a checkpoint after
+step 13. The H100 values are read from the plot above. The runs differ in
+batch size (256 samples per step on GB200, 512 on H100), in rollout staleness
+(async with a maximum age of one step on GB200, synchronous on H100), and in
+the truncated importance sampling ratio (5 on GB200, 2 on H100).
+
+- Training reward follows the H100 run, rising to about 0.8 by step 14.
+- AIME 2024 validation accuracy is 0.49 at step 10, 0.69 at step 20, and 0.64
+  at step 30, compared with 0.57, 0.72, and 0.65 on H100. The gap narrows from
+  0.08 to about 0.01, consistent with GB200 using half as many samples per
+  step.
+- Generation KL error is higher, about `2.5e-3` to `3e-3`, from the
+  one-step-stale async rollouts. It peaks at `4.8e-3` and `4.1e-3` on the
+  steps right after validation, when the rollouts are the oldest.
+- Mean response length and approximate entropy fall more slowly, reaching
+  about 700 tokens and 0.37 at step 30, compared with about 575 tokens and
+  0.32 on H100.
+- Gradient norm has one spike to about 7.5 at step 17 that recovers at the next
+  step.
+
+![Muse-Spark-Open-816B-A42B GRPO on 48 GB200 nodes (async, 256 samples per step) compared with 32 H100 nodes (colocated, 512 samples per step): training reward, validation accuracy, mean generated tokens per sample, generation KL error, gradient norm, and approximate entropy over 30 steps](../../../assets/muse-spark/grpo-muse-spark-open-816b-h100-vs-gb200.png)
+
 ## Known Limitations
 
 - **Short validation run**: The curves cover 30 training steps with three
   validation points. Long-run convergence has not been established.
-- **Hardware and deployment coverage**: Only colocated training and generation
-  on H100 GPUs have been tested. Non-colocated deployments and Blackwell GPUs
-  have not been validated.
+- **Hardware and deployment coverage**: Colocated training and generation have
+  been tested on H100 GPUs, and non-colocated async GRPO on GB200 GPUs. The
+  GB200 run used the Inkling2 GB200 image, not this branch's pinned
+  dependencies; other Blackwell systems and colocated GB200 runs have not been
+  validated.
 - **Multimodal training**: Only the language model is trained. The vision and
   audio towers are frozen and are not served by vLLM.
 - **Sequence length**: The validated configuration uses a 3,072-token maximum
