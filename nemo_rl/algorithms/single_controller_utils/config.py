@@ -1984,6 +1984,18 @@ def validate_grpo_chunk_cap_alignment(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and cast(VllmConfig, generation_config)["vllm_cfg"].get(
+            "discard_weights_on_sleep"
+        )
+        is True
+    ):
+        raise NotImplementedError(
+            "generation.vllm_cfg.discard_weights_on_sleep is not supported by "
+            "SingleController. See #4659."
+        )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
     megatron_cfg = master_config.policy.get("megatron_cfg")
