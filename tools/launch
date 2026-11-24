@@ -122,6 +122,7 @@ for SCRIPT in $SCRIPTS; do
     fi
     # Reset optional per-script config vars so a value from a previous script in
     # the loop does not leak into a script that omits it.
+    PERF_RUN_SUFFIX=""
     SEGMENT_SIZE=""
     JOB_REAPER_COMMENT=""
     NUM_EXTERNAL_SERVICE_NODES=0
@@ -183,16 +184,16 @@ for SCRIPT in $SCRIPTS; do
         rel_pools=$(check_file_in_version_control_and_get_relpath_from_git_root $POOLS_FILE)
     fi
 
-    EXP_NAME=$(basename $SCRIPT .sh)
+    EXP_NAME="$(basename "$SCRIPT" .sh)${PERF_RUN_SUFFIX}"
     SNAPSHOT_DIR=$(bash $PROJECT_ROOT/tools/code_snapshot.sh $EXP_NAME)
 
     # Now use the variables
     for i in $(seq 1 $NUM_RUNS); do
         echo "Submitting $i/$NUM_RUNS job with ${NUM_NODES} nodes for $(basename $SCRIPT)"
-        JOB_NAME=$(basename $SCRIPT .sh)
+        JOB_NAME=$EXP_NAME
 
         script_args=(
-            logger.wandb.name=$(basename $SCRIPT .sh)
+            logger.wandb.name="$EXP_NAME"
             ++git_meta=$(git log -1 --format='%h-%f' HEAD)
             # Record the container just for provenance
             ++container=$CONTAINER

@@ -1,6 +1,6 @@
 defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
 policy:
   megatron_cfg:
     tensor_model_parallel_size: 2
@@ -10,12 +10,11 @@ policy:
     env_vars:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
   generation:
-    # Match the measured collective refit and packed-buffer target.
-    refit_transport: null
+    refit_transport: nccl_reshard
     vllm_cfg:
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200
+  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
   wandb:
-    name: grpo-qwen3-235b-32n4g-async-1off-vr200
+    name: grpo-qwen3-235b-32n4g-async-1off-vr200-nccl-reshard
