@@ -84,6 +84,12 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     JsonDebugWriter,
     TrainChunk,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    new_rollout_stats_accumulator,
+)
 from nemo_rl.algorithms.single_controller_utils.step_assembly import ShortfallCredit
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
@@ -579,6 +585,8 @@ def _stamp_advantage_stage_config(
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
 
 
 def test_resumed_mooncake_init_restores_without_partition_registration(
@@ -1540,6 +1548,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.tensor([False, True, False, False]),
             "truncated": torch.tensor([False, False, False, True]),
+            "input_lengths": torch.ones(4, dtype=torch.long),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
             # The sequence-error- and overlong-filtered rows are also flagged.
@@ -1669,6 +1678,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.tensor(mask_sample),
             "truncated": torch.tensor(truncated),
+            "input_lengths": torch.ones(len(truncated), dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1739,6 +1749,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
             "generation_logprobs": generation_logprobs,
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.tensor([False, True]),
+            "input_lengths": torch.ones(2, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1843,6 +1854,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1915,6 +1927,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
             "generation_logprobs": torch.ones(batch_size, sequence_length),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1979,6 +1992,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
             "sample_mask": torch.zeros(batch_size),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -2241,6 +2255,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
                     "sample_mask": torch.ones(2),
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
+                    "input_lengths": torch.ones(2, dtype=torch.long),
                     "generation_logprobs": prev_logprobs,
                     "prev_logprobs": prev_logprobs,
                     "teacher_reference_logprobs": teacher_logprobs,
@@ -2695,6 +2710,7 @@ def _train_pump_controller(*, sampler) -> object:
         resume_request_deadlines=MagicMock(),
         drain_step_reward_metrics=MagicMock(return_value={}),
         filter_zero_variance_groups=False,
+        pop_mask_rule_metrics=lambda: {},
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -2724,6 +2740,9 @@ def _train_pump_controller(*, sampler) -> object:
         "seq_logprob_error_metrics": [],
     }
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
+    ctrl._max_total_sequence_length = 32
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -3735,6 +3754,132 @@ def test_run_pumps_snapshots_generation_before_dispatch(
         asyncio.run(ctrl._run_pumps())
 
     assert events == ["snapshot", "dispatch"]
+
+
+class _RowDataPlane(_NoOpDataPlane):
+    """Rows keyed by sample id, so each chunk's advantage stage reads its own."""
+
+    def __init__(self, rows: dict[str, dict[str, torch.Tensor]]) -> None:
+        self.rows = rows
+
+    def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
+        del kwargs
+        return TensorDict(
+            {
+                name: torch.stack([self.rows[sid][name] for sid in sample_ids])
+                for name in select_fields
+            },
+            batch_size=[len(sample_ids)],
+        )
+
+    def put_samples(self, *, sample_ids, fields, **kwargs) -> None:
+        del kwargs
+        for row, sid in enumerate(sample_ids):
+            for name in fields.keys():
+                self.rows[sid][name] = fields[name][row].clone()
+
+
+def test_train_pump_logs_row_stats_once_per_step_and_resets_them(
+    monkeypatch,
+) -> None:
+    """Two steps of two one-group chunks: each step logs only its own rows."""
+    # (reward, mask_sample flag, sequence length) per row, one list per group.
+    groups = [
+        [(1.0, False, 30), (0.0, True, 8)],  # step 1: mixed only via the masked row
+        [(1.0, False, 20), (1.0, False, 8)],  # step 1: all pass
+        [(0.0, False, 8), (0.0, False, 8)],  # step 2: all fail
+        [(1.0, False, 8), (0.0, False, 8)],  # step 2: mixed
+    ]
+    rows: dict[str, dict[str, torch.Tensor]] = {}
+    metas = []
+    for group, members in enumerate(groups):
+        sample_ids = [f"g{group}-{member}" for member in range(len(members))]
+        for sid, (reward, flagged, length) in zip(sample_ids, members):
+            rows[sid] = {
+                "total_reward": torch.tensor(reward),
+                "token_mask": torch.tensor([0.0, 1.0, 1.0]),
+                "sample_mask": torch.tensor(1.0),
+                "mask_sample": torch.tensor(flagged),
+                "truncated": torch.tensor(False),
+                "input_lengths": torch.tensor(length),
+            }
+        metas.append(
+            KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=sample_ids,
+                fields=[],
+                sequence_lengths=[3] * len(members),
+                extra_info={
+                    ROLLOUT_METRICS: [{"mask_rules/eval_incomplete_rate": 0.5}]
+                },
+                tags=[
+                    {"weight_version": 0, GROUP_ID_TAG: f"group-{group}"}
+                    for _ in members
+                ],
+            )
+        )
+
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    algo = GRPOConfig(
+        num_prompts_per_step=2,
+        num_generations_per_prompt=2,
+        max_num_steps=2,
+        seq_logprob_error_threshold=None,
+    )
+    ctrl._master_config.grpo = ctrl._algo_cfg = algo
+    ctrl._advantage_estimator = _MaskRecordingAdvantageEstimator()
+    ctrl._dp_client = _RowDataPlane(rows)
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._max_total_sequence_length = 32
+    ctrl._rollout_manager.pop_mask_rule_metrics = MagicMock(
+        side_effect=[
+            {
+                "mask_rules/rollouts_seen": 4.0,
+                "mask_rules/eval_incomplete_reward_mean": 0.0,
+            },
+            {},
+        ]
+    )
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    assert ctrl._train_steps == 2
+    step_1, step_2 = (
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    )
+    # Step 1: the flagged row does not train but still votes (include).
+    assert step_1["masking/rows"] == 4.0
+    assert step_1["masking/env_flag_rows"] == 1.0
+    assert step_1["masking/trained_rows"] == 3.0
+    assert step_1["masking/reinstated_rows"] == 1.0
+    assert step_1["masking/groups"] == 2.0
+    assert step_1["groups/count"] == 2.0
+    assert step_1["groups/mixed_count"] == 1.0
+    # Two of the three trained rows sit in the all-pass group.
+    assert step_1["groups/zero_advantage_sample_frac"] == pytest.approx(2 / 3)
+    assert step_1["gen_tokens/mean"] == 2.0
+    # Only the 30-token row is above 90 % of max_total_sequence_length (32).
+    assert step_1["seq_len/frac_above_90pct_ctx"] == pytest.approx(1 / 3)
+    # Both rule-metric families reach the step: per-group rates and step totals.
+    assert step_1["mask_rules/eval_incomplete_rate"] == 0.5
+    assert step_1["mask_rules/rollouts_seen"] == 4.0
+    assert step_1["mask_rules/eval_incomplete_reward_mean"] == 0.0
+    # Step 2 starts from empty accumulators: nothing is carried over from step 1.
+    assert step_2["masking/rows"] == 4.0
+    assert step_2["masking/env_flag_rows"] == 0.0
+    assert step_2["masking/trained_rows"] == 4.0
+    assert step_2["masking/groups"] == 2.0
+    assert step_2["groups/count"] == 2.0
+    assert step_2["groups/mixed_count"] == 1.0
+    assert step_2["seq_len/frac_above_90pct_ctx"] == 0.0
+    assert "mask_rules/rollouts_seen" not in step_2
+    assert ctrl._rollout_manager.pop_mask_rule_metrics.call_count == 2
 
 
 @pytest.mark.parametrize("dies_in", [None, "get_step_metrics"])
@@ -5412,6 +5557,7 @@ def test_streaming_ppo_advantage_stage_normalizes_each_chunk_independently(
                 "token_mask": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
                 "sample_mask": torch.ones(2),
                 "values": torch.zeros(2, 2),
+                "input_lengths": torch.full((2,), 2),
                 "mask_sample": torch.zeros(2, dtype=torch.bool),
                 "truncated": torch.zeros(2, dtype=torch.bool),
             },
@@ -5463,6 +5609,7 @@ def test_streaming_ppo_filtered_single_token_has_finite_loss_and_gradients() -> 
         {
             "total_reward": torch.tensor([2.0, 7.0]),
             "token_mask": torch.tensor([[0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 1.0, 1.0]]),
+            "input_lengths": torch.tensor([2, 4]),
             "sample_mask": torch.ones(2),
             "values": torch.zeros(2, 4),
             "mask_sample": torch.tensor([False, True]),
@@ -5522,6 +5669,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             "values": torch.zeros(batch_size, sequence_length),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -5892,6 +6040,7 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
             "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
             "total_reward": torch.tensor([1.0, 0.0, 5.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
+            "input_lengths": torch.full((batch_size,), sequence_length),
             # Row 0 trains at half weight; row 2 is a token-capture placeholder.
             "sample_mask": torch.tensor([0.5, 1.0, 0.0]),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
@@ -6060,6 +6209,7 @@ def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
             "prompt_ids_for_adv": torch.tensor([[0], [0], [1], [1]]),
             "total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0]),
             "token_mask": token_mask,
+            "input_lengths": torch.full((4,), token_mask.shape[1]),
             "sample_mask": torch.tensor([1.0, 1.0, 0.0, 0.0]),
             "mask_sample": torch.zeros(4, dtype=torch.bool),
             "truncated": torch.zeros(4, dtype=torch.bool),
@@ -6166,6 +6316,7 @@ def test_advantage_stage_placeholders_never_vote(
                 "reward/a": rewards.clone(),
                 "reward/b": 2 * rewards,
                 "token_mask": tokens,
+                "input_lengths": torch.full((n,), tokens.shape[1]),
                 "sample_mask": torch.tensor([1.0] * 3 + [0.0] * (n - 3)),
                 "mask_sample": torch.tensor([False, False, True] + [False] * (n - 3)),
                 "truncated": torch.zeros(n, dtype=torch.bool),

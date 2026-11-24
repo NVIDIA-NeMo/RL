@@ -73,6 +73,15 @@ from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
     has_logical_owners,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    accumulate_masking_stats,
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    new_rollout_stats_accumulator,
+    stats_accumulator_to_rpc,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -250,6 +259,8 @@ class AdvantageStageConfig:
             *adv_cfg.repeated_batch_fields,
             adv_cfg.mask_sample_field,
             adv_cfg.truncated_field,
+            # Sequence lengths for the per-step rollout_stats (context use).
+            INPUT_LENGTHS,
         ]
         if self.message_level_advantage_penalties_enabled:
             fields.extend(
@@ -386,6 +397,13 @@ class AdvantageOutcome:
     # What this call stored in the dump, so the controller's publish can tell a
     # missing chunk from an empty one.
     train_data_dump_receipt: Optional[ChunkReceipt] = None
+    # Per-row masking and rollout statistics for this call, as plain lists (one
+    # scalar per row, no token dimension; see masking_stats.py /
+    # rollout_stats.py). Percentiles and per-group stats need the rows, so they
+    # cannot be pre-reduced like reward_partial. The controller merges them
+    # across calls and reduces them once per step.
+    masking_stats: Optional[dict[str, list[list[Any]]]] = None
+    rollout_stats: Optional[dict[str, list[list[Any]]]] = None
 
 
 class AdvantageComputer:
@@ -531,13 +549,11 @@ class AdvantageComputer:
         overlong_rows, normalize_rows, row_agents = agent_override_rows(
             cfg.algo, meta.tags, len(meta.sample_ids)
         )
+        overlong_filtering = (
+            overlong_rows if overlong_rows is not None else cfg.algo.overlong_filtering
+        )
         sample_mask_metrics, num_mask_sample_filtered = _apply_async_sample_masks(
-            mask_batch,
-            overlong_filtering=(
-                overlong_rows
-                if overlong_rows is not None
-                else cfg.algo.overlong_filtering
-            ),
+            mask_batch, overlong_filtering=overlong_filtering
         )
         if overlong_rows is not None:
             # One key per configured agent in every record: the step reduction
@@ -779,6 +795,36 @@ class AdvantageComputer:
                 malformed_thinking_advantage=cfg.algo.malformed_thinking_advantage,
             )
 
+        masking_stats = new_masking_stats_accumulator()
+        accumulate_masking_stats(
+            masking_stats,
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            sample_mask=sample_mask,
+            mask_sample=mask_sample,
+            truncated=truncated,
+            overlong_filtering=overlong_filtering,
+            pre_seq_error_sample_mask=pre_seq_error_sample_mask,
+            final_sample_mask=final_sample_mask,
+            baseline_mask=advantage_valid_mask,
+        )
+        rollout_stats = new_rollout_stats_accumulator()
+        accumulate_rollout_stats(
+            rollout_stats,
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            sample_mask=final_sample_mask,
+            token_mask=token_mask,
+            truncated=truncated,
+            # Optional: the seq_len metrics are skipped for a step whose rows
+            # carry no lengths.
+            seq_lens=(
+                tensor_field(data, INPUT_LENGTHS)
+                if INPUT_LENGTHS in data.keys()
+                else None
+            ),
+            baseline_mask=advantage_valid_mask,
+        )
         metric_rows = (
             owner_batch.representative_rows if owner_batch is not None else slice(None)
         )
@@ -900,4 +946,6 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_receipt=train_data_dump_receipt,
+            masking_stats=None if logical else stats_accumulator_to_rpc(masking_stats),
+            rollout_stats=None if logical else stats_accumulator_to_rpc(rollout_stats),
         )

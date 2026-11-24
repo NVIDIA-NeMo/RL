@@ -326,6 +326,35 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(
 
 
 @pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        (None, ()),
+        (
+            [{"field": "response.metadata.ng_termination_reason", "equals": "x"}],
+            ("response.metadata.ng_termination_reason",),
+        ),
+    ],
+)
+def test_build_nemo_gym_config_carries_the_mask_rule_fields(
+    detected_uv_dirs, rules, expected
+):
+    env_configs = _env_configs()
+    if rules is not None:
+        env_configs["mask_sample_rules"] = rules
+
+    cfg = build_nemo_gym_config(
+        env_configs,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )
+
+    assert cfg["mask_sample_rule_fields"] == expected
+
+
+@pytest.mark.parametrize(
     ("configured", "expected"),
     [
         ({}, ("/opt/nemo-gym/.uv-cache", "/opt/nemo-gym/venvs")),

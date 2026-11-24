@@ -1103,3 +1103,67 @@ def test_forest_failed_pending_was_already_masked(policy: str) -> None:
     receipt = result["receipt"]
     assert receipt["capture_poisoned"] and receipt["pending_call_ids"] == ["c1"]
     assert _receipt_staging_keys(receipt) == []
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_forest_full_result_keeps_the_mask_rule_fields(configured: bool) -> None:
+    from nemo_rl.experience.mask_sample_rules import (
+        matching_rules,
+        parse_mask_sample_rules,
+    )
+
+    rules = parse_mask_sample_rules(
+        {
+            "mask_sample_rules": [
+                {
+                    "field": "response.metadata.ng_termination_reason",
+                    "equals": "incomplete_reasoning",
+                }
+            ]
+        }
+    )
+    env = _capture_env()
+    env._forest_training, env._selection_policy = True, "returned_history"
+    env.cfg = (
+        {"mask_sample_rule_fields": tuple(rule.field for rule in rules)}
+        if configured
+        else {}
+    )
+    # A poisoned capture still builds full_result; a clean one would need a
+    # full selectable manifest.
+    env._control = AsyncMock(
+        return_value={
+            "capture_key": "r0",
+            "records": [],
+            "failures": [
+                {
+                    "model_call_id": "c1",
+                    "reason": "request_finished_without_staged_coordinates",
+                }
+            ],
+            "attempted_call_ids": ["c1"],
+            "pending_call_ids": ["c1"],
+        }
+    )
+    gym_result = {
+        "reward": 0.0,
+        "response": {
+            "output": [],
+            "metadata": {"ng_termination_reason": "incomplete_reasoning"},
+        },
+    }
+    result = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, gym_result)
+    )
+    full_result = result["full_result"]
+    assert full_result["reward"] == 0.0
+    if configured:
+        assert full_result["response"] == {
+            "metadata": {"ng_termination_reason": "incomplete_reasoning"}
+        }
+        assert matching_rules(full_result, rules) == [
+            "response_metadata_ng_termination_reason"
+        ]
+    else:
+        assert "response" not in full_result
+        assert matching_rules(full_result, rules) == []

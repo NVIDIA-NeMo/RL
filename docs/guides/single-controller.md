@@ -142,6 +142,35 @@ Recovery saves raw rewards and three Boolean checks per unfinished rollout, and 
 Penalty rates and final reward statistics use valid finalized rows. Reward mean, standard deviation, minimum, maximum, exact median and histogram are pooled from individual final rewards for the groups consumed by each training step. Agent reward statistics use those same final values. When full-result table logging is enabled, agent results retain their context and sample identity with the final reward substituted after shaping and penalties. This retains one reward observation per valid row, plus optional table data, in pending checkpoint state.
 Existing low/high effort means and exact length medians are preserved; `mean_reward_low` measures the shaped reward before penalties. Pending statistics survive recovery and are consumed once. Message-level advantage overrides remain unsupported with capture and fail at setup.
 
+## Masking incomplete rollouts
+
+An environment drops a sample from the loss by setting `instance_config.mask_sample` in its response. With NeMo-Gym, `env.mask_sample_rules` derives the same flag from fields the Gym response already carries, so no environment change is needed:
+
+```yaml
+env:
+  mask_sample_rules:
+    - name: eval_incomplete        # verifier timed out / errored
+      field: evaluation_completed
+      equals: false
+    - name: harness_unfinished     # agent harness hit its budget
+      field: opencode_finished
+      equals: false
+```
+
+A rule matches when the dotted `field` exists and equals `equals` (type-strict for booleans). Rules apply after the `env.should_mask_flagged_samples` gate, so they are honored even when the environment's own flags are dropped. They require the NeMo-Gym rollout path; setup rejects them otherwise, and the legacy GRPO driver rejects them too.
+
+A masked row never contributes a gradient. `grpo.masked_reward_policy` decides whether its reward still votes in the group baseline/std: `include` (the default) keeps it, so a timed-out attempt still counts as a failure for its siblings; `exclude` drops it. Token-capture placeholders never vote.
+
+Per-step metrics, logged under `train/`:
+
+- `mask_rules/*`, two families:
+  - Per group, averaged over the groups trained in the step: `<name>_rate` and `any_rate`.
+  - Per step, over every rollout generated since the previous step, including groups that are filtered or retried: `<name>_count`, `<name>_frac`, `any_count`, `any_frac` and `rollouts_seen`, plus `<name>_reward_mean`, the mean reward of the rollouts the rule matched.
+- `masking/*`: why rows were masked (placeholder, env flag, truncated, sequence-logprob error), trained vs masked vs baseline rows, and the mean reward of each population.
+- Rollout distributions: `gen_tokens/*`, `turns/*`, `seq_len/*`, `groups/*`, `reward/{std,pass_frac}` and `truncated_frac`.
+
+`masking/*` and the rollout distributions are counted per physical row, so they are not emitted under Forest training (`token_capture.forest_training`).
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
