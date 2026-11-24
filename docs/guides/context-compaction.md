@@ -2,10 +2,7 @@
 
 This opt-in SingleController GRPO and PPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
 
-The underlying mechanism is **forest training**: selected captured calls become
-training paths with one reward per logical rollout. GRPO shares one advantage
-across the rollout's rows, while PPO runs GAE on each row. Compaction is
-one use case; branches and independent context roots use the same reconstruction.
+The underlying mechanism is **forest training**: selected captured calls become training paths with one reward per logical rollout. GRPO shares one advantage across the rollout's rows, while PPO runs GAE on each row. Compaction is one use case; branches and independent context roots use the same reconstruction.
 The walkthrough below uses the default `returned_history` selection policy.
 
 The editable SVG figures below are adapted from Terry Kong’s review illustrations: [data flow](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-data-flow.html), [calls to rows](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-calls-to-rows.html), [compaction guards](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html), and [batch size](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-cc-batch-size.html). The reference figures retain his layout and visual conventions, updated for the implementation described here; the three introductory figures expand the same example step by step. Token IDs and row counts in the figures are illustrative.
@@ -167,16 +164,7 @@ The masked-sequence count includes every row excluded by the rollout decision.
 
 Optional `token_capture.min_valid_fraction_per_group` compares the fraction of verified logical rollouts with the configured minimum. Each rollout counts once, regardless of segment count, and execution padding is excluded. A group below the minimum is discarded and the controller seeks a replacement within its existing replacement budget. The default, `None`, disables this group-level filter.
 
-With PPO, the critic scores every physical row and GAE runs per row with that
-row's own values; every row of a logical rollout carries the rollout's reward.
-The logical rollout still decides validity as above. GAE and advantage whitening
-exclude rows masked from the loss, including execution padding.
-The critic trains on all of a step's rows as one optimizer step, and execution
-padding is sized for both the policy's and the critic's data-parallel and
-microbatch shapes. Forest PPO requires `ppo.value_training_mode: whole_batch`.
-Each physical row is its own GAE episode: the reward sits on the row's last
-response token and values do not bootstrap across rows, which matters when
-`gae_lambda < 1`.
+With PPO, the critic scores every physical row and GAE runs per row with that row's own values; every row of a logical rollout carries the rollout's reward. The logical rollout still decides validity as above. GAE and advantage whitening exclude rows masked from the loss, including execution padding. The critic trains on all of a step's rows as one optimizer step, and execution padding is sized for both the policy's and the critic's data-parallel and microbatch shapes. Forest PPO requires `ppo.value_training_mode: whole_batch`. Each physical row is its own GAE episode: the reward sits on the row's last response token and values do not bootstrap across rows, which matters when `gae_lambda < 1`.
 
 Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
