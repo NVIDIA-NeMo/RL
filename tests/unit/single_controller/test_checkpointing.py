@@ -5071,7 +5071,7 @@ class TestMetricName:
 
         def seed(actor):
             async def validate():
-                assert not actor._rollout_permitted.is_set()
+                assert actor._validation_drain_complete is not None
                 validation_steps.append(actor._train_steps)
                 return {"accuracy": {2: 0.75, 4: 0.25}[actor._train_steps]}
 

@@ -51,6 +51,9 @@ from nemo_rl.algorithms.metric_utils import (
     MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
     REWARD_KEY,
     SETUP_TIMING_PREFIX,
+    VALIDATION_ACCURACY_KEY,
+    VALIDATION_AVG_LENGTH_KEY,
+    VALIDATION_PASS_K_KEY,
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
@@ -4994,18 +4997,18 @@ def aggregate_validation_metrics(
     """Compute rollout-weighted means and the fraction of prompts solved at K."""
     num_samples = len(rewards)
     if num_samples == 0:
-        return {"accuracy": 0.0, "avg_length": 0.0}
+        return {VALIDATION_ACCURACY_KEY: 0.0, VALIDATION_AVG_LENGTH_KEY: 0.0}
 
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
     metrics = {
-        "accuracy": rewards_tensor.mean().item(),
-        "avg_length": total_length_tokens / num_samples,
+        VALIDATION_ACCURACY_KEY: rewards_tensor.mean().item(),
+        VALIDATION_AVG_LENGTH_KEY: total_length_tokens / num_samples,
     }
     if generations_per_prompt > 1:
         assert num_samples % generations_per_prompt == 0, (
             "Validation rewards must be divisible by grpo.val_num_generations_per_prompt"
         )
-        metrics["pass_k"] = (
+        metrics[VALIDATION_PASS_K_KEY] = (
             (rewards_tensor.view(-1, generations_per_prompt) > 0)
             .any(dim=1)
             .float()
@@ -5163,12 +5166,12 @@ def validate(
         val_metrics = aggregate_validation_metrics(
             total_rewards, total_length_tokens, val_num_generations_per_prompt
         )
-        accuracy = val_metrics["accuracy"]
-        avg_length = val_metrics["avg_length"]
-        pass_k = val_metrics.get("pass_k")
+        accuracy = val_metrics[VALIDATION_ACCURACY_KEY]
+        avg_length = val_metrics[VALIDATION_AVG_LENGTH_KEY]
+        pass_k = val_metrics.get(VALIDATION_PASS_K_KEY)
         val_metrics.update(additional_metrics_to_report)
         if pass_k is not None:
-            val_metrics["pass_k"] = pass_k
+            val_metrics[VALIDATION_PASS_K_KEY] = pass_k
 
         # Print sample conversations only once at the end of validation
         try:

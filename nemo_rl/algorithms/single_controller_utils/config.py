@@ -54,6 +54,12 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
+from nemo_rl.algorithms.metric_utils import (
+    VALIDATION_ACCURACY_KEY,
+    VALIDATION_AVG_LENGTH_KEY,
+    VALIDATION_NUM_SAMPLES_KEY,
+    VALIDATION_PASS_K_KEY,
+)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -2253,9 +2259,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         if algo_cfg.max_val_samples is not None and algo_cfg.max_val_samples < 1:
             raise ValueError("max_val_samples must be positive or null")
-        allowed_metrics = {"accuracy", "avg_length", "num_samples"}
+        allowed_metrics = {
+            VALIDATION_ACCURACY_KEY,
+            VALIDATION_AVG_LENGTH_KEY,
+            VALIDATION_NUM_SAMPLES_KEY,
+        }
         if algo_cfg.val_num_generations_per_prompt > 1:
-            allowed_metrics.add("pass_k")
+            allowed_metrics.add(VALIDATION_PASS_K_KEY)
         for metric in (val_rank_metric, stop_metric):
             if metric is not None and metric not in allowed_metrics:
                 raise ValueError(

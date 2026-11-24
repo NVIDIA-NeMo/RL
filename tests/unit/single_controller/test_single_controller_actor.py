@@ -239,6 +239,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         tq_buffer=tq_buffer,
         rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
+        val_dataloader=None,
+        val_env_handles=None,
         fleet_monitor=None,
         generation_router=None,
         train_cluster=None,
@@ -3639,7 +3641,9 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, reopen_rollouts=True
+    )
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
@@ -3716,6 +3720,17 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
     ctrl._trainer_warmup_kwargs = None
+    ctrl._algo_cfg = GRPOConfig(val_period=0)
+    ctrl._train_steps = 0
+    ctrl._trainer_warmup_task = None
+    ctrl._engine_supervisor = None
+    ctrl._finalizer_actors = []
+    ctrl._storage_units = ()
+    ctrl._rollout_trace = MagicMock()
+    ctrl._train_data_dump = None
+    ctrl._finish_pending_save = AsyncMock()
+    ctrl._logger = MagicMock()
+    ctrl._checkpointer = MagicMock()
     events = []
 
     def snapshot() -> None:
@@ -3889,7 +3904,9 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert ctrl._rollout_permitted.is_set()
         assert sampler.select_bounds[0] == (1, 2)
         ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(
+        calibration_data=None, reopen_rollouts=True
+    )
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -4121,6 +4138,7 @@ def _ppo_train_pump_controller(
     ctrl._value_loss_fn = MagicMock(name="value_loss_fn")
     ctrl._master_config.grpo = None
     ctrl._master_config.ppo = PPOConfig.model_construct(
+        val_period=0,
         num_prompts_per_step=1,
         max_num_steps=1,
         policy_training_start_step=policy_training_start_step,
@@ -4395,7 +4413,9 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         # closed; the sync (mocked -- the real one reopens the gate) is the wake.
         assert stand_downs == [False]
         ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
-        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+        ctrl._sync_weights.assert_awaited_once_with(
+            calibration_data=None, reopen_rollouts=True
+        )
     else:
         ctrl._sync_weights.assert_not_awaited()
         ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
@@ -5077,7 +5097,7 @@ def test_full_batch_ppo_keeps_shared_generation_asleep_until_critic_finishes(
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
 
-    async def wake_generation(*, calibration_data) -> int:
+    async def wake_generation(*, calibration_data, reopen_rollouts) -> int:
         assert calibration_data is None
         assert "critic.finish_training" in calls
         calls.append("generation_wake")
@@ -5125,6 +5145,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
             "is_policy_training_step": True,
             "is_final_checkpoint": True,
             "publish_now": False,
+            "val_metrics": None,
         }
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)

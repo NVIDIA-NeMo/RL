@@ -261,12 +261,9 @@ class GenerationConfig(TypedDict):
     top_logprobs: NotRequired[
         int
     ]  # Sampler candidates per token; 0 disables collection.
-    # Validation-only sampling. The exemplar YAMLs default these to the train
-    # values above via interpolation (${.temperature}, ...), so validation
-    # samples exactly like training unless overridden. Only honored on the
-    # NeMo-Gym vLLM and TRT-LLM rollout paths (guarded in grpo.setup()); a
-    # val_top_k override also needs val_temperature or val_top_p to differ, since
-    # the server tells validation requests apart by those two.
+    # Validation sampling defaults to training via YAML interpolation. Native SC
+    # vLLM passes overrides per request. Legacy Gym vLLM/TRT-LLM servers use
+    # temperature and top_p to distinguish profiles, so top_k alone cannot differ.
     val_temperature: float
     val_top_p: float
     val_top_k: int | None

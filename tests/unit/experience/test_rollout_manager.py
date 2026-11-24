@@ -79,8 +79,8 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
-from nemo_rl.utils.timer import Timer
 from nemo_rl.models.generation.interfaces import GenerationSamplingParams
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (

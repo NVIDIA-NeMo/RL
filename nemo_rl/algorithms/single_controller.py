@@ -89,13 +89,15 @@ from nemo_rl.algorithms.grpo import (
     _save_adaptive_loss_state,
     _update_adaptive_loss_state,
     _validation_early_stop_message,
-    aggregate_validation_metrics,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
+    aggregate_validation_metrics,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
+    VALIDATION_ACCURACY_KEY,
+    VALIDATION_NUM_SAMPLES_KEY,
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
@@ -191,6 +193,7 @@ from nemo_rl.environments.checkpointing.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
     FinalizedReward,
@@ -1024,6 +1027,8 @@ class SingleControllerActor:
             "trainer_version": self._trainer_version,
         }
 
+    _validation_drain_complete: asyncio.Event | None = None
+
     def _should_validate(self, *, is_last_step: bool) -> bool:
         cfg = self._algo_cfg
         return (
@@ -1045,6 +1050,10 @@ class SingleControllerActor:
         if message is not None:
             print(message, flush=True)
         return message is not None
+
+    async def _drain_training_rollouts_for_validation(self) -> None:
+        self._validation_drain_complete = asyncio.Event()
+        await asyncio.gather(*tuple(self._dispatched_rollouts))
 
     async def _run_validation(self) -> dict[str, Any]:
         """Evaluate the current generator without admitting training samples."""
@@ -1069,6 +1078,14 @@ class SingleControllerActor:
         prompts_seen = 0
         max_inflight = self._async_cfg.max_inflight_prompts
         started_at = time.monotonic()
+
+        async def run_validation_prompt(sample: DatumSpec) -> PromptGroupRecord:
+            record = await self._rollout_manager.run_rollout(
+                sample, validation=validation
+            )
+            self._validation_completed_prompts += 1
+            return record
+
         for batch in self._val_dataloader:
             count = batch.size
             if cfg.max_val_samples is not None:
@@ -1077,12 +1094,11 @@ class SingleControllerActor:
                 async with asyncio.TaskGroup() as tasks:
                     rollouts = [
                         tasks.create_task(
-                            self._rollout_manager.run_rollout(
+                            run_validation_prompt(
                                 cast(
                                     DatumSpec,
                                     {key: value[row] for key, value in batch.items()},
-                                ),
-                                validation=validation,
+                                )
                             )
                         )
                         for row in range(start, min(count, start + max_inflight))
@@ -1102,7 +1118,6 @@ class SingleControllerActor:
                         for completion in record.completions
                     )
             prompts_seen += count
-            self._validation_completed_prompts += count
             if prompts_seen == cfg.max_val_samples:
                 break
 
@@ -1110,7 +1125,7 @@ class SingleControllerActor:
             **aggregate_validation_metrics(
                 rewards, total_length, cfg.val_num_generations_per_prompt
             ),
-            "num_samples": len(rewards),
+            VALIDATION_NUM_SAMPLES_KEY: len(rewards),
         }
         step = self._train_steps
         print(f"Validation step {step}: {metrics}", flush=True)
@@ -2334,18 +2349,36 @@ class SingleControllerActor:
                 await wait_with_maybe_refill(self._buffer_capacity)
             finally:
                 self._buffer_capacity_waiters -= 1
-            # check if inflight rollouts is full
-            self._rollout_slot_waiters += 1
-            try:
-                await wait_with_maybe_refill(sem)
-            finally:
-                self._rollout_slot_waiters -= 1
-            # wait for rollout to be permitted
-            self._rollout_permitted_waiters += 1
-            try:
-                await self._rollout_permitted.wait()
-            finally:
-                self._rollout_permitted_waiters -= 1
+            while True:
+                drain_complete = self._validation_drain_complete
+                if drain_complete is not None:
+                    if (
+                        self._dynamic_sampling_enabled
+                        and self._sampler.uses_pooled_replacements
+                    ):
+                        # Admitted groups may need spares from this iterator to drain.
+                        await maybe_refill()
+                        try:
+                            await asyncio.wait_for(drain_complete.wait(), timeout=0.1)
+                        except TimeoutError:
+                            pass
+                    else:
+                        await drain_complete.wait()
+                    continue
+                self._rollout_slot_waiters += 1
+                try:
+                    await wait_with_maybe_refill(sem)
+                finally:
+                    self._rollout_slot_waiters -= 1
+                self._rollout_permitted_waiters += 1
+                try:
+                    await self._rollout_permitted.wait()
+                finally:
+                    self._rollout_permitted_waiters -= 1
+                if self._validation_drain_complete is None:
+                    break
+                # Admitted replacements may need this slot while validation drains.
+                sem.release()
             dispatch_started = time.monotonic()
 
             task_started_event = asyncio.Event()
@@ -3771,14 +3804,6 @@ class SingleControllerActor:
                         step_finalizer_rewards
                     ).items():
                         step_metrics[name] = Table(data=data, columns=["Full result"])
-                try:
-                    step_metrics.update(
-                        await asyncio.to_thread(
-                            self._gen.get_step_metrics, keep_snapshot=True
-                        )
-                    )
-                except RayActorError as error:
-                    log.warning("Skipping generation step metrics: %s", error)
                 if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
                     try:
                         prefix_counts = await asyncio.to_thread(
@@ -3875,9 +3900,17 @@ class SingleControllerActor:
                 val_metrics = None
                 early_stop = False
                 if should_validate:
-                    self._rollout_permitted.clear()
                     with self._timer.time("validation_rollout_drain"):
-                        await asyncio.gather(*tuple(self._dispatched_rollouts))
+                        await self._drain_training_rollouts_for_validation()
+
+                try:
+                    step_metrics.update(
+                        await asyncio.to_thread(
+                            self._gen.get_step_metrics, keep_snapshot=True
+                        )
+                    )
+                except RayActorError as error:
+                    log.warning("Skipping generation step metrics: %s", error)
 
                 ft_save_period = self._master_config.checkpointing.ft_save_period
                 # _train_steps was already incremented above, so it equals
@@ -3970,12 +4003,22 @@ class SingleControllerActor:
 
                 if should_validate:
                     val_metrics = await self._run_validation()
+                    try:
+                        await asyncio.to_thread(self._gen.snapshot_step_metrics)
+                    except RayActorError as error:
+                        log.warning(
+                            "Skipping post-validation generation snapshot: %s", error
+                        )
                     early_stop = self._validation_should_stop(val_metrics)
                     will_save_checkpoint |= (
                         early_stop and self._master_config.checkpointing.enabled
                     )
                     if not (early_stop or is_last_step or should_save_by_timeout):
                         self._rollout_permitted.set()
+                        assert self._validation_drain_complete is not None
+                        drain_complete = self._validation_drain_complete
+                        self._validation_drain_complete = None
+                        drain_complete.set()
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
@@ -4969,7 +5012,7 @@ class SingleControllerActor:
         """
         save_state = self._save_state
         if val_metrics is not None:
-            save_state.val_reward = val_metrics["accuracy"]
+            save_state.val_reward = val_metrics[VALIDATION_ACCURACY_KEY]
         elif hasattr(save_state, "val_reward"):
             delattr(save_state, "val_reward")
 

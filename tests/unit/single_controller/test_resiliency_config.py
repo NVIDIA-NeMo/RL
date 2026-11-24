@@ -72,6 +72,7 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             **async_kwargs,
         ),
         grpo=GRPOConfig.model_construct(
+            val_period=0,
             num_prompts_per_step=num_prompts_per_step,
             num_generations_per_prompt=4,
             skip_reference_policy_logprobs_calculation=False,
@@ -455,6 +456,7 @@ class TestWrongPathFaultToleranceIsRejected:
                 rollout_failure=rollout_failure,
             ),
             grpo=GRPOConfig.model_construct(
+                val_period=0,
                 num_prompts_per_step=2,
                 num_generations_per_prompt=4,
                 skip_reference_policy_logprobs_calculation=False,

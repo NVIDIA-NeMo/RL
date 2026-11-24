@@ -68,6 +68,12 @@ GRAD_NORM_KEY = "grad_norm"
 LEARNING_RATE_KEY = "lr"
 MEAN_GEN_TOKENS_PER_SAMPLE_KEY = "mean_gen_tokens_per_sample"
 
+VALIDATION_ACCURACY_KEY = "accuracy"
+VALIDATION_AVG_LENGTH_KEY = "avg_length"
+VALIDATION_NUM_SAMPLES_KEY = "num_samples"
+VALIDATION_PASS_K_KEY = "pass_k"
+
+
 #: Teed rows for the keys above, which GRPO, PPO, SFT, OPD and the single
 #: controller all build from the same producers.
 TRAINING_TEED_METRICS = (
