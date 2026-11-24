@@ -16,7 +16,7 @@ import io
 import itertools
 import logging
 import re
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, TypedDict, Union
 
 import ray
 import torch
@@ -24,6 +24,7 @@ from math_verify import grader
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+from pydantic import BaseModel
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -40,12 +41,11 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 from nemo_rl.evals import answer_parsing
 
 
-class MathEnvConfig(TypedDict):
-    num_workers: int
-    stop_strings: NotRequired[list[str] | None]  # Default stop strings for this env
-    # The verifier type. None defaults to "math".
-    verifier_type: NotRequired[str | None]
-    math_verify_impl: NotRequired[str | None]
+class MathEnvConfig(BaseModel, extra="allow"):
+    num_workers: int = 8
+    # Key into the environment's WORKER_CLASS_DICT.
+    verifier_type: str = "math"
+    math_verify_impl: str = "hf_math_verify"
 
 
 @contextlib.contextmanager
@@ -376,16 +376,13 @@ class MathEnvironmentMetadata(TypedDict):
 class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
     WORKER_CLASS_DICT: dict[str, type[ray.remote]]
 
-    def __init__(self, cfg: MathEnvConfig):
-        self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
+    def __init__(self, cfg: MathEnvConfig | dict[str, Any]):
+        # MasterConfig.env is a plain dict, so validate where it is consumed.
+        self.cfg = MathEnvConfig.model_validate(cfg)
+        self.num_workers = self.cfg.num_workers
         self._worker_counter = itertools.count()
-        verifier_type = cfg.get("verifier_type", "math")
-        assert isinstance(verifier_type, str), (
-            f"{verifier_type=} must be a string but was {type(verifier_type)}"
-        )
 
-        worker_cls = self.WORKER_CLASS_DICT[verifier_type]
+        worker_cls = self.WORKER_CLASS_DICT[self.cfg.verifier_type]
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
@@ -502,7 +499,7 @@ class MathEnvironment(BaseMathEnvironment):
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
-                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+                math_verify_impl=self.cfg.math_verify_impl,
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
@@ -606,7 +603,7 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
                 chunk,
                 ground_truth_chunk,
                 return_extracted_answer,
-                math_verify_impl=self.cfg.get("math_verify_impl", "hf_math_verify"),
+                math_verify_impl=self.cfg.math_verify_impl,
             )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)

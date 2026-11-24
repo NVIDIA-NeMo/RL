@@ -108,8 +108,6 @@ from nemo_rl.environments.code_jaccard_environment import CodeJaccardEnvironment
 
 env_config = {
     "num_workers": 2,
-    # Optional default stop strings (unused in scoring but available for consistency)
-    "stop_strings": None,
 }
 
 code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
@@ -117,14 +115,12 @@ code_jaccard_env = CodeJaccardEnvironment.remote(env_config)
 
 ### Configuration
 - `num_workers` (int): Number of parallel verification workers.
-- `stop_strings` (list[str] | None): Optional default stop strings (propagated downstream; not required for scoring).
 
 ### Sample GRPO Config
 ```yaml
 env:
   code_jaccard:
     num_workers: 2
-    stop_strings: null
 data:
   env_name: code_jaccard
 ```
