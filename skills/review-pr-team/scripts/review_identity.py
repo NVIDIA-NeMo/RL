@@ -434,8 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "footer" and not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
         parser.error("footer needs --head with the full SHA of the reviewed commit")
 
-    pr = _pr(args.pr)
     me = _login()
+    pr = _pr(args.pr)
     kind = "self" if me == pr["author"]["login"] else "expert"
     ident = detect()
 
@@ -474,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Run /review-pr-team {args.pr} in a fresh Claude Code or Codex session with an allowed model."
         )
         return 3
-    if ident.transcript is None and me is None:
+    if me is None:
         print("OK (bot-app-token)")
     elif ident.transcript is None:
         print(
