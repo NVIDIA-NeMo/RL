@@ -152,7 +152,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         check_outdated_config(config)
-        config = MasterConfig(**config)
+        config = MasterConfig.model_validate(config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 

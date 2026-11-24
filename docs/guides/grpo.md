@@ -582,7 +582,7 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 | Behavior | Metrics |
 | --- | --- |
 | **Follows `normalization`** — global token mean, sequence mean, or group token mean | `loss`, `kl_penalty` |
-| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `token_abs_logprob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
 | **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
 
@@ -740,6 +740,30 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Per-Environment Settings
+
+In a multi-environment NeMo-Gym run, `grpo.agent_overrides` sets `overlong_filtering` and `adv_estimator.normalize_rewards` for one environment's rows. Unset fields inherit the run-wide value, and environments without an entry keep the run-wide values.
+
+```yaml
+grpo:
+  overlong_filtering: false                 # run-wide
+  adv_estimator: {normalize_rewards: true}  # run-wide
+  agent_overrides:
+    rubric_judge_agent:
+      overlong_filtering: true   # this environment's truncated rows leave the loss
+      normalize_rewards: false   # no division by the group's reward std
+```
+
+| Field | Replaces |
+|---|---|
+| `overlong_filtering` | `grpo.overlong_filtering` |
+| `normalize_rewards` | `grpo.adv_estimator.normalize_rewards` (needs `adv_estimator.name: grpo`) |
+
+- **Key.** Each key is the rows' attribution key, the same key as `grpo.length_penalty.agent_overrides`: the NeMo-Gym agent name for flat rows, and the `task_id.taskset` for materialized task rows (see [NeMo Gym integration](../design-docs/nemo-gym-integration.md)). Use the name that appears in the `<name>/reward/*` metrics. A key that matches no row is ignored. Keys that contain `:` must be set in YAML, not as a Hydra command-line override.
+- **Where it works.** SingleController with `token_capture.enabled: true` only, because the token-capture finalizer tags each row with its key. The SingleController config validation rejects it without token capture, and the legacy `setup()` rejects it.
+- **Dynamic sampling.** With `use_dynamic_sampling: true` and `masked_reward_policy: exclude`, an `overlong_filtering` override must equal the run-wide value, because dynamic sampling votes with the run-wide flag.
+- **Metrics.** `num_masked_seqs_by_overlong_filtering/<key>` counts each configured key's rows that overlong filtering removed, and `num_rows_without_agent_tag` counts rows that fell back to the run-wide values (expected 0). Forest runs (`token_capture.forest_training`) do not log these two metrics.
+
 #### Advantage Clipping
 
 After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.
@@ -817,7 +841,7 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` and `token_abs_logprob_error` to monitor training–generation logprob mismatch.
 `loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
@@ -828,6 +852,14 @@ $$
 $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
+
+### Absolute Token Logprob Error
+
+`token_abs_logprob_error` averages the absolute difference between the previous policy's logprob and the generation logprob for the sampled token, in nats. Each of the $n$ valid tokens has equal weight.
+
+$$
+\text{token-abs-logprob-error} = \frac{1}{n}\sum_{i=1}^{n} \left|\log p_{\mathrm{prev},i} - \log p_{\mathrm{gen},i}\right|
+$$
 
 ### KL Divergence Error
 This feature is controlled by the following metrics:

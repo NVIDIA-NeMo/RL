@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
+    AgentOverrideConfig,
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
@@ -4512,6 +4513,24 @@ def test_setup_rejects_megatron_router_replay_before_side_effects(
             dataset=MagicMock(),
             val_dataset=None,
         )
+
+    mock_logger.assert_not_called()
+
+
+def test_setup_rejects_agent_overrides_before_side_effects(mock_grpo_components):
+    """Only the SingleController advantage stage applies grpo.agent_overrides."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.agent_overrides = {
+        "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(NotImplementedError, match="grpo.agent_overrides"),
+    ):
+        setup(master_config, MagicMock(), MagicMock(), None)
 
     mock_logger.assert_not_called()
 
