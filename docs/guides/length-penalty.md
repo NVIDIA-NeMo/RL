@@ -2,7 +2,7 @@
 
 This guide documents the length-penalty and length-bonus algorithms implemented in `nemo_rl/utils/length_penalty.py`.
 
-They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the data-plane driver (`grpo_train_sync`, `data_plane.enabled: true`), the async `AsyncTrajectoryCollector`, and SingleController. Validation rollouts never apply them, so validation metrics stay on the raw environment reward. The block requires the NeMo-Gym path: a run with `grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
+They apply to NeMo-Gym GRPO **training** rollouts on the legacy driver (`grpo_train`), the async `AsyncTrajectoryCollector`, and SingleController. Validation rollouts never apply them, so validation metrics stay on the raw environment reward. The block requires the NeMo-Gym path: a run with `grpo.length_penalty` set and `env.should_use_nemo_gym` false is rejected at setup.
 
 Configure `grpo.length_penalty`. The block is typed (`LengthPenaltyConfig` in `nemo_rl/utils/length_penalty.py`): unknown keys, misspelled `length_type` / gate values, a `profile_band` channel with `b <= a` or `f` outside `[0, 1]` are all rejected when the config is loaded, before the first rollout. The length adjustments mutate `full_result["reward"]` in place during rollout postprocessing; the reward as handed to the hook is kept on the batch as `env_reward` (see [Metrics](#metrics)).
 

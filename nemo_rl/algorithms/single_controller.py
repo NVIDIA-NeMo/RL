@@ -1747,8 +1747,7 @@ class SingleControllerActor:
     async def _log_data_plane_metrics(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. Never raises.
 
-        On by default, so this runs every step of every recipe. Mirrors
-        ``grpo_sync._log_data_plane_metrics``.
+        On by default, so this runs every step of every recipe.
         """
         with metrics_never_fail_the_step(self._train_steps):
             await self._log_data_plane_metrics_impl(total_step_time)
@@ -3323,8 +3322,7 @@ class SingleControllerActor:
                         )
 
                     if getattr(self._gen, "requires_kv_scale_sync", False):
-                        # Mirrors grpo_sync's calibration filter. The static
-                        # list cannot name the VLM extras -- which of
+                        # The static list cannot name the VLM extras -- which of
                         # pixel_values / image_grid_thw / ... exist is
                         # per-processor -- so without the union this path
                         # calibrates image-blind on a VLM run.
@@ -3916,7 +3914,7 @@ class SingleControllerActor:
             # Must precede the step_finished=True log below. That log commits
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no
-            # failed return, just an empty chart. grpo_sync had the same bug.
+            # failed return, just an empty chart.
             await self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(

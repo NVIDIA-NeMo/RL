@@ -1,3 +1,0 @@
-defaults: grpo-gemma3-1b-it-1n8g-automodel.yaml
-data_plane:
-  enabled: true

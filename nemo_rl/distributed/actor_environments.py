@@ -97,12 +97,6 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     # ReplayBuffer needs the vLLM environment to handle trajectory data from
     # VllmGenerationWorker.
     "nemo_rl.algorithms.async_utils.ReplayBuffer": ["vllm"],
-    # SyncRolloutActor doesn't import vllm directly -- policy_generation is a Ray
-    # actor handle. The vLLM env is needed because (1) transfer_queue is bundled
-    # into the vLLM venv (and the policy training venvs), and the actor writes
-    # flattened tensors to TQ via dp_client.put_samples; (2) same-node colocation
-    # with VllmGenerationWorker avoids duplicate venv caches.
-    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": ["vllm"],
     # Captured rollout finalization imports Gym's staging/rebuild package.
     ROLLOUT_REASSEMBLER_ACTOR_FQN: ["nemo_gym"],
     # transfer_queue + mooncake are core dependencies: no extra venv.

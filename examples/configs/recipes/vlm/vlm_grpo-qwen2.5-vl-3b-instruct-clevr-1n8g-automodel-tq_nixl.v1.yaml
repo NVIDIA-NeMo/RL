@@ -1,4 +1,0 @@
-defaults: vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-automodel.v1.yaml
-data_plane:
-  enabled: true
-  backend: nixl

@@ -28,9 +28,9 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 # Metrics combined across the sequences of one packed bin by extremum, not sum.
 # Keep in sync with _MB_METRIC_MIN / _MB_METRIC_MAX in
-# single_controller_utils/utils.py, grpo.py, grpo_sync.py and ppo.py.
+# single_controller_utils/utils.py, grpo.py and ppo.py.
 #
-# TODO: duplicated across seven sites. Omitting one silently sums extrema instead
+# TODO: duplicated across six sites. Omitting one silently sums extrema instead
 # of reducing them, reporting a "min" larger than any individual value. Hoist
 # into a single shared definition in loss/interfaces.py.
 _SEQ_METRIC_MIN: frozenset[str] = frozenset(

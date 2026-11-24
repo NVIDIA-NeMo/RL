@@ -4,14 +4,9 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 
 ---
 
-## `test_architecture_invariants.py` (7 test functions)
+## `test_architecture_invariants.py` (2 test functions)
 
-- `test_select_sync_trainer_dispatches_both_trainers` — `data_plane.factory.select_sync_trainer` returns `grpo_train` vs `grpo_train_sync` per config.
-- `test_make_policy_factory_pairs_tq_policy_with_the_sync_trainer` — `make_policy_factory` returns `None` when the data plane is off, and threads `dp_cfg` into a `TQPolicy` when it is on.
-- `test_launchers_dispatch_through_the_shared_helpers` — Parametrized over `run_grpo.py` / `run_vlm_grpo.py`: each launcher must call both helpers, so a third launcher inherits the invariant.
-- `test_sync_trainer_is_call_compatible_with_legacy_trainer` — Sync and legacy trainers keep the same call signature.
-- `test_both_trainers_wire_deduplicate_multimodal_data_into_repeat_interleave` — Both trainers pass the dedup flag through.
-- `test_sync_trainer_rejects_message_level_advantage_penalties` — Sync trainer hard-fails on an unsupported penalty shape.
+- `test_grpo_trainer_wires_deduplicate_multimodal_data_into_repeat_interleave` — The legacy trainer passes the dedup flag through.
 - `test_data_plane_client_abc_method_present` — Parametrized: renaming an ABC method is a wire break — keep the swap surface stable.
 
 ## `test_codec_jagged.py` (9 tests)
@@ -175,25 +170,18 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_dynbatch_legacy_equals_tq[simple|mooncake_cpu]` — Same claim for dynamic batching.
 - `test_no_packing_legacy_equals_tq[simple|mooncake_cpu]` — Sanity: lossless transport even without packing/dynbatch.
 
-## `test_smoke.py` (5 tests)
+## `test_smoke.py` (2 tests)
 
-- `test_sync_utils_module_imports` — Catches FQN drift after `algorithms.sync_utils` consolidation.
-- `test_sync_rollout_actor_registered_under_vllm_tier` — Multinode dep: tensordict must be on the vLLM tier.
 - `test_kvbatchmeta_schema_unchanged` — Schema-pin: KVBatchMeta is the cross-process boundary.
 - `test_dataplane_client_abc_surface` — Catches accidental ABC method removal/rename.
-- `test_async_and_sync_actors_share_env_tier` — Sync mirrors async's env tier (both drive vLLM).
 
-## `test_sync_one_hop.py` (9 tests)
+## `test_sync_one_hop.py` (5 tests)
 
 - `test_write_columns_lands_in_tq` — write_columns lands fields in TQ.
 - `test_read_columns_returns_only_requested_fields` — read_columns honors `select_fields`.
 - `test_write_then_read_roundtrip_after_train_window` — Full lifecycle: rollout puts → driver deltas → read deltas back.
 - `test_meta_keys_identity_across_dp_shards` — `shard_meta_for_dp` must NOT mint new keys.
 - `test_kv_clear_uses_meta_keys_minted_at_rollout` — Step-end clear targets the SAME keys rollout minted.
-- `test_apply_dynamic_sampling_filters_zero_std` — Drops zero-std uids and clears their TQ payload.
-- `test_apply_dynamic_sampling_completes_when_train_size_reached` — When cache hits train_prompts_size, is_complete=True.
-- `test_apply_dynamic_sampling_overflow_slices_and_clears` — Overflow: slice + clear discards.
-- `test_apply_dynamic_sampling_raises_on_max_gen_batches` — Exceeding max_gen_batches raises loudly.
 
 ## `test_tq_lifecycle.py` (5 tests, some ×2 backends)
 

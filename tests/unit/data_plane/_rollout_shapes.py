@@ -51,8 +51,7 @@ def make_rollout_batch(
 ) -> dict[str, Any]:
     """Return a fields dict shaped like rollout's first put.
 
-    Mirrors what ``SyncRolloutActor.rollout_to_tq`` actually writes:
-    int64 token ids, int32 masks, bf16 logprobs, fp32 (or bf16) advantages,
+    Carries int64 token ids, int32 masks, bf16 logprobs, fp32 (or bf16) advantages,
     optional ``multi_modal_inputs`` dict for VLM models.
 
     Args:

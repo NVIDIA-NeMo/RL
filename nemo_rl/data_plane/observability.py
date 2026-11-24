@@ -1119,8 +1119,8 @@ def metrics_never_fail_the_step(step: int) -> Iterator[None]:
 def backend_health_metrics(backend: str) -> tuple[str, dict[str, float]] | None:
     """The backend's own counters for the driver to log every step, with their prefix.
 
-    Logged even with observability off, by both drivers (the single controller
-    and ``grpo_sync``): a leak only shows over a long run, and the first SSD
+    Logged even with observability off, by the single controller:
+    a leak only shows over a long run, and the first SSD
     spill (nixl) or offload round (Mooncake) of a run logs its one warning
     from inside these readers. ``None`` for the simple backend or a process
     without the backend's TQ client. Blocking (Mooncake reads the master's

@@ -292,7 +292,6 @@ def test_train_pump_drives_mcore_training_step(
         config=policy_cfg,
         tokenizer=tokenizer,
         dp_cfg=dp_cfg,
-        tq_partition_id=_PARTITION_ID,
     )
 
     try:

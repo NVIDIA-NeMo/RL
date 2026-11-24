@@ -6039,7 +6039,7 @@ def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
     An over-length prompt reaches the data plane with ``sample_mask`` 0 (the
     dataset's ``loss_multiplier``). It never votes under either policy, so
     Reinforce++ normalizes over the trainable rows only and gives them
-    ``[1, -1]``, as the legacy and TransferQueue trainers do.
+    ``[1, -1]``, as the legacy trainers do.
     """
     cfg = GRPOConfig(
         masked_reward_policy=policy,

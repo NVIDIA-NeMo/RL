@@ -38,7 +38,6 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     OPD_FULL_HIDDEN_STATES_FIELD,
-    OPD_FULL_LOGITS_FIELD,
     OPD_FULL_TEACHER_INDEX_FIELD,
     ROUTED_EXPERTS_FIELD,
 )
@@ -370,37 +369,6 @@ class TestTQPolicyOPDFullColumn:
             OPD_FULL_TEACHER_INDEX_FIELD,
         ]
 
-    def test_prepare_step_registers_the_teacher_index_column(self):
-        p, _ = _make_tq_policy()
-        p._opd_full_field = OPD_FULL_HIDDEN_STATES_FIELD
-        p._opd_full_teacher_index_field = OPD_FULL_TEACHER_INDEX_FIELD
-        p.tq_partition_id = "train"
-        p.dp_client = MagicMock()
-
-        p.prepare_step(num_samples=4, group_size=2)
-
-        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
-        assert fields == [
-            *DP_TRAIN_FIELDS,
-            OPD_FULL_HIDDEN_STATES_FIELD,
-            OPD_FULL_TEACHER_INDEX_FIELD,
-        ]
-
-    def test_prepare_val_partition_registers_the_teacher_index_column(self):
-        p, _ = _make_tq_policy()
-        p._opd_full_field = OPD_FULL_HIDDEN_STATES_FIELD
-        p._opd_full_teacher_index_field = OPD_FULL_TEACHER_INDEX_FIELD
-        p.dp_client = MagicMock()
-
-        p.prepare_val_partition(num_samples=4, partition_id="val")
-
-        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
-        assert fields == [
-            *DP_TRAIN_FIELDS,
-            OPD_FULL_HIDDEN_STATES_FIELD,
-            OPD_FULL_TEACHER_INDEX_FIELD,
-        ]
-
     def test_train_from_meta_requests_the_teacher_index_column(self):
         p, _ = _make_tq_policy()
         p._opd_full_field = OPD_FULL_HIDDEN_STATES_FIELD
@@ -430,29 +398,3 @@ class TestTQPolicyOPDFullColumn:
             OPD_FULL_HIDDEN_STATES_FIELD,
             OPD_FULL_TEACHER_INDEX_FIELD,
         ]
-
-    def test_prepare_step_registers_the_teacher_payload_column(self):
-        """The TQ schema is fixed at registration.
-
-        A column missing there is rejected on the teacher's write rather than
-        silently created.
-        """
-        p, _ = _make_tq_policy()
-        p._opd_full_field = OPD_FULL_LOGITS_FIELD
-        p.tq_partition_id = "train"
-        p.dp_client = MagicMock()
-
-        p.prepare_step(num_samples=4, group_size=2)
-
-        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
-        assert fields == [*DP_TRAIN_FIELDS, OPD_FULL_LOGITS_FIELD]
-
-    def test_prepare_step_leaves_the_schema_alone_when_opd_full_is_off(self):
-        p, _ = _make_tq_policy()
-        p.tq_partition_id = "train"
-        p.dp_client = MagicMock()
-
-        p.prepare_step(num_samples=4)
-
-        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
-        assert fields == list(DP_TRAIN_FIELDS)

@@ -297,7 +297,6 @@ def test_script_skips_by_extra_not_by_name():
     )
     listed = {line.split("\t")[0] for line in proc.stdout.splitlines() if line.strip()}
     assert "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector" not in listed
-    assert "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor" not in listed
     assert (
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
         in listed

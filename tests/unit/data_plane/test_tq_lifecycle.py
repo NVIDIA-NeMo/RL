@@ -663,10 +663,9 @@ def _object_payload(n: int) -> np.ndarray:
 def test_object_round_trip_backends(tq_client_backends) -> None:
     """np.ndarray(dtype=object) put → get → decode equality, both backends.
 
-    Mirrors the wire used by ``SyncRolloutActor.kv_first_write`` for
+    Mirrors the wire used by ``kv_first_write`` for
     ``message_log`` / ``content``: object fields ride as
-    ``np.ndarray(dtype=object)`` (matching ``sync_rollout_actor.py``
-    line 273 / 292); the TensorDict constructor wraps them as
+    ``np.ndarray(dtype=object)``; the TensorDict constructor wraps them as
     ``NonTensorData`` internally. :func:`read_columns` →
     :func:`materialize` decodes them back to ``np.ndarray(dtype=object)``.
     """
@@ -711,18 +710,15 @@ def test_object_round_trip_backends(tq_client_backends) -> None:
 
 
 def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None:
-    """End-to-end mirror of ``SyncRolloutActor.kv_first_write``.
+    """End-to-end ``kv_first_write`` round trip.
 
     Pins the production e2e GRPO pipeline shape on both backends:
 
-    * ``register_partition`` declares ``DP_TRAIN_FIELDS`` (tensor-only),
-      matching :meth:`TQPolicy.prepare_step`.
+    * ``register_partition`` declares ``DP_TRAIN_FIELDS`` (tensor-only).
     * ``bulk_batch`` includes 1D + 2D tensors **and** an
-      ``np.ndarray(dtype=object)`` (``content``) — the shape built by
-      ``sync_rollout_actor.py`` lines 257–273.
+      ``np.ndarray(dtype=object)`` (``content``).
     * ``kv_first_write`` does the put through :func:`pack_jagged_fields`.
-    * ``read_columns`` fetches a mixed tensor + object subset, the same
-      pattern used by ``grpo_sync.py`` lines 887–896.
+    * ``read_columns`` fetches a mixed tensor + object subset.
 
     Regression guard for the data-plane wire round-trip end-to-end.
     """
@@ -732,7 +728,7 @@ def test_object_and_tensor_mixed_round_trip_backends(tq_client_backends) -> None
     sample_ids = [f"sample_{i}" for i in range(n)]
     partition_id = "mix-e2e"
 
-    # Tensor-only schema — matches `TQPolicy.prepare_step`.
+    # Tensor-only schema.
     client.register_partition(
         partition_id=partition_id,
         fields=list(DP_TRAIN_FIELDS),

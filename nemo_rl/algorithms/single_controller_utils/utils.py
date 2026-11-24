@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from nemo_rl.experience.reward_penalties import FinalizedReward
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 
-# Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
+# Reduction rules for all_mb_metrics. Mirror grpo.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
     {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
 )

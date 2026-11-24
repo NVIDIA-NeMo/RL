@@ -129,28 +129,6 @@ def _validate_config_section(
         ) from e
 
 
-def _sync_trainer_names(tree: ast.Module) -> set[str]:
-    """Names this launcher may call its synchronous trainer by.
-
-    Two shapes ship: ``run_grpo_nemo_gym.py`` calls ``grpo_train`` directly,
-    while ``run_vlm_grpo.py`` binds whatever ``select_sync_trainer`` returned
-    and calls that. Return one or the other, never their union -- a launcher
-    that calls the factory and then ignores it in favour of ``grpo_train`` is
-    the silent-legacy-trainer bug, and a union would pass it.
-    """
-    bound = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "select_sync_trainer"
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    return bound or {"grpo_train"}
-
-
 def _check_no_local_paths(path: str) -> None:
     text = Path(path).read_text().lower()
     for local_prefix in ("/lustre/", "/scratch/", "/home/"):
@@ -405,9 +383,7 @@ def test_multimodal_launchers_forward_processor_to_both_trainers(
     """Keep sync and async multimodal processing wired to the processor."""
     launcher = Path(__file__).parents[2] / launcher_relpath
     tree = ast.parse(launcher.read_text())
-    dispatch_names = {"async_grpo_train": "async"} | dict.fromkeys(
-        _sync_trainer_names(tree), "sync"
-    )
+    dispatch_names = {"async_grpo_train": "async", "grpo_train": "sync"}
     trainer_calls = {
         dispatch_names[node.func.id]: node
         for node in ast.walk(tree)
@@ -458,10 +434,7 @@ def test_vlm_launcher_dispatches_on_async_grpo_enabled():
     }
 
     assert "async_grpo_train" in async_calls
-    # Which trainer the else-branch ends up in is data_plane.enabled's decision,
-    # made inside select_sync_trainer at runtime; all this can see is that the
-    # branch calls whatever the factory handed back.
-    assert sync_calls & _sync_trainer_names(tree)
+    assert "grpo_train" in sync_calls
 
 
 def test_reward_penalty_config_requires_explicit_unwanted_token_ids():

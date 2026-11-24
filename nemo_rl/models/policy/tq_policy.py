@@ -17,8 +17,7 @@ Exposes ``train_from_meta`` / ``get_logprobs_from_meta`` /
 ``get_reference_policy_logprobs_from_meta`` — same return shapes as
 ``Policy.{train, get_logprobs, get_reference_policy_logprobs}`` but
 accepting a ``KVBatchMeta`` instead of a ``BatchedDataDict``. The meta
-names per-sample TQ keys minted once at rollout
-(:class:`nemo_rl.experience.sync_rollout_actor.SyncRolloutActor`); each
+names per-sample TQ keys minted once at rollout; each
 dispatch slices the key list per DP rank via
 :func:`nemo_rl.data_plane.preshard.shard_meta_for_dp` (no re-fan-out,
 no key minting). Workers fetch their slice from TQ via
@@ -130,7 +129,7 @@ class TQPolicy(TQDriverMixin, Policy):
 
     The partition lifecycle (``register_partition`` / ``clear_samples``) is
     the trainer's responsibility — this class assumes the partition
-    named by ``tq_partition_id`` (default ``"train"``) is open with a
+    named by each meta is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
@@ -141,7 +140,6 @@ class TQPolicy(TQDriverMixin, Policy):
         dp_cfg: DataPlaneRuntimeConfig,
         checkpointing: bool = False,
         storage_unit_node_ids: Optional[list[str]] = None,
-        tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -163,7 +161,6 @@ class TQPolicy(TQDriverMixin, Policy):
             checkpointing=checkpointing,
             storage_unit_node_ids=storage_unit_node_ids,
         )
-        self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
@@ -211,71 +208,6 @@ class TQPolicy(TQDriverMixin, Policy):
         except Exception as e:
             warnings.warn(f"Error closing data-plane client: {e}")
         return super().shutdown()
-
-    def prepare_step(
-        self,
-        num_samples: int,
-        group_size: Optional[int] = None,
-    ) -> None:
-        """Register the per-step TQ partition.
-
-        Sync trainers call this at the start of each step. The static
-        partition id ``"train"`` is cleared and reused across steps. The
-        schema is the union of all consumer fields — producers write
-        only the subset they have, consumers fetch via ``select_fields``.
-
-        Args:
-            num_samples: Expected total samples this step.
-            group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
-        """
-        self.dp_client.register_partition(
-            partition_id=self.tq_partition_id,
-            fields=fields_with_optional_opd_full(
-                fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-                ),
-                field=self._opd_full_field,
-                teacher_index_field=self._opd_full_teacher_index_field,
-            ),
-            num_samples=num_samples,
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
-            grpo_group_size=group_size,
-        )
-
-    def prepare_val_partition(
-        self, num_samples: int, *, partition_id: str = "val"
-    ) -> None:
-        """Register a per-batch val partition (single consumer, no GRPO grouping).
-
-        Sync val trainers call this at the start of each val batch.
-        Distinct from :meth:`prepare_step` because val has its own
-        partition id and a single consumer task.
-        """
-        self.dp_client.register_partition(
-            partition_id=partition_id,
-            fields=fields_with_optional_opd_full(
-                fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
-                ),
-                field=self._opd_full_field,
-                teacher_index_field=self._opd_full_teacher_index_field,
-            ),
-            num_samples=num_samples,
-            consumer_tasks=[partition_id],
-            grpo_group_size=None,
-        )
-
-    def discard_samples(self, sample_ids: list[str], partition_id: str) -> None:
-        """Drop a set of uids from TQ.
-
-        Used both for step-end teardown (via :meth:`finish_step`) and
-        mid-step filtering (e.g. dynamic sampling).
-        """
-        self.dp_client.clear_samples(sample_ids=sample_ids, partition_id=partition_id)
-
-    def finish_step(self, meta: KVBatchMeta) -> None:
-        """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
-        self.discard_samples(meta.sample_ids, meta.partition_id)
 
     def collect_data_plane_snapshots(
         self, driver_client: Any = None

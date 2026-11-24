@@ -86,6 +86,7 @@ from nemo_rl.data.utils import (
     load_dataloader_state,
     save_dataloader_state,
 )
+from nemo_rl.data_plane.factory import data_plane_enabled
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -776,25 +777,6 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
             "grpo.deduplicate_multimodal_data=true is currently qualified "
             "only with policy.generation.backend=vllm."
         )
-    # The data plane accepts deduplicated payloads, so the wire format is not
-    # the constraint -- but note what dedup buys there. ``to_wire`` emits one
-    # row per *logical* row, so a shared segment is concatenated once per
-    # generation: the saving is in driver RAM (the deepcopy memo), not in wire
-    # or TQ-storage bytes, which stay O(G x images). The one gap is NeMo-Gym:
-    # ``grpo_train_sync`` does not call
-    # ``attach_initial_nemo_gym_image_payloads``, which supplies the initial
-    # image tensors a Gym dataset omits from ``extra_env_info``. That helper is
-    # itself gated on ``should_use_nemo_gym``, so non-Gym recipes never needed
-    # it and are unaffected.
-    if (master_config.data_plane or {}).get("enabled", False) and (
-        should_use_nemo_gym(master_config)
-    ):
-        raise NotImplementedError(
-            "grpo.deduplicate_multimodal_data=true with data_plane.enabled=true "
-            "is not supported for NeMo-Gym runs: the TransferQueue trainer does "
-            "not attach the initial Gym image payloads. Non-Gym recipes are "
-            "supported."
-        )
 
 
 def _needs_hf_refit_handshake(
@@ -858,6 +840,11 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if data_plane_enabled(master_config.data_plane):
+        raise ValueError(
+            "The legacy path no longer supports TransferQueue "
+            "(data_plane.enabled=true); please use the single-controller path."
+        )
     if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
             "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
@@ -1612,9 +1599,7 @@ def setup(
             "(reference model is not loaded)."
         )
 
-    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
-    # Policy subclass without this shared setup needing to know the data
-    # plane exists. Default is the plain Policy class — legacy behavior.
+    # A caller-supplied factory replaces the plain Policy class.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
     def init_policy(reserved_http_server_ports: Optional[dict[int, int]] = None):
@@ -2952,7 +2937,7 @@ def _apply_async_sample_masks(
     # placeholder row plus a row-aligned marker column, and a reason here that
     # masks marked rows ahead of overlong filtering and reports
     # num_masked_seqs_by_empty_response_output. The producer runs in the shared
-    # Gym actor, so it must be opt-in until the sync, grpo_sync, distillation,
+    # Gym actor, so it must be opt-in until the sync, distillation,
     # and single-controller paths also mask the placeholder rows.
     # (field, metric, timer label, required, enabled)
     mask_reasons = [
@@ -3055,7 +3040,7 @@ def _advantage_valid_mask(
     ``include`` lets every row with a nonzero dataset weight vote
     (``_include_valid_mask``); ``exclude`` lets the rows with a nonzero (final)
     loss weight vote. Both return a binary mask and leave ``sample_mask``
-    unchanged. The legacy and TransferQueue trainers carry no synthetic
+    unchanged. The legacy trainers carry no synthetic
     placeholder rows; the SingleController stage excludes its token-capture
     placeholders itself (see ``advantage_stage.py``).
     """
@@ -4264,13 +4249,13 @@ def _grpo_train_impl(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
-                    # Router replay (R3) on the legacy data_plane.enabled=false
-                    # driver path: routed_experts already rides flat_messages
+                    # Router replay (R3) on the legacy driver path:
+                    # routed_experts already rides flat_messages
                     # (attached to message_log during rollout, then batched into
                     # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
                     # but the train_data whitelist above drops it. Copy it back so
                     # the Megatron worker's train-stage router-replay guard finds
-                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
+                    # it.
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )
@@ -5405,18 +5390,6 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
     max_generation_failures = master_config.grpo.async_grpo.max_generation_failures
-
-    if router_replay_enabled(master_config.policy) and (
-        master_config.data_plane or {}
-    ).get("enabled", False):
-        raise NotImplementedError(
-            "policy.router_replay.enabled=true with async GRPO on this "
-            "entrypoint is supported only when data_plane.enabled=false. For "
-            "async + TransferQueue, use the SingleController entrypoint: "
-            "examples/run_grpo_single_controller.py with e.g. "
-            "examples/configs/recipes/llm/"
-            "grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml"
-        )
 
     if master_config.grpo.async_grpo.max_trajectory_age_steps > 1:
         if not master_config.grpo.async_grpo.in_flight_weight_updates:

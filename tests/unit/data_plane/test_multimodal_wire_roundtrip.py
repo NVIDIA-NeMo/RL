@@ -106,7 +106,7 @@ def _make_vlm_rollout_output(
 
 
 def _sync_rollout_write_loop(fb: BatchedDataDict, bulk_batch: BatchedDataDict) -> None:
-    """Replay the write loop in ``sync_rollout_actor.rollout_to_tq``.
+    """Write one rollout batch's fields the way a producer does.
 
     Copies non-multimodal fields verbatim, then hands every multimodal
     field to the *production* encoder ``encode_multimodal_for_wire`` —
