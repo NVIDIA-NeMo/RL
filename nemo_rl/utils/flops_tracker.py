@@ -118,6 +118,8 @@ def convert_config_to_flops_config(
             layers=config.num_hidden_layers,
             ffn_hs=config.intermediate_size,
             vocab_size=config.vocab_size,
+            query_groups=config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
         ), qwen2
     elif isinstance(config, (Qwen3Config, Qwen3MoeConfig)):
         return FLOPSConfig(
