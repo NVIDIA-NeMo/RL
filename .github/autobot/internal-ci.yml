@@ -1,0 +1,8 @@
+# .github/autobot/internal-ci.yml
+# /internal-ci reads this from the default branch only, so edits take effect once merged.
+# Keys are dl/joc/nemo-ci scripts/launch_pipeline.py flags without "--". `arguments` are the
+# defaults; `overridable` lists the ones a command may set, e.g. /internal-ci test-case=<name> test-cluster=pretyche
+# The RL image is always built from the PR head, so test-image is not settable.
+eligible_teams: [automation, rl_autobot_approvers]
+arguments: {test-cluster: cw_dfw, test-suites: nightly}
+overridable: [test-cluster, test-suites]
