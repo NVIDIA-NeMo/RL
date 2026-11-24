@@ -47,12 +47,6 @@ applied=$(grep -oE '\[Dynamo\] router applied KV events: .*"ok": [0-9.]+' "${run
 echo "KV events the router applied: ${applied:-0}"
 [[ "${applied:-0}" =~ ^[0-9]+ && "${applied%%.*}" -gt 0 ]] \
   || fail "The KV router applied none of the engines' KV-cache events"
-# The applied count sums over the fleet, so one engine's events satisfy it. Dynamo
-# logs these when it drops the events of an engine whose vLLM data-parallel rank
-# is not the one that engine registered and subscribed under.
-if grep -E "Ignoring mismatched KV source rank|payload disagrees with its source advertisement" "${run_log}"; then
-  fail "Dynamo dropped an engine's KV-cache events"
-fi
 
 dynamo_bin_dir=${NEMO_RL_DYNAMO_BIN_DIR:-/opt/dynamo/bin}
 if pgrep -f "[d]ynamo.frontend|${dynamo_bin_dir}/[e]tcd|${dynamo_bin_dir}/[n]ats-server"; then

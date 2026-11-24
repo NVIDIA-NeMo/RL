@@ -111,20 +111,19 @@ _MAIN_ATTENTION_KINDS = (
 
 
 def dynamo_kv_events_config(
-    cfg: DynamoCfg, *, prefix_caching: bool, data_parallel: bool
+    cfg: DynamoCfg, llm_kwargs: dict[str, Any]
 ) -> Optional[dict[str, Any]]:
     """The ``kv_events_config`` that feeds Dynamo's KV router.
 
-    None unless the frontend routes by KV and the engine caches prefixes: vLLM
-    publishes block events only for the blocks its prefix cache stores.
-    ``data_parallel`` says the engine is one rank of a vLLM data-parallel group
-    (expert parallelism wider than tensor parallelism).
+    None unless the frontend routes by KV and the engine, built from
+    ``llm_kwargs``, caches prefixes: vLLM publishes block events only for the
+    blocks its prefix cache stores.
     """
-    if cfg.frontend_args.router_mode != "kv" or not prefix_caching:
+    if cfg.frontend_args.router_mode != "kv" or not llm_kwargs["enable_prefix_caching"]:
         return None
-    if data_parallel:
-        # vLLM offsets the endpoint by the engine's rank, which it does for tcp
-        # only; it leaves port 0 alone and binds a free port on the node's IP.
+    if llm_kwargs.get("data_parallel_size", 1) > 1:
+        # One rank of a vLLM data-parallel group. vLLM offsets the endpoint by the
+        # rank and takes only tcp there; port 0 binds a free port on the node's IP.
         endpoint = "tcp://*:0"
     else:
         # A random abstract-namespace socket per engine (dynamo-integration.md).
@@ -578,8 +577,8 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         await self._llm.abort(context.id())
 
     async def kv_event_sources(self) -> list[KvEventSource]:
-        # vLLM reports the endpoint each publisher bound, under the rank it stamps
-        # on its events. It binds a wildcard host, which no subscriber can connect to.
+        # The endpoint vLLM bound, under the rank it stamps on its events. A user's own
+        # kv_events_config can keep a wildcard host, which no subscriber can connect to.
         return [
             ZmqSource(endpoint=source.endpoint.replace("*", "127.0.0.1"), dp_rank=rank)
             for rank, source in self._llm.get_kv_event_sources().items()

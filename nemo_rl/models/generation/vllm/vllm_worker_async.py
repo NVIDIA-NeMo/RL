@@ -107,7 +107,6 @@ from nemo_rl.models.generation.vllm.utils import (
     validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_dp_size
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
@@ -601,14 +600,7 @@ class VllmAsyncGenerationWorkerImpl(
             # the stat logger feeds its per-engine load signal.
             llm_kwargs.setdefault(
                 "kv_events_config",
-                dynamo_kv_events_config(
-                    dynamo_cfg(self.cfg),
-                    prefix_caching=llm_kwargs["enable_prefix_caching"],
-                    data_parallel=resolve_vllm_dp_size(
-                        self.tensor_parallel_size, self.expert_parallel_size
-                    )
-                    > 1,
-                ),
+                dynamo_kv_events_config(dynamo_cfg(self.cfg), llm_kwargs),
             )
             self.stat_loggers.append(SnapshotStatLogger)
 

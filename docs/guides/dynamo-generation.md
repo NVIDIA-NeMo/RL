@@ -23,7 +23,7 @@ With `dynamo: true`:
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and registers with the frontends from inside its own worker process. Setup waits until every frontend routes to every engine.
 - With NeMo-Gym (`vllm_cfg.expose_http_server: true`), each frontend starts its render workers at launch and builds them while the engines load, from the settings one engine sends before it loads. Gym's first calls then do not wait for them. Other runs start none.
 - vLLM publishes KV-cache events only for blocks its prefix cache stores. With `vllm_cfg.enable_prefix_caching: false`, the engines publish none, and the KV router routes on load alone.
-- With `vllm_cfg.expert_parallel_size > tensor_parallel_size`, each vLLM data-parallel rank of an expert-parallel group is an engine of its own behind the frontends, as it is natively. Those engines publish their KV-cache events on a TCP port of the node's IP, which vLLM reads from the node's default route. On a node without one, set `VLLM_HOST_IP`.
+- With `vllm_cfg.expert_parallel_size > tensor_parallel_size`, each vLLM data-parallel rank of an expert-parallel group is an engine of its own behind the frontends, as it is natively. Those engines publish their KV-cache events on a TCP port of their node's IP, which vLLM reads from `VLLM_HOST_IP` or, when that is unset, from the node's default route. If you set `VLLM_HOST_IP`, set it per node, in the environment that node's Ray workers start with: a value exported where the run is launched or set in `vllm_cfg.env_vars` reaches every node, and an engine cannot bind another node's address.
 - Shutdown stops the services after the engines.
 
 ## Configure
