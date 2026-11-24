@@ -1215,6 +1215,33 @@ def test_prefix_cache_hit_rate_is_omitted_when_a_restart_skews_the_pair():
     assert "vllm/prefix_cache_hit_rate" not in metrics
 
 
+def test_prefix_cache_and_preemption_counters_survive_worker_aggregation():
+    """The new series must pass the kept-names filter, or they never reach compute."""
+
+    def worker(queries: float, hits: float, preemptions: float) -> dict[str, float]:
+        return {
+            "vllm:prefix_cache_queries": queries,
+            "vllm:prefix_cache_hits": hits,
+            "vllm:num_preemptions": preemptions,
+            # Close siblings vLLM also ships; they must not be summed in.
+            "vllm:external_prefix_cache_queries": 9999.0,
+            "vllm:external_prefix_cache_hits": 9999.0,
+        }
+
+    start = aggregate_spec_decode_counters([worker(500.0, 200.0, 1.0)] * 2)
+    end = aggregate_spec_decode_counters(
+        [worker(900.0, 500.0, 2.0), worker(900.0, 500.0, 3.0)]
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prefix_cache_queries"] == 800.0
+    assert metrics["vllm/prefix_cache_hits"] == 600.0
+    assert math.isclose(metrics["vllm/prefix_cache_hit_rate"], 0.75)
+    assert metrics["vllm/preemptions"] == 3.0
+    assert "vllm:external_prefix_cache_queries" not in end
+
+
 def test_length_is_truncation_aware_not_a_failure():
     """``length`` means max_tokens was reached, which is routine in RL.
 

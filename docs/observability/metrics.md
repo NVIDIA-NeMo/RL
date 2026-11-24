@@ -142,9 +142,9 @@ Two deliberate metric/span disagreements to know about before comparing a metric
 
 Read from the vLLM engine's own Prometheus registry, delta'd per step. `snapshot_step_metrics()` takes a baseline before generation and `get_step_metrics()` a second reading after, both fanned out to the DP-leader workers; the same snapshot pair also feeds the spec-decode metrics, so the wider coverage costs no extra RPC.
 
-Each series, its kind and the vLLM family it is derived from are declared in `VLLM_TEED_METRICS` in `nemo_rl/models/generation/vllm/metric_names.py`: prompt and generation token counters, mean prompt and generation lengths, and counters of `ok` and `failed` generations.
+Each series, its kind and the vLLM family it is derived from are declared in `VLLM_TEED_METRICS` in `nemo_rl/models/generation/vllm/metric_names.py`: prompt and generation token counters, mean prompt and generation lengths, counters of `ok` and `failed` generations, prefix-cache token counters (queried and hit), the prefix-cache hit rate, and a preemption counter.
 
-The counters carry the step's delta, so summing them across steps reconstructs the run total. The means come from each histogram's `sum`/`count` delta, so they are exact rather than bucket-interpolated; a step in which the engine served no request omits them rather than reporting a zero-length sequence.
+The counters carry the step's delta, so summing them across steps reconstructs the run total. `rl.vllm.prefix_cache.hit_rate` is hits over queries for the step; it is omitted when the step queried no tokens (for example with prefix caching off). Average it across steps; do not sum it. The means come from each histogram's `sum`/`count` delta, so they are exact rather than bucket-interpolated; a step in which the engine served no request omits them rather than reporting a zero-length sequence.
 
 **What counts as failed.** vLLM's finish reasons are `stop`, `length`, `abort`, `error` and `repetition`. Only `stop` and `length` leave a usable sample behind, and `length` is a normal RL outcome — a rollout routinely runs to `max_tokens` — so those two are `ok` and *everything else* is `failed`. Counting the remainder rather than an explicit deny-list keeps `ok + failed` equal to the engine's own total even if a future vLLM adds a reason we have not heard of.
 
