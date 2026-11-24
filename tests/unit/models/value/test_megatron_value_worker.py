@@ -640,6 +640,77 @@ def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
     assert "media_token_validity_mask" not in data
 
 
+def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    module = "nemo_rl.models.value.workers.megatron_value_worker"
+    increments = []
+    for gbs in (4, 8):
+        worker = SimpleNamespace(
+            _train_step_state=None,
+            media_placeholder_token_id=None,
+            model=MagicMock(spec=["zero_grad_buffer", "train"]),
+            optimizer=MagicMock(**{"step.return_value": (True, 0.0, 0)}),
+            scheduler=MagicMock(),
+            cfg={
+                "train_global_batch_size": 2,
+                "train_micro_batch_size": 1,
+                "megatron_cfg": {"empty_unused_memory_level": 0},
+            },
+            dp_size=1,
+            _policy_like_cfg={},
+            mcore_state=SimpleNamespace(straggler_timer=None),
+            model_slices_context_parallel_inputs=None,
+            defer_fp32_logits=False,
+            _maybe_run_manual_gc=MagicMock(),
+        )
+        data = BatchedDataDict(
+            {"input_ids": torch.ones((gbs, 2), dtype=torch.long, device="cuda")}
+        )
+        rerun = SimpleNamespace(
+            should_run_forward_backward=MagicMock(side_effect=[True, False])
+        )
+        with (
+            patch(f"{module}.parallel_state"),
+            patch(
+                f"{module}.process_global_batch",
+                return_value={
+                    "batch": data,
+                    "global_valid_seqs": torch.tensor(1.0),
+                    "global_valid_toks": torch.tensor(1.0),
+                },
+            ),
+            patch(
+                f"{module}.get_microbatch_iterator",
+                return_value=(iter(()), 1, 1, None, 2),
+            ),
+            patch(f"{module}.get_rerun_state_machine", return_value=rerun),
+            patch(f"{module}.LossPostProcessor"),
+            patch(f"{module}.megatron_forward_backward", return_value=[]),
+            patch(f"{module}.get_pg_collection"),
+            patch(f"{module}.logical_and_across_model_parallel_group"),
+            patch(
+                f"{module}.reduce_max_stat_across_model_parallel_group",
+                return_value=0.0,
+            ),
+            patch(f"{module}.is_pipeline_last_stage", return_value=True),
+            patch(f"{module}.get_pipeline_model_parallel_last_rank"),
+            patch(f"{module}.get_pipeline_model_parallel_group"),
+            patch("torch.distributed.all_reduce"),
+            patch("torch.distributed.broadcast_object_list"),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.cuda.nvtx.range_push"),
+            patch("torch.cuda.nvtx.range_pop"),
+        ):
+            MegatronValueWorkerImpl.train(worker, data, loss_fn=object(), gbs=gbs)
+        worker.optimizer.step.assert_called_once_with()
+        increments.append(worker.scheduler.step.call_args.kwargs["increment"])
+
+    assert increments == [2, 2]
+
+
 def test_finish_training_preserves_model_move_contract(monkeypatch):
     """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
