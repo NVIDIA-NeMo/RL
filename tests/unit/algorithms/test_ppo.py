@@ -1479,6 +1479,25 @@ def test_compute_critic_metrics_aggregates_and_namespaces_results():
     assert metrics["critic/explained_var"] == pytest.approx(0.75)
 
 
+def test_merge_policy_epoch_results_sums_flops_over_epochs():
+    from nemo_rl.algorithms.ppo import _merge_policy_epoch_results
+
+    epochs = [
+        {"loss": 0.5, "total_flops": 1.0e15, "train_elapsed_seconds": 2.0},
+        {"loss": 0.25, "total_flops": 1.0e15, "train_elapsed_seconds": 2.0},
+    ]
+
+    assert _merge_policy_epoch_results(epochs) == {
+        "loss": 0.25,
+        "total_flops": 2.0e15,
+        "train_elapsed_seconds": 4.0,
+    }
+    assert epochs[1]["total_flops"] == 1.0e15
+    assert _merge_policy_epoch_results([{"loss": 0.5}, {"loss": 0.25}]) == {
+        "loss": 0.25
+    }
+
+
 def test_compute_critic_metrics_handles_zero_return_variance():
     from nemo_rl.algorithms.ppo import _compute_critic_metrics
 

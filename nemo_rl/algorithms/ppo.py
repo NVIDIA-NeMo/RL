@@ -1328,6 +1328,25 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     return critic_metrics
 
 
+def _merge_policy_epoch_results(
+    epoch_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the last policy epoch's results with FLOPs and elapsed time summed.
+
+    Each ``Policy.train`` call counts only its own epoch, while the
+    ``policy_training`` timer that FLOPS reporting divides by covers every epoch.
+    """
+    last = epoch_results[-1]
+    return {
+        **last,
+        **{
+            key: sum(result[key] for result in epoch_results)
+            for key in ("total_flops", "train_elapsed_seconds")
+            if key in last
+        },
+    }
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1857,6 +1876,7 @@ def ppo_train(
                         POLICY_GENERATION_STALE = True
 
                     print("▶ Training policy...", flush=True)
+                    policy_epoch_results: list[dict[str, Any]] = []
                     for policy_epoch in range(ppo_epochs):
                         print(
                             f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...",
@@ -1870,11 +1890,14 @@ def ppo_train(
                                 tracer=_tracer,
                             ),
                         ):
-                            train_results = policy.train(
-                                train_data,
-                                loss_fn,
-                                timer=timer,
+                            policy_epoch_results.append(
+                                policy.train(
+                                    train_data,
+                                    loss_fn,
+                                    timer=timer,
+                                )
                             )
+                    train_results = _merge_policy_epoch_results(policy_epoch_results)
 
                 if train_results is not None:
                     print(
@@ -2859,12 +2882,14 @@ def async_ppo_train(
                         )
                     with timer.time("training_prep"):
                         policy.prepare_for_training()
+                    policy_epoch_results: list[dict[str, Any]] = []
                     for policy_epoch in range(ppo_epochs):
                         print(f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...")
                         with timer.time("policy_training"):
-                            train_results = policy.train(
-                                train_data, loss_fn, timer=timer
+                            policy_epoch_results.append(
+                                policy.train(train_data, loss_fn, timer=timer)
                             )
+                    train_results = _merge_policy_epoch_results(policy_epoch_results)
 
                 # ---- 8. Refit once after all PPO epochs ----
                 # Warmup still advances the replay-buffer version, but skips the
