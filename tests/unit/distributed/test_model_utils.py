@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import itertools
 import math
 import os
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import ray
@@ -23,6 +26,11 @@ import torch
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
+)
+from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.loss.loss_input import (
+    prepare_loss_input,
+    prepare_packed_loss_input,
 )
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropyToFixedLogits,
@@ -2642,3 +2650,109 @@ def test_score_centering_chunked_grad_with_activation_logits(single_rank_gloo_gr
     expected = expected + (log_p.gather(-1, ids[:, 1:, :1]) * mask).sum()
     expected.backward()
     torch.testing.assert_close(full.grad, ref.grad.float(), atol=1e-6, rtol=1e-5)
+
+
+def _run_sampling_filter_chunk_equivalence(rank, tp_size, init_file):
+    """Compare chunked with unchunked training logprobs under top-k/top-p filters.
+
+    Covers the filtered logprobs and the unfiltered ones of the reference-KL
+    penalty, their gradients, and a last chunk shorter than the chunk size.
+    """
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=tp_size,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        vocab = 64
+        shard = slice(rank * vocab // tp_size, (rank + 1) * vocab // tp_size)
+        loss_fn = SimpleNamespace(
+            input_type=LossInputType.LOGPROB, reference_policy_kl_penalty=0.1
+        )
+        torch.manual_seed(7)
+        input_ids = torch.randint(0, vocab, (2, 8))
+        full = torch.randn(2, 8, vocab)
+        # Every other target is the most likely token, which every filter keeps.
+        input_ids[:, 1::2] = full[:, 0:-1:2].argmax(-1)
+        weights = torch.randn(2, 7)
+        # Rows of 5 and 7 tokens, padded to 8 and 12, as one packed row.
+        boundaries = ((0, 5, 12), (0, 8, 20))
+        packed = torch.cat(
+            [
+                torch.cat([full[i : i + 1, :n], full.new_zeros(1, p - n, vocab)], dim=1)
+                for i, (n, p) in enumerate([(5, 8), (7, 12)])
+            ],
+            dim=1,
+        )
+
+        def run(is_packed, dtype, sampling_params, chunk_size):
+            logits = (packed if is_packed else full)[..., shard].to(dtype)
+            logits = logits.clone().requires_grad_()
+            prepare = prepare_packed_loss_input if is_packed else prepare_loss_input
+            loss_input, data = prepare(
+                logits * 1.0,  # non-leaf logits, as in training
+                {"input_ids": input_ids},
+                loss_fn,
+                *(boundaries if is_packed else ()),
+                vocab_parallel_rank=rank,
+                vocab_parallel_group=torch.distributed.group.WORLD,
+                sampling_params=sampling_params,
+                chunk_size=chunk_size,
+            )
+            filtered = loss_input["next_token_logprobs"]
+            unfiltered = data["curr_logprobs_unfiltered"]
+            kept = torch.isfinite(filtered)
+            (filtered_grad,) = torch.autograd.grad(
+                (filtered.where(kept, 0.0) * weights).sum(), logits, retain_graph=True
+            )
+            (unfiltered_grad,) = torch.autograd.grad(
+                (unfiltered * weights).sum(), logits
+            )
+            return filtered, unfiltered, filtered_grad, unfiltered_grad
+
+        def spy(kernel):
+            return patch.object(kernel, "apply", wraps=kernel.apply)
+
+        filters = (
+            TrainingSamplingParams(top_k=8),
+            TrainingSamplingParams(top_p=0.9),
+            TrainingSamplingParams(top_k=8, top_p=0.9),
+        )
+        for case in itertools.product(
+            (False, True), (torch.float32, torch.bfloat16), filters
+        ):
+            unchunked = run(*case, chunk_size=None)
+            with (
+                spy(ChunkedDistributedLogprobWithSampling) as filtered_kernel,
+                spy(ChunkedDistributedLogprob) as unfiltered_kernel,
+            ):
+                # 6 divides neither sequence length (8 unpacked, 20 packed).
+                chunked = run(*case, chunk_size=6)
+            assert filtered_kernel.call_count == 1, case
+            assert unfiltered_kernel.call_count == 1, case
+            # The filtered gradient is only compared at targets that the filter keeps.
+            assert torch.isfinite(unchunked[0]).sum() >= 5, case
+            for actual, expected in zip(chunked, unchunked):
+                torch.testing.assert_close(
+                    actual, expected, msg=lambda message: f"{case}: {message}"
+                )
+        if tp_size > 1:
+            # One packed row times a chunk size of 3 is not divisible by tp_size.
+            with pytest.raises(ValueError, match="divisible by the tensor parallel"):
+                run(True, torch.float32, filters[0], chunk_size=3)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_sampling_filter_chunk_equivalence_gloo(tmp_path, tp_size):
+    """Top-k/top-p training honors logprob_chunk_size without changing the result."""
+    torch.multiprocessing.spawn(
+        _run_sampling_filter_chunk_equivalence,
+        args=(tp_size, str(tmp_path / "gloo-init")),
+        nprocs=tp_size,
+        join=True,
+    )

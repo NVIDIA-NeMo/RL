@@ -2109,7 +2109,8 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
                 "sequence_packing.enabled=true, sequence_packing.fuse_loss=true and "
                 "a positive policy.logprob_chunk_size"
             )
-        # Training top-k/top-p turns chunking off, which would silently drop the reuse.
+        # The training top-k/top-p kernels do not reuse the logits' storage, which
+        # would silently drop the reuse.
         generation = config.get("generation")
         if generation is not None and need_top_k_or_top_p_filtering(
             TrainingSamplingParams(top_k=generation["top_k"], top_p=generation["top_p"])

@@ -418,8 +418,7 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
-                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                     cp_sharder=cp_sharder,
                 )
 
@@ -683,12 +682,12 @@ def prepare_packed_loss_input(
             roll_shift=-1,
         )
 
-    # With chunking, keep logits in their original dtype: the chunked logprob
-    # kernel casts each chunk to float32 internally.
-    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
-        sampling_params
+    # ChunkedDistributedLogprob and the sampler-replay kernel cast per chunk; the
+    # top-k/top-p kernels filter in the dtype they get, so they take float32.
+    keeps_logits_dtype = chunk_size is not None and (
+        replay or not need_top_k_or_top_p_filtering(sampling_params)
     )
-    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
+    logits_for_logprobs = logits if keeps_logits_dtype else logits.to(torch.float32)
 
     def sampler_topk_logprobs(ids: torch.Tensor) -> torch.Tensor:
         return get_policy_logprobs_at_sampler_topk(
@@ -736,12 +735,12 @@ def prepare_packed_loss_input(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
-            chunk_size=chunk_size if use_chunking else None,
+            chunk_size=chunk_size,
             target_is_pre_rolled=not input_is_prepacked,
             return_packed_layout=input_is_prepacked,
-            # The grad may overwrite these logits only on the chunked path. The
-            # unfiltered KL call below reads them again, but only with chunking off.
-            reuse_logits_storage=reuse_logits_storage and use_chunking,
+            # The grad may overwrite these logits only when chunked without a sampling
+            # filter. The unfiltered KL call below reads them again, but only with one.
+            reuse_logits_storage=reuse_logits_storage and keeps_logits_dtype,
         )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
@@ -764,7 +763,7 @@ def prepare_packed_loss_input(
                     inference_only=False,
                     cp_group=context_parallel_group,
                     sampling_params=None,
-                    chunk_size=chunk_size if use_chunking else None,
+                    chunk_size=chunk_size,
                     target_is_pre_rolled=not input_is_prepacked,
                     return_packed_layout=input_is_prepacked,
                 )
