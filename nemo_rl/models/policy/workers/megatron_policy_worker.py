@@ -4993,8 +4993,8 @@ class MegatronPolicyWorkerImpl(
             and not keep_train_buffers
             and self.optimizer is not None
         ):
-            # Reloading the shared storage zeros it; restore optimizer masters
-            # before forward pre-hooks gather the parameters.
+            # reload_from_cpu() zeros the shared storage. Restage optimizer
+            # masters before a logprob forward gathers parameters from it.
             self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.eval()
 
