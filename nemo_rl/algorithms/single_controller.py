@@ -4508,17 +4508,10 @@ class SingleControllerActor:
 
         Returns the problems found, empty when everything is well. It *reports* rather
         than raises so the caller can route the verdict through ``stall_action``, the
-        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
-        under the documented default (``"warn"``, which promises to "only report"), and
-        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
-        the run -- a run-ending path switched on by default, in a feature whose whole
-        posture is inert-by-default.
+        same way the stall path does.
 
-        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
-        -- precisely the case this check exists to catch -- left the await hanging
-        forever, the pump never ticked again, and stall detection was dead exactly when
-        it was needed. A probe that does not answer within one tick IS the unhealthy
-        signal; it is not a reason to stop watching.
+        Each probe is bounded. A probe that does not answer within one tick IS the
+        unhealthy signal; it is not a reason to stop watching.
 
         The NeMo-Gym entry of the environment handles is read with
         ``as_nemo_gym_shard_set``, the way the rollout code reads it, and every actor
