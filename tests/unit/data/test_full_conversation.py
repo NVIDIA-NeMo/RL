@@ -652,13 +652,22 @@ def test_zero_next_token_targets_are_rejected(
         )
 
 
-def test_missing_bos_eos(tokenizer: PreTrainedTokenizerFast) -> None:
+def test_missing_bos_eos_is_skipped_like_incremental_sft(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    def token_ids(**kwargs: Any) -> list[int]:
+        return torch.cat(
+            [m["token_ids"] for m in format_messages(tokenizer, **kwargs)]
+        ).tolist()
+
     tokenizer.bos_token = None
-    with pytest.raises(ValueError, match="no BOS"):
-        format_messages(tokenizer, add_bos_token=True)
+    with pytest.warns(UserWarning, match="does not have a BOS token"):
+        with_bos = token_ids(add_bos_token=True)
+    assert with_bos == token_ids(add_bos_token=False)
     tokenizer.eos_token = None
-    with pytest.raises(ValueError, match="no EOS"):
-        format_messages(tokenizer)
+    with pytest.warns(UserWarning, match="does not have an EOS token"):
+        with_eos = token_ids(add_eos_token=True)
+    assert with_eos == token_ids(add_eos_token=False)
 
 
 def test_eos_addition_stays_supervised(tokenizer: PreTrainedTokenizerFast) -> None:
@@ -1120,6 +1129,98 @@ def test_stock_nemotron_history_reasoning(truncate_history: bool) -> None:
     assert ("REASONING" in assistant[0]["content"]) == (not truncate_history)
     assert "CURRENT_REASONING" in assistant[-1]["content"]
     assert not any("RESULT_" in m["content"] for m in assistant)
+
+
+def test_stock_qwen_without_bos_matches_incremental_sft() -> None:
+    # examples/configs/sft.yaml sets add_bos: true, and Qwen has no BOS token.
+    tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        revision="7ae557604adf67be50417f59c2c2f167def9a775",
+    )
+    assert tokenizer.bos_token is None
+    source = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "last"},
+    ]
+
+    def processed(name: str) -> tuple[list[int], list[int]]:
+        result = PROCESSOR_REGISTRY[name](
+            {"messages": copy.deepcopy(source), "task_name": "test"},
+            TaskDataSpec(),
+            tokenizer,
+            16384,
+            0,
+            add_bos=True,
+            add_eos=True,
+            add_generation_prompt=False,
+        )
+        log = result["message_log"]
+        add_loss_mask_to_message_log([log])
+        return (
+            torch.cat([m["token_ids"] for m in log]).tolist(),
+            torch.cat([m["token_loss_mask"] for m in log]).tolist(),
+        )
+
+    with pytest.warns(UserWarning, match="does not have a BOS token"):
+        incremental = processed("sft_processor")
+    with pytest.warns(UserWarning, match="does not have a BOS token"):
+        full = processed("sft_full_conversation_processor")
+    assert full == incremental
+
+
+def test_stock_qwen3_generation_prompt_keeps_tool_call_token_trained() -> None:
+    # The generation prompt ends with an empty think block, but Qwen3 renders an
+    # earlier tool-call turn without one, so the two share only the "<" of
+    # "<tool_call>". The mask must not cut through that token.
+    tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen3-0.6B", revision="c1899de289a04d12100db370d81485cdf75e47ca"
+    )
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, enable_thinking=False
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "check",
+                "description": "Check a number",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                },
+            },
+        }
+    ]
+    source = [
+        {"role": "user", "content": "Check 1"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_0001",
+                    "type": "function",
+                    "function": {"name": "check", "arguments": {"n": 1}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0001", "content": "RESULT_1"},
+        {"role": "assistant", "content": "Done."},
+    ]
+    log = get_full_conversation_message_log(
+        source,
+        tokenizer,
+        prompt=None,
+        tools=tools,
+        add_bos_token=False,
+        add_eos_token=True,
+        mask_generation_prompt=True,
+    )
+    assistant = [m for m in log if m["role"] == "assistant"]
+    assert len(assistant) == 2
+    assert tokenizer.decode(assistant[0]["token_ids"][:1]) == "<tool_call>"
 
 
 @pytest.mark.parametrize("limit", [None, 0, -1])

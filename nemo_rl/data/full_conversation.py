@@ -15,6 +15,7 @@
 """Full-conversation SFT formatting with automatic assistant loss ownership."""
 
 import inspect
+import warnings
 from collections.abc import Callable, Mapping
 from functools import lru_cache, partial
 from os.path import commonprefix
@@ -275,6 +276,7 @@ def _resolve_template(
 
 
 def _mask_generation_prompts(
+    tokenizer: PreTrainedTokenizerBase,
     template: str,
     messages: list[dict[str, Any]],
     template_options: dict[str, Any],
@@ -297,7 +299,15 @@ def _mask_generation_prompts(
             prompt = _generation_prompt(
                 template, messages[:message_index], template_options
             )
-            start += len(commonprefix([prompt, text[start : start + len(prompt)]]))
+            shared = len(commonprefix([prompt, text[start : start + len(prompt)]]))
+            if shared < len(prompt):
+                # Never cut through a prompt token, such as a special token
+                # that shares only its first characters with the turn.
+                offsets = tokenizer(
+                    prompt, add_special_tokens=False, return_offsets_mapping=True
+                )["offset_mapping"]
+                shared = max((end for _, end in offsets if end <= shared), default=0)
+            start += shared
         masked.append((start, end))
     return masked
 
@@ -316,16 +326,22 @@ def _add_bos_eos(
             "The chat template renders non-whitespace content after the final "
             "assistant message's loop iteration. " + _UNSUPPORTED_TEMPLATE
         )
-    if add_eos_token:
-        if tokenizer.eos_token is None:
-            raise ValueError("EOS requested but the tokenizer has no EOS token.")
+    if add_eos_token and tokenizer.eos_token is None:
+        warnings.warn(
+            "add_eos_token is True but the tokenizer does not have an EOS token. "
+            "Skipping EOS token addition."
+        )
+    elif add_eos_token:
         # Like the incremental formatter, ignore only trailing newlines here.
         if not text.rstrip("\n").endswith(tokenizer.eos_token):
             text += tokenizer.eos_token
     spans = [*spans[:-1], (spans[-1][0], len(text))]
-    if add_bos_token:
-        if tokenizer.bos_token is None:
-            raise ValueError("BOS requested but the tokenizer has no BOS token.")
+    if add_bos_token and tokenizer.bos_token is None:
+        warnings.warn(
+            "add_bos_token is True but the tokenizer does not have a BOS token. "
+            "Skipping BOS token addition."
+        )
+    elif add_bos_token:
         if not text.startswith(tokenizer.bos_token):
             text = tokenizer.bos_token + text
             shift = len(tokenizer.bos_token)
@@ -442,7 +458,7 @@ def get_full_conversation_message_log(
     text, spans = _render_with_message_spans(template, prepared, template_options)
     if mask_generation_prompt:
         spans = _mask_generation_prompts(
-            template, prepared, template_options, text, spans
+            tokenizer, template, prepared, template_options, text, spans
         )
     text, spans = _add_bos_eos(
         tokenizer,
