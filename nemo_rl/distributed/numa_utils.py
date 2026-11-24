@@ -52,6 +52,10 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
     numa_set_preferred() for memory policy. Best-effort: failures are
     logged, never raised.
 
+    Only allocations and threads created after the call follow the binding;
+    existing memory and threads keep their placement. Call it before the
+    first CUDA call to place the CUDA context's host memory on the GPU's socket.
+
     Args:
         gpu_id: Node-global physical GPU index (``nvidia-smi`` numbering), which
             is how the affinity file is keyed. Passed explicitly because

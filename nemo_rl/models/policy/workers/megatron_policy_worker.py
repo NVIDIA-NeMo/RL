@@ -983,12 +983,6 @@ class MegatronPolicyWorkerImpl(
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
-        # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
-        enable_batch_invariant_mode(config)
-        torch.cuda.set_device(local_rank)
-
-        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
-        apply_transformer_engine_patch()
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
@@ -996,7 +990,15 @@ class MegatronPolicyWorkerImpl(
         # keys the affinity file. Pass it explicitly: CUDA_VISIBLE_DEVICES lists
         # all node devices here (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
         # set by configure_worker), so it can't identify this worker's GPU.
+        # Bind before the CUDA context exists so its host memory lands on the GPU's socket.
         bind_to_gpu_numa(local_rank)
+
+        # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
+        enable_batch_invariant_mode(config)
+        torch.cuda.set_device(local_rank)
+
+        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
+        apply_transformer_engine_patch()
 
         # OTel providers are process-global, so the driver's setup does not
         # reach this actor. No-op unless telemetry is enabled.

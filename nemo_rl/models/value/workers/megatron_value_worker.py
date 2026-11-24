@@ -434,9 +434,6 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
-        torch.cuda.set_device(local_rank)
-
-        apply_transformer_engine_patch()
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
@@ -445,7 +442,12 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         # GPU index that keys the affinity file. Pass it explicitly:
         # CUDA_VISIBLE_DEVICES lists all node devices here
         # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
+        # Bind before the CUDA context exists so its host memory lands on the GPU's socket.
         bind_to_gpu_numa(local_rank)
+
+        torch.cuda.set_device(local_rank)
+
+        apply_transformer_engine_patch()
 
         # OTel providers are process-global, so the driver's setup does not
         # reach this actor. No-op unless telemetry is enabled.
