@@ -55,7 +55,6 @@ import yaml
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
@@ -116,6 +115,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
+    forest_execution_row_multiple,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
@@ -1202,17 +1202,14 @@ def test_forest_checkpoint_metadata_compatibility(
             )
 
 
-def _forest_consumer(dp_size: int, **cfg: Any) -> SimpleNamespace:
-    """A fixed-batch Megatron trainer or critic as setup sizes Forest rows for it."""
-    return SimpleNamespace(
-        cfg={
-            "megatron_cfg": {"enabled": True},
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {"enabled": False},
-            **cfg,
-        },
-        sharding_annotations=SimpleNamespace(get_axis_size=lambda _: dp_size),
-    )
+def _forest_consumer(**cfg: Any) -> dict[str, Any]:
+    """A fixed-batch Megatron trainer or critic config as Forest row sizing reads it."""
+    return {
+        "megatron_cfg": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        **cfg,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1232,15 +1229,20 @@ def test_forest_ppo_checkpoint_pins_the_critic_row_multiple(
     mc.token_capture.forest_training = True
     algo_cfg = PPOConfig.model_construct()
     # Policy and reference forwards: DP 2 x lcm(train 2, logprob 2) = 4.
-    policy = _forest_consumer(2, train_micro_batch_size=2, logprob_batch_size=2)
+    policy = _forest_consumer(train_micro_batch_size=2, logprob_batch_size=2)
 
     def row_multiple(*, dp_size: int = 1, **cfg: int) -> int:
         # Critic: DP x lcm(train MBS, logprob_batch_size when set); 1 x 3 by default.
-        value = _forest_consumer(dp_size, **({"train_micro_batch_size": 3} | cfg))
-        return sc_setup_mod._forest_execution_row_multiple(mc, algo_cfg, policy, value)
+        value = _forest_consumer(**({"train_micro_batch_size": 3} | cfg))
+        ppo_mc = mc.model_copy(
+            update={"policy": policy, "value": value, "ppo": algo_cfg}
+        )
+        return forest_execution_row_multiple(
+            ppo_mc, algo_cfg, policy_dp=2, value_dp=dp_size
+        )
 
-    policy_only = sc_setup_mod._forest_execution_row_multiple(
-        mc, algo_cfg, policy, None
+    policy_only = forest_execution_row_multiple(
+        mc.model_copy(update={"policy": policy}), algo_cfg, policy_dp=2
     )
     assert policy_only == 4
     saved = row_multiple()

@@ -88,6 +88,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutRecoveryConfig,
     TokenCaptureConfig,
     TrainerWarmupConfig,
+    _forest_consumer_row_multiple,
     _validate_opd_full_config,
     forest_execution_row_multiple,
     logprob_passes_required,
@@ -3957,21 +3958,21 @@ def test_forest_row_multiple_depends_on_packing(packing: bool, logprobs: bool) -
         train_micro_batch_size=4,
         logprob_batch_size=6,
     )
-    assert forest_execution_row_multiple(
+    assert _forest_consumer_row_multiple(
         mc.policy, dp_size=2, logprobs_required=logprobs
     ) == (2 if packing else (24 if logprobs else 8))
     for invalid_dp in (0, -1, True):
         with pytest.raises(ValueError, match="positive"):
-            forest_execution_row_multiple(
+            _forest_consumer_row_multiple(
                 mc.policy, dp_size=invalid_dp, logprobs_required=logprobs
             )
     mc.policy["dynamic_batching"]["enabled"] = True
     with pytest.raises(ValueError, match="non-interleaved Megatron"):
-        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+        _forest_consumer_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
     mc.policy["dynamic_batching"]["enabled"] = False
     mc.policy["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = 2
     with pytest.raises(ValueError, match="non-interleaved Megatron"):
-        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+        _forest_consumer_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
 
 
 def test_grpo_setup_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp(
@@ -5317,7 +5318,7 @@ def test_forest_row_multiple_rejects_invalid_microbatch_sizes(
 ):
     forest_config.policy[field] = value
     with pytest.raises(ValueError, match="positive integers"):
-        forest_execution_row_multiple(
+        _forest_consumer_row_multiple(
             forest_config.policy, dp_size=2, logprobs_required=True
         )
 
@@ -5436,37 +5437,33 @@ def test_forest_ppo_startup_rejects_unsupported_setting(
 
 @pytest.mark.parametrize("value_packing", [False, True])
 def test_forest_row_multiple_includes_the_critic(forest_config, value_packing):
-    def consumer(cfg, dp_size):
-        return SimpleNamespace(
-            cfg=cfg,
-            sharding_annotations=SimpleNamespace(get_axis_size=lambda _: dp_size),
-        )
-
-    trainer = consumer(forest_config.policy, 2)
-    value_cfg = {
-        "megatron_cfg": {"enabled": True},
-        "dynamic_batching": {"enabled": False},
-        "sequence_packing": {"enabled": value_packing},
-        "train_micro_batch_size": 5,
-    }
-    args = (forest_config, forest_config.grpo, trainer)
-    policy_only = sc_setup_mod._forest_execution_row_multiple(*args, None)
-    assert policy_only == forest_execution_row_multiple(
+    policy_only = forest_execution_row_multiple(
+        forest_config, forest_config.grpo, policy_dp=2
+    )
+    assert policy_only == _forest_consumer_row_multiple(
         forest_config.policy,
         dp_size=2,
         logprobs_required=any(
             logprob_passes_required(forest_config, forest_config.grpo)
         ),
     )
-    critic = consumer(value_cfg, 3)
+    mc = _forest_ppo_config(forest_config)
+    mc.value = {
+        "megatron_cfg": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": value_packing},
+        "train_micro_batch_size": 5,
+    }
+    with pytest.raises(ValueError, match="critic DP size"):
+        forest_execution_row_multiple(mc, mc.ppo, policy_dp=2)
     # Packed critics need whole DP shards; fixed ones DP x lcm(train, value MBS).
-    assert sc_setup_mod._forest_execution_row_multiple(*args, critic) == math.lcm(
-        policy_only, 3 if value_packing else 15
-    )
-    value_cfg["logprob_batch_size"] = 7
-    assert sc_setup_mod._forest_execution_row_multiple(*args, critic) == math.lcm(
-        policy_only, 3 if value_packing else 105
-    )
+    assert forest_execution_row_multiple(
+        mc, mc.ppo, policy_dp=2, value_dp=3
+    ) == math.lcm(policy_only, 3 if value_packing else 15)
+    mc.value["logprob_batch_size"] = 7
+    assert forest_execution_row_multiple(
+        mc, mc.ppo, policy_dp=2, value_dp=3
+    ) == math.lcm(policy_only, 3 if value_packing else 105)
 
 
 def test_forest_startup_rejects_mismatched_configured_batch_size(forest_config):

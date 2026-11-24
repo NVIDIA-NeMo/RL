@@ -21,7 +21,6 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
-import math
 import os
 import threading
 import time
@@ -70,7 +69,6 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
-from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
@@ -87,7 +85,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     dedicated_value_enabled,
     forest_execution_row_multiple,
     is_ppo_run,
-    logprob_passes_required,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
     validate_grpo_chunk_cap_alignment,
@@ -934,30 +931,6 @@ def _spinup_gym(
         ),
     )
     return shard_set, time.perf_counter() - t0
-
-
-def _forest_execution_row_multiple(
-    master_config: MasterConfig,
-    algo_cfg: GRPOConfig | PPOConfig,
-    trainer: TQPolicy,
-    value: Optional[TQValue],
-) -> int:
-    """Rows per Forest group must split evenly for the policy and any critic."""
-    multiple = forest_execution_row_multiple(
-        trainer.cfg,
-        dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-        logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
-    )
-    if value is None:
-        return multiple
-    return math.lcm(
-        multiple,
-        forest_execution_row_multiple(
-            value.cfg,
-            dp_size=value.sharding_annotations.get_axis_size("data_parallel"),
-            logprobs_required="logprob_batch_size" in value.cfg,
-        ),
-    )
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -2757,7 +2730,16 @@ def setup_single_controller(
                 )
             )
     forest_row_multiple = (
-        _forest_execution_row_multiple(master_config, algo_cfg, trainer, value)
+        forest_execution_row_multiple(
+            master_config,
+            algo_cfg,
+            policy_dp=trainer.sharding_annotations.get_axis_size("data_parallel"),
+            value_dp=(
+                None
+                if value is None
+                else value.sharding_annotations.get_axis_size("data_parallel")
+            ),
+        )
         if token_capture_cfg.forest_training
         else 1
     )
