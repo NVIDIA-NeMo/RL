@@ -42,6 +42,7 @@ from pydantic import BaseModel, ConfigDict
 from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation import vllm as vllm_generation_pkg
 from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery
+from nemo_rl.models.generation.prefix_recovery.recovery import _ResolvedGenerationCut
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -927,18 +928,30 @@ def test_prefix_overflow_precedes_media_validation(
 def test_restored_call_reaches_the_engine_with_the_remaining_budget(
     monkeypatch, prefix_tokens, max_tokens, min_tokens, terminal
 ):
-    """The engine sees the durable prefix as prompt and only what is left to decode."""
+    """The engine sees the durable prefix as prompt and only what is left to decode.
+
+    The restored routes and sampler top-k reach the call's capture, and a
+    finished prefix answers with its restored routes: native and Dynamo both
+    restore through start_capture.
+    """
     app = _FakeApp()
     conversation = [10, 31, 2]
     # The cut's rows: the generated tokens, with one non-generated token that
     # a resumed call must not count as its own output.
     delta = [40 + i for i in range(prefix_tokens)] + [99]
     mask = [1.0] * prefix_tokens + [0.0]
+    # One route row per saved token: 1 layer, top-2.
+    routes = torch.arange(2 * len(delta), dtype=torch.int16).reshape(-1, 1, 2)
+    sampler_topk = (
+        torch.zeros(prefix_tokens, 4, dtype=torch.long),
+        torch.zeros(prefix_tokens, 4),
+    )
     admission = SimpleNamespace(
         mode="token_in",
         request_replay=None,
         capture_key="r0",
         model_call_id="c1",
+        prev_len=len(conversation),
         generation_cut=SimpleNamespace(
             prefix_token_count=prefix_tokens,
             effective_output_limit=6,
@@ -962,14 +975,15 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
         "_resolve_admission_prefix",
         lambda self, admission: list(conversation),
     )
-    monkeypatch.setattr(
-        NoPrefixRecovery,
-        "resolve_restore",
-        lambda self, admission, prefix: (
-            admission,
-            SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
-        ),
-    )
+
+    async def resolve_restore(self, admission, prefix):
+        return admission, _ResolvedGenerationCut(
+            snapshot=SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
+            routed_experts=routes,
+            sampler_topk=sampler_topk,
+        )
+
+    monkeypatch.setattr(NoPrefixRecovery, "resolve_restore", resolve_restore)
     begin = MagicMock()
     monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
@@ -1022,10 +1036,19 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
     assert (request.max_tokens, request.min_tokens) == (max_tokens, min_tokens)
     assert request._original_min_tokens == 4
     assert begin.call_args.kwargs["resumed_generation_token_ids"] == delta[:-1]
+    assert begin.call_args.kwargs["generation_cut_routed_experts"] is routes
+    assert begin.call_args.kwargs["generation_cut_sampler_topk"] is sampler_topk
     if terminal is not None:
         # Answered from the saved prefix, without decoding a token.
         assert outputs == ["finished output"]
         assert [finished.reason for finished in built] == [terminal]
+        # The engine never ran, so the answer carries the saved routes: the
+        # turn before the delta and the final token have none.
+        terminal_routes = built[0].routed_experts
+        assert terminal_routes.shape[0] == len(conversation) + len(delta)
+        assert torch.equal(terminal_routes[len(conversation) : -1], routes[:-1])
+        assert (terminal_routes[: len(conversation)] < 0).all()
+        assert (terminal_routes[-1] < 0).all()
 
 
 def test_setup_refuses_a_full_generator_without_the_restored_call_arguments():

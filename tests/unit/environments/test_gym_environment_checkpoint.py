@@ -96,7 +96,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
             assert snapshot is not None
             assert snapshot.commit.manifest.instances == {"tools/replica-0": ()}
             async with barrier.checkpoint() as cut:
-                await snapshot.check_against_cut(cut)
+                await snapshot.check_against_cut(cut, frozenset())
                 assert ledger.expected_staging_keys() == {"on-wire/call-0"}
                 actor.mark("tq-cut")
         await asyncio.wait_for(completion, _ASYNC_TEST_TIMEOUT_S)
@@ -458,7 +458,7 @@ def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
         async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
             assert snapshot is not None
             async with barrier.checkpoint() as cut:
-                await snapshot.check_against_cut(cut)
+                await snapshot.check_against_cut(cut, frozenset())
 
         (commit,) = [call for call in actor.calls if call[0] == "commit"]
         assert commit[1][2] == (saved,)
@@ -486,7 +486,7 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
             async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
                 assert snapshot is not None
                 async with barrier.checkpoint() as cut:
-                    await snapshot.check_against_cut(cut)
+                    await snapshot.check_against_cut(cut, frozenset())
 
         assert actor.operations()[-1] == "resume"
 
@@ -921,12 +921,15 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
 
     @staticmethod
     async def _save(
-        gym: Any, barrier: DataPlaneCheckpointBarrier, tmp_path: Path
+        gym: Any,
+        barrier: DataPlaneCheckpointBarrier,
+        tmp_path: Path,
+        tq_staging_keys: frozenset[str] = frozenset(),
     ) -> None:
         async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
             assert snapshot is not None
             async with barrier.checkpoint() as cut:
-                await snapshot.check_against_cut(cut)
+                await snapshot.check_against_cut(cut, tq_staging_keys)
 
     @staticmethod
     def _assert_restorable(
@@ -1026,16 +1029,12 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 )
             )
 
-            async def list_staging_keys() -> list[str]:
-                # The dropped row's staging is gone by the time the cut looks.
-                return [key_0]
+            gym = gym_environment_checkpoint(coordinator, ledger)
 
-            gym = gym_environment_checkpoint(
-                coordinator, ledger, list_staging_keys=list_staging_keys
-            )
-
+            # The dropped row's staging is gone by the time the cut looks.
             await asyncio.wait_for(
-                self._save(gym, barrier, tmp_path), _ASYNC_TEST_TIMEOUT_S
+                self._save(gym, barrier, tmp_path, frozenset({key_0})),
+                _ASYNC_TEST_TIMEOUT_S,
             )
 
             saved = load_gym_checkpoint_manifest(tmp_path)
@@ -1067,18 +1066,13 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 )
             )
 
-            async def list_staging_keys() -> list[str]:
-                return [key_0]
-
-            gym = gym_environment_checkpoint(
-                coordinator, ledger, list_staging_keys=list_staging_keys
-            )
+            gym = gym_environment_checkpoint(coordinator, ledger)
 
             async def save() -> frozenset[str]:
                 async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
                     assert snapshot is not None
                     async with barrier.checkpoint() as cut:
-                        return await snapshot.check_against_cut(cut)
+                        return await snapshot.check_against_cut(cut, frozenset({key_0}))
 
             kept = await asyncio.wait_for(save(), _ASYNC_TEST_TIMEOUT_S)
 
@@ -1108,7 +1102,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 ledger.mark_environment_retired({"tools/replica-0": [row_0]})
                 async with barrier.checkpoint() as cut:
                     with pytest.raises(RuntimeError, match="ownership changed"):
-                        await snapshot.check_against_cut(cut)
+                        await snapshot.check_against_cut(cut, frozenset())
 
         asyncio.run(exercise())
 
@@ -1167,15 +1161,6 @@ class _GateRecordingManager:
         self.gates.append(gate)
 
 
-class _StagingClient:
-    def __init__(self) -> None:
-        self.partitions: list[str] = []
-
-    def list_sample_ids(self, *, partition_id: str) -> list[str]:
-        self.partitions.append(partition_id)
-        return ["staged-0"]
-
-
 def _builder_config(*, turn: bool, prefix: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         rollout_recovery=SimpleNamespace(
@@ -1197,7 +1182,6 @@ def test_build_fences_the_generation_workers_for_prefix_recovery() -> None:
         _builder_config(turn=False, prefix=True),  # type: ignore[arg-type]
         env_handles={"nemo_gym": FakeGymActor()},
         rollout_manager=_GateRecordingManager(),  # type: ignore[arg-type]
-        dp_client=_StagingClient(),
         generation=generation,
     )
 
@@ -1211,7 +1195,6 @@ def test_build_refuses_prefix_recovery_without_a_generation_handle() -> None:
             _builder_config(turn=False, prefix=True),  # type: ignore[arg-type]
             env_handles={"nemo_gym": FakeGymActor()},
             rollout_manager=_GateRecordingManager(),  # type: ignore[arg-type]
-            dp_client=_StagingClient(),
         )
 
 
@@ -1222,7 +1205,6 @@ def test_build_keeps_no_environment_state_without_turn_recovery() -> None:
         _builder_config(turn=False),  # type: ignore[arg-type]
         env_handles={"nemo_gym": FakeGymActor()},
         rollout_manager=manager,  # type: ignore[arg-type]
-        dp_client=_StagingClient(),
     )
 
     assert isinstance(built, NoEnvironmentCheckpoint)
@@ -1230,15 +1212,13 @@ def test_build_keeps_no_environment_state_without_turn_recovery() -> None:
 
 
 def test_build_wires_gym_for_turn_recovery() -> None:
-    """Gym closes dispatch through the gate it installs and reads staged rows."""
+    """Gym closes dispatch through the gate it installs."""
     manager = _GateRecordingManager()
-    client = _StagingClient()
 
     built = build_environment_checkpoint(
         _builder_config(turn=True),  # type: ignore[arg-type]
         env_handles={"nemo_gym": FakeGymActor()},
         rollout_manager=manager,  # type: ignore[arg-type]
-        dp_client=client,
     )
 
     assert isinstance(built, GymEnvironmentCheckpoint)
@@ -1247,5 +1227,3 @@ def test_build_wires_gym_for_turn_recovery() -> None:
     assert built._ledger is manager.recovery_ledger
     assert built._allow_restart_only_servers is True
     assert built._obsolete_cut_rows is None
-    assert asyncio.run(built._list_staging_keys()) == ["staged-0"]
-    assert client.partitions == ["rollout_staging"]

@@ -110,7 +110,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     if config.ppo.async_ppo is None:

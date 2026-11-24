@@ -35,9 +35,10 @@ This module imports vLLM; import it only where vLLM is installed.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Collection, Optional, Protocol
 
+import torch
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
 )
@@ -50,6 +51,7 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _classify_restored_prefix_terminal,
+    _restored_prefix_terminal_routes,
     _RestoredPrefixTerminal,
     mark_restored_terminal,
     plan_restore,
@@ -114,6 +116,11 @@ class RestoredCall:
     output_limit: int
     # What is left of that budget; None keeps the request's own.
     max_tokens: Optional[int]
+    # Router replay: the saved prefix's routes; None when cuts stage no routes.
+    routed_experts: Optional[torch.Tensor] = None
+    # Score centering: the saved prefix's sampler top-k (token ids, logprobs);
+    # None when cuts stage none.
+    sampler_topk: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 async def resolve_restored_call(
@@ -128,12 +135,13 @@ async def resolve_restored_call(
     """
     if serving_admission.generation_cut is None:
         return serving_admission, None
-    # Off-loop: the saved rows are a blocking TQ read.
-    resolved_admission, saved = await asyncio.to_thread(
-        host._prefix_recovery.resolve_restore, serving_admission, prefix_token_ids
+    # On the serving loop, so restores arriving together share one TQ read.
+    resolved_admission, resolved = await host._prefix_recovery.resolve_restore(
+        serving_admission, prefix_token_ids
     )
-    if saved is None:
+    if resolved is None:
         return resolved_admission, None
+    saved = resolved.snapshot
     original_min_tokens = getattr(request, "min_tokens", None)
     plan = plan_restore(
         prefix_token_ids=prefix_token_ids,
@@ -152,6 +160,8 @@ async def resolve_restored_call(
         resumed_generation_token_ids=list(plan.resumed_generation_token_ids),
         output_limit=plan.output_limit,
         max_tokens=plan.max_tokens,
+        routed_experts=resolved.routed_experts,
+        sampler_topk=resolved.sampler_topk,
     )
 
 
@@ -460,6 +470,15 @@ async def start_capture(
         terminal = classify_restored_terminal(
             restored, prompt_token_ids, admission, max_model_len=max_model_len
         )
+        if terminal is not None and restored.routed_experts is not None:
+            # The engine never runs for a terminal prefix, so its output
+            # carries the restored routes instead.
+            terminal = replace(
+                terminal,
+                routed_experts=_restored_prefix_terminal_routes(
+                    restored.routed_experts, prev_len=admission.prev_len
+                ),
+            )
         # A restored terminal prefix generates nothing more.
         max_tokens = None
         if not plan.measure_only and terminal is None:
@@ -511,6 +530,10 @@ async def start_capture(
         prefix_token_ids=plan.begin_call_prefix_token_ids,
         media=media,
         generation_cut=None if restored is None else restored.saved,
+        generation_cut_routed_experts=(
+            None if restored is None else restored.routed_experts
+        ),
+        generation_cut_sampler_topk=None if restored is None else restored.sampler_topk,
         resumed_generation_token_ids=(
             None if restored is None else restored.resumed_generation_token_ids
         ),
