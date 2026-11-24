@@ -234,6 +234,41 @@ def test_malformed_think_tag_string_check_catches_spelled_out_tags():
     )
 
 
+@pytest.mark.parametrize(
+    "gen_1, gen_2, allow, expected",
+    [
+        # the terminal turn was cut off mid-thought
+        ([11, 2, 12], [14, 15], False, 1),
+        ([11, 2, 12], [14, 15], True, 0),
+        # only the final span is exempt
+        ([11, 12], [14, 2, 15], True, 1),
+        # the exemption does not cover a generated open tag or a second close tag
+        ([11, 2, 12], [1, 14], True, 1),
+        ([11, 2, 12], [14, 2, 2], True, 1),
+    ],
+)
+def test_final_span_may_be_unclosed(gen_1, gen_2, allow, expected):
+    prompt_1, prompt_2 = [10, THINK_OPEN], [13, THINK_OPEN]
+    reward, counts, _ = finalize_capture_reward(
+        1.0,
+        checks=None,
+        penalty_config=RewardPenaltyConfig(
+            penalize_malformed_think_tag=True,
+            token_ids={"think_open": THINK_OPEN, "think_close": THINK_CLOSE},
+        ),
+        effort_config=None,
+        token_ids=[*prompt_1, *gen_1, *prompt_2, *gen_2],
+        link_spans=[
+            ("c1", len(prompt_1), len(gen_1)),
+            ("c2", len(prompt_2), len(gen_2)),
+        ],
+        decode=_decode,
+        thinking_tags=["<think>", "</think>"],
+        final_span_may_be_unclosed=allow,
+    )
+    assert (counts["malformed_think_tag"], reward) == (expected, 1.0 - expected)
+
+
 def test_malformed_think_tag_requires_decode():
     reward, counts, _ = finalize_capture_reward(
         1.0,

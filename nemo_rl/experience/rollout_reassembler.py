@@ -607,6 +607,9 @@ class RolloutReassembler:
                     link_spans=reward_spans,
                     decode=self._decode if self._tokenizer is not None else None,
                     thinking_tags=self._thinking_tags,
+                    # Forest scoring stops at the terminal call, the one call the
+                    # output limit can cut off mid-thought.
+                    final_span_may_be_unclosed=forest_training,
                 )
             except ValueError as error:
                 return rejected(f"reward_processing:{error}", staging_keys)
