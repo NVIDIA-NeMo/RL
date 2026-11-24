@@ -22,7 +22,9 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 
 _PARTITION_ID = "rollout_data"
 # TQReplayBuffer.commit writes these training-row fields per prompt;
@@ -161,3 +163,51 @@ class _SyncDPAdapter:
                 v = torch.nested.to_padded_tensor(v, padding=0)
             out[k] = v
         return TensorDict(out, batch_size=td.batch_size)
+
+
+class _ReadyGroupBuffer:
+    """Replay-buffer surface the samplers read, holding complete ready groups."""
+
+    def __init__(self, generations: int) -> None:
+        self._generations = generations
+        self._groups_added = 0
+        self.meta_list: list[KVBatchMeta] = []
+        self.target_step_list: list[int] = []
+        self.ready_list: list[bool] = []
+
+    def __len__(self) -> int:
+        return len(self.meta_list)
+
+    @property
+    def start_weight_list(self) -> list[int]:
+        return [0] * len(self.meta_list)
+
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        del group_ids
+
+    def add_groups(self, count: int) -> None:
+        for _ in range(count):
+            group = f"group-{self._groups_added}"
+            self._groups_added += 1
+            self.meta_list.append(
+                KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name=None,
+                    sample_ids=[f"{group}_g{i}" for i in range(self._generations)],
+                    sequence_lengths=[16] * self._generations,
+                    tags=[{"weight_version": 0, GROUP_ID_TAG: group}]
+                    * self._generations,
+                )
+            )
+            self.target_step_list.append(0)
+            self.ready_list.append(True)
+
+    async def claim_for_training(self, indices: list[int]) -> int:
+        for index in sorted(indices, reverse=True):
+            del self.meta_list[index]
+            del self.target_step_list[index]
+            del self.ready_list[index]
+        return len(indices)
