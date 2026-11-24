@@ -3153,6 +3153,7 @@ def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capt
             return stream()
 
     impl = _nemo_gym_impl(True)
+    impl._tokenizer = SimpleNamespace(pad_token_id=0)
     impl._length_penalty_config = LengthPenaltyConfig(
         default=LengthPenaltyParams(
             length_type="chars", group_total_length_penalty_coeff=0.2

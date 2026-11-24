@@ -3668,7 +3668,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
             handles={"tools": [first, second]}, route_to_shard={"agent": "tools"}
         )
     }
-    impl._tokenizer = None
+    impl._tokenizer = SimpleNamespace(pad_token_id=0)
     impl._effort_config = None
     impl._length_penalty_config = None
 
@@ -3702,17 +3702,26 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     assert selected == [second, second, second]
 
 
-def _postprocess_rollouts(first_prompts, group_ids=None, agent_name="agent"):
+def _postprocess_rollouts(
+    first_prompts, group_ids=None, agent_name="agent", taskset=None
+):
     """Postprocess one group whose first prompts are the given token lists.
 
     ``group_ids`` mirrors what ``_prepare_nemo_gym_rows`` stamps on each row;
     ``None`` entries leave the key off, as rows from a direct caller arrive.
+    ``taskset`` builds materialized task rows, which carry no ``agent_ref``.
     """
     if group_ids is None:
         group_ids = [None] * len(first_prompts)
     rows = []
     for group_id in group_ids:
-        row = {"agent_ref": {"name": agent_name}}
+        if taskset is None:
+            row = {"agent_ref": {"name": agent_name}}
+        else:
+            row = {
+                "task_id": {"taskset": taskset, "task_id": "first"},
+                "task_input": {},
+            }
         if group_id is not None:
             row[rollouts_mod.NEMO_GYM_GROUP_ID_KEY] = group_id
         rows.append(row)
@@ -3760,8 +3769,8 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     The comparison is within each logical prompt group (``_ng_group_id``),
     so a validation batch with one rollout per prompt stays
     silent, and rows without the key form a single group. The warning is
-    reported once per agent name in a process; the ``baseline_groups/*`` keys
-    carry the per-step signal.
+    reported once per attribution key in a process; the ``baseline_groups/*``
+    keys carry the per-step signal.
     """
     monkeypatch.setattr(rollouts_mod, "_DISTINCT_FIRST_PROMPT_WARNED", set())
 
@@ -3787,7 +3796,7 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert record.levelname == "WARNING"
     assert "form 1 logical prompt group(s) with 2 distinct" in record.getMessage()
     assert "do not share a prompt prefix" in record.getMessage()
-    assert "agent(s) ['agent']" in record.getMessage()
+    assert "attribution key(s) ['agent']" in record.getMessage()
 
     # The same agent's next group still reports the count but warns no more.
     caplog.clear()
@@ -3820,7 +3829,7 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert partial.rollout_metrics["baseline_groups/logical_groups"] == 2
     [record] = warnings()
     assert "3 NeMo-Gym rollouts form 2 logical prompt group(s)" in record.getMessage()
-    assert "agent(s) ['other']" in record.getMessage()
+    assert "attribution key(s) ['other']" in record.getMessage()
 
     # Shared text across groups must not hide a split within one of them.
     caplog.clear()
@@ -3835,7 +3844,17 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert overlapping.rollout_metrics["baseline_groups/samples"] == 4
     [record] = warnings()
     assert "do not share a prompt prefix" in record.getMessage()
-    assert "agent(s) ['overlapping']" in record.getMessage()
+    assert "attribution key(s) ['overlapping']" in record.getMessage()
+
+    # A materialized task row carries no agent_ref; its taskset is reported.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        materialized = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9]], taskset="math:train"
+        )
+    assert materialized.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    [record] = warnings()
+    assert "attribution key(s) ['math:train']" in record.getMessage()
 
     # A one-rollout group is trivially distinct and must stay silent.
     caplog.clear()

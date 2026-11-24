@@ -159,10 +159,11 @@ BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC = "baseline_groups/distinct_first_
 BASELINE_GROUPS_LOGICAL_GROUPS_METRIC = "baseline_groups/logical_groups"
 BASELINE_GROUPS_SAMPLES_METRIC = "baseline_groups/samples"
 
-# Agent names whose rollouts were already reported, in this process, for not
-# sharing a first prompt within a logical prompt group. Reported the first time
-# only: a harness that renders a per-rollout identifier does so in every group
-# of every step, and the baseline_groups/* keys carry the per-step signal.
+# Attribution keys (the agent of a flat row, the taskset of a materialized task)
+# whose rollouts were already reported, in this process, for not sharing a first
+# prompt within a logical prompt group. Reported the first time only: a harness
+# that renders a per-rollout identifier does so in every group of every step,
+# and the baseline_groups/* keys carry the per-step signal.
 _DISTINCT_FIRST_PROMPT_WARNED: set[str] = set()
 
 
@@ -3553,21 +3554,21 @@ def _postprocess_single_nemo_gym_group(
     rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = logical_groups
     rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(results)
     if any(len(prompt_ids) > 1 for prompt_ids in prompt_ids_by_group.values()):
-        unreported_agents = sorted(
-            {row["agent_ref"]["name"] for row in nemo_gym_rows}
+        unreported_keys = sorted(
+            {result["attribution_key"] for result in results}
             - _DISTINCT_FIRST_PROMPT_WARNED
         )
-        if unreported_agents:
-            _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_agents)
+        if unreported_keys:
+            _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_keys)
             logger.warning(
                 "%d NeMo-Gym rollouts form %d logical prompt group(s) with %d "
                 "distinct first prompts; rollouts within at least one group do not "
                 "share a prompt prefix. Check that per-rollout identifiers are not changing "
-                "the agent harness prompt (agent(s) %s; reported once per agent).",
+                "the agent harness prompt (attribution key(s) %s; reported once per key).",
                 len(results),
                 logical_groups,
                 distinct_first_prompts,
-                unreported_agents,
+                unreported_keys,
             )
 
     final_batch = BatchedDataDict[DatumSpec](
