@@ -129,6 +129,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
 )
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -722,6 +723,13 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
 
     def set_tally_step_provider(self, provider: Any) -> None:
         self.tally_step_provider = provider
