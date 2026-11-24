@@ -265,6 +265,10 @@ class MegatronDynamoEngine:
             "update_weights_from_collective", refit_timeout_s=refit_timeout_s
         )
 
+    def swap_weights_via_reshard(self) -> list[ray.ObjectRef]:
+        # The native refit's receive side; the trainers send with is_source=True.
+        return self._all("swap_weights_via_reshard", is_source=False)
+
     def suspend_for_refit(self) -> list[ray.ObjectRef]:
         return self._all("suspend_for_refit")
 

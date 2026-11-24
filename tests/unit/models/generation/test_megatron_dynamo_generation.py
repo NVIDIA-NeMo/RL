@@ -931,6 +931,49 @@ def test_resume_attempts_every_engine_and_reports_all_failures(env):
     ]
 
 
+def _native(refit_backend: str, prefill_tp: int = 2) -> dict:
+    """A config whose engines refit through Megatron-Core's native path."""
+    generation = _with_layout({"tensor_model_parallel_size": prefill_tp})
+    generation["refit_transport"] = "mcore"
+    generation["mcore_generation_config"]["refit_backend"] = refit_backend
+    generation["mcore_generation_config"]["refit_execution_batch_bytes"] = None
+    return generation
+
+
+@pytest.mark.parametrize("refit_backend", ["gloo", "nccl"])
+@pytest.mark.parametrize("prefill_tp", [2, 4], ids=["uniform", "mixed"])
+def test_native_refit_fans_out_with_rank_offsets(env, prefill_tp, refit_backend):
+    generation = env.started(
+        generation_config=_native(refit_backend, prefill_tp), world_size=prefill_tp + 4
+    )
+    assert generation.uses_native_refit
+    world_size = 8 + prefill_tp + 4
+    prefixes = (0, prefill_tp, prefill_tp + 2)
+
+    # No HF conversion tasks on the native path: nothing reaches an engine.
+    assert generation.prepare_refit_info(None) is None
+    assert env.log == []
+
+    futures = generation.init_collective(
+        "10.0.0.9", 1234, world_size, train_world_size=8
+    )
+    futures += generation.update_weights_from_collective()
+    # One future per rank of every engine, for the init and for the swap.
+    assert len(futures) == 2 * (prefill_tp + 4)
+    assert env.log == [
+        f"{name}.mcore_init(ws={world_size},off={8 + prefix},"
+        f"backend={refit_backend},batch=None)"
+        for name, prefix in zip(_NAMES, prefixes, strict=True)
+    ] + [f"{name}.swap(source=False)" for name in _NAMES]
+
+    # The native transfer cannot be aborted: a deadline is refused before any
+    # engine is entered.
+    env.log.clear()
+    with pytest.raises(NotImplementedError, match="cannot enforce a refit deadline"):
+        generation.update_weights_from_collective(refit_timeout_s=5.0)
+    assert env.log == []
+
+
 def test_rank_offsets_continue_across_replicas(env):
     """A second replica's engines start after the first replica's, not at the trainers."""
     env.nodes = ["10.0.0.1"] * 3 + ["10.0.0.2"] * 3
