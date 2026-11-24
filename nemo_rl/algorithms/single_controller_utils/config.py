@@ -2291,8 +2291,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
         if is_ppo_run(master_config):
             if forest_algo_cfg.value_training_mode != "whole_batch":  # type: ignore
-                # Forest pads the whole step to the critic's DP and microbatch
-                # sizes; split mode shards each chunk on its own.
+                # Not yet validated with Forest: group padding aligns every chunk to
+                # both models, but no test or run covers the per-chunk critic update.
                 raise ValueError(
                     "forest training requires ppo.value_training_mode=whole_batch"
                 )
