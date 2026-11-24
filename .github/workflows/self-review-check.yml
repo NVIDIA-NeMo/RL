@@ -36,9 +36,8 @@ permissions:
   statuses: write
 
 concurrency:
-  # One group per PR and trigger type: a newer run cancels only an older run of the same type, so each type's
-  # latest run finishes and the PR's check list never shows a leftover cancelled run. This also keeps fork review
-  # events (read-only token) from cancelling a run that can post. Each run reads reviews and threads fresh.
+  # One group per PR and trigger type: a run cancels only older runs of its own type, so the check list keeps no
+  # cancelled run. Fork review runs (read-only token) also can't cancel a push run that can post.
   group: self-review-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
