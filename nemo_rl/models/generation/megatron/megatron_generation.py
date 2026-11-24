@@ -37,6 +37,7 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -106,10 +107,7 @@ class MegatronGeneration(GenerationInterface):
         """
         colocated = config["generation"]["colocated"]["enabled"]
         placement = config["generation"]["colocated"]
-        explicit_placement = any(
-            placement.get(key) is not None
-            for key in ("learner_gpu_indices", "engine_gpu_indices")
-        )
+        explicit_placement = sm_partition.role_gpu_indices(placement) != (None, None)
         cluster._init_placement_groups(
             strategy=None if colocated else "PACK",
             use_unified_pg=explicit_placement
@@ -375,9 +373,9 @@ class MegatronGeneration(GenerationInterface):
             **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
         }
-        if any(
-            config["generation"]["colocated"].get(key) is not None
-            for key in ("learner_gpu_indices", "engine_gpu_indices")
+        if sm_partition.role_gpu_indices(config["generation"]["colocated"]) != (
+            None,
+            None,
         ):
             # Bridge validates dummy train/eval batch metadata even on inference-only workers.
             # Preserve the learner batch; align the copied metadata to the engine's DP size.
@@ -420,15 +418,10 @@ class MegatronGeneration(GenerationInterface):
         config: PolicyConfig, cluster: RayVirtualCluster
     ) -> Optional[list[int]]:
         """Match joint dense/expert shard ownership across the two rank layouts."""
-        from nemo_rl.models.megatron import sm_partition
-
         if sm_partition.engine_sm_fraction(config) is None:
             return None
         placement_config = config["generation"]["colocated"]
-        if any(
-            placement_config.get(key) is not None
-            for key in ("learner_gpu_indices", "engine_gpu_indices")
-        ):
+        if sm_partition.role_gpu_indices(placement_config) != (None, None):
             return None  # The borrowed views already establish both role orders.
         placement = sm_partition.engine_rank_gpus(
             cluster.world_size(),

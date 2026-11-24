@@ -1108,3 +1108,21 @@ def test_validate_role_gpu_subsets_fails_before_placement(learner, engine, match
     )
     with pytest.raises(ValueError, match=match):
         smp.validate_gpu_subsets(cfg, 16)
+
+
+@pytest.mark.parametrize(
+    "count, overrides, match",
+    [
+        (True, {}, "positive integer"),
+        (0, {}, "positive integer"),
+        (17, {}, "available GPU pool"),
+        (2, {}, "expert"),
+        (8, {"engine_gpu_indices": [0, 1, 2, 3]}, "only one"),
+        (8, {"learner_gpu_indices": [0, 1, 2, 3]}, "number of learner GPUs"),
+    ],
+)
+def test_validate_inference_gpu_count(count, overrides, match):
+    cfg = _cfg(**{"megatron_cfg.context_parallel_size": 1})
+    cfg["generation"]["colocated"].update(num_inference_gpus=count, **overrides)
+    with pytest.raises(ValueError, match=match):
+        smp.validate_gpu_subsets(cfg, 16)

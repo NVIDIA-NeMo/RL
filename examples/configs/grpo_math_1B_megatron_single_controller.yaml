@@ -237,10 +237,8 @@ policy:
       async_engine: true
     colocated:
       enabled: false
-      # Ordered indices in the topology-sorted pool for co-resident Megatron.
-      # null selects all GPUs. Every engine GPU must also be a learner GPU.
-      learner_gpu_indices: null
-      engine_gpu_indices: null
+      # MPS inference uses all learner GPUs by default, or the first N in topology order.
+      num_inference_gpus: null
       learner_mps_priority: null
       inference_mps_priority: null
       resources:

@@ -537,8 +537,7 @@ def _build_clusters(
         # Reserve once before the trainer and generation builders start on separate threads.
         MegatronGeneration.init_cluster_placement_groups(cluster, master_config.policy)
         placement = generation_config["colocated"]
-        learner_indices = placement.get("learner_gpu_indices")
-        engine_indices = placement.get("engine_gpu_indices")
+        learner_indices, engine_indices = sm_partition.role_gpu_indices(placement)
         train_cluster = (
             cluster if learner_indices is None else cluster.subset(learner_indices)
         )

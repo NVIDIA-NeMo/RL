@@ -542,7 +542,16 @@ def test_build_clusters_reuses_all_training_gpus_for_mps(monkeypatch):
     init_groups.assert_called_once_with(train, master_config.policy)
 
 
-def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
+@pytest.mark.parametrize(
+    "selection, expected",
+    [
+        ({"num_inference_gpus": 8}, range(8)),
+        ({"engine_gpu_indices": list(range(8, 16))}, list(range(8, 16))),
+    ],
+)
+def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(
+    monkeypatch, selection, expected
+):
     cfg = _make_master_config(backend="megatron", megatron_enabled=True)
     cfg.policy["megatron_cfg"].update(
         tensor_model_parallel_size=1,
@@ -552,7 +561,7 @@ def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
         expert_tensor_parallel_size=1,
     )
     placement = cfg.policy["generation"]["colocated"]
-    placement.update(engine_sm_fraction=0.42, engine_gpu_indices=list(range(8, 16)))
+    placement.update(engine_sm_fraction=0.42, **selection)
     parent = MagicMock(num_gpus_per_node=8)
     factory = MagicMock(return_value=parent)
     monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", factory)
@@ -560,7 +569,7 @@ def test_build_clusters_borrows_gpu_groups_from_one_mps_pool(monkeypatch):
     assert train is parent and engine is parent.subset.return_value
     assert value is teacher is None
     factory.assert_called_once()
-    parent.subset.assert_called_once_with(list(range(8, 16)))
+    parent.subset.assert_called_once_with(expected)
     parent._init_placement_groups.assert_called_once_with(
         strategy="PACK", use_unified_pg=True
     )

@@ -216,7 +216,7 @@ def test_subset_engine_batch_metadata_uses_its_own_dp_world(monkeypatch):
     config["train_global_batch_size"] = 64
     config["train_micro_batch_size"] = 2
     config["generation"]["colocated"].update(
-        enabled=False, engine_sm_fraction=0.0, engine_gpu_indices=list(range(24))
+        enabled=False, engine_sm_fraction=0.0, num_inference_gpus=24
     )
     config["generation"]["mcore_generation_config"].update(
         tensor_model_parallel_size=2,

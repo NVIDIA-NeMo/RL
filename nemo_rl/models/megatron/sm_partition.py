@@ -26,7 +26,7 @@ import os
 import subprocess
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
@@ -108,7 +108,7 @@ def validate(
     if frac is None:
         gen = (policy_cfg or {}).get("generation") or {}
         placement = gen.get("colocated") or {}
-        for key in ("learner_gpu_indices", "engine_gpu_indices"):
+        for key in ("num_inference_gpus", "learner_gpu_indices", "engine_gpu_indices"):
             if placement.get(key) is not None:
                 raise ValueError(f"{key} requires co-resident Megatron generation")
         return
@@ -446,19 +446,42 @@ class ParallelismLayout:
             )
 
 
+def role_gpu_indices(
+    placement: Mapping[str, Any],
+) -> tuple[Sequence[int] | None, Sequence[int] | None]:
+    """Resolve inference count in learner rank order. None denotes the parent pool."""
+    learner = placement.get("learner_gpu_indices")
+    engine = placement.get("engine_gpu_indices")
+    count = placement.get("num_inference_gpus")
+    if count is None:
+        return learner, engine
+    if engine is not None:
+        raise ValueError(
+            "Specify only one of num_inference_gpus and engine_gpu_indices"
+        )
+    if type(count) is not int or count < 1:
+        raise ValueError("num_inference_gpus must be a positive integer")
+    if learner is None:
+        return None, range(count)
+    if count > len(learner):
+        raise ValueError("num_inference_gpus exceeds the number of learner GPUs")
+    return learner, learner[:count]
+
+
 def validate_gpu_subsets(policy_cfg: Any, world: int) -> None:
     """Validate ordered roles against the physical pool before Ray reserves GPUs."""
     from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
     placement = policy_cfg["generation"]["colocated"]
-    if all(
-        placement.get(key) is None
-        for key in ("learner_gpu_indices", "engine_gpu_indices")
-    ):
+    learner, engine = role_gpu_indices(placement)
+    if learner is None and engine is None:
         return
+    if (
+        placement.get("num_inference_gpus") is not None
+        and placement["num_inference_gpus"] > world
+    ):
+        raise ValueError("num_inference_gpus exceeds the available GPU pool")
     physical = range(world)
-    learner = placement.get("learner_gpu_indices")
-    engine = placement.get("engine_gpu_indices")
     learner = physical if learner is None else learner
     engine = physical if engine is None else engine
     for role, indices in (("learner", learner), ("engine", engine)):

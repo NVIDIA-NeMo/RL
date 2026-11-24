@@ -7,10 +7,10 @@ Megatron training and inference run in separate processes under CUDA MPS. Each i
 The eight-GPU Nano recipe uses TP1/EP4 for both roles. By default, all eight GPUs run both processes. To train on all eight and run one four-GPU inference group, use
 
 ```bash
-bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.engine_gpu_indices=[4,5,6,7]'
+bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.num_inference_gpus=4'
 ```
 
-`learner_gpu_indices` and `engine_gpu_indices` specify each role’s logical GPU order within the same topology-sorted parent pool. A null list selects the entire parent pool independently for that role. Every engine GPU must also be a learner GPU, and each role must fill complete dense and expert model-parallel groups. For 16 learners and eight inference workers on the last eight GPUs, leave the learner list null and select engine indices 8 through 15. Reversing those selections fails validation. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
+The learner uses the full training allocation. Set `policy.generation.colocated.num_inference_gpus` to run inference on the first N of those GPUs in topology order. For example, a count of 8 in a 16-GPU allocation runs training on all 16 and inference on eight. The count must fit complete inference model-parallel groups. The conventional disjoint setup uses its existing resource split.
 
 The Nano recipe gives both roles full SM access (`engine_sm_fraction: 0.0`). Under contention it favors inference by running its MPS client at normal priority (`0`) and the learner at below-normal priority (`1`). These are CUDA scheduling hints. Set either priority independently at launch. For example, to give both clients normal priority:
 
