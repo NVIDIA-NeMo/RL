@@ -319,11 +319,11 @@ The value of the design is therefore: a contract where there was a side effect, 
 
 | Phase | Scope | Acceptance | Status |
 | --- | --- | --- | --- |
-| 0 | Root-reason counts and re-rooted token counts on the existing path | Distribution measured on the SWE recipe. This sizes the benefit of every later phase. | Metrics implemented. Measured on a two-step SWE smoke only; see [SWE smoke](#swe-smoke). |
+| 0 | Root-reason counts and re-rooted token counts on the existing path | Distribution measured on the SWE recipe. This sizes the benefit of every later phase. | Metrics implemented. Measured on 16 SWE rollouts of two tasks; see [SWE smoke](#swe-smoke). |
 | 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation and by training rows built from the route in a unit test. |
 | 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations. The SWE smoke ran two steps with identical root statistics in the first step; prompts were not compared token by token there. |
-| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Rejection mode implemented (`vllm_cfg.tito_reject_root_reasons`). Matching-rule changes not started: the rules live in Gym, and the smoke shows no root reason that a rule change would recover. |
-| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Not started. The Megatron chat endpoint lives in Megatron-LM. |
+| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Rejection mode implemented (`vllm_cfg.tito_reject_root_reasons`). No matching-rule change made: in 299 measured calls no root had a reason that a rule change would recover. The rules live in Gym. |
+| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Not started. The token-only route has to be added to the Megatron-LM server; see [Megatron backend](#megatron-backend). |
 
 ## Implementation status
 
@@ -359,7 +359,24 @@ Two GRPO steps of the SWE-bench Verified smoke recipe (Qwen3-0.6B, one prompt, t
 
 The first step is the same in both arms, as expected when the two paths build the same prompts. The second step differs in how many calls the agent made, which this sample cannot attribute to the interface: sampling is not deterministic across runs and each step has two rollouts. The loss and gradient norm were zero in both arms, so the smoke shows that data flows through training and nothing about learning.
 
-The only root reason other than `first_call` was `no_prefix_match`, which no design that accepts text histories can recover. This sample gives no reason to change the root policy, and it is too small to rule one out.
+A longer run with the interface on, eight steps and sixteen rollouts on the same two tasks, finished without a bridge error or a poisoned rollout:
+
+| Calls | Token-in | `first_call` roots | `no_prefix_match` roots | Other root reasons | `finalize/rerooted_tokens` |
+| --- | --- | --- | --- | --- | --- |
+| 299 | 276 (92.3%) | 16 | 7 (2.3%) | 0 | 53224 |
+
+The only root reason other than `first_call` was `no_prefix_match`, which no design that accepts text histories can recover. `ambiguous_candidate`, `non_user_suffix`, `render_options_changed`, and `worker_rooted` did not occur, so these runs give no reason to change the matching rules. They cover two tasks, one agent harness, and a 0.6B model; a different harness can produce a different distribution.
+
+### Megatron backend
+
+Not implemented. What it needs, and where:
+
+| Piece | Where | State |
+| --- | --- | --- |
+| Token-only route | The Megatron-LM text generation server, which NeMo RL starts through `start_text_gen_server` and does not own | Missing. It must accept a token prompt and pass the request's `ng_capture` through `offload_params`, as the chat route does. |
+| Parent resolution | `TQMegatronPromptPreparer.prepare_prompt` in `nemo_rl/models/generation/megatron/token_capture.py` | Exists for the chat route: it resolves the admission's staged prefix and splices it over the rendered history. For a token prompt it would prepend the prefix instead. |
+| Chat adapter | The same `prepare_prompt` | The splice there can be replaced by the shared `bridge_suffix`. Not done, because it cannot be validated without a Megatron inference run. |
+| Recording | `TQMegatronTokenStager` | Unchanged. |
 
 What the first implementation leaves out:
 
@@ -442,7 +459,7 @@ Yes. The design is built on it. The TITO path is the token capture path with one
 ## Not yet verified
 
 - No root-reason distribution has been measured at a useful sample size, so the share of token shift this design removes is unknown.
-- The interface has run only a two-step SWE smoke. Throughput is unmeasured, and the root-reason distribution comes from four rollouts.
+- The interface has run 16 SWE rollouts of two tasks with one agent harness. Throughput is unmeasured, and the root-reason distribution of other harnesses and tasks is unknown.
 - Only the Qwen3 template has been qualified. Qualification is what establishes the bridge for any other template.
 - The bridge assumes every turn-close token ends a turn. A recipe whose `stop_token_ids` include a token that the template also emits inside a turn is not supported, and qualification does not detect it.
 - vLLM's own render, generate, and derender routes were read in the v0.33.0 source. The implementation calls the engine directly and does not use them.
