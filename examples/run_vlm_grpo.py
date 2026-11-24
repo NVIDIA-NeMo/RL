@@ -19,14 +19,14 @@ import time
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, async_grpo_train, setup
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    async_grpo_train,
+    grpo_train,
+    setup,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane.factory import (
-    make_policy_factory,
-    maybe_configure_data_plane_env,
-    select_sync_trainer,
-)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
@@ -99,8 +99,6 @@ def main() -> None:
         print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     with rl_init_timer.time("ray_connect"):
-        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 
     with rl_init_timer.time("tokenizer"):
@@ -146,7 +144,6 @@ def main() -> None:
             dataset,
             val_dataset,
             processor=processor,
-            policy_factory=make_policy_factory(config.data_plane),
         )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -192,13 +189,11 @@ def main() -> None:
             processor=processor,
         )
     else:
-        # ``select_sync_trainer`` prints which sync trainer it picked.
-        trainer = select_sync_trainer(master_config, label="VLM GRPO")
-        # grpo_train_sync defers checkpoint finalization to the checkpointer's
-        # background threads; the context manager guarantees they are flushed on
-        # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+        print("🚀 Running synchronous VLM GRPO training")
+        # Flush the checkpointer's background finalization threads on exit;
+        # shutdown() is idempotent.
         with checkpointer:
-            trainer(
+            grpo_train(
                 policy,
                 policy_generation,
                 dataloader,

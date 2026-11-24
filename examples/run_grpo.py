@@ -26,11 +26,6 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane.factory import (
-    make_policy_factory,
-    maybe_configure_data_plane_env,
-    select_sync_trainer,
-)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import (
@@ -119,8 +114,6 @@ def main() -> None:
         # and the waterfall name a phase the same way.
         with startup_span():
             with rl_init_timer.time("ray_init"):
-                # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-                maybe_configure_data_plane_env(config.data_plane)
                 # Opens rl.setup.ray_init itself, so no span here.
                 init_ray()
 
@@ -172,7 +165,6 @@ def main() -> None:
                     tokenizer,
                     dataset,
                     val_dataset,
-                    policy_factory=make_policy_factory(config.data_plane),
                 )
 
             rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -232,15 +224,12 @@ def main() -> None:
                     alias_to_group_alias=alias_to_group_alias,
                 )
             else:
-                # Two parallel synchronous trainers (verl-style — main_ppo.py vs
-                # main_ppo_sync.py). data_plane.enabled selects which one runs.
-                trainer = select_sync_trainer(master_config)
-                trainer_owns_environment_shutdown = trainer is grpo_train
-                # grpo_train_sync defers checkpoint finalization to the checkpointer's
-                # background threads; the context manager guarantees they are flushed on
-                # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+                print("🚀 Running synchronous GRPO training")
+                trainer_owns_environment_shutdown = True
+                # Flush the checkpointer's background finalization threads on exit;
+                # shutdown() is idempotent.
                 with checkpointer:
-                    trainer(
+                    grpo_train(
                         policy,
                         policy_generation,
                         dataloader,
