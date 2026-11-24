@@ -146,10 +146,12 @@ def apply_simulator_overrides(
         colocated = generation["colocated"]
         if not colocated["enabled"]:
             colocated["resources"]["num_nodes"] = settings.num_nodes
-            if generation["backend"] == "sglang":
+            gpus_per_node = colocated["resources"]["gpus_per_node"]
+            # A null gpus_per_node is left to setup, which rejects it with a clear error.
+            if generation["backend"] == "sglang" and gpus_per_node is not None:
                 # SGLang sizes its engines from num_gpus, not from the cluster.
                 generation["sglang_cfg"]["sglang_server_config"]["num_gpus"] = (
-                    colocated["resources"]["gpus_per_node"] * settings.num_nodes
+                    gpus_per_node * settings.num_nodes
                 )
         raw_config["cluster"]["num_nodes"] = settings.num_nodes
     raw_config["data"]["validation"] = None

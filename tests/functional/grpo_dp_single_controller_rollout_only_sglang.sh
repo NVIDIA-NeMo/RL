@@ -69,6 +69,9 @@ uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --
     $@ \
     2>&1 | tee $RUN_LOG
 
+# Gate the SGLang stand-in by name: the hold-time gate below passes for any no-op synchronizer.
+grep -q "weight_sync=SGLangNoOpWeightSynchronizer" $RUN_LOG
+
 if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 

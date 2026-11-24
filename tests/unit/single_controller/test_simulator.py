@@ -102,6 +102,17 @@ def test_apply_overrides_sizes_sglang_engines_from_num_nodes() -> None:
     assert generation["colocated"]["resources"]["num_nodes"] == 4
 
 
+def test_apply_overrides_leaves_a_null_sglang_gpus_per_node_to_setup() -> None:
+    raw = _raw_config()
+    generation = raw["policy"]["generation"]
+    generation["backend"] = "sglang"
+    generation["colocated"]["resources"]["gpus_per_node"] = None
+    generation["sglang_cfg"] = {"sglang_server_config": {"num_gpus": 1}}
+    # Setup rejects the null with a clear message; the override must not raise first.
+    apply_simulator_overrides(raw, SimulatorConfig(num_nodes=4))
+    assert generation["sglang_cfg"]["sglang_server_config"]["num_gpus"] == 1
+
+
 def test_apply_overrides_keeps_recipe_values_when_keys_are_unset() -> None:
     raw = _raw_config()
     apply_simulator_overrides(raw, SimulatorConfig())
@@ -431,8 +442,10 @@ def test_noop_weight_synchronizer_is_never_stale_and_holds_the_refit_time() -> N
 class _FakeSGLangGeneration:
     """Records the refit lifecycle calls an SGLang synchronizer makes."""
 
-    def __init__(self, *, invalidate_ok: bool = True) -> None:
-        self.pause_generation_mode = "retract"
+    def __init__(
+        self, *, invalidate_ok: bool = True, pause_generation_mode: str = "retract"
+    ) -> None:
+        self.pause_generation_mode = pause_generation_mode
         self.calls: list[tuple[str, Any]] = []
         self._invalidate_ok = invalidate_ok
 
@@ -447,15 +460,17 @@ class _FakeSGLangGeneration:
         self.calls.append(("continue_generation", None))
 
 
-def test_sglang_noop_synchronizer_pauses_flushes_holds_and_resumes() -> None:
-    gen = _FakeSGLangGeneration()
+# Both modes, so a sync_weights that ignores the configured mode fails here.
+@pytest.mark.parametrize("mode", ["abort", "retract"])
+def test_sglang_noop_synchronizer_pauses_flushes_holds_and_resumes(mode: str) -> None:
+    gen = _FakeSGLangGeneration(pause_generation_mode=mode)
     synchronizer = SGLangNoOpWeightSynchronizer(generation=gen, refit_time_s=0.05)
     assert synchronizer.is_stale is False
     started = time.perf_counter()
     assert synchronizer.sync_weights(kv_scales=None) is None
     assert time.perf_counter() - started >= 0.05
     assert gen.calls == [
-        ("pause_generation", "retract"),
+        ("pause_generation", mode),
         ("invalidate_kv_cache", None),
         ("continue_generation", None),
     ]

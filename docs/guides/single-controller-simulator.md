@@ -51,7 +51,7 @@ Per step:
 - Cleanup of the consumed rows, the release of buffer capacity and the version advance are the code a training run uses.
 - `_sync_weights` runs its full lifecycle (dispatch gate, `pause_generation_for_refit(clear_cache=recompute_kv_cache_after_weight_updates)`, resume) around a `NoOpWeightSynchronizer` that moves nothing and holds `refit_time_s`. The trainer version advances, which releases the sampler's next target.
 
-Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts; vLLM only), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks.
+Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts; vLLM only), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks. With SGLang the run uses the native rollout path, not NeMo-Gym, so `generation_router` and token capture, which both need NeMo-Gym, are not available either.
 
 ### Refit pause with SGLang
 
