@@ -1204,14 +1204,12 @@ class SGLangGeneration(GenerationInterface):
         With several routers (one per replica under disaggregation) the
         dispatcher picks one: the samples of a prompt share a router, and a
         new prompt goes to the usable router with the fewest requests in
-        flight (a router whose replica lost an engine is skipped).
+        flight (a router whose replica lost an engine is skipped). A request
+        that fails on one router is retried on another usable router; it
+        fails only when no usable router is left to try.
         """
         assert self._dispatcher is not None, "generate_one_sample needs the routers"
-        target = self._dispatcher.acquire(
-            ReplicaDispatcher.prompt_key(input_ids), self._usable_routers()
-        )
-        router_ip, router_port = self._router_endpoints[target]
-        url = f"http://{router_ip}:{router_port}/generate"
+        key = ReplicaDispatcher.prompt_key(input_ids)
 
         # Prepare payload for sglang server
         payload = {
@@ -1220,10 +1218,23 @@ class SGLangGeneration(GenerationInterface):
             "input_ids": input_ids,
         }
 
-        try:
-            output = await self._http_client.post(url, payload)
-        finally:
-            self._dispatcher.release(target)
+        failed: set[int] = set()
+        while True:
+            usable = [r for r in self._usable_routers() if r not in failed]
+            target = self._dispatcher.acquire(key, usable)
+            router_ip, router_port = self._router_endpoints[target]
+            url = f"http://{router_ip}:{router_port}/generate"
+            try:
+                output = await self._http_client.post(url, payload)
+                break
+            except Exception:
+                # A replica can die mid-step; until the next refit restarts it,
+                # its router fails every request, so try the other replicas.
+                failed.add(target)
+                if not any(r not in failed for r in self._usable_routers()):
+                    raise
+            finally:
+                self._dispatcher.release(target)
 
         if "output_token_logprobs" in output["meta_info"]:
             response_tokens = [

@@ -610,6 +610,48 @@ def test_pause_is_prefill_then_decode_and_resume_is_the_reverse(monkeypatch):
     assert [name for name, *_ in events] == ["e0", "e2"]
 
 
+def test_pause_waits_for_every_prefill_engine_before_any_decode_engine(monkeypatch):
+    events = []
+
+    def _get(refs):
+        events.append(("get", len(refs)))
+        return refs
+
+    monkeypatch.setattr(sglang_generation, "ray", SimpleNamespace(get=_get))
+    specs, _, _ = plan_sglang_engines(
+        num_gpus=4,
+        gpus_per_node=4,
+        layout=_layout(prefill=1, decode=1),
+        aggregated_width=1,
+        prefill_width=1,
+        decode_width=1,
+        router_scope="replica",
+    )
+    assert [s.role for s in specs] == ["prefill", "decode"] * 2
+    engines = [_RecordingEngine(name, events) for name in ("p0", "d0", "p1", "d1")]
+    generation = _generation_with_specs(specs, engines)
+
+    generation.pause_generation(mode="abort")
+    assert events == [
+        ("p0", "pause", "abort"),
+        ("p1", "pause", "abort"),
+        ("get", 2),
+        ("d0", "pause", "abort"),
+        ("d1", "pause", "abort"),
+        ("get", 2),
+    ]
+    events.clear()
+    generation.continue_generation()
+    assert events == [
+        ("d0", "continue"),
+        ("d1", "continue"),
+        ("get", 2),
+        ("p0", "continue"),
+        ("p1", "continue"),
+        ("get", 2),
+    ]
+
+
 def test_aggregated_engines_pause_all_at_once(monkeypatch):
     monkeypatch.setattr(
         sglang_generation, "ray", SimpleNamespace(get=lambda refs: refs)
@@ -1047,3 +1089,82 @@ def test_refit_peer_env_is_the_nccl_part_of_the_engine_transport_env(monkeypatch
         disagg=False, **{"sglang_cfg.disagg": {"transfer_backend": "nixl"}}
     )
     assert sglang_refit_peer_env(aggregated, {}) == {}
+
+
+class _RouterClient:
+    """Posts that fail for the URLs in ``failing`` and answer two tokens otherwise."""
+
+    def __init__(self, failing=()):
+        self.failing = set(failing)
+        self.posted = []
+
+    async def post(self, url, payload):
+        self.posted.append(url)
+        if url in self.failing:
+            raise RuntimeError(f"router down: {url}")
+        return {
+            "meta_info": {
+                "output_token_logprobs": [(-0.5, 11), (-0.25, 12)],
+                "finish_reason": {"type": "stop"},
+            }
+        }
+
+
+def _two_router_generation(client):
+    generation = _bare_generation()
+    generation._http_client = client
+    generation._router_endpoints = [("10.0.0.1", 8600), ("10.0.0.2", 8600)]
+    generation._dispatcher = ReplicaDispatcher(2)
+    return generation
+
+
+def test_generate_one_sample_retries_a_failed_request_on_another_router():
+    client = _RouterClient(failing={"http://10.0.0.1:8600/generate"})
+    generation = _two_router_generation(client)
+
+    result = asyncio.run(generation.generate_one_sample({}, [1, 2, 3], 7))
+
+    assert result == (7, [11, 12], [-0.5, -0.25], False)
+    assert client.posted == [
+        "http://10.0.0.1:8600/generate",
+        "http://10.0.0.2:8600/generate",
+    ]
+    assert generation._dispatcher._inflight == [0, 0]
+    # The prompt's later samples follow it to the router that answered.
+    key = ReplicaDispatcher.prompt_key([1, 2, 3])
+    assert generation._dispatcher._sticky[key] == 1
+
+
+def test_generate_one_sample_fails_once_every_router_failed():
+    client = _RouterClient(
+        failing={"http://10.0.0.1:8600/generate", "http://10.0.0.2:8600/generate"}
+    )
+    generation = _two_router_generation(client)
+
+    with pytest.raises(RuntimeError, match="router down: http://10.0.0.2"):
+        asyncio.run(generation.generate_one_sample({}, [1], 0))
+    assert len(client.posted) == 2
+    assert generation._dispatcher._inflight == [0, 0]
+
+
+def test_generate_one_sample_with_one_router_raises_its_error_unchanged():
+    error = RuntimeError("router 502")
+
+    class _Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, payload):
+            self.calls += 1
+            raise error
+
+    generation = _bare_generation()
+    generation._http_client = _Client()
+    generation._router_endpoints = [("127.0.0.1", 3000)]
+    generation._dispatcher = ReplicaDispatcher(1)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(generation.generate_one_sample({}, [5], 0))
+    assert excinfo.value is error
+    assert generation._http_client.calls == 1
+    assert generation._dispatcher._inflight == [0]

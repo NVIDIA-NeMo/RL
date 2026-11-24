@@ -18,11 +18,11 @@ shares (:class:`~nemo_rl.models.generation.interfaces.DisaggConfig`): a replica 
 ``num_prefill_engines`` prefill engines plus ``num_decode_engines`` decode engines
 behind ``num_frontend_workers`` frontends, and the replica count follows from the
 inference cluster's size. How a backend *implements* that layout lives in its own
-block (``trtllm_cfg`` / ``vllm_cfg``): a per-role engine override
+block (``trtllm_cfg`` / ``vllm_cfg`` / ``sglang_cfg``): a per-role engine override
 (``prefill_engine`` / ``decode_engine``) naming only what the two roles may
 disagree on, plus the backend's frontend and KV-transport settings.
 
-This module holds what both backends need and must agree on:
+This module holds what every backend needs and must agree on:
 
 * reading the layout block as its schema,
 * resolving the role blocks into complete per-role engine configs,
