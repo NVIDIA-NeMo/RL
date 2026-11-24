@@ -904,12 +904,15 @@ def apply_group_length_penalties(
         )
         additive_delta = all_adjustments[i] + profiled_adj + all_pass_rate_len_adj[i]
         additive_base_rewards[i] = original_rewards[i] + additive_delta
-        # Never flip a reward's sign (all-wrong groups stay variance-free); a capped (-inf) rollout lands at exactly 0.
-        # A reward that was already negative (only possible under correct_reward_threshold) is not raised to 0.
-        if additive_base_rewards[i] < 0 and (
-            original_rewards[i] >= 0 or additive_delta == -math.inf
-        ):
-            additive_base_rewards[i] = 0.0
+        # Never flip a reward's sign (all-wrong groups stay variance-free). A capped (-inf)
+        # rollout lands at 0, or at its env reward if that was already below 0.
+        if additive_base_rewards[i] < 0:
+            if original_rewards[i] >= -_BINARY_REWARD_TOL:
+                # Within _is_binary_reward's tolerance, so a binary 0.
+                additive_base_rewards[i] = 0.0
+            elif additive_delta == -math.inf:
+                # The cap never raises a reward that was already below 0.
+                additive_base_rewards[i] = original_rewards[i]
         r["full_result"]["reward"] = additive_base_rewards[i]
 
     # Phase 4: apply per-prompt profile_band multipliers (correct rollouts only).
@@ -975,7 +978,8 @@ def _profiled_length_adjustments(
     Returns:
         One adjustment per rollout: ``-profiled_length_penalty`` past the
         ``constant_over_n_std`` threshold, ``-inf`` past the ``zero_over_max``
-        cap (the phase-3 clamp turns it into exactly 0), otherwise 0.
+        cap (the phase-3 clamp turns it into 0, or keeps an env reward already
+        below 0), otherwise 0.
 
     Raises:
         ValueError: The penalty is on, but the row lacks equal-length
@@ -1016,7 +1020,8 @@ def _profiled_length_adjustments(
             if length >= threshold:
                 adjustments[k] = -plp
     else:
-        # zero_over_max: -inf, so the phase-3 clamp lands it at exactly 0 whatever bonus it also got.
+        # zero_over_max: -inf, so the phase-3 clamp lands it at 0 (or keeps an env reward
+        # already below 0) whatever bonus it also got.
         max_passing = max(passing)
         for k, length in enumerate(total_lengths):
             if length > max_passing:

@@ -1762,6 +1762,30 @@ class TestCorrectRewardThreshold:
         apply(results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1))
         assert rewards_of(results) == pytest.approx([1.05, 0.95, -0.1, 0.3])
 
+    def test_cap_never_raises_a_negative_reward(self):
+        # Total lengths 10, 30, 10, 30 are all over the cap (5): over the cap must
+        # never pay better than under it, so -0.1 stays -0.1.
+        results = self.graded_group([1.0, 1.0, -0.1, 0.3])
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [5, 5]
+        apply(
+            results,
+            self.cfg(threshold=0.5, profiled_length_penalty_type="zero_over_max"),
+        )
+        assert rewards_of(results) == [0.0, 0.0, -0.1, 0.0]
+
+    def test_near_zero_binary_reward_still_clamped_without_threshold(self):
+        # _is_binary_reward accepts |r| <= 1e-6, so -1e-7 is a binary 0; the
+        # profiled penalty must not push it below 0 (all-wrong groups stay
+        # variance-free).
+        results = self.graded_group([-1e-7] * 4)
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [20, 20]
+        apply(results, self.cfg(profiled_length_penalty=0.2))
+        assert rewards_of(results) == [0.0] * 4
+
     def test_reward_components_still_skipped(self):
         results = self.graded_group([1.0, 1.0, 0.4, 0.2])
         for r in results:
@@ -1779,4 +1803,46 @@ class TestCorrectRewardThreshold:
         apply(results, self.cfg(threshold=0.5, pass_rate_length_penalty_weight=0.2))
         assert rewards_of(results) == pytest.approx(
             [1.0 - 0.2 * 0.5 * 10 / 30, 1.0 - 0.2 * 0.5, 0.4, 0.2]
+        )
+
+    @staticmethod
+    def group(rewards, lengths, band=None):
+        return [
+            make_result("x" * n, "", w, band=band) for w, n in zip(rewards, lengths)
+        ]
+
+    def test_reward_equal_to_threshold_is_not_correct(self):
+        # "Strictly greater than": the two 0.5 rollouts are not compared.
+        results = self.graded_group([1.0, 1.0, 0.5, 0.5])
+        apply(results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, 0.5, 0.5])
+
+    @pytest.mark.parametrize("limit, expected", [(12, [1.05, 0.95]), (20, [1.0, 1.0])])
+    def test_profile_gate_averages_only_rollouts_above_threshold(self, limit, expected):
+        # Correct rollouts average 15 chars; counting the long graded ones
+        # (0.4, 0.2 > 0) would make it 30 and open the gate at limit 20.
+        band = {"total": {"a": limit, "b": 1000, "f": 1.0}}
+        results = self.group([1.0, 1.0, 0.4, 0.2], [10, 20, 40, 50], band=band)
+        cfg = self.cfg(
+            threshold=0.5,
+            group_total_length_penalty_coeff=0.1,
+            group_length_penalty_profile_gate=True,
+        )
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx(expected + [0.4, 0.2])
+
+    def test_profile_band_scales_only_rollouts_above_threshold(self):
+        # The multiplier scales the graded reward of correct rollouts
+        # (0.8 * 0.5) and leaves rollouts at or below the threshold alone.
+        band = {"total": {"a": 10, "b": 20, "f": 0.5}}
+        results = self.group([1.0, 0.8, 0.4, 0.2], [10, 20, 20, 20], band=band)
+        apply(results, self.cfg(threshold=0.5, profile_band_total=True))
+        assert rewards_of(results) == pytest.approx([1.0, 0.4, 0.4, 0.2])
+
+    def test_pass_rate_l_max_is_longest_rollout_above_threshold(self):
+        # l_max = 20 (longest correct), not 50 (longest reward > 0).
+        results = self.group([1.0, 1.0, 0.4, 0.2], [10, 20, 40, 50])
+        apply(results, self.cfg(threshold=0.5, pass_rate_length_penalty_weight=0.2))
+        assert rewards_of(results) == pytest.approx(
+            [1.0 - 0.2 * 0.5 * 10 / 20, 1.0 - 0.2 * 0.5, 0.4, 0.2]
         )

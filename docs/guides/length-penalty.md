@@ -594,7 +594,7 @@ its stored `total_reward` and training advantages use the adjusted reward.
 - Most length algorithms act only on positive rollouts (`reward > 0`).
 - Additive penalties can wipe a rollout's reward out but never flip its sign: the adjusted reward is clamped at 0 (stacked flat penalties exceeding the reward produce 0, not a negative value). Non-binary rewards reach the clamp only through the `zero_over_max` cap with `profiled_length_allow_non_binary_rewards`, which rejects negative rewards, or through `correct_reward_threshold`, under which an already negative reward is left as it is; otherwise their groups are skipped wholesale (see Binary Rewards Requirement).
 - `profile_band_*` multipliers also apply only to originally correct rollouts.
-- `profiled_length_penalty_type: zero_over_max` is the one adjustment that overrides all others: a capped rollout's reward is exactly 0. Capped correct rollouts show up in `length_penalty/wiped_correct_frac`.
+- `profiled_length_penalty_type: zero_over_max` is the one adjustment that overrides all others: a capped rollout's reward is 0, or its env reward if that was already below 0. Capped correct rollouts show up in `length_penalty/wiped_correct_frac`.
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group pressure.
 - zMAD is more selective: it only hits high-side outliers.
 
