@@ -52,6 +52,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import (
+    AgentOverrideConfig,
     GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
@@ -588,24 +589,26 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
 @pytest.mark.parametrize(
     ("shared_tp", "prefill", "decode", "segment_size"),
     [
-        # Every engine TP 4: a 1-prefill + 2-decode replica spans 12 GPUs, two nodes.
-        (4, {}, {}, 2),
-        # 1 prefill at TP 4 next to 2 decode at TP 2: an 8-GPU replica, one node.
-        (2, {"tensor_model_parallel_size": 4}, {}, 1),
-        # Per-role widths, not the shared TP 2, size the replica: 8 + 4 + 4 = 16.
+        # Every engine TP 4: the 12-GPU replica spans two nodes, but only one
+        # engine needs NVLink, so a segment is one node.
+        (4, {}, {}, 1),
+        # Per-role widths, not the shared TP 2, size the segment: a TP 8 prefill
+        # engine fills one node.
         (
             2,
             {"tensor_model_parallel_size": 8},
             {"tensor_model_parallel_size": 4},
-            2,
+            1,
         ),
+        # A TP 16 prefill engine spans two 8-GPU nodes, so a segment is two.
+        (2, {"tensor_model_parallel_size": 16}, {}, 2),
     ],
-    ids=["uniform_tp4", "prefill_tp4_decode_tp2", "prefill_tp8_decode_tp4"],
+    ids=["uniform_tp4", "prefill_tp8_decode_tp4", "prefill_tp16"],
 )
 def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
     monkeypatch, shared_tp, prefill, decode, segment_size
 ):
-    """A P/D replica of Megatron engines spans the sum of its engines' TP x PP."""
+    """Behind Dynamo the NVLink segment is the widest engine, not the replica."""
     from tests.unit.models.generation.test_megatron_dynamo_config import (
         MEGATRON_POLICY,
         _megatron_config,
@@ -1249,6 +1252,18 @@ class TestSetup:
         )
 
         with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_agent_overrides_require_token_capture(self):
+        """Without token capture no row is tagged, so the overrides would be ignored."""
+        mc = _make_master_config()
+        mc.grpo.agent_overrides = {
+            "rubric_judge_agent": AgentOverrideConfig(normalize_rewards=False)
+        }
+
+        with pytest.raises(
+            ValueError, match="grpo.agent_overrides requires token_capture.enabled=true"
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_replay_capable_sampler(self):
@@ -3282,6 +3297,41 @@ class TestSetup:
         assert setup_kwargs["prefix_write_max_rows"] == 17
         assert setup_kwargs["prefix_write_max_tokens"] == 4096
         assert setup_kwargs["prefix_read_max_rows"] == 5
+
+    @pytest.mark.parametrize("with_overrides", [False, True])
+    def test_finalizers_stamp_agent_names_only_with_agent_overrides(
+        self, patched_factories, with_overrides: bool
+    ):
+        """grpo.agent_overrides turns on the finalizers' per-row agent tag."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        if with_overrides:
+            mc.grpo.agent_overrides = {
+                "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+            }
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            _patched_gym_token_capture([MagicMock(name="finalizer")]) as (
+                _,
+                mock_create_finalizer_actors,
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (_, actor_config), _ = mock_create_finalizer_actors.call_args
+        assert actor_config.stamp_agent_names is with_overrides
 
     def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
         """The same vLLM workers stage the calls; Gym reaches them through the frontend."""

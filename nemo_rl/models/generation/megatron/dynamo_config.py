@@ -15,16 +15,15 @@
 """Configuration for serving Megatron prefill/decode engines behind Dynamo.
 
 ``policy.generation.dynamo: true`` on a ``backend: megatron`` config is the
-switch. ``policy.generation.dynamo_cfg`` tunes the frontend and the timeouts;
-every field carries its default. The replica shape comes from the
-backend-neutral ``policy.generation.disaggregation`` block, and each role's
+switch. ``policy.generation.dynamo_cfg`` is the same block as for vLLM
+(``nemo_rl.models.generation.dynamo.config.DynamoCfg``): it tunes the frontend
+and the timeouts, and every field carries its default. The replica shape comes
+from the backend-neutral ``policy.generation.disaggregation`` block, and each role's
 engine layout from ``mcore_generation_config.prefill_engine`` / ``decode_engine``.
 """
 
 from collections.abc import Mapping
 from typing import Any
-
-from pydantic import BaseModel, Field, PositiveFloat
 
 from nemo_rl.models.generation.disagg_layout import (
     ROLES,
@@ -33,10 +32,7 @@ from nemo_rl.models.generation.disagg_layout import (
     replica_width_from,
     resolve_disagg_layout,
 )
-from nemo_rl.models.generation.dynamo.config import (
-    DynamoFrontendArgsBase,
-    dynamo_enabled,
-)
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.megatron.config import (
     EngineLayoutOverrides,
     merged_inference_megatron_cfg,
@@ -50,27 +46,6 @@ from nemo_rl.models.generation.megatron.config import (
 DYNAMO_REFIT_TRANSPORTS: tuple[str | None, ...] = (None, "mcore")
 # Copy services the native refit may use behind Dynamo.
 DYNAMO_MCORE_REFIT_BACKENDS: tuple[str, ...] = ("nccl", "gloo")
-
-
-class MegatronDynamoCfg(BaseModel, extra="forbid"):
-    """``policy.generation.dynamo_cfg`` for Megatron engines behind Dynamo."""
-
-    # Bounds etcd/NATS/frontend start-up and every engine's registration.
-    startup_timeout_s: PositiveFloat = 600.0
-    # Deadline for one rollout through the frontend. None waits as long as
-    # generation takes, as the native generate_async does.
-    request_timeout_s: PositiveFloat | None = None
-    # With router_mode kv, each request goes to the prefill engine holding most
-    # of its prefix; each router picks the prefill and the decode engine for its
-    # own requests.
-    frontend_args: DynamoFrontendArgsBase = Field(
-        default_factory=DynamoFrontendArgsBase
-    )
-
-
-def megatron_dynamo_cfg(generation_cfg: Mapping[str, Any]) -> MegatronDynamoCfg:
-    """The validated ``dynamo_cfg`` block; an absent block means all defaults."""
-    return MegatronDynamoCfg.model_validate(generation_cfg.get("dynamo_cfg") or {})
 
 
 def role_overrides(generation_cfg: Mapping[str, Any], role: Role) -> dict[str, int]:
@@ -147,7 +122,9 @@ def replica_width(policy_config: Mapping[str, Any]) -> int:
     """GPUs one prefill/decode replica of Megatron engines spans.
 
     The Dynamo frontend routes across the whole fleet, so a replica only fixes
-    the P:D ratio and keeps each group's engines next to each other.
+    the P:D ratio and keeps each group's engines next to each other. It is not
+    an NVLink unit: ``MegatronGeneration.nvlink_domain_span`` is the widest
+    engine.
     """
     widths = engine_widths(policy_config)
     return replica_width_from(
@@ -205,7 +182,8 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
         ValueError: For a config whose shape the engines cannot serve.
     """
     assert generation_cfg["backend"] == "megatron" and dynamo_enabled(generation_cfg)
-    megatron_dynamo_cfg(generation_cfg)
+    # The same schema as vLLM behind Dynamo: one managed frontend for both.
+    dynamo_cfg(generation_cfg)
     for role in ROLES:
         role_overrides(generation_cfg, role)
     disaggregation = resolve_disagg_layout(generation_cfg)

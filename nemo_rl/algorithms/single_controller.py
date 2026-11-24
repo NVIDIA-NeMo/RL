@@ -2772,7 +2772,7 @@ class SingleControllerActor:
                 b. Full-batch PPO closes each actor epoch here (kept for ppo_epochs > 1);
                     streaming PPO and GRPO accumulate across chunks and close the policy
                     step in 5. Streaming PPO requires ppo.ppo_epochs=1.
-            4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
+            4. Close the chunk. Collect sample lags and refresh the dispatch tally. The
                 consumed rows stay in TQ: staged capture deltas are read by the policy
                 workers during 3, so nothing is cleared until the step closes.
                 Streaming PPO prepares the critic before waiting for the next chunk.
@@ -2816,7 +2816,7 @@ class SingleControllerActor:
             self._step_assembler.begin_step(version_during_step)
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
-            min_sample_version = None
+            sample_lags: list[int] = []
             step_open = False
             value_inference_prepared = False
             chunks_dispatched = 0
@@ -3342,17 +3342,12 @@ class SingleControllerActor:
                         )
 
                     # ---- 4. Clear the batch ----
-                    # Refresh min_sample_version
-                    curr_min_sample_version = min(
-                        t["weight_version"]
+                    # Pool across chunks so each retained rollout has equal weight.
+                    sample_lags.extend(
+                        version_during_step - t["weight_version"]
                         for t in train_meta.tags  # type: ignore
+                        if not forest_training or t["segment_index"] == 0
                     )
-                    if min_sample_version is not None:
-                        min_sample_version = min(
-                            min_sample_version, curr_min_sample_version
-                        )
-                    else:
-                        min_sample_version = curr_min_sample_version
 
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
@@ -3894,14 +3889,18 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # min sample version refers to the version each consumed sample was
-            # generated with; lag = training version - oldest sample version.
-            lag = (
-                version_during_step - min_sample_version
-                if min_sample_version is not None
-                else 0
-            )
-            step_metrics["weight_version_lag"] = lag
+            lag = step_metrics["weight_version_lag_max"] = max(sample_lags, default=0)
+            if sample_lags:
+                step_metrics["weight_version_lag_mean"] = statistics.fmean(sample_lags)
+                percentiles = (
+                    statistics.quantiles(sample_lags, n=100, method="inclusive")
+                    if len(sample_lags) > 1
+                    else sample_lags * 99
+                )
+                for percentile in (50, 90, 95, 99):
+                    step_metrics[f"weight_version_lag_p{percentile}"] = percentiles[
+                        percentile - 1
+                    ]
             # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.

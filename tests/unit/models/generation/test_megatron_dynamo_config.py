@@ -449,3 +449,41 @@ def test_megatron_generation_refuses_router_replay_behind_dynamo() -> None:
         match="router_replay.enabled must be false when policy.generation.dynamo=true",
     ):
         resolve_generation_class(generation).validate_settings(master_config)
+
+
+def test_megatron_generation_refuses_disaggregation_without_dynamo() -> None:
+    """Only the Dynamo fleet reads the block; without it the run would serve
+    plain aggregated engines."""
+    generation = _megatron_config(dynamo=False)
+    with pytest.raises(ValueError, match="requires policy.generation.dynamo=true"):
+        MegatronGeneration.validate_settings(_master_config(generation))
+
+
+def test_dynamo_cfg_is_the_shared_dynamo_schema() -> None:
+    """Megatron reads the same ``dynamo_cfg`` block as vLLM, Gym fields included."""
+    validate_megatron_dynamo_generation(
+        _megatron_config(
+            dynamo_cfg={
+                "request_timeout_s": 30.0,
+                "frontend_args": {
+                    "session_affinity_ttl_secs": 600,
+                    "render_workers": 2,
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="extra_forbidden|Extra inputs"):
+        validate_megatron_dynamo_generation(_megatron_config(dynamo_cfg={"bogus": 1}))
+
+
+def test_nvlink_domain_span_is_the_widest_engine() -> None:
+    """The router pairs prefill and decode engines across the whole fleet, so
+    only one engine needs NVLink, not a whole replica."""
+    policy = _policy(
+        _megatron_config(
+            prefill_engine={"tensor_model_parallel_size": 4},
+            decode_engine={"tensor_model_parallel_size": 1},
+        )
+    )
+    assert replica_width(policy) == 6
+    assert MegatronGeneration.nvlink_domain_span(policy) == 4  # type: ignore[arg-type]

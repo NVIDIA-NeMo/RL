@@ -31,12 +31,12 @@ from nemo_rl.telemetry.setup import (
 )
 
 
-class DynamoFrontendArgsBase(BaseModel, extra="forbid"):
-    """Arguments for the managed ``dynamo.frontend`` every Dynamo backend shares."""
+class DynamoFrontendArgs(BaseModel, extra="forbid"):
+    """Arguments for the managed ``dynamo.frontend`` process."""
 
     # "kv" routes each request to the engine holding most of its prefix, fed by
-    # the engines' KV-cache events. No "direct": it needs a worker ID on every
-    # request, and NeMo RL's rollouts name none.
+    # the engines' vLLM KV-cache events. No "direct": it needs a worker ID on
+    # every request, and NeMo RL's rollouts name none.
     router_mode: Literal[
         "round-robin",
         "random",
@@ -44,38 +44,29 @@ class DynamoFrontendArgsBase(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
-    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
-    # Every frontend holds the whole fleet's sessions, so size it for all of them.
-    session_affinity_max_entries: PositiveInt = 16_777_216
-    # Frontends, spread round-robin over the generation nodes, each with its own
-    # router. More than one adds --router-replica-sync; with router_mode kv, every
-    # router then sees the requests the others have in flight.
-    num_frontends: PositiveInt = 1
-    extra_cli_args: list[str] = Field(default_factory=list)
-    # Extra environment for every frontend, for settings Dynamo reads only from
-    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
-    # the runtime manages.
-    extra_env: dict[str, str] = Field(default_factory=dict)
-
-
-class DynamoFrontendArgs(DynamoFrontendArgsBase):
-    """Frontend arguments for vLLM workers: NeMo-Gym session affinity and chat.
-
-    With router_mode kv the engines' vLLM KV-cache events feed the router.
-    session_affinity_max_entries is allocated as sessions start and reaped after
-    the TTL, so the cap only bounds memory; a large run holds more sessions than
-    Dynamo's own 65,536. With several frontends, NeMo-Gym keeps each session on
-    one.
-    """
-
     # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
     # pins each Gym session to one server; None disables it.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    # Entries are allocated as sessions start and reaped after the TTL, so the cap
+    # only bounds memory; a large run holds more sessions than Dynamo's own 65,536.
+    session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync; with router_mode kv, every
+    # router then sees the requests the others have in flight. NeMo-Gym keeps each
+    # session on one.
+    num_frontends: PositiveInt = 1
     # Processes that render NeMo-Gym's chat calls and build their replies (the
     # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
     # uses one core. Every frontend runs its own. See
     # docs/guides/dynamo-generation.md for sizing.
     render_workers: PositiveInt = 8
+    extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
+    # the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":

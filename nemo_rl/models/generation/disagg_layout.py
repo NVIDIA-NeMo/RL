@@ -64,8 +64,10 @@ def replica_width_from(
 ) -> int:
     """GPUs one prefill/decode replica spans: its prefill engines plus its decode engines.
 
-    The replica is the unit that must stay inside one NVLink domain, since the KV
-    cache crosses from prefill to decode on every turn.
+    For TRT-LLM, whose frontend serves one replica, the replica must stay inside
+    one NVLink domain, since the KV cache crosses from prefill to decode on every
+    turn. Behind Dynamo the router pairs prefill and decode engines across the
+    whole fleet, so there only one engine needs NVLink.
     """
     return (
         layout.num_prefill_engines * prefill_width

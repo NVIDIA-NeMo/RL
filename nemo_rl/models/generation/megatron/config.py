@@ -30,7 +30,7 @@ from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 
 if TYPE_CHECKING:
-    from nemo_rl.models.generation.megatron.dynamo_config import MegatronDynamoCfg
+    from nemo_rl.models.generation.dynamo.config import DynamoCfg
 
 
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
@@ -245,7 +245,7 @@ class MCoreGenerationConfig(GenerationConfig):
     # prefill_engine / decode_engine; `dynamo_cfg` tunes the frontend and the
     # timeouts.
     dynamo: NotRequired[bool]
-    dynamo_cfg: NotRequired["MegatronDynamoCfg"]
+    dynamo_cfg: NotRequired["DynamoCfg"]
     # Not a user key: MegatronDynamoGeneration sets it on each engine's own copy
     # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
     # worker whose config carries it builds the prefill/decode handoff engine.

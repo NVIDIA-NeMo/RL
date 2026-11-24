@@ -41,10 +41,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     reject_unenforceable_refit_deadline,
 )
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_cfg
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    MegatronDynamoCfg,
-    megatron_dynamo_cfg,
     plan_megatron_engines,
     role_overrides,
     validate_megatron_dynamo_generation,
@@ -467,7 +466,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         self.weight_synchronizer: Optional[WeightSynchronizer] = None
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
         # The engines take the policy config as-is; MegatronGeneration types it.
-        self._dynamo_cfg: MegatronDynamoCfg = megatron_dynamo_cfg(self.cfg)
+        self._dynamo_cfg: DynamoCfg = dynamo_cfg(self.cfg)
         # Names these engines' placement groups apart from any other run's.
         self._fleet_id = uuid.uuid4().hex[:8]
         self._num_gpus_per_node = cluster.num_gpus_per_node

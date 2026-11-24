@@ -37,8 +37,9 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    replica_width,
+    engine_widths,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -76,11 +77,13 @@ class MegatronGeneration(GenerationInterface):
         """Largest GPU group requiring full NVLink connectivity.
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
-        Behind Dynamo the unit is one prefill/decode replica: its engines' widths
-        summed, as for TRT-LLM disaggregation.
+        Behind Dynamo the unit is the widest engine: the router picks a request's
+        prefill and decode engine independently across the whole fleet, so the KV
+        handoff is not kept inside a replica and only an engine's own ranks need
+        NVLink.
         """
         if dynamo_enabled(config["generation"]):
-            return replica_width(config)
+            return max(engine_widths(config).values())
         if config["generation"]["colocated"]["enabled"]:
             # Placement must satisfy both the resident training layout and any
             # dedicated inference layout built on those same ranks.
@@ -263,6 +266,18 @@ class MegatronGeneration(GenerationInterface):
             raise NotImplementedError(
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
+            )
+        if not dynamo_enabled(policy_config["generation"]) and (
+            resolve_disagg_layout(policy_config["generation"]).enabled
+        ):
+            # Only MegatronDynamoGeneration reads the disaggregation block;
+            # without Dynamo the run would train plain aggregated engines.
+            raise ValueError(
+                "policy.generation.disaggregation.enabled=true with "
+                "policy.generation.backend='megatron' requires "
+                "policy.generation.dynamo=true: Megatron prefill/decode engines are "
+                "served only behind Dynamo. Set dynamo to true, or set "
+                "disaggregation.enabled to false."
             )
 
     @classmethod

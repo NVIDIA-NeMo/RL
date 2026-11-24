@@ -2660,6 +2660,10 @@ def setup_single_controller(
                     ),
                     thinking_tags=thinking_tags,
                     top_logprobs=master_config.policy["generation"]["top_logprobs"],
+                    stamp_agent_names=(
+                        master_config.grpo is not None
+                        and bool(master_config.grpo.agent_overrides)
+                    ),
                 ),
                 num_workers=token_capture_cfg.num_reassembler_workers,
             )
