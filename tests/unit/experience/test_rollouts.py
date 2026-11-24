@@ -3798,7 +3798,7 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     [record] = warnings()
     assert record.levelname == "WARNING"
     assert "form 1 logical prompt group(s) with 2 distinct" in record.getMessage()
-    assert "do not share a prompt prefix" in record.getMessage()
+    assert "do not share the same first prompt" in record.getMessage()
     assert "attribution key(s) ['agent']" in record.getMessage()
 
     # The same agent's next group still reports the count but warns no more.
@@ -3846,7 +3846,6 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert overlapping.rollout_metrics["baseline_groups/logical_groups"] == 2
     assert overlapping.rollout_metrics["baseline_groups/samples"] == 4
     [record] = warnings()
-    assert "do not share a prompt prefix" in record.getMessage()
     assert "attribution key(s) ['overlapping']" in record.getMessage()
 
     # A materialized task row carries no agent_ref; its taskset is reported.

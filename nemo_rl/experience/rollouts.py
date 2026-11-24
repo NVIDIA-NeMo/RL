@@ -3567,7 +3567,7 @@ def _postprocess_single_nemo_gym_group(
         logger.warning(
             "%d NeMo-Gym rollouts form %d logical prompt group(s) with %d "
             "distinct first prompts; rollouts within at least one group do not "
-            "share a prompt prefix. Check that per-rollout identifiers are not changing "
+            "share the same first prompt. Check that per-rollout identifiers are not changing "
             "the agent harness prompt (attribution key(s) %s; reported once per key).",
             len(results),
             logical_groups,
