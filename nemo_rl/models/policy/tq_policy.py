@@ -41,6 +41,7 @@ from typing import Any, Callable, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import TOTAL_FLOPS_KEY
 from nemo_rl.data_plane import (
     KVBatchMeta,
     build_data_plane_client,
@@ -623,7 +624,7 @@ class TQPolicy(TQDriverMixin, Policy):
         aggregated_results = _aggregate_train_results(results)
 
         if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results[TOTAL_FLOPS_KEY] = self.flops_tracker.total_flops
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
             gpus_per_worker = self.worker_group.cluster.world_size() / max(
                 len(results), 1
@@ -868,7 +869,7 @@ class TQPolicy(TQDriverMixin, Policy):
         aggregated_results = _aggregate_train_results(leader_results)
 
         if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results[TOTAL_FLOPS_KEY] = self.flops_tracker.total_flops
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
 
         return aggregated_results

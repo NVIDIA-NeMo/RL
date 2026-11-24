@@ -913,9 +913,8 @@ def print_performance_metrics(
         "enabled", False
     )
     if TOTAL_FLOPS_KEY in train_results and not packing_enabled:
-        # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
-        # over the driver-side policy_training timer, which returns as soon as the Ray
-        # future is submitted and can be much shorter than actual GPU compute time.
+        # Prefer the worker's CUDA-synchronized elapsed time: the driver-side
+        # policy_training timer also bills dispatch, collection and the slowest rank.
         train_elapsed_seconds = train_results.get(
             "train_elapsed_seconds", timing_metrics["policy_training"]
         )

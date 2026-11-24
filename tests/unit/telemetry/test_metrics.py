@@ -713,14 +713,7 @@ def test_tee_skips_prefixes_other_than_train():
 
 
 def test_the_performance_prefix_is_read_for_scalars_but_not_for_efficiency():
-    """It carries the FLOP rates, and nothing a category series should read.
-
-    ``print_performance_metrics`` output is the only place the v1 loops log
-    the FLOP tracker's rates, so the prefix has to be teed for the rows that
-    name those keys. It holds no ``efficiency/*`` key of its own, and running
-    the efficiency handler over it anyway would let a key that happened to
-    collide land on a category series.
-    """
+    """It carries the FLOP rates, and nothing a category series should read."""
     pytest.importorskip("nemo.lens")
     _import_teed_metric_owners()
     from nemo_rl.telemetry.metrics import (
@@ -819,13 +812,7 @@ def test_map_teed_scalars_reads_training_and_vllm_keys():
 
 
 def test_map_teed_scalars_reads_the_flops_keys():
-    """The three shapes the FLOP tracker's output reaches the Logger in.
-
-    The rates come from the v1 loops' ``performance`` dict and from the
-    ``train`` dict in sft/dpo/distillation; the raw per-step count is what
-    sft_v2 and the Single-Controller forward instead of a rate. All three are
-    one mapping, so a run supplying any of them is covered.
-    """
+    """The three shapes the FLOP tracker's output reaches the Logger in."""
     _import_teed_metric_owners()
 
     from nemo_rl.telemetry.metrics import map_teed_scalars

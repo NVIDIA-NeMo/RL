@@ -32,11 +32,17 @@ from nemo_rl.algorithms.distillation import (
     validate,
 )
 from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
+from nemo_rl.algorithms.metric_utils import (
+    TOTAL_FLOPS_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import Timer
 
 
 @pytest.fixture
@@ -278,6 +284,54 @@ def test_distillation_train_max_steps(mock_components):
         if call.kwargs.get("prefix") == "timing/train"
     ][-1]
     assert final_timing_call.kwargs["step_finished"] is True
+
+
+def test_distillation_train_logs_the_flop_rates_over_the_policy_training_timer(
+    mock_components,
+):
+    """The FLOP rates reach the Logger, and over policy_training, not the step."""
+    mock_components["master_config"].distillation.max_num_steps = 1
+    mock_components["student_policy"].train.return_value = {
+        **mock_components["student_policy"].train.return_value,
+        TOTAL_FLOPS_KEY: 32e12,
+        "num_ranks": 2,
+        "theoretical_tflops": 80.0,
+    }
+
+    with patch.object(
+        Timer,
+        "get_timing_metrics",
+        side_effect=lambda *_args, **_kwargs: {
+            "policy_training": 4.0,
+            "total_step_time": 16.0,
+        },
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _initial_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    train_metrics = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ][-1].args[0]
+
+    # 32e12 FLOP over 4s is 8 TFLOPS, so 4 per GPU across two ranks, and 10% of
+    # the 80 TFLOPS the two ranks peak at.
+    assert train_metrics[TRAIN_FLOPS_PER_GPU_KEY] == pytest.approx(4.0)
+    assert train_metrics[TRAIN_FP_UTILIZATION_KEY] == pytest.approx(0.1)
 
 
 def test_ft_save_period_triggers_periodic_saves(mock_components):

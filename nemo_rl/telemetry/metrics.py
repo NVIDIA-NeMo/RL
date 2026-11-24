@@ -100,11 +100,7 @@ logger = logging.getLogger(__name__)
 # separately below.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = ("train", "")
 
-# Read for declared scalars only, never for the efficiency family. The v1
-# loops log their throughput and FLOP rates in a dict of their own, so the
-# prefix has to be read for the rows that name those keys -- but it carries no
-# ``efficiency/*`` key, and scanning it for them would let another dict's
-# values land on a category series.
+# Declared scalars only; this prefix holds no efficiency/* keys.
 _SCALAR_ONLY_PREFIXES: tuple[Optional[str], ...] = (PERFORMANCE_PREFIX,)
 
 # One dimensioned gauge rather than an instrument per category, so adding a
@@ -778,7 +774,8 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
     """Mirror logged metrics into OTel (no-op unless exporting).
 
     Teed prefixes: the per-step ``train`` dicts (the ``efficiency/*``
-    durations, the training scalars and the ``vllm/*`` engine deltas), the
+    durations, the training scalars and the ``vllm/*`` engine deltas), the v1
+    loops' per-step ``performance`` dict (declared scalars alone), the
     ``timing/setup`` dict at step 0, and the Single-Controller's
     ``timing/rollout_checkpoint``, ``timing/rollout_recovery`` and
     ``rollout/checkpoint_outcome`` dicts. The OTel instruments are touched only
