@@ -36,10 +36,6 @@ ROLLOUT_METRICS = "rollout_metrics"
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
 
-# Each row's whole NeMo-Gym result as a JSON string, for the training-data
-# dump. A column, not a tag: tags ride every metadata RPC.
-GYM_FULL_RESULT_FIELD = "gym_full_result"
-
 # Per-response inverse valid-token mass for equal prompt-group loss reduction.
 GROUP_TOKEN_MEAN_WEIGHT = "group_token_mean_inverse_tokens"
 

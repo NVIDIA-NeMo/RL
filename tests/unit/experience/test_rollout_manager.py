@@ -53,9 +53,11 @@ from nemo_rl.experience.failures import (
     GymTerminalEpisodeFailure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_MODEL_SAMPLING_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1013,6 +1015,43 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert manager._impl._log_full_result_tables is True
 
 
+def test_rollout_manager_stamps_weight_version_only_when_gym_results_log_is_on():
+    """Gym rows carry the dispatch weight version only for the Gym-results log."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 2,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 0,
+            NEMO_GYM_GROUP_ID_KEY: "g",
+            "responses_create_params": {},
+        }
+    }
+
+    off = RolloutManager(**common)
+    assert off._impl._dispatch_weight_version is None
+    rows = off._impl._build_inputs(input_sample, task_index=0)
+    assert all(NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY not in row for row in rows)
+
+    on = RolloutManager(**common, stamp_dispatch_weight_version=True)
+    on._weight_version = 5
+    rows = on._impl._build_inputs(input_sample, task_index=0)
+    assert {row[NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY] for row in rows} == {5}
+
+
 @pytest.mark.parametrize("backend,accepted", [("vllm", True), ("megatron", False)])
 def test_nemo_gym_rollout_accepts_top_k_only_with_vllm(backend, accepted):
     """NeMo-Gym requests leave top_k unset; only NeMo-RL's vLLM server pins it."""
@@ -1042,8 +1081,6 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
-    dump_gym_results=False,
-    gym_results_dir=None,
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -1061,8 +1098,6 @@ def _nemo_gym_impl(
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
         log_full_result_tables=log_full_result_tables,
-        dump_gym_results=dump_gym_results,
-        gym_results_dir=gym_results_dir,
         reward_penalty_config=reward_penalty_config,
     )
 
@@ -1211,14 +1246,10 @@ def test_result_to_completion_truncated_on_length_incomplete_response(
     assert completion.truncated is expected_truncated
 
 
-@pytest.mark.parametrize(
-    ("log_full_result_tables", "dump_gym_results"),
-    [(False, False), (True, False), (False, True)],
-)
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
 @pytest.mark.parametrize("materialized", [False, True])
 def test_streamed_receipt_callback_uses_current_completion_conversion(
     log_full_result_tables,
-    dump_gym_results,
     materialized,
 ):
     attribution_key = "usersim:train" if materialized else "resolved-agent"
@@ -1245,11 +1276,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
 
             return stream()
 
-    impl = _nemo_gym_impl(
-        False,
-        log_full_result_tables=log_full_result_tables,
-        dump_gym_results=dump_gym_results,
-    )
+    impl = _nemo_gym_impl(False, log_full_result_tables=log_full_result_tables)
     env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     results = [None]
     shaping = [None]
@@ -1287,48 +1314,9 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == attribution_key
-    wants_result = log_full_result_tables or dump_gym_results
-    assert (context.full_result_json is not None) is wants_result
-    if wants_result:
-        assert json.loads(context.full_result_json)["reward"] == 1.0
-
-
-@pytest.mark.parametrize("receipt", [False, True])
-def test_every_gym_result_is_logged_as_it_lands(tmp_path, receipt):
-    result = _mask_gate_receipt_result() if receipt else _mask_gate_result()
-
-    class _RunRolloutsRemote:
-        def options(self, *, num_returns):
-            return self
-
-        def remote(self, pending, timer_prefix, per_prompt=False):
-            async def result_ref():
-                return (0, {"name": "agent"}, result, None)
-
-            async def stream():
-                yield result_ref()
-
-            return stream()
-
-    impl = _nemo_gym_impl(False, gym_results_dir=str(tmp_path / "gym_results"))
-    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
-    row = {
-        "_rowidx": 0,
-        NEMO_GYM_GROUP_ID_KEY: "group",
-        NEMO_GYM_GROUP_ATTEMPT_KEY: 1,
-        NEMO_GYM_ROLLOUT_INDEX_KEY: 0,
-    }
-    _run(impl._stream_rows(env, [row], [None], [None], 1, "timing/test"))
-
-    [path] = (tmp_path / "gym_results").glob("gym_results.*.jsonl")
-    [line] = path.read_text().splitlines()
-    assert json.loads(line) == {
-        "group_id": "group",
-        "group_attempt": 1,
-        "rollout_index": 0,
-        "rollout_id": None,
-        "full_result": result["full_result"],
-    }
+    assert (context.full_result_json is not None) is log_full_result_tables
+    if log_full_result_tables:
+        assert "reward" not in json.loads(context.full_result_json)
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -1581,6 +1569,31 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     ]
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+
+
+def test_nemo_gym_build_inputs_gives_every_rollout_a_unique_capture_key():
+    # Without token capture the id is derived per group attempt, so Gym's
+    # model-call capture never falls back to its "{task}-{rollout}" key, which
+    # repeats across steps; with it, the gate ids are used verbatim.
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._dispatch_weight_version = lambda: 7
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 3,
+            NEMO_GYM_GROUP_ID_KEY: "g",
+            "responses_create_params": {},
+        }
+    }
+
+    derived = impl._build_inputs(input_sample, task_index=0)
+    gated = impl._build_inputs(
+        input_sample, task_index=0, rollout_ids=["g_g0_aX", "g_g1_aY"]
+    )
+
+    assert [row[NEMO_GYM_ROLLOUT_ID_KEY] for row in derived] == ["g_g0_a3", "g_g1_a3"]
+    assert [row[NEMO_GYM_ROLLOUT_ID_KEY] for row in gated] == ["g_g0_aX", "g_g1_aY"]
+    assert {row[NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY] for row in derived} == {7}
 
 
 @pytest.mark.parametrize("dataset_task_index", [None, 99])

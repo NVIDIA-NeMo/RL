@@ -326,7 +326,7 @@ Field definitions:
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Each advantage estimator declares `requires_global_batch`, based on its settings. When true, setup rejects streaming chunks and the pool sends the complete batch to one actor. Reinforce++ always requires the global batch; PPO does when `normalize_advantages: true`, and OPD does when `subtract_global_baseline: true`. Standard GRPO, unnormalized PPO, and OPD without the global baseline may shard across actors, keeping each prompt group intact. New estimators must implement this property alongside their calculation; streaming validation and actor dispatch read the same requirement. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `refit_actor.enabled` — runs the weight synchronizer in a separate CPU Ray actor (`RefitActor`) on the controller's node. `false` (the default) keeps it in the controller process, where every refit's fan-out to the train workers and generation leaders, and the wait on their replies, shares the controller's process with rollout dispatch and advantage computation. Enabled, the controller awaits the actor's refit under the same deadline and keeps the rollout gate, generation pause/resume, refit membership and `RefitAborted` recovery; only the transport moves. A RefitActor that dies ends the run with an error naming it: it dies only on an OOM or node loss on the controller's node, which a refit retry cannot recover. Requires non-colocated vLLM or TensorRT-LLM generation with `policy.generation.refit_transport` `null` (collective) or `nccl_reshard`; setup rejects anything else before starting any workers.
-- `log_gym_results` — on a NeMo-Gym run, appends every received Gym rollout result to `<log_dir>/gym_results/gym_results.<pid>.jsonl` before filtering. Each line carries `group_id`, `group_attempt`, `rollout_index`, `rollout_id`, and `full_result`. This log is independent of `log_full_train_data`.
+- `gym_results_log` — on a NeMo-Gym run, logs every Gym rollout and what RL did with it to `<log_dir>/gym_results/`. See [Gym rollout logs](#gym-rollout-logs). Debug-only.
 - `log_full_train_data` — writes every consumed sample to the log dir, as Parquet chunks by default or as `train_data_step<N>.jsonl` with `debug_writer.target: json`. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool and the `json` writer each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. JSON serialization runs in the background. The `train_data_dump` timer sums chunk preparation, submission and backpressure waits with the controller's remaining flush wait and final-file publication; serialization overlapped with computation is excluded. Debug-only — leave it `false` for production runs.
 - `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots taken while training continues (`rollout_checkpointing.snapshot_attempt_interval_s`, or `snapshot_on_trainer_checkpoint` with turn-level recovery), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. The snapshot at the `checkpoint_must_save_by` deadline is allowed: that save publishes `step_N` in the background right away, and the run then stops. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
 
@@ -506,8 +506,83 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 
 ### Full training-data dumps
 
-Set `async_rl.log_full_train_data: true` to write every consumed sample to the logger directory, as Parquet chunks by default (see `async_rl.debug_writer` below). This is independent of `env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked samples and include full token IDs, token/sample loss masks, final clipped advantages, rewards, sample IDs and metadata, generation logprobs, and the student/teacher logprobs when computed. On NeMo-Gym runs, `gym_full_result` holds the Gym result when available. Only padding beyond `input_lengths` is removed; response content is not capped. The `json` writer uses the legacy singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files; the final name is published only after the optimizer step completes. A partial file is not proof of a completed training step.
+Set `async_rl.log_full_train_data: true` to write every consumed sample to the logger directory, as Parquet chunks by default (see `async_rl.debug_writer` below). This is independent of `env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked samples and include full token IDs, token/sample loss masks, final clipped advantages, rewards, sample IDs and metadata, generation logprobs, and the student/teacher logprobs when computed. Only padding beyond `input_lengths` is removed; response content is not capped. The `json` writer uses the legacy singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files; the final name is published only after the optimizer step completes. A partial file is not proof of a completed training step.
 
 The default `async_rl.debug_writer.target: parquet` selects `ParquetDebugWriter`: it writes each chunk as a Parquet file under `train_data_parquet/step-<N>/` in the logger directory, adds reference logprobs and PPO values/returns when computed, and publishes `_manifest.json` in the step directory after the optimizer step. Read only the files the manifest lists; the chunks alone are not proof of a completed step. It needs `pyarrow` and a log directory shared by the workers and the controller. To store the dump elsewhere, set `target` to the dotted import path of a `DebugWriter` subclass, for example `my_pkg.my_module.MyWriter`; any other keys under `async_rl.debug_writer` are passed to its constructor after `log_dir` and `shard_id`. The class implements `_write_chunk`, which receives each validated chunk as tensors, and `_publish_step`, and may override `close`, which the controller calls once at shutdown. It is built on the controller and on every advantage shard, so it must be importable in each of those processes.
 
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds summed across chunk preparation/writes and final-file publication. Chunk dump time is also included in `advantage_calculation`; these timings overlap.
+
+### Gym rollout logs
+
+Set `async_rl.gym_results_log.enabled: true` on a NeMo-Gym run to record every
+rollout Gym returns, including rollouts that are never trained on (filtered,
+evicted as stale, retried, or failed), and what RL did with each. Two
+append-only files land in `<log_dir>/gym_results/`, one per writing process:
+
+- `gym_results.<pid>.jsonl`, written by each NemoGym actor. One `"event":
+  "result"` line per Gym result, written as it arrives and before RL
+  post-processing, so the reward is Gym's raw reward and the token arrays of
+  the legacy (token-capture-off) path are still present. Each line carries
+  `rollout_id`, `group_id`, `group_attempt`, `rollout_index`, `task_index`,
+  `agent`, `dispatch_weight_version`, `token_capture`, and `full_result`. A
+  failed `/run` writes one `"event": "error"` line naming the rollouts still
+  pending (Gym does not say which one failed); a result RL cannot post-process
+  writes one naming that rollout.
+- `rl_outcomes.<pid>.jsonl`, written by the replay buffer (`buffered` when a
+  group's rows land in TransferQueue, `evicted` when a stale group is dropped,
+  both per group) and by the advantage stage (`trained` or `masked`, per
+  sample, with `train_step` numbered like `train_data_step<N>.jsonl` and the
+  final reward).
+
+`full_result` is what the agent's `/run` returned: the prompt, the final
+response the verifier scored, the reward and verifier fields, and the agent's
+own report of the rollout when it writes one (`ng_trajectory` and/or
+`ng_agent_observations`). That report varies by agent, and many agents return
+only their final answer. With `include_model_calls: true` (the default) the
+actor also merges NeMo-Gym's own record of every model call the rollout made
+through Gym's model server -- subagents, summarization, and LLM judges that
+use Gym's client included -- the same way `ng_collect_rollouts` does:
+`ng_model_call_capture` (per-call metadata), a normalized `ng_trajectory` with
+`model_calls[]` (request/response bodies unless `include_payloads: false`) and
+`ng_perf`. The merge runs on a copy, so nothing extra travels to the trainer.
+Gym only records model calls when its capture is on, so this requires:
+
+```yaml
+env:
+  nemo_gym:
+    observability_enabled: true
+    model_call_capture_dir: /absolute/path/every/gym/node/can/write
+```
+
+Setup rejects the combination otherwise. With `compact: true` (the default) each
+line drops what it repeats, and nothing else:
+
+- the identity keys enrichment stamps on `full_result` (the line carries them at
+  top level),
+- `ng_model_call_capture.calls` when every captured call already appears in
+  `ng_trajectory.model_calls` (otherwise the capture keeps its calls),
+- null-valued fields,
+- a captured call's `request.input`, `request.tools`, `response.output` or
+  `response.tools` that equals the agent's own field. It is replaced by a
+  reference such as `"=full_result.responses_create_params.input"` or
+  `"=full_result.response.output"`; a call whose body differs keeps it in full.
+
+Every captured call keeps its entry, timing, status, `finish_reason` and token
+counts. Set `compact: false` to log Gym's record unchanged.
+
+Every row carries a unique
+`_ng_rollout_id` (the token-capture gate id, or `<group_id>_g<i>_a<attempt>`),
+which keys both the capture file and the log line. Each rollout's capture
+file is deleted once merged (`delete_capture_after_merge`). Calls a verifier
+makes outside Gym's client, and files an agent leaves outside its result,
+are not captured.
+
+`rl_outcomes` ids are TransferQueue ids: `group_id` and `sample_id`
+(`<group_id>_g<rollout_index>`). With token capture on they equal the Gym
+rows' `group_id`; with it off TransferQueue mints a group id per attempt, and
+each `buffered` line records the `gym_group_id` and `gym_group_attempt` it
+maps to. So a `gym_results` line joins its outcome through `group_id` +
+`group_attempt` -> `buffered` -> TQ `group_id` + `rollout_index`. With token
+capture on, the trained token IDs and logprobs are in TransferQueue and the
+training-data dump rather than in these logs; with it off, they ride inside
+each model call's response body.

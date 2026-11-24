@@ -42,7 +42,6 @@ from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any, Optional, cast
 
-import numpy as np
 import torch
 
 from nemo_rl.data.captured_media import (
@@ -54,7 +53,6 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     AGENT_NAME_TAG,
-    GYM_FULL_RESULT_FIELD,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -416,7 +414,6 @@ class RolloutReassembler:
         thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
         stamp_agent_names: bool = False,
-        dump_gym_results: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         # grpo.agent_overrides: stamp each published row's tag with its group's
@@ -426,7 +423,6 @@ class RolloutReassembler:
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags
-        self._dump_gym_results = dump_gym_results
         self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -1158,7 +1154,6 @@ class RolloutReassembler:
             group_id,
             rows,
             rollout_ids,
-            log_contexts=log_contexts,
             slot_agent_names=slot_agent_names,
             mask_sample=mask_sample,
             fallback_weight_version=fallback_weight_version,
@@ -1236,7 +1231,6 @@ class RolloutReassembler:
         rows: list[FinalizedRollout],
         rollout_ids: list[str],
         *,
-        log_contexts: Sequence[RewardLogContext | None],
         slot_agent_names: Optional[list[Optional[str]]] = None,
         mask_sample: list[bool],
         fallback_weight_version: int,
@@ -1427,21 +1421,6 @@ class RolloutReassembler:
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
-        if self._dump_gym_results:
-            # Forest segments inherit their owner's result. Execution padding
-            # has no owner and must still publish a value for the column.
-            results = [
-                ctx.full_result_json if ctx and ctx.full_result_json else "null"
-                for ctx in log_contexts
-            ]
-            if logical is not None:
-                results = [
-                    results[tag["logical_slot"]]
-                    if tag["logical_slot"] is not None
-                    else "null"
-                    for tag in logical.tags
-                ]
-            train_batch[GYM_FULL_RESULT_FIELD] = np.asarray(results, dtype=object)
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         media_fields = _media_fields_for_group(layouts)

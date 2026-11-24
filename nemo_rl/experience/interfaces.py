@@ -21,6 +21,10 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Gym's run-body rollout id, shared between capture, logging and RL.
+NEMO_GYM_ROLLOUT_ID_KEY = "_ng_rollout_id"
+# Trainer weight version when the row was dispatched, for the Gym-results log.
+NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY = "_ng_dispatch_weight_version"
 # Names owned by Gym (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL), copied because their
 # readers cannot import nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat route also
 # serves workers built without nemo_gym (the ModelOpt workers). A test checks they still match.

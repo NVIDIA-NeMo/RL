@@ -158,7 +158,6 @@ class RolloutReassemblerActorConfig:
     # penalize_malformed_think_tag needs to decode generations.
     tokenizer_config: TokenizerConfig | None = None
     thinking_tags: tuple[str, ...] | None = None
-    dump_gym_results: bool = False
 
 
 @ray.remote(
@@ -200,7 +199,6 @@ class RolloutReassemblerActor:  # pragma: no cover
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
             stamp_agent_names=config.stamp_agent_names,
-            dump_gym_results=config.dump_gym_results,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

@@ -45,8 +45,16 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
-  # Append each received NeMo-Gym result to gym_results/ in the log dir.
-  log_gym_results: false
+  # NeMo-Gym runs: log every Gym rollout (with each model call it made) and
+  # RL's decision about it to gym_results/ in the log dir (debug).
+  gym_results_log:
+    enabled: false
+    # Needs env.nemo_gym.observability_enabled and model_call_capture_dir.
+    include_model_calls: true
+    include_payloads: true
+    delete_capture_after_merge: true
+    # Drop repeated fields; repeated call bodies become =full_result references.
+    compact: true
   # Write every consumed sample to the log dir (debug); the format follows debug_writer.
   log_full_train_data: false
   # Writer used by log_full_train_data. parquet writes Parquet chunks, json writes

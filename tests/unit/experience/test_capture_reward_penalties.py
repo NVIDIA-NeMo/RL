@@ -727,15 +727,3 @@ def test_checkpoint_inventory_retains_length_penalty_settings():
     }
     restored = CaptureRewardSettings.from_state(saved.to_state())
     restored.require_compatible(saved)
-
-
-def test_result_table_reports_the_final_reward_over_the_stored_raw_reward():
-    # full_result_json keeps Gym's raw reward for the training-data dump; the
-    # table must still show the reward after penalties.
-    context = RewardLogContext("agent", '{"answer":"ok","reward":1.0}')
-    observations = [FinalizedReward("sample-0", "attempt-0", 0.25, context)]
-    row = json.loads(
-        capture_reward_result_tables(observations)["agent/full_result"][0][0]
-    )
-    assert row["reward"] == 0.25
-    assert row["answer"] == "ok"

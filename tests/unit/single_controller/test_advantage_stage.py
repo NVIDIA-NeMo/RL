@@ -55,7 +55,10 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriterConfig,
     JsonDebugWriter,
@@ -68,11 +71,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (
-    GROUP_ID_TAG,
-    GROUP_TOKEN_MEAN_WEIGHT,
-    GYM_FULL_RESULT_FIELD,
-)
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, GROUP_TOKEN_MEAN_WEIGHT
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
@@ -106,9 +105,8 @@ def test_from_master_config_uses_typed_logger(
         loss_fn=ClippedPGLossConfig(),
         on_policy_distillation=None,
         policy={"generation": {"top_k": None, "top_p": 1.0}},
-        env={},
         logger=LoggerConfig(log_dir=str(tmp_path)),
-        async_rl=SimpleNamespace(
+        async_rl=AsyncRLConfig(
             log_full_train_data=log_full_train_data,
             debug_writer=DebugWriterConfig(target="json"),
         ),
@@ -147,23 +145,6 @@ class TestInputFields:
         assert adv.values_field in fields
         assert adv.invalid_tool_call_mask_field in fields
         assert adv.malformed_thinking_mask_field in fields
-
-    def test_gym_result_column_is_fetched_only_for_a_gym_dump(self) -> None:
-        assert GYM_FULL_RESULT_FIELD not in _config().input_fields()
-        # Without the dump there is nothing to write it to.
-        assert GYM_FULL_RESULT_FIELD not in (
-            _config(dump_object_fields=(GYM_FULL_RESULT_FIELD,)).input_fields()
-        )
-        assert GYM_FULL_RESULT_FIELD not in (
-            _config(train_data_dump_dir="/tmp/dump").input_fields()
-        )
-        assert (
-            GYM_FULL_RESULT_FIELD
-            in _config(
-                train_data_dump_dir="/tmp/dump",
-                dump_object_fields=(GYM_FULL_RESULT_FIELD,),
-            ).input_fields()
-        )
 
     def test_repeated_batch_fields_do_not_duplicate_the_reward_column(self) -> None:
         adv = AdvantageConfig(repeated_batch_fields=["total_reward"])
@@ -626,6 +607,7 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
+    outcome_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
     reward_scaling: RewardScalingConfig | None = None,
@@ -668,6 +650,7 @@ def _controller(
             "group_token_mean" if group_token_mean else "global_token_mean"
         ),
         train_data_dump_dir=dump_dir,
+        outcome_log_dir=outcome_dir,
         # The controller below merges JSONL parts, so the computers write JSONL.
         debug_writer=DebugWriterConfig(target="json"),
     )
@@ -766,9 +749,7 @@ def test_opd_global_baseline_pool_matches_full_batch() -> None:
         on_policy_distillation=OnPolicyDistillationConfig(enabled=True),
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir="/tmp/test-logs"),
-        async_rl=SimpleNamespace(
-            log_full_train_data=False, debug_writer=DebugWriterConfig()
-        ),
+        async_rl=AsyncRLConfig(),
     )
     config = AdvantageStageConfig.from_master_config(master_config)
     gaps = torch.tensor([1.0, 3.0, 5.0, 9.0, 11.0, 13.0]).repeat_interleave(GROUP_SIZE)
@@ -803,9 +784,7 @@ def test_ppo_pool_preserves_advantages_and_returns(normalize_advantages: bool) -
         on_policy_distillation=None,
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir="/tmp/test-logs"),
-        async_rl=SimpleNamespace(
-            log_full_train_data=False, debug_writer=DebugWriterConfig()
-        ),
+        async_rl=AsyncRLConfig(),
     )
     config = AdvantageStageConfig.from_master_config(master_config)
     rewards = torch.arange(NUM_GROUPS * GROUP_SIZE, dtype=torch.float32)
@@ -953,6 +932,29 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+
+
+def test_every_trained_row_gets_an_outcome_line(tmp_path: Path) -> None:
+    """The stage records each row it trains or masks, labeled like the dump."""
+    store = _RowStore(_rows())
+    store.rows["s1"]["sample_mask"] = torch.tensor(0.0)
+    ctrl = _controller("grpo", 0, store, outcome_dir=str(tmp_path))
+    ctrl._train_steps = 4
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    ctrl._advantage_computer._outcome_log.flush()
+
+    [log_file] = tmp_path.glob("rl_outcomes.*.jsonl")
+    lines = {
+        line["sample_id"]: line
+        for line in map(json.loads, log_file.read_text().splitlines())
+    }
+    total = NUM_GROUPS * GROUP_SIZE
+    assert sorted(lines) == sorted(f"s{i}" for i in range(total))
+    assert {line["train_step"] for line in lines.values()} == {5}
+    assert lines["s1"]["outcome"] == "masked"
+    assert lines["s0"]["outcome"] == "trained"
+    assert lines["s0"]["group_id"] == "group-0"
+    assert lines["s0"]["final_reward"] == float(store.rows["s0"]["total_reward"])
 
 
 class _JaggedRowStore(_RowStore):

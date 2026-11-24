@@ -21,7 +21,6 @@ import multiprocessing
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +56,6 @@ class TrainChunk:
             input_lengths, such as token ids and advantages.
         scalars: Per-sample columns written as given; variable-length values must
             be jagged tensors rather than padded.
-        objects: Per-sample JSON strings, such as a Gym result.
 
     With background writing, add_chunk moves the CPU tensors of the chunk to
     shared memory, so the caller must not modify them after it returns.
@@ -69,7 +67,6 @@ class TrainChunk:
     input_lengths: torch.Tensor
     sequences: dict[str, torch.Tensor]
     scalars: dict[str, torch.Tensor]
-    objects: Mapping[str, Sequence[str]] = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,10 +151,8 @@ class DebugWriter(ABC):
         num_samples = len(chunk.sample_ids)
         lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
 
-        if (
-            len(lengths) != num_samples
-            or (chunk.tags is not None and len(chunk.tags) != num_samples)
-            or any(len(values) != num_samples for values in chunk.objects.values())
+        if len(lengths) != num_samples or (
+            chunk.tags is not None and len(chunk.tags) != num_samples
         ):
             raise ValueError("Training dump column lengths do not match sample ids")
         for values in [*chunk.sequences.values(), *chunk.scalars.values()]:
@@ -279,8 +274,6 @@ class JsonDebugWriter(DebugWriter):
                     row[key] = [columns[key][i][:length].tolist()]
                 for key in chunk.scalars:
                     row[key] = [columns[key][i].tolist()]
-                for key, values in chunk.objects.items():
-                    row[key] = [json.loads(values[i])]
                 stream.write(
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )
@@ -345,7 +338,6 @@ def _parquet_schema() -> "pa.Schema":
             ("group_id", pa.string()),
             ("input_lengths", pa.int64()),
             ("metadata", pa.string()),
-            ("gym_full_result", pa.string()),
             ("token_ids", pa.list_(pa.int64())),
             ("prompt_ids", pa.list_(pa.int64())),
             ("token_loss_mask", floats()),
@@ -377,11 +369,7 @@ class ParquetDebugWriter(DebugWriter):
         """Also raise ValueError for a column the Parquet schema lacks, before any background write."""
         super()._validate(chunk)
         names = _parquet_schema().names
-        unknown = [
-            k
-            for k in (*chunk.sequences, *chunk.scalars, *chunk.objects)
-            if k not in names
-        ]
+        unknown = [k for k in (*chunk.sequences, *chunk.scalars) if k not in names]
         if unknown:
             raise ValueError(
                 f"Parquet training dump has no column(s) {unknown}; add them to "
@@ -423,7 +411,6 @@ class ParquetDebugWriter(DebugWriter):
             "step": [chunk.step + 1] * size,
             "sample_id": chunk.sample_ids,
             "input_lengths": lengths,
-            **chunk.objects,
         }
         if chunk.tags is not None:
             columns["group_id"] = [tag.get("group_id") for tag in chunk.tags]

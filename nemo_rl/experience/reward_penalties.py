@@ -408,12 +408,10 @@ class CaptureRewardSettings:
 
 @dataclass(frozen=True)
 class RewardLogContext:
-    """Task attribution and optional full Gym result for logging.
+    """Attribution and optional full-result table data, without raw reward.
 
     ``agent_name`` retains its checkpoint field name and holds the taskset for
-    materialized tasks or the resolved agent name for flat rows. The training
-    dump uses ``full_result_json`` as captured. The W&B table replaces its
-    reward with the final reward.
+    materialized tasks or the resolved agent name for flat rows.
     """
 
     agent_name: str

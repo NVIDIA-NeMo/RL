@@ -87,13 +87,18 @@ from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import (
     AGENT_NAME_TAG,
     DP_TRAIN_FIELDS,
-    GYM_FULL_RESULT_FIELD,
     INPUT_IDS,
     INPUT_LENGTHS,
     SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
+from nemo_rl.utils.gym_results_log import (
+    RL_OUTCOMES_PREFIX,
+    JsonlAppender,
+    gym_results_dir,
+    outcome_record,
+)
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -184,8 +189,9 @@ class AdvantageStageConfig:
     filtering_on: bool = False
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
-    # JSON-string object columns to fetch only when dumping training data.
-    dump_object_fields: tuple[str, ...] = ()
+    # async_rl.gym_results_log: where the stage records each row it trains or
+    # masks, or None when the log is off.
+    outcome_log_dir: Optional[str] = None
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -203,7 +209,6 @@ class AdvantageStageConfig:
             algo_config,
             is_ppo_run,
         )
-        from nemo_rl.environments.nemo_gym import should_dump_gym_results
 
         is_ppo = is_ppo_run(master_config)
         algo_cfg = algo_config(master_config)
@@ -242,10 +247,10 @@ class AdvantageStageConfig:
                 else None
             ),
             debug_writer=master_config.async_rl.debug_writer,
-            dump_object_fields=(
-                (GYM_FULL_RESULT_FIELD,)
-                if should_dump_gym_results(master_config)
-                else ()
+            outcome_log_dir=(
+                gym_results_dir(master_config.logger.log_dir)
+                if master_config.async_rl.gym_results_log.enabled
+                else None
             ),
         )
 
@@ -286,7 +291,6 @@ class AdvantageStageConfig:
                     INPUT_LENGTHS,
                     adv_cfg.prompt_ids_field,
                     adv_cfg.generation_logprobs_field,
-                    *self.dump_object_fields,
                 ]
             )
         return list(dict.fromkeys(fields))
@@ -312,8 +316,7 @@ class AdvantageRequest:
 
     meta: KVBatchMeta
     # Optimizer step these rows belong to, carried because the training dump
-    # names its file after it and the pool has no view of the controller's
-    # counter. Unset when the dump is off, which is the default.
+    # and the outcome log use it to label rows. Unset when both are disabled.
     train_step: Optional[int] = None
     # Overrides the config's policy_logprobs_required for this call, e.g. a PPO
     # critic-warmup step that ran the policy-logprob pass under in-loss filtering.
@@ -429,6 +432,12 @@ class AdvantageComputer:
                 background=True,
             )
             if config.train_data_dump_dir is not None
+            else None
+        )
+
+        self._outcome_log = (
+            JsonlAppender(config.outcome_log_dir, RL_OUTCOMES_PREFIX)
+            if config.outcome_log_dir is not None
             else None
         )
 
@@ -860,10 +869,30 @@ class AdvantageComputer:
                         # group-index key the estimator reduces over.
                         "prompt_ids": data[adv_cfg.prompt_ids_field],
                     },
-                    objects={name: list(data[name]) for name in cfg.dump_object_fields},
                 ),
             )
             train_data_dump_s = time.perf_counter() - dump_started
+
+        if self._outcome_log is not None:
+            assert request.train_step is not None
+            # Numbered like train_data_step<N>.jsonl, so the two logs line up.
+            train_step = request.train_step + 1
+            for sample_id, group_id, reward, keep in zip(
+                meta.sample_ids,
+                group_ids,
+                rewards.reshape(-1).tolist(),
+                final_sample_mask.reshape(-1).tolist(),
+                strict=True,
+            ):
+                self._outcome_log.append(
+                    outcome_record(
+                        outcome="trained" if keep else "masked",
+                        group_id=group_id,
+                        sample_id=sample_id,
+                        train_step=train_step,
+                        final_reward=float(reward),
+                    )
+                )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
