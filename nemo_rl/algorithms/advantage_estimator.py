@@ -432,6 +432,7 @@ class RawRewardAdvantageEstimator(AdvantageEstimator):
             adv_rstd = adv_var.clamp(min=1e-8).rsqrt()
             adv = (adv - adv_mean) * adv_rstd
 
+        adv = adv.masked_fill(~mask.bool(), 0.0)
         return adv, None
 
 

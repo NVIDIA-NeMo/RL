@@ -46,6 +46,7 @@ pytestmark = pytest.mark.mcore
 def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     monkeypatch, overrides, rejected
 ):
+    from nemo_rl.models.megatron import common
     from nemo_rl.models.policy.workers import megatron_policy_worker as module
 
     class Router:
@@ -71,10 +72,10 @@ def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     for key, value in overrides.items():
         if key != "routing_type":
             setattr(config, key, value)
-    monkeypatch.setattr(module, "Router", Router)
-    monkeypatch.setattr(module, "TopKRouter", TopKRouter)
+    monkeypatch.setattr(common, "Router", Router)
+    monkeypatch.setattr(common, "TopKRouter", TopKRouter)
     monkeypatch.setattr(
-        module,
+        common,
         "_unwrapped_chunks",
         lambda _: [SimpleNamespace(modules=lambda: [router])],
     )
@@ -521,3 +522,29 @@ def test_prepacked_hybridep_chunkwise_fallback(monkeypatch, caplog, chunkwise):
     assert model.config.moe_router_bias_update_rate == 0.001
     assert cfg["megatron_cfg"]["moe_flex_dispatcher_backend"] == "hybridep"
     assert len(caplog.records) == int(chunkwise)
+
+
+def test_forest_router_check_allows_bias_updates_but_not_capacity():
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    from nemo_rl.models.megatron.common import validate_forest_routers
+
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.routing_type = "none"
+    router.enable_expert_bias = True
+    router.frozen_expert_bias = False
+    router.config = SimpleNamespace(
+        moe_expert_capacity_factor=None,
+        moe_expert_rank_capacity_factor=None,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        moe_token_dropping=False,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_router_bias_update_rate=0.001,
+    )
+    model = torch.nn.Sequential(router)
+    validate_forest_routers(model)
+    router.config.moe_expert_capacity_factor = 1.0
+    with pytest.raises(ValueError, match="dropless"):
+        validate_forest_routers(model)
