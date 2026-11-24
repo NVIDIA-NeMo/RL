@@ -58,8 +58,6 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
-    from nemo_rl.data.captured_media import MediaColumnSpec
-    from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
     from nemo_rl.weight_sync.membership import RefitMembership
@@ -456,7 +454,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         assert cluster is not None, "Megatron engines behind Dynamo need a cluster."
         # The state the weight synchronizer and setup read off a generation object.
         self._policy_config = config
-        self.cfg: MCoreGenerationConfig = config["generation"]
+        # validate_megatron_dynamo_generation below checks it is a Megatron one.
+        self.cfg = cast(MCoreGenerationConfig, config["generation"])
         # The frontend URL once the engines serve; the engines expose no HTTP server.
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
@@ -675,6 +674,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         futures: list[ray.ObjectRef] = []
         if self.uses_native_refit:
             mcore_cfg = self.cfg["mcore_generation_config"]
+            refit_backend = mcore_cfg["refit_backend"]
+            # validate_megatron_dynamo_generation admits only these two.
+            assert refit_backend == "nccl" or refit_backend == "gloo", refit_backend
             for record, offset in zip(self._engine_records, offsets, strict=True):
                 futures.extend(
                     record.init_collective_mcore_generation(
@@ -685,7 +687,7 @@ class MegatronDynamoGeneration(GenerationInterface):
                         refit_execution_batch_bytes=mcore_cfg[
                             "refit_execution_batch_bytes"
                         ],
-                        refit_backend=mcore_cfg["refit_backend"],
+                        refit_backend=refit_backend,
                     )
                 )
             return futures
@@ -894,20 +896,6 @@ class MegatronDynamoGeneration(GenerationInterface):
             "engines register with no frontend."
         )
         yield  # pragma: no cover  (makes this an async generator)
-
-    def setup_token_capture(
-        self,
-        dp_cfg: "DataPlaneConfig",
-        staging_partition: str,
-        *,
-        capture_media: bool = False,
-        top_logprobs: int = 0,
-    ) -> "Optional[MediaColumnSpec]":
-        """Not served yet: token capture rides on NeMo-Gym rollouts through the frontend."""
-        raise NotImplementedError(
-            "Token capture needs NeMo-Gym rollouts, which are not yet served "
-            "through the Dynamo frontend."
-        )
 
     # ------------------------------------------------------------------
     # Engine lifecycle

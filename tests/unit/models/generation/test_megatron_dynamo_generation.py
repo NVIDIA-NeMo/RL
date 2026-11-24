@@ -1148,5 +1148,22 @@ def test_rollouts_are_not_served_yet(env):
 
     with pytest.raises(NotImplementedError, match="do not serve rollouts yet"):
         asyncio.run(collect())
-    with pytest.raises(NotImplementedError, match="NeMo-Gym"):
-        generation.setup_token_capture({}, "staging")  # type: ignore[arg-type]
+    # Called with every keyword setup passes, so a stale override with an
+    # older signature would raise TypeError instead of the refusal.
+    with pytest.raises(
+        NotImplementedError,
+        match="token_capture.enabled is not supported for MegatronDynamoGeneration",
+    ):
+        generation.setup_token_capture(
+            {},  # type: ignore[arg-type]
+            "staging",
+            capture_media=False,
+            media_family=None,
+            top_logprobs=0,
+            generation_prefix_cuts_enabled=False,
+            generation_cut_control_token=None,
+            generation_cut_control_timeout_s=None,
+            prefix_write_max_rows=1,
+            prefix_write_max_tokens=1,
+            prefix_read_max_rows=1,
+        )
