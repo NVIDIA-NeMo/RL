@@ -107,6 +107,7 @@ from nemo_rl.data_plane import (
 )
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    GYM_FULL_RESULT_FIELD,
     SAMPLER_TOPK_FIELDS,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
@@ -124,6 +125,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_actors,
     collect_dataset_agent_names,
     set_nemo_gym_log_dir,
+    should_dump_gym_results,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -409,6 +411,8 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
+    if should_dump_gym_results(master_config):
+        partition_fields.append(GYM_FULL_RESULT_FIELD)
     # Reducers declare their columns before any producer can publish values.
     partition_fields.extend(
         make_objective_reduction(
@@ -2595,6 +2599,7 @@ def setup_single_controller(
     )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    dump_gym_results = should_dump_gym_results(master_config)
     tq_buffer = TQReplayBuffer(
         dp_client,
         partition_id=partition_id,
@@ -2611,6 +2616,7 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
+        include_gym_full_result=dump_gym_results,
     )
 
     def _create_finalizers() -> list[Any]:
@@ -2657,6 +2663,7 @@ def setup_single_controller(
                     ),
                     thinking_tags=thinking_tags,
                     top_logprobs=master_config.policy["generation"]["top_logprobs"],
+                    dump_gym_results=dump_gym_results,
                     stamp_agent_names=(
                         master_config.grpo is not None
                         and bool(master_config.grpo.agent_overrides)
@@ -2738,6 +2745,12 @@ def setup_single_controller(
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,
+        ),
+        dump_gym_results=dump_gym_results,
+        gym_results_dir=(
+            os.path.join(master_config.logger.log_dir, "gym_results")
+            if use_nemo_gym and master_config.async_rl.log_gym_results
+            else None
         ),
         reward_penalty_config=resolved_reward_penalty_config,
         length_penalty_config=(

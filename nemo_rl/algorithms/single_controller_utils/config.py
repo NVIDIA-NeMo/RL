@@ -522,6 +522,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Where the dump above is written: the JSONL writer by default, or an external
     # DebugWriter selected by target.
     debug_writer: DebugWriterConfig = Field(default_factory=DebugWriterConfig)
+    # Append every NeMo-Gym rollout result, including ones never trained on, to
+    # <log_dir>/gym_results/ as it arrives. Debug-only; disabled by default.
+    log_gym_results: bool = False
     # Finalize async policy checkpoints (policy.megatron_cfg.checkpoint.async_save)
     # at a later step boundary, once every rank's background write is done, instead
     # of from a background thread whose blocking finalize holds the policy workers

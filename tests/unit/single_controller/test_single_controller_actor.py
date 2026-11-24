@@ -6238,3 +6238,16 @@ def test_worker_group_snapshots_fan_out_and_drop_silent_ranks(monkeypatch) -> No
 
     assert calls == ["get_data_plane_snapshot"]
     assert snapshots == [{"total_wall_ms": 1.0}]
+
+
+def test_advantage_stage_config_reads_the_dump_dir_off_logger_config(tmp_path):
+    # logger is a LoggerConfig model, not a dict: indexing it raised in the
+    # controller's __init__ as soon as log_full_train_data was turned on.
+    cfg = _grpo_master_config(tmp_path)
+    cfg.logger = LoggerConfig.model_construct(log_dir=str(tmp_path / "logs"))
+    cfg.async_rl.log_full_train_data = True
+
+    stage_cfg = AdvantageStageConfig.from_master_config(cfg)
+
+    assert stage_cfg.train_data_dump_dir == str(tmp_path / "logs")
+    assert stage_cfg.dump_object_fields == ()

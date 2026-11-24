@@ -201,6 +201,10 @@ def chunk() -> TrainChunk:
 def test_dump_preserves_singleton_batch_schema(
     tmp_path: Path, chunk: TrainChunk
 ) -> None:
+    results = [{"reward": 1.0, "response": {"output": ["ok"]}}, None]
+    chunk = replace(
+        chunk, objects={"gym_full_result": [json.dumps(r) for r in results]}
+    )
     original_advantages = chunk.sequences["advantages"].detach().clone()
     writer = JsonDebugWriter(str(tmp_path / "nested" / "logs"))
     writer.finish_step(0, [writer.add_chunk(chunk)])
@@ -216,11 +220,13 @@ def test_dump_preserves_singleton_batch_schema(
         "metadata",
         *chunk.sequences,
         *chunk.scalars,
+        *chunk.objects,
     }
     assert len(rows) == len(chunk.sample_ids)
     for i, row in enumerate(rows):
         length = chunk.input_lengths[i].item()
         assert set(row) == expected_keys
+        assert row["gym_full_result"] == [results[i]]
         assert row["idx"] == i
         assert row["step"] == 1
         assert row["sample_id"] == chunk.sample_ids[i : i + 1]
@@ -239,6 +245,7 @@ def test_dump_preserves_singleton_batch_schema(
     [
         ("input_lengths", False),
         ("tags", False),
+        ("gym_full_result", False),
         ("token_ids", False),
         ("rewards", False),
         ("negative", False),
@@ -262,6 +269,8 @@ def test_invalid_chunk_leaves_dump_unchanged(
     elif invalid_column == "tags":
         assert chunk.tags is not None
         chunk = replace(chunk, tags=chunk.tags[:1])
+    elif invalid_column == "gym_full_result":
+        chunk = replace(chunk, objects={"gym_full_result": ["null"]})
     elif invalid_column == "token_ids":
         chunk.sequences["token_ids"] = chunk.sequences["token_ids"][:1]
     elif invalid_column == "rewards":
@@ -654,6 +663,8 @@ def test_parquet_writer_trims_rows_and_publishes_a_manifest(
     tmp_path: Path, chunk: TrainChunk
 ) -> None:
     pq = pytest.importorskip("pyarrow.parquet")
+    results = ['{"reward": 1.0}', "null"]
+    chunk = replace(chunk, objects={"gym_full_result": results})
     writer = make_debug_writer(DebugWriterConfig(target="parquet"), str(tmp_path))
     receipt = writer.add_chunk(chunk)
     directory = tmp_path / "train_data_parquet" / "step-00000001"
@@ -667,6 +678,7 @@ def test_parquet_writer_trims_rows_and_publishes_a_manifest(
     assert table["token_ids"] == [[10, 11], [20]]
     assert table["rewards"] == [0.5, -1.0]
     assert table["values"] == [None, None]
+    assert table["gym_full_result"] == results
 
 
 def test_parquet_writer_rejects_a_short_dump_and_a_missing_chunk(

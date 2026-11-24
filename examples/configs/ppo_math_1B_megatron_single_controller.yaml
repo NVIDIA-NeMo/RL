@@ -62,6 +62,8 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # Append each received NeMo-Gym result to gym_results/ in the log dir.
+  log_gym_results: false
   # Write every consumed sample to the log dir (debug); the format follows debug_writer.
   log_full_train_data: false
   # Writer used by log_full_train_data. parquet writes Parquet chunks, json writes

@@ -212,12 +212,14 @@ def _stub_converter(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    include_gym_full_result: bool = False,
     per_token_multimodal_fields: tuple[str, ...] = (),
 ):
     del (
         record,
         pad_value_dict,
         include_message_violation_fields,
+        include_gym_full_result,
         per_token_multimodal_fields,
     )
     return BatchedDataDict[Any](

@@ -87,6 +87,7 @@ from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import (
     AGENT_NAME_TAG,
     DP_TRAIN_FIELDS,
+    GYM_FULL_RESULT_FIELD,
     INPUT_IDS,
     INPUT_LENGTHS,
     SAMPLER_TOPK_FIELDS,
@@ -183,6 +184,8 @@ class AdvantageStageConfig:
     filtering_on: bool = False
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
+    # JSON-string object columns to fetch only when dumping training data.
+    dump_object_fields: tuple[str, ...] = ()
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -200,6 +203,7 @@ class AdvantageStageConfig:
             algo_config,
             is_ppo_run,
         )
+        from nemo_rl.environments.nemo_gym import should_dump_gym_results
 
         is_ppo = is_ppo_run(master_config)
         algo_cfg = algo_config(master_config)
@@ -238,6 +242,11 @@ class AdvantageStageConfig:
                 else None
             ),
             debug_writer=master_config.async_rl.debug_writer,
+            dump_object_fields=(
+                (GYM_FULL_RESULT_FIELD,)
+                if should_dump_gym_results(master_config)
+                else ()
+            ),
         )
 
     def input_fields(self) -> list[str]:
@@ -277,6 +286,7 @@ class AdvantageStageConfig:
                     INPUT_LENGTHS,
                     adv_cfg.prompt_ids_field,
                     adv_cfg.generation_logprobs_field,
+                    *self.dump_object_fields,
                 ]
             )
         return list(dict.fromkeys(fields))
@@ -850,6 +860,7 @@ class AdvantageComputer:
                         # group-index key the estimator reduces over.
                         "prompt_ids": data[adv_cfg.prompt_ids_field],
                     },
+                    objects={name: list(data[name]) for name in cfg.dump_object_fields},
                 ),
             )
             train_data_dump_s = time.perf_counter() - dump_started
