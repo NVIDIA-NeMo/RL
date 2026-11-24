@@ -809,19 +809,51 @@ class MegatronGenerationMixin:
 
         self._inference_engine_asleep = False
 
-    def _sleep(self) -> None:
+    def _run_engine_transition(
+        self, transition: Any, *, timeout_s: float | None, target: EngineState
+    ) -> None:
+        """Run ``transition`` on the inference loop, for at most ``timeout_s`` seconds.
+
+        ``None`` waits as long as the transition takes. When a finite
+        ``timeout_s`` runs out, the transition is cancelled on the inference
+        loop before raising, so this worker's next call (the resume a failed
+        suspend is followed by) runs instead of queueing behind a wait that
+        may never end. Signals already sent stay sent; the next transition
+        starts from whatever state the engine has reached.
+
+        Raises:
+            RuntimeError: When ``timeout_s`` runs out first.
+        """
+        loop = self._inference_loop
+        assert loop is not None, "the inference loop starts with the engine"
+        future = asyncio.run_coroutine_threadsafe(transition, loop)
+        try:
+            future.result(timeout=timeout_s)
+        except TimeoutError as error:
+            future.cancel()
+            raise RuntimeError(
+                f"[Rank {self.rank}] the inference engine did not reach "
+                f"{target.name} within {timeout_s} s; it is in state "
+                f"{self.dynamic_inference_engine.state.name}"
+            ) from error
+
+    def _sleep(self, timeout_s: float | None = None) -> None:
         """Pause + suspend the engine. No-op on an engine that is already suspended.
 
         Driven by the engine's own state, not by the asleep flag, so a call
         after a failed one picks up where that one stopped: an engine left
         PAUSED is suspended, and one left SUSPENDED is not suspended twice (a
         second SUSPEND outside PAUSED ends Megatron's engine loop). Every rank
-        takes the barrier, whatever state it found.
+        takes the barrier, whatever state it found; the barrier itself is not
+        bounded by ``timeout_s``.
+
+        Args:
+            timeout_s: Bound on the state transition; ``None`` waits as long
+                as it takes.
         """
-        future = asyncio.run_coroutine_threadsafe(
-            self._sleep_engine(), self._inference_loop
+        self._run_engine_transition(
+            self._sleep_engine(), timeout_s=timeout_s, target=EngineState.SUSPENDED
         )
-        future.result()
         # The engine is suspended whatever the barrier below does.
         self._inference_engine_asleep = True
         torch.distributed.barrier()
@@ -836,11 +868,18 @@ class MegatronGenerationMixin:
         engine = self.dynamic_inference_engine
         loop_task = engine.engine_loop_task
         waiter = asyncio.ensure_future(engine.wait_until(state))
-        await asyncio.wait({waiter, loop_task}, return_when=asyncio.FIRST_COMPLETED)
-        if waiter.done():
+        try:
+            done, _ = await asyncio.wait(
+                {waiter, loop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            # Also on cancellation (a timed-out transition), so no wait is left
+            # behind on the inference loop.
+            if not waiter.done():
+                waiter.cancel()
+        if waiter in done:
             waiter.result()
             return
-        waiter.cancel()
         self._raise_engine_loop_stopped(f"waiting for {state.name}")
 
     def _raise_engine_loop_stopped(self, doing: str) -> None:
@@ -904,17 +943,21 @@ class MegatronGenerationMixin:
             self.inference_client.suspend_engines()
         await self._wait_for_engine_state(EngineState.SUSPENDED)
 
-    def _wake(self) -> None:
+    def _wake(self, timeout_s: float | None = None) -> None:
         """Resume + unpause the engine. No-op on an engine that is already running.
 
         Driven by the engine's own state, not by the asleep flag, so an engine
         a failed suspend left PAUSED or SUSPENDED is put back in service too.
-        Every rank takes the barrier, whatever state it found.
+        Every rank takes the barrier, whatever state it found; the barrier
+        itself is not bounded by ``timeout_s``.
+
+        Args:
+            timeout_s: Bound on the state transition; ``None`` waits as long
+                as it takes.
         """
-        future = asyncio.run_coroutine_threadsafe(
-            self._wake_engine(), self._inference_loop
+        self._run_engine_transition(
+            self._wake_engine(), timeout_s=timeout_s, target=EngineState.RUNNING
         )
-        future.result()
         # The engine is running whatever the barrier below does.
         self._inference_engine_asleep = False
         torch.distributed.barrier()
@@ -1225,7 +1268,7 @@ class MegatronGenerationMixin:
                 self._initialize_inference_engine(mcore_generation_config)
                 self._run_async_coordinator_start()
             else:
-                self._wake()
+                self._wake(timeout_s=kwargs.get("timeout_s"))
 
         log_gpu_memory("prepare_for_generation END")
 
@@ -2552,14 +2595,24 @@ class MegatronGenerationRefitMixin:
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
 
-    def suspend_for_refit(self) -> None:
-        """Pause+suspend the inference engine before a weight refit."""
-        if not self._inference_engine_initialized:
-            return
-        self._sleep()
+    def suspend_for_refit(self, timeout_s: float | None = None) -> None:
+        """Pause+suspend the inference engine before a weight refit.
 
-    def resume_after_refit(self) -> None:
-        """Resume+unpause the inference engine after a weight refit."""
+        Args:
+            timeout_s: The caller's remaining time; ``None`` waits as long as
+                the transition takes.
+        """
         if not self._inference_engine_initialized:
             return
-        self._wake()
+        self._sleep(timeout_s=timeout_s)
+
+    def resume_after_refit(self, timeout_s: float | None = None) -> None:
+        """Resume+unpause the inference engine after a weight refit.
+
+        Args:
+            timeout_s: The caller's remaining time; ``None`` waits as long as
+                the transition takes.
+        """
+        if not self._inference_engine_initialized:
+            return
+        self._wake(timeout_s=timeout_s)

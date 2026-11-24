@@ -189,6 +189,8 @@ class _FakeEngine:
         # Refit fakes: rank zero's calls land in the log. ``faults`` maps a
         # worker method to an exception, or "hang".
         self.faults: dict[str, object] = {}
+        # Rank zero's timeout_s per call, for the control calls that take one.
+        self.worker_timeouts: list[tuple[str, float | None]] = []
         width = sum(kwargs["cluster"].kwargs["bundle_ct_per_node_list"])
         workers = [_FakeWorker(self.short, rank) for rank in range(width)]
         self.worker_group = SimpleNamespace(
@@ -201,6 +203,8 @@ class _FakeEngine:
             return _Ref(self.alive)
         if rank == 0:
             self.log.append(self._entry(method, kwargs))
+            if "timeout_s" in kwargs:
+                self.worker_timeouts.append((method, kwargs["timeout_s"]))
         fault = self.faults.get(method)
         if fault == "hang":
             return _Ref(hang=True)
@@ -229,7 +233,7 @@ class _FakeEngine:
         if method == "swap_weights_via_reshard":
             return f"{self.short}.swap(source={kwargs['is_source']})"
         if method in ("prepare_for_generation", "set_rollout_weight_version"):
-            (value,) = kwargs.values()
+            value = kwargs["tags"] if "tags" in kwargs else kwargs["version"]
             return f"{self.short}.{method}({value})"
         return f"{self.short}.{short[method]}"
 
@@ -1011,6 +1015,32 @@ def test_a_hung_engine_call_times_out_and_the_engines_are_resumed(env):
     assert len(timeouts) == 2 + len(_NAMES)
     assert all(t <= 0.5 for t in timeouts)
     assert timeouts == sorted(timeouts)[::-1]
+
+
+def test_workers_get_the_callers_remaining_time(env):
+    """A stuck transition must give up on the worker too, or the resume queues behind it."""
+    generation = env.started()
+    generation.suspend_for_refit(timeout_s=30.0)
+    generation.prepare_for_generation(tags=["kv_cache"], timeout_s=20.0)
+    generation.resume_after_refit(timeout_s=10.0)
+    generation.suspend_for_refit()
+    for engine in env.engines:
+        (suspend, prepare, resume, unbounded) = engine.worker_timeouts
+        assert suspend[0] == "suspend_for_refit" and 0 < suspend[1] <= 30.0
+        assert prepare[0] == "prepare_for_generation" and 0 < prepare[1] <= 20.0
+        assert resume[0] == "resume_after_refit" and 0 < resume[1] <= 10.0
+        # No caller timeout: the workers wait as long as the transition takes.
+        assert unbounded == ("suspend_for_refit", None)
+
+
+def test_the_restore_after_a_failed_suspend_runs_unbounded_on_the_workers(env):
+    """This call stops waiting at the suspend's deadline; the workers finish the resume."""
+    generation = env.started()
+    env.engine("d0").faults["suspend_for_refit"] = "hang"
+    with pytest.raises(RuntimeError, match="suspend_for_refit"):
+        generation.suspend_for_refit(timeout_s=0.5)
+    for engine in env.engines:
+        assert engine.worker_timeouts[-1] == ("resume_after_refit", None)
 
 
 def test_a_restore_after_a_timed_out_suspend_is_reported_when_unconfirmed(env):

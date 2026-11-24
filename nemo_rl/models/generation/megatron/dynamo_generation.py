@@ -325,14 +325,19 @@ class MegatronDynamoEngineHandle:
         # The native refit's receive side; the trainers send with is_source=True.
         return self._all("swap_weights_via_reshard", is_source=False)
 
-    def suspend_for_refit(self) -> list[ray.ObjectRef]:
-        return self._all("suspend_for_refit")
+    # Each worker gets the caller's remaining time, so a transition stuck on a
+    # live engine gives up on the worker too, not only in the caller's wait;
+    # otherwise the worker's next call (the resume) would queue behind it.
+    def suspend_for_refit(self, *, timeout_s: float | None) -> list[ray.ObjectRef]:
+        return self._all("suspend_for_refit", timeout_s=timeout_s)
 
-    def resume_after_refit(self) -> list[ray.ObjectRef]:
-        return self._all("resume_after_refit")
+    def resume_after_refit(self, *, timeout_s: float | None) -> list[ray.ObjectRef]:
+        return self._all("resume_after_refit", timeout_s=timeout_s)
 
-    def prepare_for_generation(self, *, tags: list[str]) -> list[ray.ObjectRef]:
-        return self._all("prepare_for_generation", tags=tags)
+    def prepare_for_generation(
+        self, *, tags: list[str], timeout_s: float | None
+    ) -> list[ray.ObjectRef]:
+        return self._all("prepare_for_generation", tags=tags, timeout_s=timeout_s)
 
     def set_rollout_weight_version(self, version: int) -> list[ray.ObjectRef]:
         return self._all("set_rollout_weight_version", version=version)
@@ -773,13 +778,20 @@ class MegatronDynamoGeneration(GenerationInterface):
     # ------------------------------------------------------------------
 
     def _restore_engines(
-        self, indices: Sequence[int], *, deadline: float | None
+        self,
+        indices: Sequence[int],
+        *,
+        deadline: float | None,
+        worker_timeout_s: float | None,
     ) -> list[str]:
-        """Resume ``indices``; return the failures."""
+        """Resume ``indices`` and wait until ``deadline``; return the failures.
+
+        ``worker_timeout_s`` bounds each worker's own resume transition.
+        """
         errors: list[str] = []
         self._attempt(
             indices,
-            lambda handle: handle.resume_after_refit(),
+            lambda handle: handle.resume_after_refit(timeout_s=worker_timeout_s),
             what="resume_after_refit",
             deadline=deadline,
             errors=errors,
@@ -796,10 +808,14 @@ class MegatronDynamoGeneration(GenerationInterface):
         engine and the original error still propagates, with any resume
         failures added to it as notes. Each worker resumes from the state its
         engine is actually in, so an engine the failed suspend left paused or
-        suspended goes back into service too. The resume shares the suspend's
-        deadline: if the suspend used it up, the resumes
-        are still sent but not waited for, and the note says they were not
-        confirmed in time.
+        suspended goes back into service too. Each worker also gets what is
+        left of the deadline, so a transition stuck on a live engine gives up on
+        the worker and the resume can run there. The resume shares the
+        suspend's deadline for this call's wait: if the suspend used it up, the
+        resumes are still sent but not waited for, and the note says they were
+        not confirmed in time. The workers run that resume without a deadline
+        of their own, since cutting a recovery short would leave the engine
+        half-way again.
 
         Args:
             timeout_s: One deadline for the suspend and any resume after it;
@@ -814,14 +830,18 @@ class MegatronDynamoGeneration(GenerationInterface):
         try:
             self._call_engines(
                 indices,
-                lambda handle: handle.suspend_for_refit(),
+                lambda handle: handle.suspend_for_refit(
+                    timeout_s=_seconds_left(deadline)
+                ),
                 what="suspend_for_refit",
                 deadline=deadline,
             )
         except Exception as error:
             # The weights are unchanged, so a resume puts each engine back in
             # service. Same deadline: the caller's budget covers the restore too.
-            restore_errors = self._restore_engines(indices, deadline=deadline)
+            restore_errors = self._restore_engines(
+                indices, deadline=deadline, worker_timeout_s=None
+            )
             if restore_errors:
                 error.add_note(
                     "resuming engines after the failed suspend also failed: "
@@ -840,12 +860,15 @@ class MegatronDynamoGeneration(GenerationInterface):
         tags = kwargs.get("tags")
         if tags is None:
             return True
+        # The caller's timeout_s; None waits indefinitely.
+        deadline = _deadline(kwargs.get("timeout_s"))
         self._call_engines(
             range(self.num_engines),
-            lambda handle: handle.prepare_for_generation(tags=list(tags)),
+            lambda handle: handle.prepare_for_generation(
+                tags=list(tags), timeout_s=_seconds_left(deadline)
+            ),
             what=f"prepare_for_generation({list(tags)})",
-            # The caller's timeout_s; None waits indefinitely.
-            deadline=_deadline(kwargs.get("timeout_s")),
+            deadline=deadline,
         )
         return True
 
@@ -862,8 +885,11 @@ class MegatronDynamoGeneration(GenerationInterface):
         Raises:
             RuntimeError: Any engine failed to resume or missed the deadline.
         """
+        deadline = _deadline(timeout_s)
         errors = self._restore_engines(
-            range(self.num_engines), deadline=_deadline(timeout_s)
+            range(self.num_engines),
+            deadline=deadline,
+            worker_timeout_s=_seconds_left(deadline),
         )
         if errors:
             raise RuntimeError(

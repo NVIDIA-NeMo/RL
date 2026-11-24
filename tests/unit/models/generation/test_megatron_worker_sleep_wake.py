@@ -22,7 +22,9 @@ barrier stubbed.
 """
 
 import asyncio
+import concurrent.futures
 import threading
+import time
 from collections import deque
 
 import pytest
@@ -59,6 +61,9 @@ class _FakeEngine:
         self._state_events = {state: asyncio.Event() for state in _STABLE}
         self._state_events[EngineState.RUNNING].set()
         self.pending: deque[str] = deque()
+        # While set, the loop stays alive but no transition completes: a live
+        # engine stuck mid-transition.
+        self.stalled = False
         self.engine_loop_task = asyncio.get_running_loop().create_task(self._run())
 
     async def wait_until(self, state: EngineState) -> None:
@@ -82,6 +87,8 @@ class _FakeEngine:
             self.state = EngineState.RESUMING
 
     def _transition(self) -> None:
+        if self.stalled:
+            return
         if self.state == EngineState.PAUSING:
             self.state = EngineState.PAUSED
             self._state_events[EngineState.PAUSED].set()
@@ -271,3 +278,43 @@ def test_an_engine_loop_that_stops_during_a_wait_raises_instead_of_hanging(worke
     client.pause_engines = pause_then_break
     with pytest.raises(RuntimeError, match="while waiting for PAUSED"):
         _bounded(worker.suspend_for_refit)
+
+
+def test_a_timed_out_suspend_lets_the_next_call_run_on_the_worker(worker):
+    """A live engine stuck mid-transition: the suspend gives up and the resume runs.
+
+    A Ray actor runs a synchronous method's calls one at a time, so a suspend
+    that kept waiting would hold the resume behind it forever. One worker
+    thread stands in for that actor here.
+    """
+    engine = worker.dynamic_inference_engine
+    engine.stalled = True
+    actor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        suspend = actor.submit(worker.suspend_for_refit, timeout_s=0.2)
+        resume = actor.submit(worker.resume_after_refit, timeout_s=None)
+        with pytest.raises(RuntimeError, match="did not reach SUSPENDED within 0.2 s"):
+            suspend.result(_BOUND_S)
+        # The engine is still PAUSING: the timed-out wait was cancelled and
+        # nothing sent SUSPEND. The resume is now running on the worker.
+        assert engine.state == EngineState.PAUSING
+        time.sleep(0.1)
+        assert not resume.done()
+        engine.stalled = False
+        resume.result(_BOUND_S)
+    finally:
+        actor.shutdown(wait=False, cancel_futures=True)
+    assert engine.state == EngineState.RUNNING
+    assert worker.inference_client.sent == ["PAUSE", "UNPAUSE"]
+    assert not worker._inference_engine_asleep
+
+
+def test_a_stalled_resume_with_a_timeout_raises_instead_of_hanging(worker):
+    _bounded(worker.suspend_for_refit)
+    engine = worker.dynamic_inference_engine
+    engine.stalled = True
+    with pytest.raises(RuntimeError, match="did not reach RUNNING within 0.2 s"):
+        _bounded(lambda: worker.resume_after_refit(timeout_s=0.2))
+    engine.stalled = False
+    _bounded(worker.resume_after_refit)
+    assert engine.state == EngineState.RUNNING
