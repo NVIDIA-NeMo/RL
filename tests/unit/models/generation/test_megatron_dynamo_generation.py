@@ -35,6 +35,7 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
 from nemo_rl.models.generation.megatron.dynamo_generation import (
     MegatronDynamoEngine,
     MegatronDynamoGeneration,
+    engine_node_slots,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.weight_sync.membership import desired_membership
@@ -124,9 +125,22 @@ class _FakeCluster:
         self.log = env.log
         self.name = kwargs["name"].rsplit("_", 1)[-1]
         index = len(env.clusters)
-        (width,) = kwargs["bundle_ct_per_node_list"]
-        bundle_nodes = env.bundle_nodes.get(index, [env.nodes[index]] * width)
+        per_node = kwargs["bundle_ct_per_node_list"]
+        # One fake host per logical node; a one-node engine keeps env.nodes[index].
+        default = (
+            [env.nodes[index]] * per_node[0]
+            if len(per_node) == 1
+            else [
+                f"{env.nodes[index]}-n{node}"
+                for node, count in enumerate(per_node)
+                for _ in range(count)
+            ]
+        )
+        bundle_nodes = env.bundle_nodes.get(index, default)
         self.placement_group = _FakePlacementGroup(bundle_nodes)
+        # Set to a permutation to model a unified placement group, whose ranks
+        # take bundles in NVLink-sorted order rather than bundle order.
+        self._sorted_bundle_indices = env.sorted_bundle_indices.get(index)
         self.placement_policy_config = None
         self.log.append(f"cluster {self.name} up")
 
@@ -175,7 +189,7 @@ class _FakeEngine:
         # Refit fakes: rank zero's calls land in the log. ``faults`` maps a
         # worker method to an exception, or "hang".
         self.faults: dict[str, object] = {}
-        (width,) = kwargs["cluster"].kwargs["bundle_ct_per_node_list"]
+        width = sum(kwargs["cluster"].kwargs["bundle_ct_per_node_list"])
         workers = [_FakeWorker(self.short, rank) for rank in range(width)]
         self.worker_group = SimpleNamespace(
             workers=workers, get_dp_leader_worker_idx=lambda shard: 0
@@ -246,6 +260,8 @@ class _Env:
         _STATE = self
         self.nodes = nodes
         self.bundle_nodes: dict[int, list[str]] = {}
+        # Cluster index -> rank-ordered bundle indices of a unified placement group.
+        self.sorted_bundle_indices: dict[int, list[int]] = {}
         self.log: list[str] = []
         self.clusters: list[_FakeCluster] = []
         self.engines: list[_FakeEngine] = []
@@ -271,6 +287,8 @@ class _Env:
             self.log.append(f"placement {cluster.name}")
 
         make_engine.init_cluster_placement_groups = init_cluster_placement_groups
+        # The real rank-to-bundle mapping, so the node check reads ranks in order.
+        make_engine._rank_placement = MegatronGeneration._rank_placement
 
         # The per-engine MegatronGeneration is looked up by name at build time.
         monkeypatch.setattr(generation_module, "MegatronGeneration", make_engine)
@@ -296,6 +314,7 @@ class _Env:
             port_range_low=None,
             port_range_high=None,
             node_resource_constraints=None,
+            segment_size=None,
         )
         cluster.update(cluster_overrides)
         return MegatronDynamoGeneration(
@@ -528,28 +547,135 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
 
 
 @pytest.mark.parametrize(
-    ("prefill", "decode", "world_size", "match"),
+    ("widths", "gpus_per_node", "nodes_per_segment", "slots"),
     [
+        # Sub-node engines share nodes in launch order.
+        pytest.param([4, 4, 4], 8, None, [[0], [0], [1]], id="uniform_4"),
+        pytest.param([4, 2, 2], 8, None, [[0], [0], [0]], id="mixed_fits_one_node"),
+        pytest.param([8, 4, 4], 8, None, [[0], [1], [1]], id="mixed_spills"),
+        # A two-node TP 8 engine on 4-GPU nodes.
+        pytest.param([8, 4, 4], 4, None, [[0, 1], [2], [3]], id="two_node_tp8"),
+        # Wide engines take whole fresh nodes; two replicas.
         pytest.param(
-            {"tensor_model_parallel_size": 16},
-            {"tensor_model_parallel_size": 16},
-            48,
-            "multi-node engines",
-            id="multi_node",
+            [16, 8, 8, 16, 8, 8],
+            4,
+            8,
+            [[0, 1, 2, 3], [4, 5], [6, 7], [8, 9, 10, 11], [12, 13], [14, 15]],
+            id="two_replicas",
         ),
-        pytest.param(
-            {},
-            {"tensor_model_parallel_size": 16},
-            34,
-            r"decode engine spans 16 GPUs.*mcore_generation_config\.decode_engine",
-            id="named_role",
-        ),
+        # A wide engine after a part-filled node starts on the next node.
+        pytest.param([2, 8], 4, None, [[0], [1, 2]], id="wide_after_partial"),
+        # A small engine after a wide one starts on the node after it.
+        pytest.param([8, 2, 2], 4, None, [[0, 1], [2], [2]], id="small_after_wide"),
+        # A wide engine that would straddle a segment moves to the next one.
+        pytest.param([12, 8], 4, 4, [[0, 1, 2], [4, 5]], id="no_segment_straddle"),
     ],
 )
-def test_rejects_engines_wider_than_a_node(env, prefill, decode, world_size, match):
+def test_engine_node_slots(widths, gpus_per_node, nodes_per_segment, slots):
+    assert engine_node_slots(widths, gpus_per_node, nodes_per_segment) == slots
+
+
+@pytest.mark.parametrize(
+    ("widths", "gpus_per_node", "nodes_per_segment", "match"),
+    [
+        # TP 2 x PP 3 on 4-GPU nodes: wider than a node but not whole nodes.
+        pytest.param([6], 4, None, r"6 GPUs.*multiple of 4", id="partial_tail"),
+        pytest.param([12], 8, None, r"12 GPUs.*multiple of 8", id="not_whole_nodes"),
+        pytest.param([32], 4, 4, r"8 nodes.*segment of 4", id="wider_than_segment"),
+    ],
+)
+def test_engine_node_slots_rejects(widths, gpus_per_node, nodes_per_segment, match):
     with pytest.raises(ValueError, match=match):
-        env.generation(_with_layout(prefill, decode), world_size=world_size)
+        engine_node_slots(widths, gpus_per_node, nodes_per_segment)
+
+
+def _wide(env, **overrides):
+    """A 16-GPU prefill (TP 4 x PP 4) and two 8-GPU decodes (TP 4 x PP 2) on 4-GPU nodes."""
+    return env.generation(
+        _with_layout(
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 4},
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 2},
+        ),
+        world_size=32,
+        num_gpus_per_node=4,
+        **overrides,
+    )
+
+
+def test_engines_wider_than_a_node_take_whole_pinned_nodes(env):
+    pins = [{f"nvl-{i}": 0.001} for i in range(8)]
+    generation = _wide(env, segment_size=8, node_resource_constraints=pins)
+
+    assert [c.kwargs["bundle_ct_per_node_list"] for c in env.clusters] == [
+        [4, 4, 4, 4],
+        [4, 4],
+        [4, 4],
+    ]
+    assert [c.kwargs["node_resource_constraints"] for c in env.clusters] == [
+        pins[0:4],
+        pins[4:6],
+        pins[6:8],
+    ]
+    assert [r.world_size for r in generation.engine_records] == [16, 8, 8]
+    # The refit offsets follow the engine widths, multi-node or not.
+    assert generation.engine_rank_offsets(8) == [8, 24, 32]
+
+
+def test_engine_width_not_a_whole_number_of_nodes_names_the_role(env):
+    with pytest.raises(
+        ValueError,
+        match=r"12 GPUs.*multiple of 8.*mcore_generation_config\.decode_engine",
+    ):
+        env.generation(
+            _with_layout({}, {"tensor_model_parallel_size": 12}),
+            world_size=2 + 2 * 12,
+        )
     assert env.log == []
+
+
+def test_engine_wider_than_a_pinned_segment_names_the_role(env):
+    pins = [{f"nvl-{i}": 0.001} for i in range(8)]
+    with pytest.raises(
+        ValueError, match=r"4 nodes.*segment of 2.*mcore_generation_config\.prefill_engine"
+    ):
+        _wide(env, segment_size=2, node_resource_constraints=pins)
+    assert env.log == []
+
+
+def test_multi_node_engine_records_rank_zero_node(env):
+    generation = _wide(env)
+    assert [r.node_ip for r in generation.engine_records] == [
+        f"{env.nodes[0]}-n0",
+        f"{env.nodes[1]}-n0",
+        f"{env.nodes[2]}-n0",
+    ]
+
+
+def test_multi_node_engine_with_a_node_split_across_hosts_is_rejected(env):
+    # Prefill's second node-sized block of ranks lands on two hosts.
+    env.bundle_nodes[0] = ["h0"] * 4 + ["h1", "h1", "h2", "h2"] + ["h3"] * 8
+    with pytest.raises(RuntimeError, match=r"prefill-0 ranks 4-7 span"):
+        _wide(env)
+    assert "cluster prefill-0 down" in env.log
+
+
+def test_multi_node_engine_reads_a_unified_placement_group_in_rank_order(env):
+    # Bundles alternate between hosts; the sorted indices put each host's
+    # bundles together, so rank order lands node by node and bundle order does not.
+    env.bundle_nodes[0] = ["h1", "h0", "h3", "h2"] * 4
+    # Rank r of node n sits on bundle 4 * r + host n's offset.
+    env.sorted_bundle_indices[0] = [
+        4 * rank + offset for offset in (1, 0, 3, 2) for rank in range(4)
+    ]
+    generation = _wide(env)
+    assert generation.engine_records[0].node_ip == "h0"
+
+
+def test_multi_node_engine_on_too_few_hosts_is_rejected(env):
+    # 16 ranks packed onto 2 hosts instead of 4.
+    env.bundle_nodes[0] = ["h0"] * 8 + ["h1"] * 8
+    with pytest.raises(RuntimeError, match=r"prefill-0 .* 2 nodes, planned 4"):
+        _wide(env)
 
 
 _PINS = [{"nvl-a": 0.001}, {"nvl-b": 0.001}]
@@ -635,7 +761,7 @@ def test_start_failure_tears_down_what_exists(env):
 
 def test_engine_split_across_nodes_is_rejected(env):
     env.bundle_nodes[1] = ["10.0.0.1", "10.0.0.2"]
-    with pytest.raises(RuntimeError, match=r"decode-0 spans multiple nodes"):
+    with pytest.raises(RuntimeError, match=r"decode-0 ranks 0-\d+ span multiple nodes"):
         env.generation()
     # Rejected before the engine's workers exist.
     assert [engine.name for engine in env.engines] == ["prefill-0"]

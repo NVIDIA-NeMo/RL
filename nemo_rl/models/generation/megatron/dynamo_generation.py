@@ -108,6 +108,62 @@ def role_policy_config(
     return config
 
 
+def engine_node_slots(
+    widths: Sequence[int], gpus_per_node: int, nodes_per_segment: int | None
+) -> list[list[int]]:
+    """Inference-node indices each engine takes, in launch order.
+
+    An engine no wider than a node shares nodes with its neighbours: it starts
+    the next node when it does not fit in the GPUs the earlier engines left. A
+    wider engine takes ``width / gpus_per_node`` whole nodes, starting on a
+    fresh one. With ``nodes_per_segment`` set (the inference cluster's node
+    pins come in NVLink-domain segments of that many nodes), no engine crosses
+    a segment boundary, so every engine stays inside one NVLink domain.
+
+    Args:
+        widths: GPUs each engine spans, in launch order.
+        gpus_per_node: GPUs on every inference node.
+        nodes_per_segment: Nodes per pinned segment, or None without pins.
+
+    Returns:
+        One list of node indices per engine.
+
+    Raises:
+        ValueError: An engine wider than a node is not a whole number of
+            nodes, or is wider than one segment.
+    """
+    slots: list[list[int]] = []
+    node, used = 0, 0
+    for width in widths:
+        if width <= gpus_per_node:
+            if used + width > gpus_per_node:
+                node, used = node + 1, 0
+            slots.append([node])
+            used += width
+            continue
+        if width % gpus_per_node != 0:
+            raise ValueError(
+                f"A Megatron engine behind Dynamo spans {width} GPUs, which is wider "
+                f"than a node and not a multiple of {gpus_per_node} GPUs per node; "
+                "an engine wider than a node takes whole nodes."
+            )
+        span = width // gpus_per_node
+        start = node + 1 if used else node
+        if nodes_per_segment is not None:
+            if span > nodes_per_segment:
+                raise ValueError(
+                    f"A Megatron engine behind Dynamo spans {span} nodes, more than "
+                    f"one NVLink segment of {nodes_per_segment} nodes; engines "
+                    "wider than an NVLink domain are not supported."
+                )
+            segment_end = (start // nodes_per_segment + 1) * nodes_per_segment
+            if start + span > segment_end:
+                start = segment_end
+        slots.append(list(range(start, start + span)))
+        node, used = start + span, 0
+    return slots
+
+
 @ray.remote(num_cpus=0)
 def cluster_node_ip() -> str:  # pragma: no cover
     """IP of the node a placement-group bundle lives on."""
@@ -161,7 +217,8 @@ class MegatronDynamoEngine:
         role: ``prefill`` or ``decode``.
         world_size: Ranks the engine spans.
         instance_id: ``<role>-<ordinal>``, the engine's name in logs and errors.
-        node_ip: The node every rank of the engine sits on.
+        node_ip: The node rank zero sits on: where the engine's coordinator
+            listens.
         workers: Every worker of the engine, in rank order.
         leader: The worker leading the engine's single DP shard.
     """
@@ -191,7 +248,8 @@ class MegatronDynamoEngine:
             role: ``prefill`` or ``decode``.
             world_size: Ranks the engine spans.
             instance_id: ``<role>-<ordinal>``, the engine's name in logs and errors.
-            node_ip: The node every rank of the engine sits on.
+            node_ip: The node rank zero sits on: where the engine's
+                coordinator listens.
 
         Returns:
             A record holding the workers in rank order and the single DP shard's leader.
@@ -291,9 +349,10 @@ class MegatronDynamoGeneration(GenerationInterface):
     A sibling of ``MegatronGeneration``, not a subclass: ``resolve_generation_class``
     picks it over ``MegatronGeneration`` when the switch is set. Instead of one
     dedicated inference policy it owns one ``MegatronGeneration`` per prefill or
-    decode engine, each over
-    its own one-node virtual cluster and built with ``skip_weight_load=True`` so
-    its inference engine comes up at the first weight refit. Every engine has
+    decode engine, each over its own virtual cluster on the nodes it takes and
+    built with ``skip_weight_load=True`` so its inference engine comes up at the
+    first weight refit. An engine wider than a node takes whole nodes inside one
+    pinned NVLink segment. Every engine has
     the layout the policy config gives plus its role's
     ``mcore_generation_config.prefill_engine`` / ``decode_engine`` overrides, so prefill and
     decode engines may differ in TP and PP (the KV handoff reshards between
@@ -359,9 +418,10 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Build one engine per role; the engines come up at the first refit.
 
         Same signature as ``MegatronGeneration`` so setup builds either class the
-        same way. ``cluster`` contributes the node shape, port range and node
-        pins only; each engine gets its own one-node cluster. Its placement
-        groups stay unmaterialized, or the engines' GPUs would be booked twice.
+        same way. ``cluster`` contributes the node shape, port range, node pins
+        and segment size only; each engine gets its own cluster on the nodes it
+        takes. Its placement groups stay unmaterialized, or the engines' GPUs
+        would be booked twice.
         ``policy`` (colocation) and ``processor`` (VLM prompts) are refused;
         ``name_prefix``, ``skip_weight_load`` and ``reserved_http_server_ports``
         do not apply, since every engine is built with ``skip_weight_load=True``
@@ -378,9 +438,11 @@ class MegatronDynamoGeneration(GenerationInterface):
             reserved_http_server_ports: Unused; the engines expose no HTTP server.
 
         Raises:
-            ValueError: On an engine wider than a node, or more engines than
-                the node pins hold.
-            RuntimeError: When an engine's GPUs land on more than one node.
+            ValueError: On an engine wider than a node that is not a whole
+                number of nodes or wider than a pinned segment, or more engines
+                than the node pins hold.
+            RuntimeError: When an engine's ranks do not land node by node as
+                planned.
         """
         if policy is not None:
             raise ValueError(
@@ -408,6 +470,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._port_range_low = cluster.port_range_low
         self._port_range_high = cluster.port_range_high
         self._node_resource_constraints = cluster.node_resource_constraints
+        # Nodes per pinned NVLink segment; engines never cross one.
+        self._segment_size = cluster.segment_size
         # One record per engine, in launch (refit rank) order; what refit calls use.
         self._engine_records: list[MegatronDynamoEngine] = []
         # The owning objects, in the same order; empty on a copy.
@@ -859,36 +923,32 @@ class MegatronDynamoGeneration(GenerationInterface):
             widths: GPU ranks each engine spans, parallel to ``roles``.
 
         Raises:
-            ValueError: On an engine wider than a node, or more engines than
-                the node pins hold.
-            RuntimeError: When an engine's GPUs land on more than one node.
+            ValueError: On an engine wider than a node that is not a whole
+                number of nodes or wider than a pinned segment, or more engines
+                than the node pins hold.
+            RuntimeError: When an engine's ranks do not land node by node as
+                planned.
         """
-        for role, width in zip(roles, widths, strict=True):
-            if width > self._num_gpus_per_node:
-                raise ValueError(
-                    f"A Megatron {role} engine spans {width} GPUs "
-                    f"but nodes have {self._num_gpus_per_node}; multi-node "
-                    "engines are not supported behind Dynamo. Lower "
-                    f"policy.generation.mcore_generation_config.{role}_engine or "
-                    "mcore_generation_config tensor_model_parallel_size x "
-                    "pipeline_model_parallel_size."
-                )
-        # Which pinned inference node each engine takes, when the shared
-        # inference cluster has node pins. Engines tile the pinned nodes in
-        # launch order, each engine wholly on one node: an engine that does not
-        # fit in the GPUs the earlier engines left on the current node starts
-        # the next one. With one width this is engine_index // engines_per_node.
+        # Which inference nodes each engine takes: sub-node engines share
+        # nodes in launch order, wider ones take whole nodes inside one pinned
+        # segment (engine_node_slots).
         constraints = self._node_resource_constraints
-        pin_index_by_engine: list[int] = []
-        node_index = 0
-        used_on_node = 0
-        for width in widths:
-            if used_on_node + width > self._num_gpus_per_node:
-                node_index += 1
-                used_on_node = 0
-            pin_index_by_engine.append(node_index)
-            used_on_node += width
-        nodes_needed = node_index + 1
+        nodes_per_segment = self._segment_size if constraints is not None else None
+        # One engine at a time first, so a width that cannot be placed names
+        # its role and the config key to change.
+        for role, width in zip(roles, widths, strict=True):
+            try:
+                engine_node_slots([width], self._num_gpus_per_node, nodes_per_segment)
+            except ValueError as err:
+                raise ValueError(
+                    f"{err} Change policy.generation.mcore_generation_config."
+                    f"{role}_engine (or the shared mcore_generation_config) "
+                    "tensor_model_parallel_size x pipeline_model_parallel_size."
+                ) from err
+        node_slots_by_engine = engine_node_slots(
+            widths, self._num_gpus_per_node, nodes_per_segment
+        )
+        nodes_needed = node_slots_by_engine[-1][-1] + 1
         if constraints is not None and nodes_needed > len(constraints):
             widths_by_role = dict(zip(roles, widths, strict=True))
             raise ValueError(
@@ -910,9 +970,14 @@ class MegatronDynamoGeneration(GenerationInterface):
             role_counts[role] = ordinal + 1
             instance_id = f"{role}-{ordinal}"
             engine_policy_config = cast("PolicyConfig", policy_config_by_role[role])
+            node_slots = node_slots_by_engine[engine_index]
             cluster = RayVirtualCluster(
                 name=f"dynamo_{self._fleet_id}_{instance_id}",
-                bundle_ct_per_node_list=[width],
+                bundle_ct_per_node_list=(
+                    [width]
+                    if len(node_slots) == 1
+                    else [self._num_gpus_per_node] * len(node_slots)
+                ),
                 use_gpus=True,
                 num_gpus_per_node=self._num_gpus_per_node,
                 max_colocated_worker_groups=1,
@@ -921,7 +986,7 @@ class MegatronDynamoGeneration(GenerationInterface):
                 node_resource_constraints=(
                     None
                     if constraints is None
-                    else [constraints[pin_index_by_engine[engine_index]]]
+                    else [constraints[node] for node in node_slots]
                 ),
             )
             self._clusters.append(cluster)
@@ -931,7 +996,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             MegatronGeneration.init_cluster_placement_groups(
                 cluster, engine_policy_config
             )
-            node_ip = self._engine_node_ip(cluster, instance_id)
+            node_ip = self._engine_node_ip(cluster, instance_id, len(node_slots))
             engine = MegatronGeneration(
                 config=engine_policy_config,
                 tokenizer=self._tokenizer,
@@ -955,31 +1020,49 @@ class MegatronDynamoGeneration(GenerationInterface):
                 flush=True,
             )
 
-    def _engine_node_ip(self, cluster: RayVirtualCluster, instance_id: str) -> str:
-        """Node every bundle of an engine's cluster sits on.
+    def _engine_node_ip(
+        self, cluster: RayVirtualCluster, instance_id: str, num_nodes: int
+    ) -> str:
+        """Rank zero's node, after checking the engine landed node by node as planned.
 
+        Ranks are read in rank order (``MegatronGeneration._rank_placement``).
+        Each block of ``num_gpus_per_node`` ranks (all ranks, for an engine
+        within one node) must share one node, so its tensor-parallel group stays
+        on NVLink, and the blocks must sit on ``num_nodes`` different nodes.
         ``PACK`` is best effort: on a fragmented or partly busy cluster Ray may
-        spread an engine's bundles over several nodes, and its tensor-parallel
-        group would then silently run across them.
+        spread bundles, and the engine would then silently run its collectives
+        across nodes.
         """
+        placement_groups = cluster.get_placement_groups()
         refs = [
             cluster_node_ip.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group,
+                    placement_group=placement_groups[pg_index],
                     placement_group_bundle_index=bundle_index,
                 )
             ).remote()
-            for placement_group in cluster.get_placement_groups()
-            for bundle_index in range(placement_group.bundle_count)
+            for pg_index, bundle_index in MegatronGeneration._rank_placement(cluster)
         ]
-        node_ips = set(ray.get(refs))
-        if len(node_ips) != 1:
+        rank_ips = ray.get(refs)
+        block = len(rank_ips) if num_nodes == 1 else self._num_gpus_per_node
+        block_ips = []
+        for start in range(0, len(rank_ips), block):
+            ips = set(rank_ips[start : start + block])
+            if len(ips) != 1:
+                raise RuntimeError(
+                    f"Megatron engine {instance_id} ranks {start}-{start + block - 1} "
+                    f"span multiple nodes {sorted(ips)}; each node's worth of ranks "
+                    "must share one node."
+                )
+            block_ips.append(ips.pop())
+        if len(set(block_ips)) != num_nodes:
             raise RuntimeError(
-                f"Megatron engine {instance_id} spans multiple nodes "
-                f"{sorted(node_ips)}. Multi-node engines are not supported "
-                "behind Dynamo."
+                f"Megatron engine {instance_id} landed on {len(set(block_ips))} "
+                f"nodes, planned {num_nodes}. Ray placed the engine's per-node "
+                "bundles on fewer nodes than planned; make sure the pinned NVLink "
+                "domain has that many free whole nodes."
             )
-        return next(iter(node_ips))
+        return rank_ips[0]
 
     def shutdown(self) -> bool:
         """Stop every engine, then release their placement groups.
