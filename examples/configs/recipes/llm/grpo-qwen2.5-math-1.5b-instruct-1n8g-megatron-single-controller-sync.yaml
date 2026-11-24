@@ -7,6 +7,7 @@ logger:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
 
 # Training-time validation is disabled in this recipe.
+# See docs/guides/single-controller.md#training-time-validation.
 grpo:
   # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
   # SC reads async_rl instead, and the entrypoint raises if this block is set.
