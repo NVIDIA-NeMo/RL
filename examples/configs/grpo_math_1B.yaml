@@ -715,10 +715,9 @@ cluster:
   master_port_range_high: 1999
   segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
-# TransferQueue-mediated data plane for sync GRPO.
-# Off by default — the legacy grpo_train trainer never engages this.
-# Flip enabled=true and run grpo_train_sync to use TQ-mediated bulk
-# transfer between rollout and train. See nemo_rl/data_plane/README.md.
+# TransferQueue-mediated data plane, used by the SingleController path only.
+# Off by default — the legacy grpo_train trainer rejects enabled=true.
+# See nemo_rl/data_plane/README.md.
 data_plane:
   enabled: false
   impl: transfer_queue

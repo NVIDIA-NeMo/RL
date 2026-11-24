@@ -1,4 +1,0 @@
-defaults: grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.yaml
-data_plane:
-  enabled: true
-  backend: nixl

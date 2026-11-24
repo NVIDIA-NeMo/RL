@@ -1,3 +1,0 @@
-defaults: grpo-qwen2.5-math-1.5b-instruct-1n8g-automodel.v3.yaml
-data_plane:
-  enabled: true
