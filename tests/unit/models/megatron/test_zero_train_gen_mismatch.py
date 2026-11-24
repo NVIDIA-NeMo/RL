@@ -21,6 +21,7 @@ pushed through the same gates the workers run at startup.
 """
 
 import copy
+import inspect
 import sys
 import types
 from dataclasses import make_dataclass
@@ -35,8 +36,8 @@ from nemo_rl.models.megatron import zero_train_gen_mismatch as zgm
 GOOD_VERSIONS = {
     "transformer_engine": Version("2.18.0"),
     "flash_attn": Version("2.8.1"),
-    "flash-attn-4": Version("4.0.0b19"),
-    "nvidia-cutlass-dsl": Version("4.6.2"),
+    "flash-attn-4": Version("4.0.0b27"),
+    "nvidia-cutlass-dsl": Version("4.8.0"),
 }
 
 
@@ -528,20 +529,10 @@ def test_packages_report_each_missing_or_old_dependency(
     assert any(expected in v for v in out.violations), out.violations
 
 
-def test_packages_accept_flash_attn_4_b19_below_the_mcore_gate(monkeypatch):
-    """MCore's own gate is b20; the zero-KL preset must not repeat it."""
-    versions = dict(GOOD_VERSIONS)
-    versions["flash-attn-4"] = Version("4.0.0b19")
-    _set_versions(monkeypatch, versions)
-    out = zgm.ZeroTrainGenValidation()
-    zgm._validate_packages(out)
-    assert not any("flash-attn-4" in v for v in out.violations)
-
-
 def test_packages_accept_the_underscore_distribution_name(monkeypatch):
     versions = dict(GOOD_VERSIONS)
     del versions["flash-attn-4"]
-    versions["flash_attn_4"] = Version("4.0.0b19")
+    versions["flash_attn_4"] = Version("4.0.0b27")
     _set_versions(monkeypatch, versions)
     out = zgm.ZeroTrainGenValidation()
     zgm._validate_packages(out)
@@ -609,71 +600,6 @@ def test_platform_requires_blackwell(monkeypatch, capability, expected):
 
 
 # --------------------------------------------------------------------------- #
-# allow_installed_flash_attn_4
-# --------------------------------------------------------------------------- #
-
-
-def _fake_mcore_attention(have_fa4: bool) -> types.ModuleType:
-    module = types.ModuleType("megatron.core.transformer.attention")
-    module.HAVE_FA4 = have_fa4  # type: ignore[attr-defined]
-    module.flash_attn4_varlen_func = None  # type: ignore[attr-defined]
-    return module
-
-
-def _fake_flash_attn_cute(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    module = types.ModuleType("flash_attn.cute")
-
-    def flash_attn_varlen_func(*args, **kwargs):
-        return "fa4"
-
-    module.flash_attn_varlen_func = flash_attn_varlen_func  # type: ignore[attr-defined]
-    _install_fake_module(monkeypatch, "flash_attn.cute", module)
-    return module
-
-
-def test_allow_installed_flash_attn_4_opens_mcores_version_gate(monkeypatch):
-    attention = _fake_mcore_attention(have_fa4=False)
-    _install_fake_module(monkeypatch, attention.__name__, attention)
-    cute = _fake_flash_attn_cute(monkeypatch)
-    monkeypatch.setattr(
-        zgm, "_first_package_version", lambda names: Version("4.0.0b19")
-    )
-
-    zgm.allow_installed_flash_attn_4()
-
-    assert attention.HAVE_FA4 is True
-    assert attention.flash_attn4_varlen_func is cute.flash_attn_varlen_func
-
-
-def test_allow_installed_flash_attn_4_leaves_an_open_gate_alone(monkeypatch):
-    attention = _fake_mcore_attention(have_fa4=True)
-    sentinel = object()
-    attention.flash_attn4_varlen_func = sentinel  # type: ignore[attr-defined]
-    _install_fake_module(monkeypatch, attention.__name__, attention)
-    _fake_flash_attn_cute(monkeypatch)
-
-    def unexpected(names):
-        raise AssertionError("package lookup must not run when FA4 is already enabled")
-
-    monkeypatch.setattr(zgm, "_first_package_version", unexpected)
-
-    zgm.allow_installed_flash_attn_4()
-
-    assert attention.flash_attn4_varlen_func is sentinel
-
-
-def test_allow_installed_flash_attn_4_does_nothing_when_not_installed(monkeypatch):
-    attention = _fake_mcore_attention(have_fa4=False)
-    _install_fake_module(monkeypatch, attention.__name__, attention)
-    monkeypatch.setattr(zgm, "_first_package_version", lambda names: None)
-
-    zgm.allow_installed_flash_attn_4()
-
-    assert attention.HAVE_FA4 is False
-    assert attention.flash_attn4_varlen_func is None
-
-
-# --------------------------------------------------------------------------- #
 # enable_batch_invariant_kernels / validate_zero_train_gen_kl
 # --------------------------------------------------------------------------- #
 
@@ -697,11 +623,7 @@ def _fake_batch_invariant_kernels(
 
 def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     calls = _fake_batch_invariant_kernels(monkeypatch)
-    opened: list[bool] = []
     shimmed: list[bool] = []
-    monkeypatch.setattr(
-        zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
-    )
     monkeypatch.setattr(
         zgm, "_use_full_vocab_log_softmax", lambda: shimmed.append(True)
     )
@@ -712,7 +634,6 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
-    assert opened == [True]
     assert shimmed == [True]
     assert tuned == [True]
     assert calls == [
@@ -982,8 +903,34 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     assert shim.apply(logits, target, 0, 16, None, True) == "orig"
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, chunked):
+@pytest.mark.parametrize(
+    "shim_name,original_name",
+    [
+        ("_DistributedFullVocabLogprob", "DistributedLogprob"),
+        ("_ChunkedFullVocabLogprob", "ChunkedDistributedLogprob"),
+    ],
+)
+def test_logprob_shim_signature_matches_the_replaced_function(shim_name, original_name):
+    # The shim binds arguments by name, so its apply must list the same
+    # parameters as the replaced forward (minus self / ctx).
+    from nemo_rl.distributed import model_utils
+
+    shim = list(inspect.signature(getattr(zgm, shim_name).apply).parameters)[1:]
+    original = getattr(model_utils, original_name)
+    if isinstance(original, zgm._FullVocabLogprob):
+        original = original._original
+    replaced = list(inspect.signature(original.forward).parameters)[1:]
+    assert shim == replaced
+
+
+# The chunked function takes a trailing reuse_logits_storage after inference_only.
+@pytest.mark.parametrize(
+    "chunked,trailing_args",
+    [(False, ()), (True, ()), (True, (False,)), (True, (True,))],
+)
+def test_logprob_shim_backward_is_the_replaced_functions_backward(
+    monkeypatch, chunked, trailing_args
+):
     import torch
 
     def full_row(shard):
@@ -1015,17 +962,22 @@ def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, c
     grad_output = torch.randn(2, 5)
 
     reference_logits = shard.clone().requires_grad_()
-    Original.apply(reference_logits, target, *original_args, False).backward(
-        grad_output
-    )
+    Original.apply(
+        reference_logits, target, *original_args, False, *trailing_args
+    ).backward(grad_output)
 
     calls.clear()
     logits = shard.clone().requires_grad_()
-    shim = zgm._FullVocabLogprob(Original, chunked=chunked)
-    out = shim.apply(logits, target, *original_args, False)
+    shim_cls = (
+        zgm._ChunkedFullVocabLogprob if chunked else zgm._DistributedFullVocabLogprob
+    )
+    shim = shim_cls(Original)
+    out = shim.apply(logits, target, *original_args, False, *trailing_args)
     assert calls == []  # the forward does not call the replaced function
     out.backward(grad_output)
 
-    assert calls == [(*original_args, False)]
+    # The shim passes reuse_logits_storage explicitly, defaulting to False.
+    expected_trailing = (trailing_args or (False,)) if chunked else ()
+    assert calls == [(*original_args, False, *expected_trailing)]
     assert logits.grad.dtype == torch.bfloat16
     assert torch.equal(logits.grad, reference_logits.grad)

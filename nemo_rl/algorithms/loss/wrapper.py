@@ -19,7 +19,7 @@ import torch
 import torch.distributed
 
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
@@ -44,6 +44,38 @@ _SEQ_METRIC_MAX: frozenset[str] = frozenset(
         "opd_full_decomposition_error",
     }
 )
+
+
+class StreamingObjectiveLoss:
+    """Hand the split worker's placeholder count to the loss as its explicit denominator.
+
+    The forward callbacks pass ``global_valid_toks = global_valid_seqs = 1``;
+    the worker divides the raw sums by the all-reduced objective count at finish.
+    """
+
+    def __init__(self, loss_fn: LossFunction) -> None:
+        self.loss_fn = loss_fn
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "loss_fn":  # deepcopy/unpickle probe before __init__ ran
+            raise AttributeError(name)
+        return getattr(self.loss_fn, name)
+
+    def __call__(
+        self,
+        *args: Any,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Keyword-only, so a positional caller fails loudly here.
+        return self.loss_fn(
+            *args,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            global_objective_denominator=global_valid_toks,
+            **kwargs,
+        )
 
 
 class SequencePackingLossWrapper:
@@ -163,6 +195,9 @@ class SequencePackingLossWrapper:
             # aggregate loss and metrics
             loss_accum += loss
             for k, v in metrics.items():
+                if k == SEQ_LOGPROB_KEEP_MASK_KEY:
+                    metrics_accum.setdefault(k, []).extend(v)
+                    continue
                 if k not in metrics_accum:
                     if k in _SEQ_METRIC_MIN:
                         metrics_accum[k] = float("inf")

@@ -16,9 +16,23 @@ from typing import Any, Optional
 
 import torch
 
-from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer, ObjectiveReduction
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
+
+
+def skips_policy_logprob_pass(
+    loss_cfg: Any, seq_logprob_error_threshold: Optional[float]
+) -> bool:
+    """Whether the separate policy-logprob forward can be skipped.
+
+    ``force_on_policy_ratio`` makes the ratio 1, so previous logprobs are only
+    needed when the sequence-logprob threshold is checked before training.
+    """
+    return bool(
+        loss_cfg.force_on_policy_ratio
+        and (seq_logprob_error_threshold is None or loss_cfg.seq_logprob_error_in_loss)
+    )
 
 
 def rescale_loss_metrics(
@@ -27,21 +41,57 @@ def rescale_loss_metrics(
     *,
     token_factor: float,
     sequence_factor: float,
+    loss_divisor_factor: float,
 ) -> dict[str, Any]:
     """Change global loss denominators while preserving raw counts and extrema.
 
-    Metrics absent from ``normalizers`` are returned unchanged. Unlike
-    split-API normalization of raw sums, this only adjusts denominators
-    explicitly advertised by the loss.
+    Every metric must be listed in ``normalizers``; an unlisted metric raises
+    instead of being rescaled by a guessed denominator. ``loss_divisor_factor``
+    is the factor applied to the gradient, so ``LOSS_DIVISOR`` metrics follow it.
     """
     factors = {
         MetricNormalizer.TOKENS: token_factor,
         MetricNormalizer.SEQUENCES: sequence_factor,
+        MetricNormalizer.LOSS_DIVISOR: loss_divisor_factor,
         MetricNormalizer.NONE: 1.0,
     }
+    rescaled = {}
+    for key, value in metrics.items():
+        if key not in normalizers:
+            # Guessing a denominator would log a silently wrong value.
+            raise ValueError(
+                f"Metric {key!r} is missing from the loss's metric_normalizations; "
+                "survivor rescaling needs every metric's denominator."
+            )
+        rescaled[key] = value * factors[normalizers[key]]
+    return rescaled
+
+
+def metric_normalizer_scales(
+    objective_reduction: ObjectiveReduction,
+    *,
+    global_valid_toks: torch.Tensor,
+    global_valid_seqs: torch.Tensor,
+    global_objective_denominator: torch.Tensor,
+) -> dict[MetricNormalizer, float]:
+    """Return the finish-time multiplier of each ``MetricNormalizer`` kind.
+
+    Split-API trainers sum metrics computed with placeholder
+    ``global_valid_*=1`` and multiply each sum by the reciprocal of its
+    advertised global denominator. ``LOSS_DIVISOR`` uses
+    ``objective_reduction.loss_divisor``, the divisor the gradient used.
+    Callers pass nonzero (all-reduced) counts.
+    """
+    loss_divisor = objective_reduction.loss_divisor(
+        global_valid_toks=global_valid_toks,
+        global_valid_seqs=global_valid_seqs,
+        global_objective_denominator=global_objective_denominator,
+    )
     return {
-        key: value * factors[normalizers[key]] if key in normalizers else value
-        for key, value in metrics.items()
+        MetricNormalizer.TOKENS: float((1.0 / global_valid_toks).item()),
+        MetricNormalizer.SEQUENCES: float((1.0 / global_valid_seqs).item()),
+        MetricNormalizer.LOSS_DIVISOR: float((1.0 / loss_divisor).item()),
+        MetricNormalizer.NONE: 1.0,
     }
 
 

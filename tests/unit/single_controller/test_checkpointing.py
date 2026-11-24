@@ -56,7 +56,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
-    LEGACY_REPLAY_BUFFER_FILENAME,
     REPLAY_BUFFER_METADATA_FILENAME,
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
@@ -68,6 +67,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    ReadyFirstSampler,
+    ReadyFirstSamplerConfig,
     WindowedSamplerConfig,
     sampler_supports_buffer_checkpoint,
 )
@@ -79,9 +80,30 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.rollout_checkpointing import snapshots as snapshots_module
+from nemo_rl.algorithms.rollout_checkpointing.inventory import (
+    capture_reward_settings,
+    list_staging_keys,
+    validate_rollout_recovery_inventory,
+)
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BOOTSTRAP_DIRNAME,
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    BootstrapCompatibilityIdentity,
+    RolloutSnapshotManifest,
+    bootstrap_compatibility_identity,
+    commit_snapshot,
+    ensure_bootstrap_anchor,
+    prepare_snapshot_paths,
+)
+from nemo_rl.algorithms.rollout_checkpointing.state import (
+    ResumeSource,
+    RolloutCheckpointSaveResult,
+)
 from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
     SingleControllerActor,
-    _RolloutCheckpointSaveResult,
 )
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -93,22 +115,16 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    BOOTSTRAP_DIRNAME,
-    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
-    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-    BootstrapCompatibilityIdentity,
-    RolloutSnapshotManifest,
-    bootstrap_compatibility_identity,
-    commit_snapshot,
-    ensure_bootstrap_anchor,
-    prepare_snapshot_paths,
-)
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.step_assembly import (
+    StepAssembly as _StepAssembly,
+)
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
@@ -116,6 +132,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.route_plan import (
@@ -124,13 +141,25 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PretrainedCheckpointConfig,
+)
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import TimeoutChecker
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
-from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.environments.gym_checkpoint_fakes import (
+    FakeGymActor,
+    gym_coordinator,
+    gym_environment_checkpoint,
+)
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 from tests.unit.single_controller.test_setup import (
     _native_tq_metadata,
     patched_factories,  # noqa: F401
@@ -143,6 +172,47 @@ from tests.unit.single_controller.test_tq_replay_buffer import (
 # Instantiate the underlying class in-process (same pattern as
 # tests/unit/algorithms/test_async_utils.py for AsyncTrajectoryCollector).
 _ACTOR_CLS = SingleControllerActor.__ray_metadata__.modified_class
+
+
+class _FakeEnvironmentSnapshot:
+    """An environment's part of a snapshot that records its check and its pause."""
+
+    restarted_rollouts = 0
+
+    def __init__(self) -> None:
+        self.checked_cuts: list[Any] = []
+        self.checked_staging_keys: list[frozenset[str]] = []
+
+    async def check_against_cut(
+        self, cut: Any, tq_staging_keys: frozenset[str]
+    ) -> frozenset[str]:
+        self.checked_cuts.append(cut)
+        self.checked_staging_keys.append(tq_staging_keys)
+        return frozenset()
+
+    def metrics(self, paused_seconds: float) -> dict[str, float]:
+        return {"environment_paused_seconds": paused_seconds}
+
+
+class _FakeEnvironmentCheckpoint(NoEnvironmentCheckpoint):
+    """An environment that keeps rollout state; ``snapshot`` comes from a factory."""
+
+    def __init__(
+        self,
+        snapshot: Optional[
+            Callable[[Path], contextlib.AbstractAsyncContextManager[Any]]
+        ] = None,
+    ) -> None:
+        self._snapshot_factory = snapshot
+
+    @property
+    def holds_rollout_state(self) -> bool:
+        return True
+
+    def snapshot(self, checkpoint_path: Path):  # type: ignore[override]
+        assert self._snapshot_factory is not None
+        return self._snapshot_factory(checkpoint_path)
+
 
 _PARTITION_ID = "rollout_data"
 _STAGING_PARTITION_ID = "rollout_staging"
@@ -183,6 +253,17 @@ class _FakeTrainer:
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
+
+    def add_data_plane_snapshot_source(self, actor: Any) -> None:
+        pass
+
+    def add_data_plane_snapshot_fn(self, fn: Any) -> None:
+        pass
+
+    def get_data_plane_step_metrics(
+        self, step_time_s: float, driver_client: Any = None
+    ) -> None:
+        return None
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         pass
@@ -291,6 +372,11 @@ class _FailingFinalizeTrainer(_FakeTrainer):
 
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
+
+    # BaseSampler's gated defaults; the controller reads these directly off the sampler.
+    uses_pooled_replacements = True
+    closes_short_at_exhaustion = False
+    requires_shortfall_reconciliation = True
 
     def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
         self._supports_buffer_checkpoint = supports_buffer_checkpoint
@@ -420,6 +506,9 @@ class _RestoredGroupsSampler(_FakeSampler):
 
 
 class _FakeDPClient:
+    def capture_checkpoint(self, checkpoint_dir, *, metadata=None):
+        return None
+
     def __init__(
         self,
         *,
@@ -483,6 +572,27 @@ class _StagingInventoryDPClient:
         self.sample_ids = [key for key in self.sample_ids if key not in cleared]
 
 
+_STAGING = "rollout_staging"
+
+
+def _validate_staging(dp_client: Any, **kwargs: Any) -> int:
+    """Run the staging-inventory check over a ledger that owns ``sealed-key``."""
+    ledger = _sealed_recovery_ledger("sealed-key")
+
+    async def validate() -> int:
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            return await validate_rollout_recovery_inventory(
+                cut,
+                dp_client=dp_client,
+                recovery_ledger=ledger,
+                staging_partition=_STAGING,
+                actual_staging_keys=await list_staging_keys(dp_client, _STAGING),
+                **kwargs,
+            )
+
+    return asyncio.run(validate())
+
+
 class _BlockingDPClient(_FakeDPClient):
     def __init__(self) -> None:
         super().__init__()
@@ -516,7 +626,7 @@ class _FakeGeneration:
     def snapshot_step_metrics(self) -> None:
         pass
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         return {}
 
     def pause_generation_for_refit(
@@ -612,6 +722,15 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def set_tally_step_provider(self, provider: Any) -> None:
+        self.tally_step_provider = provider
+
+    filter_zero_variance_groups = False
+
+    def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
+        del step
+        return {}
 
     def reserve_prompt_group(
         self,
@@ -843,6 +962,7 @@ def _actor_master_config(
             "train_global_batch_size": num_prompts_per_step * 2,
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "top_k": None,
                 "top_p": 1.0,
                 "colocated": {"enabled": False},
@@ -860,19 +980,19 @@ def _actor_master_config(
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
-        checkpointing={
-            "enabled": enabled,
-            "checkpoint_dir": str(tmp_path / "checkpoints"),
-            "metric_name": metric_name,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": save_period,
-            "save_optimizer": save_optimizer,
-            "save_data_plane": data_plane_checkpoint,
-            "load_replay_buffer": load_replay_buffer,
-            "checkpoint_must_save_by": checkpoint_must_save_by,
-            "ft_save_period": ft_save_period,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=enabled,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            metric_name=metric_name,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=save_period,
+            save_optimizer=save_optimizer,
+            save_data_plane=data_plane_checkpoint,
+            load_replay_buffer=load_replay_buffer,
+            checkpoint_must_save_by=checkpoint_must_save_by,
+            ft_save_period=ft_save_period,
+        ),
         data_plane={
             "enabled": True,
             "impl": "transfer_queue",
@@ -1005,7 +1125,7 @@ def test_replay_compatibility_is_checked_without_unfinished_groups(
     try:
         assert actor._rollout_recovery_ledger.groups() == []
         with pytest.raises(ValueError, match=error):
-            asyncio.run(actor._maybe_restore_replay_buffer())
+            asyncio.run(actor._rollout_restorer._restore_replay_buffer())
         actor._buffer.load_state_dict.assert_not_awaited()
         assert actor._dp_client.clear_calls == []
     finally:
@@ -1178,7 +1298,8 @@ def _run_reserve_restore(mc: MasterConfig, actor_args: SingleControllerActorArgs
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
-        await actor._maybe_restore_replacement_reserve()
+        attach_rollout_checkpointing(actor)
+        await actor._rollout_restorer._restore_spare_prompts()
         return actor
 
     return asyncio.run(_main())
@@ -1199,7 +1320,8 @@ def _run_restore_then_train_pump(
 
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
-        await actor._maybe_restore_replay_buffer()
+        attach_rollout_checkpointing(actor)
+        await actor._rollout_restorer._restore_replay_buffer()
         actor._sampler = _RestoredGroupsSampler(restored_groups, actor._buffer)
         with patch("ray.cluster_resources", return_value={"GPU": 0}):
             await asyncio.wait_for(actor._train_pump(), timeout=60.0)
@@ -1251,7 +1373,8 @@ class TestCounterRestore:
             RuntimeError,
             match=r"dispatch_index=7, max_target_step=8",
         ):
-            actor._validate_restored_sampler_cursor()
+            attach_rollout_checkpointing(actor)
+            actor._rollout_restorer._validate_sampler_cursor()
 
     def test_accepts_sampler_cursor_covering_restored_work(self) -> None:
         actor = object.__new__(_ACTOR_CLS)
@@ -1263,7 +1386,8 @@ class TestCounterRestore:
         )
         actor._sampler = SimpleNamespace(dispatch_index=8)
 
-        actor._validate_restored_sampler_cursor()
+        attach_rollout_checkpointing(actor)
+        actor._rollout_restorer._validate_sampler_cursor()
 
     def test_restore_from_step_n(self, tmp_path):
         save_state = _initial_grpo_save_state()
@@ -1302,6 +1426,9 @@ class TestCounterRestore:
 
         assert actor._train_steps == 7
         assert actor._trainer_version == 11
+        # A group with no step of its own is charged to the step being assembled, so a
+        # resume that left this at 0 would charge the first loss to a long-closed step.
+        assert actor._step_assembler._assembling_version == 11
         assert actor._sampler.dispatch_index == 10
 
     def test_restores_exact_sampler_dispatch_index(self, tmp_path):
@@ -1326,6 +1453,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
+        assert actor._step_assembler._assembling_version == 0
         assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0
@@ -1582,22 +1710,34 @@ class TestSaveTrigger:
         assert trainer.save_calls == []
         assert _step_dir_names(tmp_path / "checkpoints") == set()
 
-    def test_timeout_saves_and_stops_training_early(self, tmp_path):
-        # 0-second budget: the first check_save() fires; the pump must save
-        # at step 1 (off the period boundary) and break out of the loop.
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_timeout_saves_and_stops_training_early(self, tmp_path, defer_finalize):
+        # 0-second budget: the first check_save() fires; the pump must save at
+        # step 1 (off the period boundary), snapshot rollouts, then stop.
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=4,
             save_period=100,
             checkpoint_must_save_by="00:00:00:00",
+            defer_finalize=defer_finalize,
         )
         trainer = _FakeTrainer()
+        published_at_snapshot: list[set[str]] = []
 
-        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer))
+        def _seed(actor) -> None:
+            async def _save_at_deadline() -> None:
+                await asyncio.to_thread(actor._checkpointer.finalize_pending)
+                published_at_snapshot.append(_step_dir_names(tmp_path / "checkpoints"))
+
+            actor._rollout_snapshots.save_at_deadline = _save_at_deadline
+
+        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer), seed=_seed)
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
         assert trainer.save_calls[0]["is_final_checkpoint"] is False
+        # The deadline snapshot runs once, after step_1 is published.
+        assert published_at_snapshot == [{"step_1"}]
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
@@ -1728,7 +1868,7 @@ class TestSaveTrigger:
             path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
             actor._pending_checkpoint = (path, 1)
             # Another publication (e.g. a rollout snapshot) holds the lock.
-            await actor._checkpoint_save_lock.acquire()
+            await actor._rollout_snapshots._save_lock.acquire()
             finish = asyncio.create_task(actor._finish_pending_save(blocking=True))
             while trainer.finalize_calls == 0:
                 await asyncio.sleep(0)
@@ -1736,7 +1876,7 @@ class TestSaveTrigger:
             finish.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await finish
-            actor._checkpoint_save_lock.release()
+            actor._rollout_snapshots._save_lock.release()
             # Still pending, so the teardown publish finds it.
             assert actor._pending_checkpoint == (path, 1)
             await actor._finish_pending_save(blocking=True)
@@ -1764,9 +1904,9 @@ class TestSaveTrigger:
         def _seed(actor):
             publish = actor._publish_when_policy_write_done
 
-            async def _record(checkpoint_path):
+            async def _record(checkpoint_path, **kwargs):
                 at_publish.append(_files(checkpoint_path))
-                await publish(checkpoint_path)
+                await publish(checkpoint_path, **kwargs)
 
             actor._publish_when_policy_write_done = _record
 
@@ -1820,6 +1960,25 @@ class TestSaveTrigger:
         with pytest.raises(ValueError, match="rollout_checkpointing"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
+    def test_deferred_finalize_allows_only_deadline_turn_snapshots(
+        self, tmp_path, on_trainer_checkpoint
+    ):
+        """Only a snapshot after each trainer checkpoint needs step_N published early."""
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing.snapshot_on_trainer_checkpoint = on_trainer_checkpoint
+
+        if on_trainer_checkpoint:
+            with pytest.raises(ValueError, match="snapshot_on_trainer_checkpoint"):
+                validate_single_controller_config(mc)
+        else:
+            validate_single_controller_config(mc)
+
 
 class TestFinalizerStateRelease:
     def test_evicted_group_releases_pending_finalizer_state(self, tmp_path: Path):
@@ -1831,10 +1990,10 @@ class TestFinalizerStateRelease:
         def seed(actor) -> None:
             actor._sampler = _EvictOnceSampler()
             # A committed, never-consumed group that the sampler evicts as stale.
-            actor._finalizer_metrics_by_group["evicted-group"] = {
+            actor._rollout_runtime.finalizer_metrics_by_group["evicted-group"] = {
                 "finalize/invalid_row_rate": 0.0
             }
-            actor._finalizer_rewards_by_group["evicted-group"] = [
+            actor._rollout_runtime.finalizer_rewards_by_group["evicted-group"] = [
                 FinalizedReward("evicted-group_g0", "attempt", 1.0, None)
             ]
 
@@ -1842,11 +2001,462 @@ class TestFinalizerStateRelease:
 
         assert actor._train_steps == 2
         assert actor._sampler.evict_calls >= 1
-        assert "evicted-group" not in actor._finalizer_metrics_by_group
-        assert "evicted-group" not in actor._finalizer_rewards_by_group
+        assert "evicted-group" not in actor._rollout_runtime.finalizer_metrics_by_group
+        assert "evicted-group" not in actor._rollout_runtime.finalizer_rewards_by_group
 
 
 class TestPeriodicRolloutCheckpoint:
+    def test_release_timeout_retains_unpublished_files_and_stops_checkpointing(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield _FakeEnvironmentSnapshot()
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                raise TimeoutError("persistence is still running")
+
+            def release(self) -> None:
+                events.append("release")
+                raise TimeoutError("persistence is still running")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            checkpoint_dir = Path(checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True)
+            (checkpoint_dir / "pending-write").write_bytes(b"in progress")
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        try:
+            with pytest.raises(RuntimeError, match="stopping checkpointing") as error:
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        assert isinstance(error.value.__cause__, TimeoutError)
+        assert events == ["persist", "release"]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert len(list(snapshots.glob("tmp_snapshot_*"))) == 1
+        assert len(list(snapshots.rglob("pending-write"))) == 1
+        assert not list(snapshots.glob("snapshot_*"))
+
+    @pytest.mark.parametrize("failure", [None, "persist", "resume", "publish"])
+    def test_deferred_tq_persists_after_resume_and_releases_on_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        live_cursor = {"cursor": {"offset": 1}}
+        actor._dataloader.state_dict = lambda: live_cursor
+        environment_snapshot = _FakeEnvironmentSnapshot()
+        cuts = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            events.append("pause")
+            yield environment_snapshot
+            events.append("resume")
+            live_cursor["cursor"]["offset"] = 2
+            if failure == "resume":
+                raise OSError("resume failed")
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                assert events == ["pause", "capture", "resume"]
+                with pytest.raises(RuntimeError):
+                    cuts[0].require_live()
+                events.append("persist")
+                if failure == "persist":
+                    raise OSError("persist failed")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            assert events == ["pause"]
+            cuts[0].require_live()
+            events.append("capture")
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        capture = actor._rollout_snapshots.capture
+
+        async def recording_capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            return await capture(cut, *args, **kwargs)
+
+        actor._rollout_snapshots.capture = recording_capture
+        if failure == "publish":
+
+            async def fail_publish(*args, **kwargs):
+                raise OSError("publish failed")
+
+            monkeypatch.setattr(actor._rollout_snapshots, "_publish", fail_publish)
+        try:
+            if failure is None:
+                assert asyncio.run(
+                    actor._rollout_snapshots.save_snapshot(force=True)
+                ).saved
+            else:
+                with pytest.raises(OSError, match=f"{failure} failed"):
+                    asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        assert events.count("release") == 1
+        assert events[-1] == "release"
+        assert not actor._dp_client.save_calls
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not list(snapshots.glob("tmp_snapshot_*"))
+        published = list(snapshots.glob("snapshot_*"))
+        assert len(published) == int(failure is None)
+        if published:
+            saved_cursor = torch.load(
+                published[0] / "train_dataloader.pt", weights_only=True
+            )
+            assert saved_cursor["cursor"]["offset"] == 1
+
+    def test_deferred_snapshot_serializes_recovery_state_after_resume(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._rollout_runtime.batch_shortfall = {3: 1}
+        events = []
+        persisted_metadata = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            events.append("pause")
+            yield _FakeEnvironmentSnapshot()
+            events.append("resume")
+            actor._rollout_runtime.batch_shortfall[3] = 2
+
+        serialize = snapshots_module._serialize_recovery_state
+
+        def recording_serialize(state):
+            events.append("serialize")
+            return serialize(state)
+
+        monkeypatch.setattr(
+            snapshots_module, "_serialize_recovery_state", recording_serialize
+        )
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                persisted_metadata.append(extra_metadata)
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            assert "rollout_recovery_payload_sha256" not in metadata
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == [
+            "pause",
+            "capture",
+            "resume",
+            "serialize",
+            "persist",
+            "release",
+        ]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        (published,) = snapshots.glob("snapshot_*")
+        recovery_path = published / ROLLOUT_RECOVERY_STATE_FILENAME
+        state = torch.load(recovery_path, weights_only=True)
+        assert state["batch_shortfall"] == {3: 1}
+        assert persisted_metadata == [
+            {
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": len(state["groups"]),
+            }
+        ]
+        output = capsys.readouterr().out
+        assert "data-plane checkpoint captured:" in output
+        assert "data-plane checkpoint save started:" not in output
+
+    def test_snapshot_lists_staging_once_and_checks_the_environment_beside_capture(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        listings = []
+        list_sample_ids = actor._dp_client.list_sample_ids
+
+        def listing(partition_id: str) -> list[str]:
+            listings.append(partition_id)
+            if partition_id == _STAGING_PARTITION_ID:
+                return ["environment-key"]
+            return list_sample_ids(partition_id)
+
+        capture_started = threading.Event()
+        environment_checked = threading.Event()
+        checked_staging_keys = []
+
+        class EnvironmentSnapshot(_FakeEnvironmentSnapshot):
+            async def check_against_cut(self, cut, tq_staging_keys):
+                checked_staging_keys.append(tq_staging_keys)
+                # Run one after another, the capture would never start.
+                assert await asyncio.to_thread(capture_started.wait, 10)
+                environment_checked.set()
+                return frozenset({"environment-key"})
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield EnvironmentSnapshot()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                pass
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            capture_started.set()
+            assert environment_checked.wait(timeout=10)
+            return Capture()
+
+        actor._dp_client.list_sample_ids = listing
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert listings.count(_STAGING_PARTITION_ID) == 1
+        assert checked_staging_keys == [frozenset({"environment-key"})]
+
+    def test_capture_phases_overlap_under_the_barrier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        build_started = threading.Event()
+        capture_started = threading.Event()
+        build_rollout_recovery_state = snapshots_module.build_rollout_recovery_state
+
+        def build(*args, **kwargs):
+            build_started.set()
+            # Phases run one after another would never reach the capture.
+            assert capture_started.wait(timeout=10)
+            return build_rollout_recovery_state(*args, **kwargs)
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                pass
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            capture_started.set()
+            assert build_started.wait(timeout=10)
+            return Capture()
+
+        monkeypatch.setattr(snapshots_module, "build_rollout_recovery_state", build)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize(
+        "phase",
+        [
+            "validate_replay_inventory",
+            "validate_rollout_recovery_inventory",
+            "build_rollout_recovery_state",
+        ],
+    )
+    def test_failed_capture_phase_releases_the_captured_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        captured = threading.Event()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            captured.set()
+            return Capture()
+
+        def fail_after_capture(*args, **kwargs):
+            assert captured.wait(timeout=10)
+            raise OSError(f"{phase} failed")
+
+        async def fail_after_capture_async(*args, **kwargs):
+            await asyncio.to_thread(fail_after_capture)
+
+        monkeypatch.setattr(
+            snapshots_module,
+            phase,
+            fail_after_capture
+            if phase == "build_rollout_recovery_state"
+            else fail_after_capture_async,
+        )
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            with pytest.raises(OSError, match=f"{phase} failed"):
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["capture", "release"]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not list(snapshots.glob("tmp_snapshot_*"))
+        assert not list(snapshots.glob("snapshot_*"))
+
+    def test_cancelled_capture_with_unconfirmed_release_raises_release_error(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        entered, proceed = threading.Event(), threading.Event()
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                pass
+
+            def release(self) -> None:
+                raise OSError("release timed out")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            entered.set()
+            assert proceed.wait(timeout=10)
+            return Capture()
+
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._rollout_snapshots.save_snapshot(force=True)
+            )
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            proceed.set()
+            with pytest.raises(CheckpointReleaseError, match="capture-1"):
+                await task
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            proceed.set()
+            actor._checkpointer.shutdown()
+
+    def test_failed_phase_does_not_hide_a_capture_release_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        failed = threading.Event()
+
+        async def fail_inventory(*args, **kwargs):
+            failed.set()
+            raise OSError("inventory failed")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            assert failed.wait(timeout=10)
+            raise CheckpointReleaseError("capture-1 still retained")
+
+        monkeypatch.setattr(
+            snapshots_module, "validate_replay_inventory", fail_inventory
+        )
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        try:
+            with pytest.raises(CheckpointReleaseError, match="capture-1"):
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+    def test_cancelled_capture_phases_release_the_captured_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        captured = threading.Event()
+        proceed = threading.Event()
+        build_rollout_recovery_state = snapshots_module.build_rollout_recovery_state
+
+        def build(*args, **kwargs):
+            assert proceed.wait(timeout=10)
+            return build_rollout_recovery_state(*args, **kwargs)
+
+        class Capture(CheckpointCapture):
+            token = "capture-1"
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            captured.set()
+            return Capture()
+
+        monkeypatch.setattr(snapshots_module, "build_rollout_recovery_state", build)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._rollout_snapshots.save_snapshot(force=True)
+            )
+            try:
+                assert await asyncio.to_thread(captured.wait, 10)
+                # Let the capture phase hand its view back to the loop.
+                await asyncio.sleep(0.1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                proceed.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["capture", "release"]
+
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
     def test_forest_snapshot_preserves_buffered_and_training_owned_rows(
@@ -1866,6 +2476,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._buffer.set_data_plane_checkpoint_barrier(
             actor._data_plane_checkpoint_barrier
         )
+        attach_rollout_checkpointing(actor)
         group = _make_forest_group_entry("claimed-group", [2, 1])
         group.update(
             start_weight=anchor_step, end_weight=anchor_step, target_step=anchor_step
@@ -1891,7 +2502,7 @@ class TestPeriodicRolloutCheckpoint:
             actor._dp_client.sample_ids = list(group["meta"].sample_ids)
             if claimed:
                 assert await actor._buffer.claim_for_training([0]) == 1
-            assert await actor._save_rollout_checkpoint(force=True)
+            assert await actor._rollout_snapshots.save_snapshot(force=True)
 
         try:
             asyncio.run(exercise())
@@ -1905,7 +2516,11 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["rolled_back_train_group_count"] == int(claimed)
-        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == []
+        # Two pools since dynamic sampling got its own; both empty here.
+        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == {
+            "replacement": [],
+            "filtered": [],
+        }
         restored_state = torch.load(
             snapshot / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
         )
@@ -1971,6 +2586,27 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
+    def _interval_free_actor(self, tmp_path: Path, timeout=None):
+        """An actor snapshotting only on wakeups or the deadline; records ``force``."""
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
+        if timeout is not None:
+            actor._timeout = timeout
+        attach_rollout_checkpointing(actor)
+        forced: list[bool] = []
+        attempted = asyncio.Event()
+
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
+            forced.append(force)
+            attempted.set()
+            return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+        actor._rollout_snapshots.save_snapshot = _save
+        return actor, forced, attempted
+
     @pytest.mark.parametrize(
         "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
     )
@@ -1981,7 +2617,7 @@ class TestPeriodicRolloutCheckpoint:
         try:
             actor._sampler.restore_dispatch_index(5)
             actor._rollout_manager.set_next_nemo_gym_task_index(123)
-            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
             assert result.saved
             assert result.reason == "completed"
         finally:
@@ -2008,11 +2644,14 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
-        assert state["reward_settings"] == actor._capture_reward_settings().to_state()
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
-            "metadata"
-        ]
+        assert (
+            state["reward_settings"]
+            == capture_reward_settings(actor._master_config).to_state()
+        )
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata=actor._dp_client.save_calls[-1]["metadata"],
+        )
         if changed_setting == "penalty":
             actor._master_config.reward_penalties.penalize_empty_final_answer = True
         elif changed_setting == "effort":
@@ -2039,11 +2678,83 @@ class TestPeriodicRolloutCheckpoint:
             }
         if changed_setting in ("penalty", "effort"):
             with pytest.raises(ValueError, match="reward settings differ"):
+                attach_rollout_checkpointing(actor)
                 asyncio.run(
-                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                    actor._rollout_restorer._restore_recovery_ledger(
+                        restored_replay_groups=0
+                    )
                 )
         else:
-            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+            asyncio.run(
+                actor._rollout_restorer._restore_recovery_ledger(
+                    restored_replay_groups=0
+                )
+            )
+
+    def test_deferred_snapshot_logs_persist_and_release_phases(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock_now = [0.0]
+
+        def clock() -> float:
+            clock_now[0] += 1e-6
+            return clock_now[0]
+
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        events = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield _FakeEnvironmentSnapshot()
+
+        serialize = snapshots_module._serialize_recovery_state
+
+        def timed_serialize(state):
+            payload, _, binding = serialize(state)
+            clock_now[0] += 5.0
+            return payload, 5.0, binding
+
+        monkeypatch.setattr(
+            snapshots_module, "_serialize_recovery_state", timed_serialize
+        )
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                clock_now[0] += 10.0
+
+            def release(self) -> None:
+                events.append("release")
+                clock_now[0] += 3.0
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = (
+            lambda checkpoint_dir, *, metadata: Capture()
+        )
+        attach_rollout_checkpointing(actor)
+        try:
+            with patch(
+                "nemo_rl.algorithms.rollout_checkpointing.snapshots.time.monotonic",
+                new=clock,
+            ):
+                assert asyncio.run(
+                    actor._rollout_snapshots.save_snapshot(force=True)
+                ).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["persist", "release"]
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["recovery_state_serialize_seconds"] == 5.0
+        # persist excludes the serialization that runs just before the write
+        assert logged["tq_persist_seconds"] == pytest.approx(10.0, abs=1e-3)
+        assert logged["tq_release_seconds"] == pytest.approx(3.0, abs=1e-3)
+        assert logged["tq_save_seconds"] == pytest.approx(
+            logged["tq_capture_seconds"] + logged["tq_persist_seconds"]
+        )
+        # the deferred write happens after the barrier, so it is not part of the hold
+        assert logged["exclusive_hold_seconds"] < 1.0
 
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
@@ -2060,7 +2771,7 @@ class TestPeriodicRolloutCheckpoint:
                     return_value=wall_time_ns,
                 ),
             ):
-                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+                result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
                 assert result.saved
         finally:
             actor._checkpointer.shutdown()
@@ -2070,6 +2781,18 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["total_save_seconds"] > 0
         assert 0 <= logged["barrier_wait_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["tq_save_seconds"] <= logged["exclusive_hold_seconds"]
+        # This backend saves inside the barrier, so serialization is held too.
+        held_phases = (
+            "replay_inventory_seconds",
+            "recovery_state_build_seconds",
+            "recovery_state_serialize_seconds",
+            "staging_inventory_seconds",
+            "tq_capture_seconds",
+        )
+        assert all(
+            0 < logged[phase] <= logged["exclusive_hold_seconds"]
+            for phase in held_phases
+        )
         assert 0 <= logged["sidecar_save_seconds"] <= logged["total_save_seconds"]
         assert 0 <= logged["snapshot_commit_seconds"] <= logged["total_save_seconds"]
         assert logged["controller_sidecar_bytes"] > 0
@@ -2078,8 +2801,9 @@ class TestPeriodicRolloutCheckpoint:
         )
         assert logged[TELEMETRY_WALL_TIME_METRIC] == 1_750_000_000.0
         assert "sample_index" not in logged
-        # No Gym coordination, so nothing was parked.
+        # The environment keeps no rollout state, so nothing was paused.
         assert "gym_parked_seconds" not in logged
+        assert "environment_paused_seconds" not in logged
         assert actor._logger.log_metrics.call_args.kwargs == {
             "step": wall_time_ns,
             "prefix": "timing/rollout_checkpoint",
@@ -2087,28 +2811,23 @@ class TestPeriodicRolloutCheckpoint:
         }
 
     @pytest.mark.parametrize("interval_s, warns", [(120.0, False), (0.5, True)])
-    def test_logs_how_long_gym_held_rollout_dispatch(
+    def test_logs_how_long_the_environment_held_rollout_dispatch(
         self, tmp_path: Path, interval_s: float, warns: bool
     ) -> None:
-        """The Gym window spans the barrier hold and is flagged past the interval."""
+        """The environment window spans the barrier hold and is flagged past the interval."""
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = (
             interval_s
         )
-        gym_commit = SimpleNamespace(manifest=SimpleNamespace(restarts={}))
-        validated_commits: list[object] = []
+        environment_snapshot = _FakeEnvironmentSnapshot()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
-            assert checkpoint_id.startswith("rollout-")
-            yield gym_commit
+        async def snapshot(_path):
+            yield environment_snapshot
 
-        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
-            validated_commits.append(commit)
-
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
-        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
         try:
             with (
                 patch(
@@ -2118,16 +2837,16 @@ class TestPeriodicRolloutCheckpoint:
                 warnings.catch_warnings(record=True) as caught,
             ):
                 warnings.simplefilter("always")
-                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+                result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
                 assert result.saved
         finally:
             actor._checkpointer.shutdown()
 
-        assert validated_commits == [gym_commit]
+        assert len(environment_snapshot.checked_cuts) == 1
         logged = actor._logger.log_metrics.call_args.args[0]
         assert (
             logged["exclusive_hold_seconds"]
-            < logged["gym_parked_seconds"]
+            < logged["environment_paused_seconds"]
             < logged["total_save_seconds"]
         )
         parked_warnings = [
@@ -2150,22 +2869,19 @@ class TestPeriodicRolloutCheckpoint:
         coordinator = gym_coordinator(gym)
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
-            async with coordinator.prepared(checkpoint_id):
-                yield SimpleNamespace(manifest=SimpleNamespace(restarts={}))
+        async def snapshot(_path):
+            async with coordinator.prepared("rollout-1"):
+                yield _FakeEnvironmentSnapshot()
 
-        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
-            return None
-
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
-        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
         try:
             with pytest.warns(UserWarning, match="resume failed"):
-                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+                result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
         finally:
             actor._checkpointer.shutdown()
 
-        assert result == _RolloutCheckpointSaveResult(saved=True, reason="completed")
+        assert result == RolloutCheckpointSaveResult(saved=True, reason="completed")
         snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
         assert [path.name for path in snapshots.iterdir()] == ["snapshot_000001"]
         assert gym.operations() == ["prepare", "renew", "resume", "resume"]
@@ -2184,28 +2900,31 @@ class TestPeriodicRolloutCheckpoint:
         gym_parked = asyncio.Event()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def snapshot(_path):
             gym_phase_events.append("park")
             try:
                 gym_parked.set()
                 await asyncio.Event().wait()  # prepare/commit/drain never finish
-                yield object()
+                yield _FakeEnvironmentSnapshot()
             finally:
                 gym_phase_events.append("resume")
 
-        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
 
-        async def exercise() -> _RolloutCheckpointSaveResult:
+        async def exercise() -> RolloutCheckpointSaveResult:
             if stale_commit_event:
                 # A step that committed before this attempt does not stop it.
-                actor._optimizer_commit_started.set()
-            save = asyncio.create_task(actor._save_rollout_checkpoint(force=True))
+                actor._rollout_snapshots._optimizer_commit_started.set()
+            save = asyncio.create_task(
+                actor._rollout_snapshots.save_snapshot(force=True)
+            )
             await asyncio.wait_for(gym_parked.wait(), timeout=5.0)
             # Gym stays parked until a step commits during this attempt.
             await asyncio.sleep(0.05)
             assert not save.done()
             assert gym_phase_events == ["park"]
-            actor._begin_optimizer_commit()
+            actor._rollout_snapshots._begin_optimizer_commit()
             return await asyncio.wait_for(save, timeout=5.0)
 
         try:
@@ -2213,7 +2932,7 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert result == _RolloutCheckpointSaveResult(
+        assert result == RolloutCheckpointSaveResult(
             saved=False, reason="trainer_state_changed"
         )
         assert gym_phase_events == ["park", "resume"]
@@ -2228,7 +2947,12 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._master_config.rollout_checkpointing.max_consecutive_failures = 2
-        actor._gym_checkpoint_coordinator = object() if gym_coordinated else None
+        actor._environment_checkpoint = (
+            _FakeEnvironmentCheckpoint()
+            if gym_coordinated
+            else NoEnvironmentCheckpoint()
+        )
+        attach_rollout_checkpointing(actor)
         actor._train_steps = 1
         # Two streaks of discards (2, then 3) split by a saved snapshot.
         reasons = [
@@ -2244,19 +2968,21 @@ class TestPeriodicRolloutCheckpoint:
             done = asyncio.Event()
             calls = 0
 
-            async def _save(*, force: bool = False) -> _RolloutCheckpointSaveResult:
+            async def _save(
+                *, force: bool = False, staged: bool = False
+            ) -> RolloutCheckpointSaveResult:
                 nonlocal calls
                 del force
                 reason = reasons[min(calls, len(reasons) - 1)]
                 calls += 1
                 if calls == len(reasons):
                     done.set()
-                return _RolloutCheckpointSaveResult(
+                return RolloutCheckpointSaveResult(
                     saved=reason == "completed", reason=reason
                 )
 
-            actor._save_rollout_checkpoint = _save
-            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            actor._rollout_snapshots.save_snapshot = _save
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
             await asyncio.wait_for(done.wait(), timeout=5.0)
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
@@ -2285,17 +3011,17 @@ class TestPeriodicRolloutCheckpoint:
                 "nemo_rl.algorithms.single_controller.time.monotonic",
                 new=_SteppingClock(start=10.0),
             ):
-                actor._log_rollout_checkpoint_outcome(
+                actor._rollout_snapshots._log_outcome(
                     outcome="completed",
                     reason="completed",
                     attempt_duration_seconds=2.0,
                 )
-                actor._log_rollout_checkpoint_outcome(
+                actor._rollout_snapshots._log_outcome(
                     outcome="skipped",
                     reason="no_data_plane_mutations",
                     attempt_duration_seconds=0.1,
                 )
-                actor._log_rollout_checkpoint_outcome(
+                actor._rollout_snapshots._log_outcome(
                     outcome="completed",
                     reason="completed",
                     attempt_duration_seconds=1.0,
@@ -2313,6 +3039,7 @@ class TestPeriodicRolloutCheckpoint:
             "reason_missing_trainer_anchor",
             "reason_no_data_plane_mutations",
             "reason_optimizer_commit_in_progress",
+            "reason_shortfall_reconciliation_pending",
             "reason_timeout",
             "reason_trainer_state_changed",
         }
@@ -2343,14 +3070,17 @@ class TestPeriodicRolloutCheckpoint:
     def test_logs_restore_phase_total_and_reused_groups(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
-        actor._rollout_checkpoint_load_metrics = {
-            "snapshot_resolution_seconds": 0.5,
-            "dataloader_load_seconds": 1.0,
-            "tq_load_seconds": 2.0,
-            "future_restore_phase_seconds": 5.0,
-        }
+        actor._resume = ResumeSource(
+            rollout_checkpoint_load_metrics={
+                "snapshot_resolution_seconds": 0.5,
+                "dataloader_load_seconds": 1.0,
+                "tq_load_seconds": 2.0,
+                "future_restore_phase_seconds": 5.0,
+            }
+        )
         try:
-            actor._log_rollout_restore_metrics(
+            attach_rollout_checkpointing(actor)
+            actor._rollout_restorer._log_restore_metrics(
                 replay_metadata_load_seconds=3.0,
                 recovery_prepare_seconds=4.0,
                 restored_replay_groups=5,
@@ -2398,6 +3128,8 @@ class TestPeriodicRolloutCheckpoint:
                     "inflight_batch_sizes": {0: [2], 1: [1]},
                     "num_pending_samples": {0: [1], 1: [3]},
                     "kv_cache_usage_perc": {0: [0.5], 1: [0.7]},
+                    "dynamo_frontend_queued_requests": {0: [5.0], 1: [2.0]},
+                    "dynamo_frontend_inflight_requests": {0: [9.0], 1: [1.0]},
                 },
             ]
         )
@@ -2429,6 +3161,11 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["vllm_requests_running"] == 3
         assert logged["vllm_requests_waiting"] == 4
         assert logged["vllm_kv_cache_usage_mean"] == pytest.approx(0.6)
+        assert logged["dynamo_frontend_requests_queued"] == 7
+        assert logged["dynamo_frontend_requests_inflight"] == 10
+        # Each frontend's own counts show which one the calls pile up in.
+        assert logged["dynamo_frontend_0_requests_queued"] == 5
+        assert logged["dynamo_frontend_1_requests_inflight"] == 1
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
@@ -2484,7 +3221,7 @@ class TestPeriodicRolloutCheckpoint:
 
     def _saved_snapshot(self, actor, tmp_path: Path) -> Path:
         try:
-            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
         finally:
             actor._checkpointer.shutdown()
         return (
@@ -2505,18 +3242,25 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(recovery_path, weights_only=True)
         state["reward_settings"] = None
         torch.save(state, recovery_path)
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = {
-            **actor._dp_client.save_calls[-1]["metadata"],
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-        }
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata={
+                **actor._dp_client.save_calls[-1]["metadata"],
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+            },
+        )
         with pytest.raises(ValueError, match="saved with token capture disabled"):
-            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+            attach_rollout_checkpointing(actor)
+            asyncio.run(
+                actor._rollout_restorer._restore_recovery_ledger(
+                    restored_replay_groups=0
+                )
+            )
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
-    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+    def test_snapshot_persists_and_restores_pending_step_state(
         self, tmp_path: Path, checkpoint_kind: str
     ):
         """Only canonical groups' pending statistics are saved; restore keeps them."""
@@ -2527,6 +3271,8 @@ class TestPeriodicRolloutCheckpoint:
         from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
 
         actor = self._actor(tmp_path)
+        actor._rollout_runtime.steps_allowed_short = {0}
+        actor._rollout_runtime.batch_shortfall = {0: 1}
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -2544,7 +3290,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._buffer.training_claims = [canonical_group]
         actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
         pending = {"finalize/reward_count": 1.0, "finalize/reward_sum": 2.0}
-        actor._finalizer_metrics_by_group = {
+        actor._rollout_runtime.finalizer_metrics_by_group = {
             "claimed-group": dict(pending),
             "unfinished-group": {"finalize/reward_count": 9.0},
         }
@@ -2556,7 +3302,7 @@ class TestPeriodicRolloutCheckpoint:
                 RewardLogContext("agent", '{"answer":"ok"}'),
             )
         ]
-        actor._finalizer_rewards_by_group = {
+        actor._rollout_runtime.finalizer_rewards_by_group = {
             "claimed-group": observations,
             "unfinished-group": [],
         }
@@ -2579,22 +3325,35 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
+        assert state["steps_allowed_short"] == [0]
+        assert state["batch_shortfall"] == {0: 1}
         assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
         assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
             "claimed-group": observations
         }
 
-        actor._finalizer_metrics_by_group = {}
-        actor._finalizer_rewards_by_group = {}
+        actor._rollout_runtime.steps_allowed_short = set()
+        actor._rollout_runtime.batch_shortfall = {}
+        actor._rollout_runtime.finalizer_metrics_by_group = {}
+        actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
         actor._buffer._metadata_state["groups"] = [canonical_group]
-        actor._last_checkpoint_path = str(snapshot)
-        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
-            "metadata"
-        ]
-        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
-        assert actor._finalizer_metrics_by_group == {"claimed-group": pending}
-        assert actor._finalizer_rewards_by_group == {"claimed-group": observations}
+        actor._resume = ResumeSource(
+            path=str(snapshot),
+            data_plane_metadata=actor._dp_client.save_calls[-1]["metadata"],
+        )
+        attach_rollout_checkpointing(actor)
+        asyncio.run(
+            actor._rollout_restorer._restore_recovery_ledger(restored_replay_groups=1)
+        )
+        assert actor._rollout_runtime.finalizer_metrics_by_group == {
+            "claimed-group": pending
+        }
+        assert actor._rollout_runtime.finalizer_rewards_by_group == {
+            "claimed-group": observations
+        }
+        assert actor._rollout_runtime.steps_allowed_short == {0}
+        assert actor._rollout_runtime.batch_shortfall == {0: 1}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -2620,7 +3379,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
 
         try:
-            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
             assert result.saved
         finally:
             actor._checkpointer.shutdown()
@@ -2649,22 +3408,82 @@ class TestPeriodicRolloutCheckpoint:
 
     def test_snapshot_skips_optimizer_commit_window(self, tmp_path: Path):
         actor = self._actor(tmp_path)
-        actor._optimizer_commit_in_progress = True
+        actor._rollout_snapshots._optimizer_commit_in_progress = True
         try:
-            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            result = asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
             assert not result.saved
             assert result.reason == "optimizer_commit_in_progress"
             assert actor._dp_client.save_calls == []
         finally:
             actor._checkpointer.shutdown()
 
+    @pytest.mark.parametrize("when", ["before_attempt", "after_anchor"])
+    def test_snapshot_waits_for_selection_shortfall_reconciliation(
+        self, tmp_path: Path, when: str
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._algo_cfg.num_prompts_per_step = 4
+        actor._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+        actor._master_config.async_rl.sampler = ReadyFirstSamplerConfig(
+            max_staleness_versions=1
+        )
+        actor._sampler = ReadyFirstSampler(actor._buffer, max_staleness_versions=1)
+        actor._step_assembler._step_assembly = _StepAssembly(0, 0, [])
+        attach_rollout_checkpointing(actor)
+
+        def lose() -> None:
+            for _ in range(3):
+                actor._step_assembler.credit_shortfall(None)
+            assert actor._rollout_runtime.batch_shortfall == {0: 3}
+
+        async def exercise() -> None:
+            if when == "before_attempt":
+                lose()
+            else:
+                resolve_anchor = actor._rollout_snapshots._resolve_anchor
+
+                async def lose_after_anchor():
+                    anchor = await resolve_anchor()
+                    lose()
+                    return anchor
+
+                actor._rollout_snapshots._resolve_anchor = lose_after_anchor
+            skipped = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert not skipped.saved
+            assert skipped.reason == "shortfall_reconciliation_pending"
+            assert actor._dp_client.save_calls == []
+            if when == "after_anchor":
+                actor._rollout_snapshots._resolve_anchor = resolve_anchor
+            async with actor._data_plane_checkpoint_barrier.checkpoint() as cut:
+                with pytest.raises(RuntimeError, match="unreconciled selection"):
+                    await actor._rollout_snapshots.capture(
+                        cut, tmp_path / "unsafe", "rollout_snapshot"
+                    )
+            credits = actor._step_assembler._step_assembly.selection_credits
+            actor._step_assembler._step_assembly.selection_credits = None
+            actor._step_assembler._step_assembly.selected_groups = 3
+            actor._step_assembler.reconcile_selection_credits(0, credits)
+            assert actor._target_groups_for_step(0) == 3
+            assert actor._target_groups_for_step(1) == 2
+            saved = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert saved.saved
+
+        try:
+            asyncio.run(exercise())
+            paths = list(tmp_path.rglob(ROLLOUT_RECOVERY_STATE_FILENAME))
+            assert len(paths) == 1
+            state = torch.load(paths[0], weights_only=True)
+            assert state["batch_shortfall"] == {0: 1, 1: 2}
+        finally:
+            actor._checkpointer.shutdown()
+
     def test_snapshot_reports_no_new_mutations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
-        actor._last_rollout_snapshot_mutation_version = (
+        actor._rollout_snapshots._last_snapshot_mutation_version = (
             actor._data_plane_checkpoint_barrier.mutation_version
         )
         try:
-            result = asyncio.run(actor._save_rollout_checkpoint())
+            result = asyncio.run(actor._rollout_snapshots.save_snapshot())
         finally:
             actor._checkpointer.shutdown()
 
@@ -2683,27 +3502,296 @@ class TestPeriodicRolloutCheckpoint:
         async def _main() -> None:
             attempted = asyncio.Event()
 
-            async def _save(*, force: bool = False) -> Any:
+            async def _save(*, force: bool = False, staged: bool = False) -> Any:
                 del force
                 attempted.set()
                 return SimpleNamespace(saved=False, reason="no_data_plane_mutations")
 
-            actor._save_rollout_checkpoint = _save
-            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            actor._rollout_snapshots.save_snapshot = _save
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
             await asyncio.sleep(0)
-            actor._rollout_checkpoint_wakeup.set()
+            actor._rollout_snapshots._wakeup.set()
             try:
                 await asyncio.wait_for(attempted.wait(), timeout=1.0)
             finally:
                 pump.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await pump
-            assert not actor._rollout_checkpoint_wakeup.is_set()
+            assert not actor._rollout_snapshots._wakeup.is_set()
 
         try:
             asyncio.run(_main())
         finally:
             actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
+    def test_pump_without_an_interval_waits_for_a_trainer_checkpoint(
+        self, tmp_path: Path, on_trainer_checkpoint: bool
+    ):
+        actor, forced, attempted = self._interval_free_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_on_trainer_checkpoint = (
+            on_trainer_checkpoint
+        )
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
+            try:
+                await asyncio.sleep(0.05)
+                assert forced == []
+                actor._rollout_snapshots.trainer_checkpoint_published(1)
+                if on_trainer_checkpoint:
+                    await asyncio.wait_for(attempted.wait(), timeout=1.0)
+                else:
+                    await asyncio.sleep(0.05)
+            finally:
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == ([False] if on_trainer_checkpoint else [])
+
+    def test_pump_without_an_interval_snapshots_at_a_pre_step_deadline(
+        self, tmp_path: Path
+    ):
+        actor, forced, _ = self._interval_free_actor(
+            tmp_path, timeout=TimeoutChecker(timeout="00:00:00:00")
+        )
+        try:
+            asyncio.run(asyncio.wait_for(actor._rollout_snapshots.run(), timeout=5.0))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == [True]
+        assert actor._rollout_snapshots.stop_requested
+
+    def test_pump_without_an_interval_ignores_a_deadline_wait_after_step_one(
+        self, tmp_path: Path
+    ):
+        """Past step 0 the train pump owns the deadline, so a stale wait saves nothing."""
+        actor, forced, _ = self._interval_free_actor(tmp_path)
+
+        async def _main() -> None:
+            # Timed for a deadline 1s away, then step 1 finishes first.
+            with patch.object(
+                actor._rollout_snapshots,
+                "_seconds_until_next_attempt",
+                return_value=0.01,
+            ):
+                actor._train_steps = 1
+                pump = asyncio.create_task(actor._rollout_snapshots.run())
+                await asyncio.sleep(0.1)
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == []
+
+    @pytest.mark.parametrize(
+        ("holds_rollout_state", "outcome", "expected"),
+        [
+            (False, "completed", "no attempt"),
+            (True, "completed", "saved"),
+            (True, "skipped", "warns"),
+            (True, OSError("storage unavailable"), "warns"),
+            (True, RuntimeError("broken checkpoint invariant"), "raises"),
+        ],
+        ids=["no-environment-state", "saved", "skipped", "io-error", "invariant"],
+    )
+    def test_deadline_snapshot(
+        self, tmp_path: Path, holds_rollout_state, outcome, expected
+    ):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._environment_checkpoint = (
+            _FakeEnvironmentCheckpoint()
+            if holds_rollout_state
+            else NoEnvironmentCheckpoint()
+        )
+        attach_rollout_checkpointing(actor)
+        actor._train_steps = 1
+        actor._rollout_snapshots._wakeup.set()
+        forced: list[bool] = []
+
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
+            forced.append(force)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "skipped":
+                return RolloutCheckpointSaveResult(
+                    saved=False, reason="optimizer_commit_in_progress"
+                )
+            return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+        actor._rollout_snapshots.save_snapshot = _save
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                if expected == "raises":
+                    with pytest.raises(RuntimeError, match="broken checkpoint"):
+                        asyncio.run(actor._rollout_snapshots.save_at_deadline())
+                else:
+                    asyncio.run(actor._rollout_snapshots.save_at_deadline())
+        finally:
+            actor._checkpointer.shutdown()
+
+        deadline_warnings = [
+            w for w in caught if "checkpoint deadline" in str(w.message)
+        ]
+        if expected == "no attempt":
+            assert forced == []
+            return
+        assert forced == [True]
+        assert not actor._rollout_snapshots._wakeup.is_set()
+        assert bool(deadline_warnings) is (expected == "warns")
+
+    def _staged_actor(self, tmp_path: Path, on_environment_save=lambda: None):
+        """An actor at step 1 whose environment save runs ``on_environment_save``."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            on_environment_save()
+            yield _FakeEnvironmentSnapshot()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
+        actor._train_steps = actor._trainer_version = 1
+        return actor
+
+    def test_a_staged_snapshot_overlaps_the_policy_write_then_moves_into_step_n(
+        self, tmp_path: Path
+    ):
+        checkpoints = tmp_path / "checkpoints"
+        write_landed = threading.Event()
+        published_at_environment_save: list[bool] = []
+
+        def environment_save() -> None:
+            published_at_environment_save.append((checkpoints / "step_1").exists())
+            write_landed.set()
+
+        actor = self._staged_actor(tmp_path, environment_save)
+        # A staged snapshot a killed run left behind.
+        (checkpoints / "tmp_rollout_snapshot_step_0").mkdir(parents=True)
+        (checkpoints / "tmp_step_1").mkdir()
+        # step_1's policy write lands only once the environment has been saved.
+        actor._checkpointer.begin_finalization(
+            checkpoints / "tmp_step_1", wait_fn=lambda: write_landed.wait(5.0)
+        )
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result.saved
+        assert published_at_environment_save == [False]
+        snapshot = checkpoints / "step_1" / "rollout_snapshots" / "snapshot_000001"
+        assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["trainer_publish_wait_seconds"] >= 0.0
+
+    def test_a_staged_snapshot_without_a_published_step_n_is_dropped(
+        self, tmp_path: Path
+    ):
+        """A failed or missing policy write publishes no step_N; nothing is left."""
+        actor = self._staged_actor(tmp_path)
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert not result.saved
+        assert result.reason == "missing_trainer_anchor"
+        checkpoints = tmp_path / "checkpoints"
+        assert not (checkpoints / "step_1").exists()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        snapshots = actor._rollout_snapshots
+        # Only the cadence check reads the target; the rest of this actor is
+        # built for sibling recovery.
+        actor._master_config.rollout_recovery.target_level = (
+            RecoveryTargetLevel.PREFIX
+            if prefix_cuts_enabled
+            else RecoveryTargetLevel.SIBLING
+        )
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", environment_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        snapshots._last_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(snapshots.save_snapshot())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
 
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
@@ -2718,7 +3806,9 @@ class TestPeriodicRolloutCheckpoint:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2726,8 +3816,8 @@ class TestPeriodicRolloutCheckpoint:
                     two_failures.set()
                 raise OSError("storage unavailable")
 
-            actor._save_rollout_checkpoint = _failing_save
-            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            actor._rollout_snapshots.save_snapshot = _failing_save
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
             await asyncio.wait_for(two_failures.wait(), timeout=1.0)
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
@@ -2753,17 +3843,19 @@ class TestPeriodicRolloutCheckpoint:
         actor._train_steps = 1
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 del force
                 raise OSError("storage unavailable")
 
-            actor._save_rollout_checkpoint = _failing_save
+            actor._rollout_snapshots.save_snapshot = _failing_save
             with pytest.raises(
                 RuntimeError,
                 match="periodic rollout checkpoint failed 2 consecutive times",
             ):
                 await asyncio.wait_for(
-                    actor._rollout_checkpoint_pump(),
+                    actor._rollout_snapshots.run(),
                     timeout=1.0,
                 )
 
@@ -2795,12 +3887,18 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
+        actor._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(FakeGymActor()), manager=actor._rollout_manager
+        )
+        attach_rollout_checkpointing(actor)
 
         async def _main() -> None:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2808,8 +3906,8 @@ class TestPeriodicRolloutCheckpoint:
                     two_failures.set()
                 raise error
 
-            actor._save_rollout_checkpoint = _failing_save
-            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            actor._rollout_snapshots.save_snapshot = _failing_save
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
             await asyncio.wait_for(two_failures.wait(), timeout=1.0)
             pump.cancel()
             await asyncio.gather(pump, return_exceptions=True)
@@ -2830,10 +3928,16 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
         actor._train_steps = 1
+        actor._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(FakeGymActor()), manager=actor._rollout_manager
+        )
+        attach_rollout_checkpointing(actor)
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2842,10 +3946,10 @@ class TestPeriodicRolloutCheckpoint:
                     {"tools/replica-0": RuntimeError("unexpected participant set")},
                 )
 
-            actor._save_rollout_checkpoint = _failing_save
+            actor._rollout_snapshots.save_snapshot = _failing_save
             with pytest.raises(GymCheckpointOperationError, match="participant set"):
                 await asyncio.wait_for(
-                    actor._rollout_checkpoint_pump(),
+                    actor._rollout_snapshots.run(),
                     timeout=1.0,
                 )
 
@@ -2865,16 +3969,18 @@ class TestPeriodicRolloutCheckpoint:
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
                 raise RuntimeError("broken checkpoint invariant")
 
-            actor._save_rollout_checkpoint = _failing_save
+            actor._rollout_snapshots.save_snapshot = _failing_save
             with pytest.raises(RuntimeError, match="broken checkpoint invariant"):
                 await asyncio.wait_for(
-                    actor._rollout_checkpoint_pump(),
+                    actor._rollout_snapshots.run(),
                     timeout=1.0,
                 )
 
@@ -2890,6 +3996,240 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
+    @pytest.mark.parametrize("failure", [None, "persist", "release", "cancel"])
+    def test_trainer_persists_retained_tq_after_barrier_before_publication(
+        self, tmp_path: Path, failure: str | None
+    ) -> None:
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path, buffer_checkpoint=True),
+            _make_actor_args(),
+            SetupTimingMetrics(),
+        )
+        actor._train_steps = actor._trainer_version = 1
+        live_cursor = {"cursor": {"offset": 1}}
+        actor._dataloader.state_dict = lambda: live_cursor
+        entered = threading.Event()
+        proceed = threading.Event()
+        events = []
+        cuts = []
+        original_capture = actor._rollout_snapshots.capture
+
+        async def capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            return await original_capture(cut, *args, **kwargs)
+
+        actor._rollout_snapshots.capture = capture
+
+        class Capture(CheckpointCapture):
+            def persist(self, *, extra_metadata=None) -> None:
+                with pytest.raises(RuntimeError):
+                    cuts[0].require_live()
+                events.append("persist")
+                entered.set()
+                assert proceed.wait(timeout=10)
+                events.append("persist_settled")
+                if failure == "persist":
+                    raise OSError("persist failed")
+
+            def release(self) -> None:
+                assert events[-1] == "persist_settled"
+                events.append("release")
+                if failure == "release":
+                    raise OSError("release failed")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            cuts[0].require_live()
+            events.append("capture")
+            return Capture()
+
+        @contextlib.asynccontextmanager
+        async def unexpected_environment_snapshot(_path):
+            raise AssertionError("trainer checkpoints must not snapshot Gym")
+            yield  # pragma: no cover
+
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(
+            unexpected_environment_snapshot
+        )
+        actor._rollout_snapshots._environment_checkpoint = actor._environment_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 10)
+                assert not actor._trainer.save_calls
+                assert not (tmp_path / "checkpoints" / "step_1").exists()
+
+                async def mutate() -> None:
+                    async with actor._data_plane_checkpoint_barrier.mutation():
+                        live_cursor["cursor"]["offset"] = 2
+
+                await asyncio.wait_for(mutate(), timeout=5)
+                if failure == "cancel":
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert "release" not in events
+                proceed.set()
+                if failure == "cancel":
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                elif failure is not None:
+                    with pytest.raises(OSError, match=f"{failure} failed"):
+                        await task
+                else:
+                    await task
+                await asyncio.to_thread(actor._checkpointer.finalize_pending)
+            finally:
+                proceed.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+        assert events == ["capture", "persist", "persist_settled", "release"]
+        assert not actor._dp_client.save_calls
+        published = tmp_path / "checkpoints" / "step_1"
+        assert published.exists() == (failure is None)
+        assert len(actor._trainer.save_calls) == int(failure is None)
+        if failure is None:
+            assert torch.load(published / "train_dataloader.pt", weights_only=True) == {
+                "cursor": {"offset": 1}
+            }
+
+    def test_trainer_deferred_save_binds_recovery_hash_in_persisted_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        sample_ids = ["g0-0", "g0-1"]
+        dp_client = _FakeDPClient(sample_ids=sample_ids)
+        replay_metadata = {
+            "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+            "storage": REPLAY_BUFFER_METADATA_STORAGE,
+            "partition_id": _PARTITION_ID,
+            "saved_capacity": 4,
+            "manifest_digest": "digest-1",
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name="train",
+                        sample_ids=sample_ids,
+                        fields=["input_ids"],
+                        sequence_lengths=[16, 16],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
+                    ),
+                    "start_weight": 0,
+                    "end_weight": 0,
+                    "target_step": None,
+                    "group_id": "g0",
+                }
+            ],
+        }
+        events: list[str] = []
+
+        class Capture(CheckpointCapture):
+            def __init__(self, checkpoint_dir, metadata):
+                self.checkpoint_dir = Path(checkpoint_dir)
+                self.metadata = metadata
+
+            def persist(self, *, extra_metadata=None) -> None:
+                events.append("persist")
+                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                (self.checkpoint_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "storage_saved": True,
+                            "user_metadata": {
+                                **self.metadata,
+                                **(extra_metadata or {}),
+                            },
+                        }
+                    )
+                )
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            events.append("capture")
+            assert "rollout_recovery_payload_sha256" not in metadata
+            return Capture(checkpoint_dir, metadata)
+
+        dp_client.capture_checkpoint = capture_checkpoint
+        _run_train_pump(
+            mc,
+            _make_actor_args(
+                dp_client=dp_client,
+                tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
+            ),
+        )
+
+        assert events == ["capture", "persist", "release"]
+        assert not dp_client.save_calls
+        step_dir = tmp_path / "checkpoints" / "step_1"
+        recovery_path = step_dir / ROLLOUT_RECOVERY_STATE_FILENAME
+        assert recovery_path.is_file()
+        user_metadata = json.loads(
+            (step_dir / "data_plane" / "metadata.json").read_text()
+        )["user_metadata"]
+        assert user_metadata["rollout_recovery_payload_sha256"] == (
+            hashlib.sha256(recovery_path.read_bytes()).hexdigest()
+        )
+
+    def test_trainer_native_fallback_stays_inside_barrier(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path),
+            _make_actor_args(),
+            SetupTimingMetrics(),
+        )
+        actor._train_steps = actor._trainer_version = 1
+        cuts = []
+        original_capture = actor._rollout_snapshots.capture
+        original_save = actor._dp_client.save_checkpoint
+
+        async def capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            captured = await original_capture(cut, *args, **kwargs)
+            assert captured.data_plane is None
+            return captured
+
+        def save_checkpoint(*args, **kwargs):
+            cuts[0].require_live()
+            return original_save(*args, **kwargs)
+
+        actor._rollout_snapshots.capture = capture
+        actor._dp_client.save_checkpoint = save_checkpoint
+        try:
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
+        finally:
+            actor._checkpointer.shutdown()
+        assert len(actor._dp_client.save_calls) == 1
+        assert (tmp_path / "checkpoints" / "step_1").exists()
+        output = capsys.readouterr().out
+        assert output.count("data-plane checkpoint save started:") == 1
+        assert "data-plane checkpoint captured:" not in output
+
     @pytest.mark.nemo_gym
     @pytest.mark.parametrize(
         "damage",
@@ -2915,6 +4255,7 @@ class TestDataPlaneCheckpoint:
         state = build_rollout_recovery_state(
             ledger,
             batch_shortfall={},
+            steps_allowed_short=set(),
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
                 config.reward_penalties, None, None
@@ -2958,6 +4299,7 @@ class TestDataPlaneCheckpoint:
         )
         actor._master_config.token_capture.forest_training = damage != "mode"
         actor._dataloader = SimpleNamespace(dataset={7: {"idx": 7}})
+        attach_rollout_checkpointing(actor)
         try:
             if damage not in {None, "failed_without_row"}:
                 expected_error = {
@@ -2969,12 +4311,16 @@ class TestDataPlaneCheckpoint:
                 }[damage]
                 with pytest.raises((ValueError, RuntimeError), match=expected_error):
                     asyncio.run(
-                        actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                        actor._rollout_restorer._restore_recovery_ledger(
+                            restored_replay_groups=0
+                        )
                     )
                 assert dp.clear_calls == []
             else:
                 asyncio.run(
-                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                    actor._rollout_restorer._restore_recovery_ledger(
+                        restored_replay_groups=0
+                    )
                 )
                 assert dp.clear_calls == [(["orphan"], _STAGING_PARTITION_ID)]
                 restored = actor._rollout_recovery_ledger.get_group("g7")
@@ -3000,31 +4346,29 @@ class TestDataPlaneCheckpoint:
         dp_client = _FakeDPClient()
         mc.token_capture.forest_training = forest_training
 
-        async def _main() -> None:
-            actor = _ACTOR_CLS(
-                mc,
-                _make_actor_args(save_state=save_state, dp_client=dp_client),
-                SetupTimingMetrics(),
-            )
-            # The helper receives one explicit identity instead of reading
-            # mutable controller fields after checkpoint I/O has started.
-            actor._trainer_version = 11
-            actor._current_epoch = 5
-            actor._rollout_manager.execution_row_multiple = 4
-            await actor._save_data_plane_checkpoint(
-                str(tmp_path / "tmp_step_3"),
+        actor = _ACTOR_CLS(
+            mc,
+            _make_actor_args(save_state=save_state, dp_client=dp_client),
+            SetupTimingMetrics(),
+        )
+        # The helper receives one explicit identity instead of reading
+        # mutable controller fields after checkpoint I/O has started.
+        actor._trainer_version = 11
+        actor._current_epoch = 5
+        actor._rollout_manager.execution_row_multiple = 4
+        try:
+            metadata = actor._rollout_snapshots._data_plane_checkpoint_metadata(
                 train_steps=3,
                 trainer_version=7,
                 current_epoch=2,
             )
+        finally:
             actor._checkpointer.shutdown()
 
-        asyncio.run(_main())
-
-        metadata = dp_client.save_calls[0]["metadata"]
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
         assert metadata["single_controller_epoch"] == 2
+        assert metadata["loss_normalization"] == "global_token_mean"
         assert metadata["forest_training"] is forest_training
         assert metadata["forest_execution_row_multiple"] == (
             4 if forest_training else None
@@ -3171,32 +4515,17 @@ class TestDataPlaneCheckpoint:
         assert not (tmp_path / "checkpoints" / "step_1").exists()
 
     def test_rollout_recovery_inventory_rejects_missing_staging_rows(self):
-        staging_partition = "rollout_staging"
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
-        )
-        actor._dp_client = _StagingInventoryDPClient([], partition_id=staging_partition)
-
-        async def validate_inventory() -> None:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                await actor._validate_rollout_recovery_inventory(
-                    cut,
-                    replay_metadata=None,
-                    clear_unreferenced=False,
-                )
+        dp_client = _StagingInventoryDPClient([], partition_id=_STAGING)
 
         with pytest.raises(RuntimeError, match=r"missing=\['sealed-key'\]"):
-            asyncio.run(validate_inventory())
+            _validate_staging(dp_client, replay_metadata=None, clear_unreferenced=False)
 
     def test_rollout_recovery_inventory_merges_routes_and_clears_orphans(self):
-        staging_partition = "rollout_staging"
         route_key = "canonical-route-key"
         route_plan = encode_route_plan(
             RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
-                staging_partition=staging_partition,
+                staging_partition=_STAGING,
                 spans=(),
                 cleanup_staging_keys=(route_key,),
                 expected_token_length=0,
@@ -3215,79 +4544,43 @@ class TestDataPlaneCheckpoint:
             ]
         }
         dp_client = _StagingInventoryDPClient(
-            ["sealed-key", route_key, "orphan-key"],
-            partition_id=staging_partition,
+            ["sealed-key", route_key, "orphan-key"], partition_id=_STAGING
         )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
+
+        referenced = _validate_staging(
+            dp_client, replay_metadata=replay_metadata, clear_unreferenced=True
         )
-        actor._dp_client = dp_client
 
-        async def validate_inventory() -> int:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                return await actor._validate_rollout_recovery_inventory(
-                    cut,
-                    replay_metadata=replay_metadata,  # type: ignore[arg-type]
-                    clear_unreferenced=True,
-                )
-
-        assert asyncio.run(validate_inventory()) == 2
-
-        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert referenced == 2
+        assert dp_client.clear_calls == [(["orphan-key"], _STAGING)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
 
     def test_rollout_recovery_inventory_preserves_gym_manifest_staging_keys(self):
-        staging_partition = "rollout_staging"
         dp_client = _StagingInventoryDPClient(
-            ["sealed-key", "gym-owned-key", "orphan-key"],
-            partition_id=staging_partition,
+            ["sealed-key", "gym-owned-key", "orphan-key"], partition_id=_STAGING
         )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
+
+        referenced = _validate_staging(
+            dp_client,
+            replay_metadata=None,
+            clear_unreferenced=True,
+            additional_expected_staging_keys={"gym-owned-key"},
         )
-        actor._dp_client = dp_client
 
-        async def validate_inventory() -> int:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                return await actor._validate_rollout_recovery_inventory(
-                    cut,
-                    replay_metadata=None,
-                    clear_unreferenced=True,
-                    additional_expected_staging_keys={"gym-owned-key"},
-                )
-
-        assert asyncio.run(validate_inventory()) == 2
-        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert referenced == 2
+        assert dp_client.clear_calls == [(["orphan-key"], _STAGING)]
         assert sorted(dp_client.sample_ids) == ["gym-owned-key", "sealed-key"]
 
     def test_rollout_recovery_inventory_rejects_missing_gym_staging_key(self):
-        staging_partition = "rollout_staging"
-        dp_client = _StagingInventoryDPClient(
-            ["sealed-key"],
-            partition_id=staging_partition,
-        )
-        actor = object.__new__(_ACTOR_CLS)
-        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
-        actor._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition=staging_partition)
-        )
-        actor._dp_client = dp_client
-
-        async def validate_inventory() -> None:
-            async with DataPlaneCheckpointBarrier().mutation() as cut:
-                await actor._validate_rollout_recovery_inventory(
-                    cut,
-                    replay_metadata=None,
-                    clear_unreferenced=True,
-                    additional_expected_staging_keys={"missing-gym-key"},
-                )
+        dp_client = _StagingInventoryDPClient(["sealed-key"], partition_id=_STAGING)
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
-            asyncio.run(validate_inventory())
+            _validate_staging(
+                dp_client,
+                replay_metadata=None,
+                clear_unreferenced=True,
+                additional_expected_staging_keys={"missing-gym-key"},
+            )
 
         assert dp_client.clear_calls == []
         assert dp_client.sample_ids == ["sealed-key"]
@@ -3491,26 +4784,36 @@ class _OrderRecordingCritic:
 
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
+        self._keep_resident = False
 
     def prepare_for_training(self) -> None:
-        self.calls.append("critic.prepare_for_training")
+        self.calls.append(
+            "critic.prepare_for_training:resident"
+            if self._keep_resident
+            else "critic.prepare_for_training"
+        )
 
     def save_checkpoint(self, **kwargs: Any) -> None:
         self.save_kwargs = kwargs
         self.calls.append("critic.save_checkpoint")
 
     def finish_training(self) -> None:
-        self.calls.append("critic.finish_training")
+        self.calls.append(
+            "critic.finish_training:resident"
+            if self._keep_resident
+            else "critic.finish_training"
+        )
 
 
 def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     """Bare actor carrying only what _save_checkpoint reads."""
     actor = object.__new__(_ACTOR_CLS)
+    actor._rollout_runtime = RolloutRuntimeState()
     checkpoint_path = tmp_path / "tmp_step_1"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    actor._checkpoint_save_lock = asyncio.Lock()
+    attach_rollout_checkpointing(actor)
     actor._save_state = SimpleNamespace()
     actor._rollout_manager = _FakeRolloutManager()
     actor._train_steps = 1
@@ -3518,16 +4821,19 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._current_epoch = 0
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
-    actor._replacement_reserve = []
-    actor._finalizer_metrics_by_group = {}
-    actor._finalizer_rewards_by_group = {}
+    actor._rollout_runtime.replacement_reserve = []
+    actor._rollout_runtime.filtered_reserve = []
+    actor._rollout_runtime.finalizer_metrics_by_group = {}
+    actor._rollout_runtime.finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing={"metric_name": None, "save_data_plane": False},
+        checkpointing=CheckpointingConfig.model_construct(
+            metric_name=None, save_data_plane=False
+        ),
         data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
@@ -3535,16 +4841,89 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer = MagicMock()
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
-    actor._gym_checkpoint_coordinator = None
-    actor._rollout_dispatch_admission_gate = None
+    actor._environment_checkpoint = NoEnvironmentCheckpoint()
+    attach_rollout_checkpointing(actor)
     actor._is_ppo = True
     actor._loss_fn = object()
+    actor._value_dedicated = False
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
 
 
 class TestPPOSaveOrder:
+    def test_dedicated_models_save_without_migration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.single_controller._write_latest_checkpoint_status",
+            lambda *args, **kwargs: None,
+        )
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {}, is_policy_training_step=True, is_final_checkpoint=True
+            )
+        )
+
+        assert calls == [
+            "critic.prepare_for_training:resident",
+            "critic.save_checkpoint",
+            "critic.finish_training:resident",
+            "policy.save_checkpoint",
+        ]
+
+    def test_failed_dedicated_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        actor._value.save_checkpoint = MagicMock(
+            side_effect=RuntimeError("critic save failed")
+        )
+
+        with pytest.raises(RuntimeError, match="critic save failed"):
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+
+        assert calls == ["critic.prepare_for_training:resident"]
+
+    def test_cancelled_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_save(**kwargs: Any) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        actor._value.save_checkpoint = blocked_save
+
+        async def cancel_save() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+            finally:
+                release.set()
+
+        asyncio.run(cancel_save())
+        assert "critic.finish_training:resident" not in calls
+
     def test_the_policy_is_offloaded_across_the_critic_save(
         self, tmp_path, monkeypatch
     ):
@@ -3563,9 +4942,9 @@ class TestPPOSaveOrder:
         actor = _ppo_save_actor(tmp_path, calls)
         publish = actor._publish_when_policy_write_done
 
-        async def _record_publish(checkpoint_path):
+        async def _record_publish(checkpoint_path, **kwargs):
             calls.append("publish")
-            await publish(checkpoint_path)
+            await publish(checkpoint_path, **kwargs)
 
         actor._publish_when_policy_write_done = _record_publish
 
@@ -3617,9 +4996,31 @@ class TestPPOWarmupCheckpoint:
         # The critic trains from step 0, so its optimizer is always written.
         assert actor._value.save_kwargs["optimizer_path"] is not None
 
+    @pytest.mark.parametrize("consumed_samples", [0, 16])
+    def test_grpo_skipped_step_checkpoint_preserves_only_initialized_optimizer(
+        self, actor, consumed_samples
+    ):
+        actor._is_ppo = False
+        actor._consumed_samples = consumed_samples
+        actor._train_steps = 2
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {"skipped_step": 1},
+                is_policy_training_step=True,
+                is_final_checkpoint=True,
+            )
+        )
+
+        assert actor._trainer.save_kwargs["weights_path"] is not None
+        assert (actor._trainer.save_kwargs["optimizer_path"] is not None) == (
+            consumed_samples > 0
+        )
+        assert actor._save_state.consumed_samples == consumed_samples
+
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
         # Seed it so the delattr in the warmup branch is observable; the bare
         # namespace never had the attribute, so the assertion would be vacuous.
         setattr(actor._save_state, "train:loss", 1.23)
@@ -3635,7 +5036,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
             asyncio.run(
@@ -3837,6 +5238,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
@@ -3847,17 +5249,17 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
-        checkpointing={
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": True,
-            "keep_top_k": None,
-            "save_period": 2,
-            "save_optimizer": True,
-            "save_data_plane": True,
-            "checkpoint_must_save_by": None,
-        },
+        checkpointing=CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=True,
+            keep_top_k=None,
+            save_period=2,
+            save_optimizer=True,
+            save_data_plane=True,
+            checkpoint_must_save_by=None,
+        ),
     )
 
 
@@ -3928,7 +5330,7 @@ class TestSetupResumeWiring:
     ):
         ckpt_dir = tmp_path / "ckpts"
         mc = _setup_master_config(str(ckpt_dir))
-        mc.checkpointing["save_period"] = 1
+        mc.checkpointing.save_period = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
@@ -4068,8 +5470,10 @@ class TestSetupResumeWiring:
         tmp_path,
     ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
-        pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
-        mc.checkpointing["pretrained_checkpoint"] = pretrained
+        pretrained = PretrainedCheckpointConfig(
+            path="/some/ckpt", format="megatron_bridge"
+        )
+        mc.checkpointing.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -4226,26 +5630,6 @@ class TestReplayBufferPersistence:
         assert (ckpt_dir / "step_2" / REPLAY_BUFFER_METADATA_FILENAME).exists()
         assert buffer.metadata_state_dict_calls == [4]
 
-    def test_run_rejects_legacy_replay_file(self, tmp_path):
-        ckpt_dir = tmp_path / "resume_ckpt"
-        ckpt_dir.mkdir()
-        torch.save({"groups": ["legacy"]}, ckpt_dir / LEGACY_REPLAY_BUFFER_FILENAME)
-        mc = _actor_master_config(
-            tmp_path,
-            max_num_steps=0,
-            buffer_checkpoint=True,
-            data_plane_checkpoint=True,
-        )
-        buffer = _FakeTQBuffer()
-
-        with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
-            _run_actor_run(
-                mc,
-                _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
-            )
-
-        assert buffer.load_calls == []
-
     def test_run_restores_native_tq_replay_metadata_without_payload_reput(
         self, tmp_path
     ):
@@ -4395,8 +5779,14 @@ class TestReplayBufferPersistence:
                 ),
                 SetupTimingMetrics(),
             )
-            restored = await actor._maybe_restore_replay_buffer()
-            await actor._maybe_restore_rollout_recovery(restored_replay_groups=restored)
+            restored = await actor._rollout_restorer._restore_replay_buffer()
+            await actor._rollout_restorer._restore_recovery_ledger(
+                restored_replay_groups=restored
+            )
+            # What _run_pumps does with restore's answer: dispatch through the
+            # ledger, the only dispatch that can launch the queued groups.
+            assert actor._rollout_restorer._requires_recovery_dispatch
+            actor._rollout_recovery_enabled = True
             assert actor._buffer_capacity._value == 4
             actor._rollout_permitted.set()
             try:
@@ -4430,7 +5820,8 @@ class TestReplayBufferPersistence:
         actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
         actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         actor._rollout_manager = _FakeRolloutManager()
-        actor._restored_replay_groups_to_regenerate = [
+        attach_rollout_checkpointing(actor)
+        actor._rollout_restorer._groups_to_regenerate = [
             {
                 "meta": KVBatchMeta(
                     partition_id=_PARTITION_ID,
@@ -4445,7 +5836,8 @@ class TestReplayBufferPersistence:
 
         async def regenerate() -> None:
             async with actor._data_plane_checkpoint_barrier.mutation() as cut:
-                await actor._queue_restored_replay_groups_for_regeneration(cut)
+                attach_rollout_checkpointing(actor)
+                await actor._rollout_restorer._queue_replay_groups_for_regeneration(cut)
 
         with pytest.raises(ValueError, match="prompt"):
             asyncio.run(regenerate())
@@ -4610,32 +6002,6 @@ class TestReplayBufferPersistence:
 
         assert buffer.load_calls == []
 
-    def test_native_replay_metadata_rejects_missing_manifest_digest(self, tmp_path):
-        ckpt_dir = tmp_path / "resume_ckpt"
-        ckpt_dir.mkdir()
-        torch.save({"groups": []}, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
-        mc = _actor_master_config(
-            tmp_path,
-            max_num_steps=0,
-            buffer_checkpoint=True,
-            data_plane_checkpoint=True,
-        )
-        buffer = _FakeTQBuffer()
-        tq_metadata = _data_plane_checkpoint_metadata()
-        del tq_metadata["replay_manifest_digest"]
-
-        with pytest.raises(ValueError, match="missing a replay manifest digest"):
-            _run_actor_run(
-                mc,
-                _make_actor_args(
-                    tq_buffer=buffer,
-                    last_checkpoint_path=str(ckpt_dir),
-                    data_plane_checkpoint_metadata=tq_metadata,
-                ),
-            )
-
-        assert buffer.load_calls == []
-
     def test_run_missing_native_replay_metadata_starts_empty(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
         ckpt_dir.mkdir()
@@ -4698,17 +6064,18 @@ class TestReplacementReservePersistence:
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path), _make_actor_args(), SetupTimingMetrics()
         )
-        actor._last_checkpoint_path = str(tmp_path)
-        actor._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": schema
-        }
+        actor._resume = ResumeSource(
+            path=str(tmp_path),
+            data_plane_metadata={"rollout_recovery_schema_version": schema},
+        )
+        attach_rollout_checkpointing(actor)
         try:
             if schema >= 5:
                 with pytest.raises(FileNotFoundError, match="replacement_reserve"):
-                    asyncio.run(actor._maybe_restore_replacement_reserve())
+                    asyncio.run(actor._rollout_restorer._restore_spare_prompts())
             else:
-                asyncio.run(actor._maybe_restore_replacement_reserve())
-            assert list(actor._replacement_reserve) == []
+                asyncio.run(actor._rollout_restorer._restore_spare_prompts())
+            assert list(actor._rollout_runtime.replacement_reserve) == []
         finally:
             actor._checkpointer.shutdown()
 
@@ -4727,14 +6094,19 @@ class TestReplacementReservePersistence:
         actor = _run_train_pump(
             mc,
             _make_actor_args(),
-            seed=lambda a: a._replacement_reserve.extend(["spare0", "spare1"]),
+            seed=lambda a: a._rollout_runtime.replacement_reserve.extend(
+                ["spare0", "spare1"]
+            ),
         )
 
         reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
         assert reserve_path.exists()
-        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        assert torch.load(reserve_path, weights_only=False) == {
+            "replacement": ["spare0", "spare1"],
+            "filtered": [],
+        }
         # Saved, not consumed: the pool the run continues with is untouched.
-        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
     def test_save_writes_an_empty_reserve(self, tmp_path):
         """New checkpoints distinguish an empty pool from a missing sidecar."""
@@ -4744,7 +6116,10 @@ class TestReplacementReservePersistence:
 
         step_dir = tmp_path / "checkpoints" / "step_2"
         assert step_dir.exists()
-        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == []
+        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == {
+            "replacement": [],
+            "filtered": [],
+        }
 
     def test_run_restores_the_pooled_spares(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
@@ -4760,7 +6135,7 @@ class TestReplacementReservePersistence:
             ),
         )
 
-        assert list(actor._replacement_reserve) == ["spare0", "spare1"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
     def test_run_restores_the_pool_when_replay_metadata_is_absent(self, tmp_path):
         """An empty replay restore must not suppress the independent spare pool.
@@ -4787,7 +6162,7 @@ class TestReplacementReservePersistence:
         )
 
         assert buffer.load_calls == []
-        assert list(actor._replacement_reserve) == ["spare0"]
+        assert list(actor._rollout_runtime.replacement_reserve) == ["spare0"]
 
     def test_run_without_a_reserve_file_starts_with_an_empty_pool(self, tmp_path):
         """A checkpoint predating this file, or any run that never diverted."""
@@ -4803,4 +6178,4 @@ class TestReplacementReservePersistence:
             ),
         )
 
-        assert list(actor._replacement_reserve) == []
+        assert list(actor._rollout_runtime.replacement_reserve) == []

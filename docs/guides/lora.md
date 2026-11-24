@@ -1,16 +1,10 @@
 # LoRA (Low-Rank Adaptation)
 
-NeMo RL supports LoRA for parameter-efficient fine-tuning. LoRA reduces the number of
-trainable parameters by learning low-rank update matrices for selected linear layers while
-keeping the base model frozen. This lowers memory usage and checkpoint size, and enables
-serving many task-specific adapters on top of a single shared base model.
+NeMo RL supports LoRA for parameter-efficient fine-tuning. LoRA reduces the number of trainable parameters by learning low-rank update matrices for selected linear layers while keeping the base model frozen. This lowers memory usage and checkpoint size, and enables serving many task-specific adapters on top of a single shared base model.
 
-This page is the single reference for LoRA in NeMo RL. It covers backend support, a
-side-by-side schema comparison, backend-specific config examples, and links to the
-algorithm guides and checkpoint-export tooling.
+This page is the single reference for LoRA in NeMo RL. It covers backend support, a side-by-side schema comparison, backend-specific config examples, and links to the algorithm guides and checkpoint-export tooling.
 
-For the theory behind the method, see
-[LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
+For the theory behind the method, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
 
 ## Backend Support
 
@@ -24,8 +18,7 @@ LoRA is implemented on two training backends, each with its own config schema:
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
 ```{note}
-Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so set
-`use_triton: false` in that case (see the parameter details below).
+Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so set `use_triton: false` in that case (see the parameter details below).
 ```
 
 ## Schema Comparison
@@ -90,9 +83,7 @@ policy:
 
 ### Grouped MoE Experts
 
-`match_all_linear: true` matches linear modules and skips Automodel's grouped
-expert modules. To adapt grouped experts, set `match_all_linear: false` and
-include their module names in `target_modules`, for example:
+`match_all_linear: true` matches linear modules and skips Automodel's grouped expert modules. To adapt grouped experts, set `match_all_linear: false` and include their module names in `target_modules`, for example:
 
 ```yaml
 policy:
@@ -107,11 +98,8 @@ policy:
     lora_refit_mode: merged
 ```
 
-With merged refitting, the grouped expert adapters are merged into
-`gate_and_up_projs` and `down_projs` before conversion to the inference engine's
-weight format. The adapter tensors themselves are excluded from the refit.
-The example explicitly selects merged refitting; synchronous vLLM otherwise
-defaults to native adapter refitting.
+With merged refitting, the grouped expert adapters are merged into `gate_and_up_projs` and `down_projs` before conversion to the inference engine's weight format. The adapter tensors themselves are excluded from the refit.
+The example explicitly selects merged refitting; synchronous vLLM otherwise defaults to native adapter refitting.
 
 ## Megatron Configuration
 
@@ -163,22 +151,12 @@ policy:
 
 ## Warm-Starting from a LoRA Checkpoint
 
-`restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an
-SFT LoRA into GRPO. The accepted path format differs by backend:
+`restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an SFT LoRA into GRPO. The accepted path format differs by backend:
 
-- **Automodel**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing
-  `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights`
-  or its `model/` subdirectory).
-- **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
-  directory, or a checkpoint root containing one.
+- **Automodel**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights` or its `model/` subdirectory).
+- **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX` directory, or a checkpoint root containing one.
 
-The donor's `dim`/`alpha` must match this run's. On Automodel, a donor's recorded
-`base_model_name_or_path` (unless absent, empty, or `N/A`) must also equal this run's
-`policy.model_name` as an exact string: an HF repo ID and a local path for the same model
-will not match, nor will a model moved to a different path. Setup fails loudly otherwise. Optimizer, RNG,
-and train state always start fresh. `restore_from` requires `enabled: true`. When resuming from a
-NeMo RL training checkpoint, the resumed weights take precedence for the policy; the KL reference
-policy still anchors to the warm-started (donor) adapters, not to the bare base model.
+The donor's `dim`/`alpha` must match this run's. On Automodel, a donor's recorded `base_model_name_or_path` (unless absent, empty, or `N/A`) must also equal this run's `policy.model_name` as an exact string: an HF repo ID and a local path for the same model will not match, nor will a model moved to a different path. Setup fails loudly otherwise. Optimizer, RNG, and train state always start fresh. `restore_from` requires `enabled: true`. When resuming from a NeMo RL training checkpoint, the resumed weights take precedence for the policy; the KL reference policy still anchors to the warm-started (donor) adapters, not to the bare base model.
 
 ## Usage by Algorithm
 
@@ -210,36 +188,16 @@ GRPO supports LoRA on both backends. Enable the Automodel adapter with:
 uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-For Automodel training with synchronous vLLM generation, **native LoRA refit is the
-default**: NeMo RL sends only the factorized A/B tensors, replaces an in-memory vLLM
-adapter, and selects it on every generation request. The base model is loaded once and is
-not overwritten during adapter updates.
+For Automodel training with synchronous vLLM generation, **native LoRA refit is the default**: NeMo RL sends only the factorized A/B tensors, replaces an in-memory vLLM adapter, and selects it on every generation request. The base model is loaded once and is not overwritten during adapter updates.
 
-Native refit currently supports the topology-default transport (colocated CUDA IPC or
-non-colocated NCCL) and matching BF16/FP16 trainer and rollout precision. It exports the
-trainer's LoRA tensors through the model's Automodel state-dict adapter when one is
-present, so custom model layouts such as grouped MoE are converted to conventional
-per-expert HF/PEFT factors with the orientation consumed by vLLM. It fails at setup for
-unsupported combinations such as asynchronous vLLM, vLLM's exposed HTTP server (NeMo
-Gym), speculative decoding, quantized rollout models, custom refit transports, DoRA,
-`moe_rank_scaling`, or Megatron LoRA. Models with dynamically updated MoE router bias
-fail before their first native refit rather than silently omitting that mutable state.
-Native refit also fails rather than silently dropping a trained module that the selected
-vLLM model implementation cannot apply. For example, Qwen2 does not expose `lm_head` as
-a native-LoRA module; configure its Automodel LoRA policy with
-`match_all_linear=false` and `exclude_modules=["*lm_head*"]`, or use merged refit.
+Native refit currently supports the topology-default transport (colocated CUDA IPC or non-colocated NCCL) and matching BF16/FP16 trainer and rollout precision. It exports the trainer's LoRA tensors through the model's Automodel state-dict adapter when one is present, so custom model layouts such as grouped MoE are converted to conventional per-expert HF/PEFT factors with the orientation consumed by vLLM. It fails at setup for unsupported combinations such as asynchronous vLLM, vLLM's exposed HTTP server (NeMo Gym), speculative decoding, quantized rollout models, custom refit transports, DoRA, `moe_rank_scaling`, or Megatron LoRA. Models with dynamically updated MoE router bias fail before their first native refit rather than silently omitting that mutable state.
+Native refit also fails rather than silently dropping a trained module that the selected vLLM model implementation cannot apply. For example, Qwen2 does not expose `lm_head` as a native-LoRA module; configure its Automodel LoRA policy with `match_all_linear=false` and `exclude_modules=["*lm_head*"]`, or use merged refit.
 
-Individual recipes may still set
-`policy.automodel_cfg.automodel_kwargs.force_hf=true` for model-specific training or
-parallelization compatibility. That setting is independent of native refit; native refit
-itself accepts either HF-native LoRA names or names converted by a custom Automodel
-state-dict adapter.
+Individual recipes may still set `policy.automodel_cfg.automodel_kwargs.force_hf=true` for model-specific training or parallelization compatibility. That setting is independent of native refit; native refit itself accepts either HF-native LoRA names or names converted by a custom Automodel state-dict adapter.
 
-Native refit requires `policy.generation.backend: vllm`. Other rollout backends use the
-`merged` representation and must set `policy.generation.lora_refit_mode: merged`.
+Native refit requires `policy.generation.backend: vllm`. Other rollout backends use the `merged` representation and must set `policy.generation.lora_refit_mode: merged`.
 
-The previous full-weight behavior remains available as an explicit compatibility or
-performance opt-in:
+The previous full-weight behavior remains available as an explicit compatibility or performance opt-in:
 
 ```yaml
 policy:
@@ -247,17 +205,13 @@ policy:
     lora_refit_mode: merged
 ```
 
-Merged refit materializes `W + scale * B @ A` in the rollout dtype. In reduced precision,
-this can discard LoRA updates that are smaller than the BF16/FP16 spacing of the base
-weight and therefore can increase the trainer/generation logprob mismatch.
+Merged refit materializes `W + scale * B @ A` in the rollout dtype. In reduced precision, this can discard LoRA updates that are smaller than the BF16/FP16 spacing of the base weight and therefore can increase the trainer/generation logprob mismatch.
 
 See the [GRPO guide](grpo.md) for the full GRPO workflow.
 
 ### DPO
 
-DPO fully supports LoRA on **both** the Automodel and Megatron backends, using the same
-`lora_cfg` / `peft` config blocks as SFT and GRPO. There is no dedicated DPO LoRA recipe;
-enable it on an existing DPO config via an override. For the Automodel backend:
+DPO fully supports LoRA on **both** the Automodel and Megatron backends, using the same `lora_cfg` / `peft` config blocks as SFT and GRPO. There is no dedicated DPO LoRA recipe; enable it on an existing DPO config via an override. For the Automodel backend:
 
 ```bash
 uv run examples/run_dpo.py policy.automodel_cfg.lora_cfg.enabled=true
@@ -293,8 +247,7 @@ DPO LoRA is supported on both backends but ships no dedicated recipe — enable 
 
 ## Exporting a LoRA Checkpoint to Hugging Face Format
 
-After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports
-two export modes:
+After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
 
 - **Merged**: fold the adapter into the base model and export a single standalone Hugging Face checkpoint for inference or evaluation.
 - **Adapter-only**: export only the adapter weights in Hugging Face PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).

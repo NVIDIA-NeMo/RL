@@ -154,10 +154,9 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
-            # A value model consumes tokens only; unioning the rollout's
-            # multimodal columns in would fetch and broadcast pixels this
-            # forward discards.
-            include_multimodal=False,
+            # Only the Megatron critic supports VLM inputs. AutoModel critics
+            # must not receive media because their packing path is text-only.
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         value_meta, privilege_kwargs = self._privileged_dispatch(
             value_meta, privilege_prefixes
@@ -218,8 +217,7 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            # See get_values: token-only inputs, so no multimodal union.
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         train_meta, privilege_kwargs = self._privileged_dispatch(
             train_meta, privilege_prefixes
@@ -277,13 +275,13 @@ class TQValue(TQDriverMixin, Value):
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
-        """Accumulate a token-only chunk using the existing presharded worker API."""
+        """Accumulate a training chunk using the existing presharded worker API."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(

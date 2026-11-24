@@ -23,7 +23,7 @@ uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7
 
 ## Dynamic Sampling
 
-Standard GRPO trains on all generated responses, even when they have identical rewards (zero gradient signal) within a prompt group of generations. Dynamic sampling filters to keep only groups with diverse rewards (`std > 0`), and accumulates them across batches until reaching the target batch size. Dynamic sampling can be enabled by setting `use_dynamic_sampling=True` in your configuration. For implementation details, see the [`dynamic_sampling`](../../nemo_rl/algorithms/grpo.py) function. 
+Standard GRPO trains on all generated responses, even when they have identical rewards (zero gradient signal) within a prompt group of generations. Dynamic sampling filters to keep only groups with diverse rewards (`std > 0`), and accumulates them across batches until reaching the target batch size. Dynamic sampling can be enabled by setting `use_dynamic_sampling=True` in your configuration. For implementation details, see the [`dynamic_sampling`](../../nemo_rl/algorithms/grpo.py) function. The single-controller path supports it too, by resampling a substitute for each filtered group instead of accumulating batches; see [Dynamic sampling](single-controller.md#dynamic-sampling) for its requirements.
 
 **Algorithm**: For each training step:
 
@@ -85,7 +85,7 @@ grpo:
 > [!NOTE]
 > **Clip-Higher** and **Token-Level Policy Gradient Loss** are already supported in NeMo RL and can be configured through the `loss_fn` section of your experiment config:
 > - Set `ratio_clip_max` to enable Clip-Higher (e.g., `ratio_clip_max: 0.28`)
-> - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss (see [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this changes and the tradeoff against sequence-level normalization)
+> - Set `normalization: global_token_mean` to enable Token-Level Policy Gradient Loss (see [Loss Normalization](grpo.md#loss-normalization) for what this changes and the tradeoff against sequence-level normalization)
 > 
 > See the full [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml) for reference.
 

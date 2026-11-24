@@ -49,6 +49,7 @@ recoverable for 100% of them -- but not uniformly.
 
 import asyncio
 import json
+import os
 from dataclasses import replace
 from typing import Any, Collection, Iterable, Mapping, Optional, Sequence
 
@@ -58,6 +59,11 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.grouping import prompt_group_ids
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.value.config import SwePrivilegedCriticConfig
+from nemo_rl.utils.path_utils import load_checkpoint_object, path_exists
+
+# The prefix cache, saved with a checkpointed replay buffer so the restored groups
+# keep their reference blocks.
+PRIVILEGE_PREFIXES_FILENAME = "privilege_prefixes.pt"
 
 # The accepted fix, in priority order. swe-bench-ext and SWE-rebench use
 # ``patch``, nv-internal-1 uses ``gold_patch``, SWE-Gym carries ``golden_patch``
@@ -664,8 +670,28 @@ class SwePrivilegePrefixStore:
                 self._group_keys[group_id] = key
                 self._refcounts[key] = self._refcounts.get(key, 0) + 1
 
-    def __len__(self) -> int:
-        return len(self._prefixes)
+    def restore_from_checkpoint(
+        self, checkpoint_path: str, metas: Sequence[KVBatchMeta]
+    ) -> None:
+        """Load the checkpoint's prefix cache for the restored replay groups ``metas``.
+
+        Raises:
+            FileNotFoundError: The checkpoint has no prefix cache.
+        """
+        path = os.path.join(checkpoint_path, PRIVILEGE_PREFIXES_FILENAME)
+        if not path_exists(path):
+            raise FileNotFoundError(
+                f"Restored {len(metas)} replay group(s) for the privileged critic, "
+                f"but the checkpoint has no {PRIVILEGE_PREFIXES_FILENAME}."
+            )
+        # weights_only=False: prefix tensors plus plain stats dicts, a trusted
+        # same-job artifact like the replay metadata.
+        self.restore(load_checkpoint_object(path, weights_only=False), metas)
+        print(
+            f"📦 Restored {len(self._prefixes)} privileged-critic prefix(es) for "
+            f"{len(metas)} restored replay group(s)",
+            flush=True,
+        )
 
 
 def _privilege_tags(meta: KVBatchMeta) -> list[dict[str, Any]]:

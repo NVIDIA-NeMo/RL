@@ -42,7 +42,7 @@ import json
 import logging
 import math
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -61,7 +61,12 @@ if TYPE_CHECKING:
         StageResult,
     )
 
+from nemo_rl.data_plane.codec import stack_or_nest
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
+    CAPTURE_CODE_TO_MODE,
+    CAPTURE_MODE_TO_CODE,
+    GENERATION_CUT_STAGING_PREFIX,
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -139,8 +144,45 @@ STAGING_FIELDS = [
     ROUTED_LEN_FIELD,
 ]
 
-_MODE_TO_CODE = {"text": 0, "token_in": 1}
-_CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+
+def generation_cut_staging_key(
+    checkpoint_id: str,
+    rollout_id: str,
+    model_call_id: str,
+    *,
+    chunk_sequence: int,
+) -> str:
+    """Return an immutable key for one checkpointed generation chunk."""
+    if not checkpoint_id or not rollout_id or not model_call_id:
+        raise ValueError("generation-cut key components must be non-empty")
+    if chunk_sequence < 0:
+        raise ValueError("generation-cut chunk sequence must be non-negative")
+    return (
+        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/"
+        f"{model_call_id}/{chunk_sequence}"
+    )
+
+
+def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) -> bool:
+    """Match a physical TQ key to the row's logical call identity."""
+    if key == snapshot.staging_key:
+        return True
+    if not key.startswith(GENERATION_CUT_STAGING_PREFIX):
+        return False
+    checkpoint_and_identity = key.removeprefix(GENERATION_CUT_STAGING_PREFIX)
+    checkpoint_id, checkpoint_separator, identity_and_sequence = (
+        checkpoint_and_identity.partition("/")
+    )
+    logical_key, sequence_separator, chunk_sequence = identity_and_sequence.rpartition(
+        "/"
+    )
+    return bool(
+        checkpoint_id
+        and checkpoint_separator
+        and sequence_separator
+        and chunk_sequence.isdecimal()
+        and logical_key == snapshot.staging_key
+    )
 
 
 class MediaMetadataIntegrityError(ValueError):
@@ -394,6 +436,26 @@ class TQStagingStore:
             tags=[tags or {}],
         )
 
+    def put_many(
+        self,
+        keys: Sequence[str],
+        fields: TensorDict,
+        *,
+        tags: Sequence[dict[str, Any]],
+    ) -> None:
+        """Publish one compatible batch of keyed rows in a single TQ call."""
+        row_count = int(fields.batch_size[0]) if fields.batch_size else 0
+        if len(keys) != len(tags) or row_count != len(keys):
+            raise ValueError("batch keys, fields, and tags must have equal lengths")
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+            fields=fields,
+            tags=list(tags),
+        )
+
     def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
         return _call_dp(
             self._dp_client,
@@ -443,11 +505,24 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
+        self._prefix_store: TQStagingStore | None = None
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
+
+    def set_prefix_writer(self, dp_client: Any) -> None:
+        """Route prefix PUTs and failed-prefix cleanup through a separate client.
+
+        Install once, before accepting cuts. Terminal writes, restore reads,
+        and ordinary cleanup retain their original client.
+        """
+        if self._prefix_store is not None:
+            raise RuntimeError("A prefix writer is already installed")
+        self._prefix_store = TQStagingStore(
+            dp_client, staging_partition=self._store._staging_partition
+        )
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -466,7 +541,7 @@ class TQTokenSink:
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
         no transactional rollback: if the write raises, the attempted key is
         discarded best-effort before the failure is reported (see
-        ``_discard_failed_write``).
+        ``_discard_failed_writes``).
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
@@ -474,203 +549,9 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
-            remaining = dict(attachments) if attachments is not None else None
-            if remaining is not None and ROUTED_EXPERTS_FIELD in remaining:
-                remaining.pop(ROUTED_EXPERTS_FIELD)
-                remaining = remaining or None
-            sampler_columns: dict[str, torch.Tensor] = {}
-            if remaining is not None and any(
-                key in remaining for key in SAMPLER_TOPK_FIELDS
-            ):
-                if not all(key in remaining for key in SAMPLER_TOPK_FIELDS):
-                    raise ValueError(
-                        "sampler top-k attachments require both IDs and logprobs"
-                    )
-                ids = remaining.pop(SAMPLER_TOPK_TOKEN_IDS_FIELD)
-                logprobs = remaining.pop(SAMPLER_TOPK_LOGPROBS_FIELD)
-                if (
-                    not isinstance(ids, torch.Tensor)
-                    or not isinstance(logprobs, torch.Tensor)
-                    or ids.ndim != 2
-                    or ids.shape != logprobs.shape
-                    or ids.dtype != torch.int32
-                    or logprobs.dtype != torch.float32
-                    or ids.device.type != "cpu"
-                    or logprobs.device.type != "cpu"
-                ):
-                    raise ValueError(
-                        "sampler top-k attachments require matching CPU [T, K] int32 IDs and float32 logprobs"
-                    )
-                sampler_columns = {
-                    SAMPLER_TOPK_TOKEN_IDS_FIELD: ids.unsqueeze(0),
-                    SAMPLER_TOPK_LOGPROBS_FIELD: logprobs.unsqueeze(0),
-                }
-                remaining = remaining or None
-            if remaining is not None and not self._capture_media:
-                raise ValueError(
-                    "media attachments require a media-enabled staging partition"
-                )
-            media = validate_media_tensors(remaining)
-            media_columns: dict[str, torch.Tensor] | None = None
-            if self._capture_media:
-                if self._media_pixel_dtype is None:
-                    raise ValueError("media-enabled staging requires media_pixel_dtype")
-                if media is not None and media.imgs.dtype != self._media_pixel_dtype:
-                    raise ValueError(
-                        f"media imgs dtype {media.imgs.dtype} does not match the "
-                        f"staging column dtype {self._media_pixel_dtype}"
-                    )
-                media_columns = _media_columns(
-                    media, _media_sentinels(self._media_pixel_dtype)
-                )
-            field_dict = {
-                "token_ids_delta": torch.from_numpy(
-                    np.array([record.token_ids_delta], dtype=np.int64)
-                ),
-                "token_mask_delta": torch.from_numpy(
-                    np.array([record.token_mask_delta], dtype=np.float32)
-                ),
-                "generation_logprobs_delta": torch.from_numpy(
-                    np.array([record.generation_log_probs_delta], dtype=np.float32)
-                ),
-                "schema_version": torch.tensor(
-                    [record.schema_version], dtype=torch.int64
-                ),
-                "digest_version": torch.tensor(
-                    [record.digest_version], dtype=torch.int64
-                ),
-                "extras_digest_version": torch.tensor(
-                    [record.extras_digest_version], dtype=torch.int64
-                ),
-                "capture_key_utf8": _bytes_tensor(record.capture_key.encode("utf-8")),
-                "model_call_id_utf8": _bytes_tensor(
-                    record.model_call_id.encode("utf-8")
-                ),
-                "parent_call_id_utf8": _bytes_tensor(
-                    (record.parent_call_id or "\0").encode("utf-8")
-                ),
-                "parent_call_id_present": torch.tensor(
-                    [record.parent_call_id is not None], dtype=torch.bool
-                ),
-                "capture_mode": torch.tensor(
-                    [_MODE_TO_CODE[record.mode]], dtype=torch.int64
-                ),
-                "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
-                "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
-                "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
-                "weight_version": torch.tensor(
-                    [record.weight_version], dtype=torch.int64
-                ),
-                "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
-                "extras_digest_bytes": _bytes_tensor(
-                    bytes.fromhex(record.extras_digest)
-                ),
-            }
-            chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
-            cumulative_hash, cumulative_hash_present = _optional_digest_fields(
-                record.cumulative_hash
-            )
-            field_dict.update(
-                {
-                    "chain_hash_bytes": chain_hash,
-                    "chain_hash_present": chain_hash_present,
-                    "cumulative_hash_bytes": cumulative_hash,
-                    "cumulative_hash_present": cumulative_hash_present,
-                }
-            )
-            extras_metadata = dict(record.extras) if record.extras is not None else None
-            routed = (
-                extras_metadata.pop("routed_experts", None)
-                if extras_metadata is not None
-                else None
-            )
-            metadata_json = json.dumps(
-                extras_metadata,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
-            if self._capture_media:
-                # Detect metadata corruption without loading route or pixel tensors.
-                # This checksum is independent of Gym's combined extras commitment.
-                field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
-                    hashlib.sha256(metadata_json).digest()
-                )
-            routed_len = 0
-            routed_encoding = ROUTE_ENCODING_NONE
-            router_attachment = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
-            if (
-                attachments is not None
-                and ROUTED_EXPERTS_FIELD in attachments
-                and not isinstance(router_attachment, torch.Tensor)
-            ):
-                raise ValueError("routed_experts attachment must be a tensor")
-            if router_attachment is not None and not isinstance(routed, dict):
-                raise ValueError(
-                    "routed_experts attachment requires its capture metadata"
-                )
-            if routed is not None:
-                delta_len = len(record.token_ids_delta)
-                if isinstance(routed, dict):
-                    if not isinstance(router_attachment, torch.Tensor):
-                        raise ValueError(
-                            "routed_experts metadata requires a tensor attachment"
-                        )
-                    experts = router_attachment
-                    routed_encoding = ROUTE_ENCODING_TENSOR
-                elif isinstance(routed, str):
-                    from nemo_rl.utils.routed_experts_codec import (
-                        decode_routed_experts,
-                    )
-
-                    dtype_name = routed.split(":", 3)[1]
-                    dtype = {
-                        "int8": torch.int8,
-                        "int16": torch.int16,
-                        "int32": torch.int32,
-                    }.get(dtype_name)
-                    if dtype is None:
-                        raise ValueError(
-                            f"unsupported routed_experts dtype {dtype_name!r}"
-                        )
-                    experts = decode_routed_experts(routed, dtype)
-                    routed_encoding = ROUTE_ENCODING_ENVELOPE
-                else:
-                    experts = torch.tensor(routed, dtype=torch.int16)
-                    routed_encoding = ROUTE_ENCODING_LIST
-                expected_len = delta_len + boundary_route_rows(record.prev_len)
-                if experts.dim() != 3 or experts.shape[0] != expected_len:
-                    raise ValueError(
-                        "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for "
-                        f"prev_len={record.prev_len}, delta_len={delta_len} "
-                        f"(expected {expected_len} rows)"
-                    )
-                field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
-                routed_len = int(experts.shape[0])
-            field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
-                [routed_encoding], dtype=torch.int64
-            )
-            field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            if media_columns is not None:
-                field_dict.update(media_columns)
-            field_dict.update(sampler_columns)
-            tags = [
-                {
-                    "capture_key": record.capture_key,
-                    "model_call_id": record.model_call_id,
-                    "parent_call_id": record.parent_call_id,
-                    "prev_len": record.prev_len,
-                    "delta_len": record.delta_len,
-                    "cum_len": record.cum_len,
-                    "weight_version": record.weight_version,
-                    "digest": record.digest,
-                    "schema_version": record.schema_version,
-                }
-            ]
+            field_dict, tags = self._encode_record(record, attachments=attachments)
             write_started = True
-            self._store.put(key, field_dict, tags=tags[0])
+            self._store.put(key, field_dict, tags=tags)
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
@@ -682,13 +563,293 @@ class TQTokenSink:
                 error,
             )
             if write_started:
-                self._discard_failed_write(key)
+                self._discard_failed_writes([key])
             return StageResult(
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
         return StageResult(ok=True, staging_key=key)
 
-    def _discard_failed_write(self, key: str) -> None:
+    def _encode_record(
+        self,
+        record: StagedCallRecord,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+        generation_cut_chunk: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """Encode one capture row and its tags without publishing it.
+
+        A generation-cut chunk carries exactly one route row per token and no
+        boundary row: only the resume path reads it back, and the resumed
+        call's canonical row supplies the boundary route the reassembler uses.
+        """
+        remaining = dict(attachments) if attachments is not None else None
+        if remaining is not None and ROUTED_EXPERTS_FIELD in remaining:
+            remaining.pop(ROUTED_EXPERTS_FIELD)
+            remaining = remaining or None
+        sampler_columns: dict[str, torch.Tensor] = {}
+        if remaining is not None and any(
+            key in remaining for key in SAMPLER_TOPK_FIELDS
+        ):
+            if not all(key in remaining for key in SAMPLER_TOPK_FIELDS):
+                raise ValueError(
+                    "sampler top-k attachments require both IDs and logprobs"
+                )
+            ids = remaining.pop(SAMPLER_TOPK_TOKEN_IDS_FIELD)
+            logprobs = remaining.pop(SAMPLER_TOPK_LOGPROBS_FIELD)
+            if (
+                not isinstance(ids, torch.Tensor)
+                or not isinstance(logprobs, torch.Tensor)
+                or ids.ndim != 2
+                or ids.shape != logprobs.shape
+                or ids.dtype != torch.int32
+                or logprobs.dtype != torch.float32
+                or ids.device.type != "cpu"
+                or logprobs.device.type != "cpu"
+            ):
+                raise ValueError(
+                    "sampler top-k attachments require matching CPU [T, K] int32 IDs and float32 logprobs"
+                )
+            sampler_columns = {
+                SAMPLER_TOPK_TOKEN_IDS_FIELD: ids.unsqueeze(0),
+                SAMPLER_TOPK_LOGPROBS_FIELD: logprobs.unsqueeze(0),
+            }
+            remaining = remaining or None
+        if remaining is not None and not self._capture_media:
+            raise ValueError(
+                "media attachments require a media-enabled staging partition"
+            )
+        media = validate_media_tensors(remaining)
+        media_columns: dict[str, torch.Tensor] | None = None
+        if self._capture_media:
+            if self._media_pixel_dtype is None:
+                raise ValueError("media-enabled staging requires media_pixel_dtype")
+            if media is not None and media.imgs.dtype != self._media_pixel_dtype:
+                raise ValueError(
+                    f"media imgs dtype {media.imgs.dtype} does not match the "
+                    f"staging column dtype {self._media_pixel_dtype}"
+                )
+            media_columns = _media_columns(
+                media, _media_sentinels(self._media_pixel_dtype)
+            )
+        field_dict = {
+            "token_ids_delta": torch.from_numpy(
+                np.array([record.token_ids_delta], dtype=np.int64)
+            ),
+            "token_mask_delta": torch.from_numpy(
+                np.array([record.token_mask_delta], dtype=np.float32)
+            ),
+            "generation_logprobs_delta": torch.from_numpy(
+                np.array([record.generation_log_probs_delta], dtype=np.float32)
+            ),
+            "schema_version": torch.tensor([record.schema_version], dtype=torch.int64),
+            "digest_version": torch.tensor([record.digest_version], dtype=torch.int64),
+            "extras_digest_version": torch.tensor(
+                [record.extras_digest_version], dtype=torch.int64
+            ),
+            "capture_key_utf8": _bytes_tensor(record.capture_key.encode("utf-8")),
+            "model_call_id_utf8": _bytes_tensor(record.model_call_id.encode("utf-8")),
+            "parent_call_id_utf8": _bytes_tensor(
+                (record.parent_call_id or "\0").encode("utf-8")
+            ),
+            "parent_call_id_present": torch.tensor(
+                [record.parent_call_id is not None], dtype=torch.bool
+            ),
+            "capture_mode": torch.tensor(
+                [CAPTURE_MODE_TO_CODE[record.mode]], dtype=torch.int64
+            ),
+            "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
+            "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
+            "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
+            "weight_version": torch.tensor([record.weight_version], dtype=torch.int64),
+            "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
+            "extras_digest_bytes": _bytes_tensor(bytes.fromhex(record.extras_digest)),
+        }
+        chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
+        cumulative_hash, cumulative_hash_present = _optional_digest_fields(
+            record.cumulative_hash
+        )
+        field_dict.update(
+            {
+                "chain_hash_bytes": chain_hash,
+                "chain_hash_present": chain_hash_present,
+                "cumulative_hash_bytes": cumulative_hash,
+                "cumulative_hash_present": cumulative_hash_present,
+            }
+        )
+        extras_metadata = dict(record.extras) if record.extras is not None else None
+        routed = (
+            extras_metadata.pop("routed_experts", None)
+            if extras_metadata is not None
+            else None
+        )
+        metadata_json = json.dumps(
+            extras_metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
+        if self._capture_media:
+            # Detect metadata corruption without loading route or pixel tensors.
+            # This checksum is independent of Gym's combined extras commitment.
+            field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
+                hashlib.sha256(metadata_json).digest()
+            )
+        routed_len = 0
+        routed_encoding = ROUTE_ENCODING_NONE
+        router_attachment = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
+        if (
+            attachments is not None
+            and ROUTED_EXPERTS_FIELD in attachments
+            and not isinstance(router_attachment, torch.Tensor)
+        ):
+            raise ValueError("routed_experts attachment must be a tensor")
+        if router_attachment is not None and not isinstance(routed, dict):
+            raise ValueError("routed_experts attachment requires its capture metadata")
+        if routed is not None:
+            delta_len = len(record.token_ids_delta)
+            if isinstance(routed, dict):
+                if not isinstance(router_attachment, torch.Tensor):
+                    raise ValueError(
+                        "routed_experts metadata requires a tensor attachment"
+                    )
+                experts = router_attachment
+                routed_encoding = ROUTE_ENCODING_TENSOR
+            elif isinstance(routed, str):
+                from nemo_rl.utils.routed_experts_codec import (
+                    decode_routed_experts,
+                )
+
+                dtype_name = routed.split(":", 3)[1]
+                dtype = {
+                    "int8": torch.int8,
+                    "int16": torch.int16,
+                    "int32": torch.int32,
+                }.get(dtype_name)
+                if dtype is None:
+                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
+                experts = decode_routed_experts(routed, dtype)
+                routed_encoding = ROUTE_ENCODING_ENVELOPE
+            else:
+                experts = torch.tensor(routed, dtype=torch.int16)
+                routed_encoding = ROUTE_ENCODING_LIST
+            expected_len = delta_len + (
+                0 if generation_cut_chunk else boundary_route_rows(record.prev_len)
+            )
+            if experts.dim() != 3 or experts.shape[0] != expected_len:
+                raise ValueError(
+                    "routed_experts must already be delta-aligned: "
+                    f"got shape {tuple(experts.shape)} for "
+                    f"prev_len={record.prev_len}, delta_len={delta_len} "
+                    f"(expected {expected_len} rows)"
+                )
+            field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
+            routed_len = int(experts.shape[0])
+        field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
+            [routed_encoding], dtype=torch.int64
+        )
+        field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+        if media_columns is not None:
+            field_dict.update(media_columns)
+        field_dict.update(sampler_columns)
+        tags = {
+            "capture_key": record.capture_key,
+            "model_call_id": record.model_call_id,
+            "parent_call_id": record.parent_call_id,
+            "prev_len": record.prev_len,
+            "delta_len": record.delta_len,
+            "cum_len": record.cum_len,
+            "weight_version": record.weight_version,
+            "digest": record.digest,
+            "schema_version": record.schema_version,
+        }
+        return field_dict, tags
+
+    def stage_generation_prefix_batch(
+        self,
+        records: Sequence[StagedCallRecord],
+        *,
+        checkpoint_id: str,
+        chunk_sequences: Sequence[int],
+        attachments: Sequence[Mapping[str, Any] | None] | None = None,
+    ) -> list[str]:
+        """Publish generation-cut chunks; return their keys in order.
+
+        Rows must share column names, dtypes and trailing dims (one worker's
+        cut does) and go in one put; mismatched rows raise before writing and
+        the caller writes each row alone. A failed put discards
+        every key of the batch, then raises.
+        """
+        if not records:
+            return []
+        if attachments is None:
+            attachments = [None] * len(records)
+        keys = [
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.capture_key,
+                record.model_call_id,
+                chunk_sequence=sequence,
+            )
+            for record, sequence in zip(records, chunk_sequences, strict=True)
+        ]
+        store = self._store if self._prefix_store is None else self._prefix_store
+        encoded = self._encode_prefix_batch(records, attachments)
+        try:
+            for indices, fields, tags in encoded:
+                store.put_many([keys[index] for index in indices], fields, tags=tags)
+        except Exception as error:
+            # A dead writer cannot discard its own partial write; the local
+            # client can.
+            self._discard_failed_writes(
+                keys,
+                store=self._store
+                if isinstance(error, PrefixWriterDiedError)
+                else store,
+            )
+            raise
+        return keys
+
+    def _encode_prefix_batch(
+        self,
+        records: Sequence[StagedCallRecord],
+        attachments: Sequence[Mapping[str, Any] | None],
+    ) -> list[tuple[list[int], TensorDict, list[dict[str, Any]]]]:
+        """Encode each row, then stack the rows into one batch."""
+        rows = [
+            self._encode_record(
+                record, attachments=row_attachments, generation_cut_chunk=True
+            )
+            for record, row_attachments in zip(records, attachments, strict=True)
+        ]
+        # The TensorDict takes row 0's column names, and stack_or_nest promotes
+        # mismatched dtypes and nests mismatched trailing dims without raising.
+        layouts = {
+            tuple(
+                (name, fields[name].dtype, tuple(fields[name].shape[2:]))
+                for name in sorted(fields)
+            )
+            for fields, _ in rows
+        }
+        if len(layouts) > 1:
+            raise ValueError("generation-prefix batch rows have different layouts")
+        return [
+            (
+                list(range(len(rows))),
+                TensorDict(
+                    {
+                        name: stack_or_nest([row[name][0] for row, _ in rows])
+                        for name in rows[0][0]
+                    },
+                    batch_size=[len(rows)],
+                ),
+                [tags for _, tags in rows],
+            )
+        ]
+
+    def _discard_failed_writes(
+        self, keys: Sequence[str], *, store: TQStagingStore | None = None
+    ) -> None:
         """Reclaim whatever a failed combined write may have left behind.
 
         TQ writes a row field by field and only then publishes readiness, so
@@ -700,12 +861,12 @@ class TQTokenSink:
         logged at ERROR for the operator; the call is still reported failed.
         """
         try:
-            self._store.clear([key])
+            (self._store if store is None else store).clear(list(keys))
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure
             logging.getLogger(__name__).error(
-                "TQTokenSink could not discard the failed write for %s: %s: %s; "
+                "TQTokenSink could not discard %d failed writes: %s: %s; "
                 "the staging partition may retain orphaned field keys",
-                key,
+                len(keys),
                 type(error).__name__,
                 error,
             )
@@ -1066,7 +1227,7 @@ class TQTokenSource:
         for index, key in enumerate(staging_keys):
             row = _select_row(rows, index)
             snapshot = _row_to_base_snapshot(row)
-            if snapshot.staging_key != key:
+            if not _staging_key_matches_snapshot(key, snapshot):
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
                 )
@@ -1152,7 +1313,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
     mode_code = int(_row_leaf(row, "capture_mode")[0].item())
     try:
-        mode = _CODE_TO_MODE[mode_code]
+        mode = CAPTURE_CODE_TO_MODE[mode_code]
     except KeyError as error:
         raise ValueError(f"unknown capture_mode code {mode_code}") from error
     routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())

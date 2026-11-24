@@ -70,6 +70,13 @@ class SwePrivilegedCriticConfig(BaseModel, extra="forbid"):
     caps: SwePrivilegedCriticCaps = Field(default_factory=SwePrivilegedCriticCaps)
 
 
+class ValueResourcesConfig(BaseModel, extra="forbid"):
+    num_nodes: int | None = Field(
+        default=None,
+        description="Number of full nodes reserved for a dedicated value model.",
+    )
+
+
 class ValueConfig(TypedDict):
     """Configuration for Value models in PPO.
 
@@ -94,6 +101,8 @@ class ValueConfig(TypedDict):
     # Backend configuration - Automodel or Megatron
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    dedicated: NotRequired[bool]
+    resources: NotRequired[ValueResourcesConfig]
 
     # HuggingFace config overrides
     hf_config_overrides: NotRequired[dict[str, Any]]
