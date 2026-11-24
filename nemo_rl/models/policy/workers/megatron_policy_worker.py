@@ -2913,6 +2913,8 @@ class MegatronPolicyWorkerImpl(
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          Without ``keep_on_gpu``, only the model-parallel replica leader gets it;
+          other ranks get an empty BatchedDataDict.
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
@@ -4969,8 +4971,8 @@ class MegatronPolicyWorkerImpl(
 
             MXFP8 overlap aliases the parameter all-gather buffer to grad
             storage. That allocation remains resident even when
-            ``keep_train_buffers`` is false because logprob forward pre-hooks
-            may need it for parameter all-gather.
+            ``keep_train_buffers`` is false because the one-time parameter
+            gather below writes into it.
         """
         # First worker call after the controller's select() wait returns, so this
         # is also the "idle wait end" marker. Whether the offload was suppressed
@@ -5365,6 +5367,8 @@ class MegatronPolicyWorkerImpl(
                         if v.is_cuda:
                             # Avoid pageable-host staging during CUDA offload.
                             # Publish the state only after its copy has completed.
+                            # Torch caches freed pinned blocks, so host RSS stays
+                            # up after onload; later offloads reuse them.
                             destination = torch.empty_like(
                                 v, device="cpu", pin_memory=True
                             )
