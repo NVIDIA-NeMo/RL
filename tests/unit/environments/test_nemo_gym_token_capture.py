@@ -407,10 +407,13 @@ def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names() -> None
     refusal of a prompt that no longer fits the context window. No such call
     can be a lineage parent, so none of these rows poisons the verified chain."""
     # Deferred: collection also runs in shards without nemo_gym.
-    from nemo_gym.token_id_capture import UNSERVED_CALL_FAILURE_REASONS
+    from nemo_gym.token_id_capture import (
+        ENGINE_REFUSED_CALL_REASON,
+        UNSERVED_CALL_FAILURE_REASONS,
+    )
 
     # The engine's refusal stays under test whatever else the set holds.
-    assert "engine_refused_request" in UNSERVED_CALL_FAILURE_REASONS
+    assert ENGINE_REFUSED_CALL_REASON in UNSERVED_CALL_FAILURE_REASONS
     env = _capture_env()
     manifest = {
         "capture_key": "r0",
