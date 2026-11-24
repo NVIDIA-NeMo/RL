@@ -1,6 +1,7 @@
 # First-pass PR grading by the autobot pr-risk-label workflow.
 # Read from the default branch: having this file there opts the repo in.
 # The agent follows the skill below and may only use the labels listed here.
+# Values must match the calls in skills/pr-classify/SKILL.md step 3; change both together.
 skill: nemo-rl:pr-classify
 labels:
   complexity: [low, medium, high, unknown]

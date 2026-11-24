@@ -9,8 +9,8 @@ when_to_use: Classifying or triaging a PR; the autobot PR classify agent grading
 Give a maintainer a first pass on a PR: how hard it is to review, whether it can change training, and what evidence it should show. **A wrong confident call is worse than `unknown`.** When no rule or diff fact decides a call, say `unknown` so a human looks at it.
 
 Read both references before grading:
-- [references/rubric.md](references/rubric.md): the rules for every call. A specific rule beats the general guidance.
-- [references/categories.md](references/categories.md): the category keys and their notes.
+- [references/rubric.md](references/rubric.md): the rules for every call. A specific rule beats the general guidance. Grading rules live only here.
+- [references/categories.md](references/categories.md): the category keys and what each covers.
 
 ## Inputs
 
@@ -29,7 +29,7 @@ Judge from the code only. Do not use review comments, comment counts, bugs found
    - `benign`: `yes` | `no` | `unknown`
    - `discuss_design_first`: `yes` | `no` | `unknown`
    - `convergence_risk`: `none` | `low` | `medium` | `high` | `unknown`
-   - `proof_needed`: a list from `functionality`, `convergence`, `perf`; or `["none"]`; or `["unknown"]`
+   - `proof_needed`: a list from `functionality`, `convergence`, `perf`; or none (label `proof:none`, JSON `[]`); or unknown (label `proof:unknown`, JSON `null`)
 
    The basis is either `rule: <the rubric rule, with its PR number>` or `diff: <file + what changed>`. If you cannot write one, the call is `unknown`, and its reason says what is missing (e.g. "nothing separates medium from high").
 4. **Respect human labels.** For each label family (`complexity:`, `convergence-risk:`, `proof:`), check the label timeline. If a person (not the bot) added or removed a label in that family, leave the family alone: keep their value, record it as `set_by` in the JSON, and show "set by @user" in the table. Still report your own call in the JSON as `agent_value`, so overrides can be turned into rubric rules.
@@ -41,23 +41,19 @@ Judge from the code only. Do not use review comments, comment counts, bugs found
 
 Keep exactly one label per family for complexity and convergence risk, and one label per needed proof:
 
-| Call | Labels |
-|---|---|
-| Complexity | `complexity:low`, `complexity:medium`, `complexity:high`, `complexity:unknown` |
-| Convergence risk | `convergence-risk:none`, `convergence-risk:low`, `convergence-risk:medium`, `convergence-risk:high`, `convergence-risk:unknown` |
-| Proof needed | any of `proof:functionality`, `proof:convergence`, `proof:perf`; or `proof:none`; or `proof:unknown` |
+Each label is `<family>:<value>`, using the families and allowed values in [`.github/autobot/pr-grade.yml`](../../.github/autobot/pr-grade.yml): `complexity:`, `convergence-risk:`, `proof:`.
 
 Benign and discuss-design-first have no labels; they live in the comment and the JSON. Remove stale labels in a family only when the family is not human-set.
 
 ### Check title (step 1 of the rollout)
 
-Until the comment can be posted, the agent sets a check named `Autobot PR classify #<number>` on the head. Its title is one line:
+Until the comment can be posted, the agent sets the check named by `check` in `.github/autobot/pr-grade.yml` on the head. Its title is one line:
 
 ```
-complexity:high · convergence-risk:high · proof:functionality+convergence · 1 unknown
+complexity:high · convergence-risk:high · proof:functionality+convergence
 ```
 
-When nothing is unknown, leave out the last segment.
+The title lists the PR's final labels in each family (human-set ones included), in `pr-grade.yml` order, which is the format the workflow publishes and reads back on a re-run.
 
 ### Comment (step 2 of the rollout)
 

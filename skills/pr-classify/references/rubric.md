@@ -1,6 +1,6 @@
 # PR classification rubric
 
-These rules come from a maintainer audit of 113 merged NeMo-RL PRs (November 2026). Each rule names the PR it was learned from, so you can look at that PR's diff when a case is close.
+These rules come from a maintainer audit of 113 merged NeMo-RL PRs (November 2026). Each rule names the PR it was learned from, so you can look at that PR's diff when a case is close. A few came from the audit notes rather than one PR, and say so.
 
 ## How to apply the rules
 
@@ -27,7 +27,7 @@ When is it `high`? Any of these:
 - **It changes what the loss sees or counts, at any size.** Size does not cap complexity here:
   - skipping a logprob pass, even in 16 lines (#4670, CISPO single forward; #5130, #5080 in-loss sequence filtering). Logprobs feed masks in many places, so skipping them spreads.
   - changing which tokens count toward reward lengths or loss masks, even at ~60 lines (#4487).
-- **Loss or advantage code at about 200+ source lines**, even in one file. Below that it is `medium`, and `low` only when trivially benign (reindent, reorder arguments, rename).
+- **Loss or advantage code at about 200+ source lines**, even in one file. Below that it is `medium`, and `low` only when trivially benign (reindent, reorder arguments, rename). (From the maintainer audit notes, not a single PR.)
 - **It runs a core step on a new execution path**, e.g. the weight synchronizer in a separate actor (#5182).
 - **It touches vLLM's executor layer**: the DP path, executors, the Ray vs MP backend, or which patches apply in each. That holds even at ~280 lines (#2517), because the reviewer must know how vLLM uses Ray and how our patches fit in.
 - **Streaming training in the single controller**, e.g. capping streaming train chunk size (#5036).
@@ -36,7 +36,7 @@ When is it `high`? Any of these:
 - **Rollout-checkpoint recovery at a large size**, e.g. ~850 lines restoring router-replay state across prefixes (#4612).
 
 At least `medium`:
-- A small change to an existing loss's math, e.g. clamping a ratio before `exp`, is `medium`. It is `high` only at about 200+ source lines, or when it changes what the loss counts or skips.
+- A small change to an existing loss's math, e.g. clamping a ratio before `exp`, is `medium`. It is `high` only at about 200+ source lines, or when it changes what the loss counts or skips. (From the maintainer audit notes, not a single PR.)
 - Overlap, async or thread-pool perf features are `medium`, not `high`, unless another `high` rule also matches (#5154).
 - Fixes to how training-step metrics are counted or windowed (#5155).
 - Refactors of a few hundred source lines, e.g. ~670 lines extracting refit parameter-spec collection (#4764). With that size, a bad design would be rejected, so a human must check it.
@@ -46,7 +46,8 @@ At least `medium`:
 - Perf changes that persist less state or save it later (rollout or trainer data-plane checkpoints) are `medium` (#5139).
 - A sampler behavior change, even at ~20 lines, is `medium`, not `low` (#5079).
 - Event logs and ledgers follow size: ~330 lines is `medium` (#5048).
-- Chat template changes are at least `medium`.
+- Chat template changes are at least `medium`, since they decide what tokens training sees (from the audit notes: moving prefix chat template handling out of vLLM into the OpenAI server utilities).
+- A source change in the single controller (rollout manager, async utilities, overlap and barriers) is at least `medium`, even when small (from the audit notes).
 
 `low` even in a hard area:
 - **A fix for a plain functional failure** (something broken, not a subtle correctness issue), e.g. restoring calls a resumed turn carried over under forest training (#5147). A hard topic does not make every PR in it hard.
@@ -69,7 +70,7 @@ At least `medium`:
 - *(tentative)* A recipe-only fix that makes a broken run work again, e.g. capping `max_new_tokens` (#5314).
 
 `no`:
-- **Any perf change**, since benign covers performance (#4769).
+- **Any perf change**, since benign covers performance (#4769), except a provably equivalent refactor (#5192, above).
 - Launcher changes that alter how every run behaves, even if not what it learns, e.g. raising the fd soft limit (#5058).
 - Patching a third-party library's behavior from our side, e.g. patching PyTorch for parallel torch_dist reads (#4714).
 
@@ -101,10 +102,10 @@ Could the change alter learning (loss, advantages, sampling, data order or packi
 - `low`: it touches code a run executes but is unlikely to change learning.
 
 `high`:
-- **Every dependency upgrade**: Gym, vLLM, Megatron-Bridge, Transformers, Automodel, uv.lock, 3rdparty submodules, the container (#5005, #4852, #4793, #4753, #5195). Scope: a lockfile change that only rides along with a small feature (one extra package, or a re-resolve that moves a few pins) is not an upgrade (#4894).
+- **Every dependency upgrade**: Gym, vLLM, Megatron-Bridge, Transformers, Automodel, uv.lock, 3rdparty submodules, the container (#5005, #4852, #4793, #4753, #5195). Scope: a lockfile change that only rides along with a small feature (one extra package, or a re-resolve that moves a few pins) is not an upgrade (#4894). Neither is a bump of a dev-only tool that no training run imports (linter, type checker, formatter) (#5298).
 - **Anything low precision** (FP8, FP4, MXFP8, quantization), including first-time FP8 support (#3638, #3294).
-- **Masking, advantages or losses**, even when framed as an optimization (#5130), and skipping work the loss depends on (#5080).
-- **Sampler behavior changes**, e.g. allowing a forced ratio with ready-first sampling (#5079).
+- **Masking, advantages or losses**, even when framed as an optimization (#5130), and skipping work the loss depends on (#5080), unless it is a provably equivalent refactor (#5192), which is `low`.
+- **Sampler behavior changes**, e.g. allowing a forced ratio with ready-first sampling (#5079). Keeping or dropping the KV or prefix cache across pause and resume is a sampler behavior change, because it changes how async RL behaves (from the audit notes).
 - **Code shared by every run on an engine**, e.g. reworking vLLM worker code or the native vLLM path (#4979, #4905).
 - **Core mid-rollout recovery**: checkpointing in-flight rollout state and resuming from it (#4500, #4506). The resumed run must converge like an uninterrupted one.
 - **Pausing and resuming engines around refit**, with KV recompute (#3929).
@@ -139,6 +140,8 @@ Could the change alter learning (loss, advantages, sampling, data order or packi
 What evidence should the PR show (W&B runs, nightlies, benchmarks)?
 
 - **Dependency upgrades: all three** (#5005, #5195, #4852).
+- **A new model or recipe following the existing pattern:** `convergence`, `perf`, or both (from the audit notes).
+- **A recipe switch of `refit_transport` or the MoE backend:** `perf`, since backends are meant to be functionally the same (from the audit notes).
 - **Every perf change needs `perf`**, even small or launcher-only ones (#5026, #4713). Perf includes memory (#5036). Scaling out serving needs `perf` to show no loss, not a gain (#5115).
 - **A new loss, loss term or algorithm variant needs `convergence` only** (#4750, #5006, #5013). A convergence run also shows it works, so do not add `functionality`. The same holds for a fix or tweak to an existing loss.
 - **Skip-work optimizations whose speed gain is obvious need `convergence` only** (#5080, #4670). Masking, advantage or loss optimizations whose gain must be shown need `convergence + perf` (#5130).
