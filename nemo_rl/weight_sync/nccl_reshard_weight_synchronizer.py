@@ -296,7 +296,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
-        if self._generation.cfg["backend"] == "sglang":
+        if self._policy.cfg["generation"]["backend"] == "sglang":
             self._build(
                 desired_membership(
                     absent_shards=[],
