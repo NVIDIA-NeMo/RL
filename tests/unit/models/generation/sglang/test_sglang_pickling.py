@@ -91,6 +91,20 @@ def test_round_trip_builds_a_client_copy_with_its_own_loop():
         _shutdown_driver(gen)
 
 
+def test_client_copy_shutdown_keeps_the_shared_post_actors():
+    gen = _make_driver_generation()
+    gen._http_client._post_actors = ["poster-handle"]
+    try:
+        copy = pickle.loads(pickle.dumps(gen))
+        client = copy._http_client
+        assert copy.shutdown() is True
+        # aclose() would have killed the shared POST actors and emptied this list.
+        assert client._post_actors == ["poster-handle"]
+    finally:
+        gen._http_client._post_actors = []
+        _shutdown_driver(gen)
+
+
 def test_pickling_rejects_a_running_health_monitor():
     gen = _make_driver_generation()
     try:
