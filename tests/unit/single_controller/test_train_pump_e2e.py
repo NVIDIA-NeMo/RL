@@ -451,7 +451,7 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
-            assert metrics["weight_version_lag"] >= 0
+            assert metrics["weight_version_lag_max"] >= 0
             # Only a simulator run reports the simulated hold.
             assert "simulated_train_time_s" not in metrics
             assert "simulated_train_idle_skipped_s" not in metrics
