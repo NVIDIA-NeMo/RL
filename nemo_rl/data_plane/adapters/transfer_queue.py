@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import ctypes
+import functools
 import glob
 import importlib
 import ipaddress
@@ -35,13 +36,16 @@ import resource
 import socket
 import threading
 import time
+import types
 import warnings
 import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
+import psutil
+import ray
 import torch
 
 # Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
@@ -50,7 +54,9 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
-from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
+from nemo_rl.data_plane.adapters.transfer_queue_env import rdma_rails
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -58,8 +64,11 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    gdr_enabled,
     storage_unit_placement,
 )
+from nemo_rl.data_plane.local_disk import note_ssd_dir_fallback_once
+from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
 LOGGER = logging.getLogger(__name__)
@@ -109,7 +118,8 @@ def rdma_devices() -> str:
     fabric where each rail is its own subnet, a cross-rail draw has no route and
     dies with "transport retry counter exceeded".
 
-    IB and RoCE are never mixed; InfiniBand is preferred when present.
+    Device choice is ``transfer_queue_env.rdma_rails``: IB over RoCE, never
+    mixed, and without the management interface's RDMA function.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -123,11 +133,8 @@ def rdma_devices() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    layers = rail_link_layers()
-    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
-    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     # No space after the comma: mooncake splits on "," only.
-    return ",".join(ib or roce)
+    return ",".join(rdma_rails())
 
 
 def _mooncake_transport_config() -> dict:
@@ -263,7 +270,7 @@ class _StagingPoolRegistry:
 
     def _build(self, client: Any) -> _NativeStagingPool:
         # Deferred: mooncake.store is a compiled extension, absent without the wheel.
-        from mooncake.store import BufferPool  # pyrefly: ignore[import-error]
+        from mooncake.store import BufferPool  # pyrefly: ignore[missing-import]
 
         pool_bytes = self._n_slots * self._max_bytes
         if client.local_buffer_size < pool_bytes:
@@ -506,6 +513,55 @@ def _patch_scalar_field_schema() -> None:
 # without ever running __init__, so import is the earliest point that covers
 # every user of this module.
 _patch_scalar_field_schema()
+
+
+def _with_cached_cpu_count(psutil_module: Any) -> types.SimpleNamespace:
+    """``psutil_module`` with ``cpu_count`` cached per argument.
+
+    Every other attribute is the module's own, so TQ code that uses more of
+    ``psutil`` keeps working.
+    """
+    return types.SimpleNamespace(
+        **{
+            **vars(psutil_module),
+            "cpu_count": functools.lru_cache(maxsize=None)(psutil_module.cpu_count),
+        }
+    )
+
+
+def _patch_physical_core_count() -> None:
+    """Count the host's physical cores once per process, not on every TQ put/get.
+
+    Upstream ``limit_pytorch_auto_parallel_threads`` wraps every client
+    ``async_put`` / ``async_get_data`` and calls
+    ``psutil.cpu_count(logical=False)`` each time. On Linux that globs
+    ``/sys/devices/system/cpu`` and opens a topology file per CPU, and every
+    one of those accesses releases the GIL. In a process whose GIL is held by
+    a busy thread, such as a vLLM worker's engine loop, each access waits to
+    get it back: the count took 0.2–8 s per call there instead of ~1.5 ms,
+    and was most of the time of every TQ write the worker made.
+
+    The physical core count cannot change while a process runs, so the module's
+    ``psutil`` is swapped for one whose ``cpu_count`` is cached. TQ's own
+    controller and storage-unit actors never import this module and keep
+    counting per call.
+
+    ``tests/unit/data_plane/test_tq_core_count_patch.py`` drives TQ's context
+    manager, so a TQ pin that stops counting through this module fails there.
+    """
+    try:
+        from transfer_queue.utils import common as _common
+    except ImportError:
+        return
+    if getattr(_common, "_nrl_core_count_cached", False):
+        return
+    # pyrefly: ignore[bad-assignment]  the namespace stands in for the module on purpose
+    _common.psutil = _with_cached_cpu_count(psutil)
+    _common._nrl_core_count_cached = True
+
+
+# At import for the same reason as _patch_scalar_field_schema.
+_patch_physical_core_count()
 
 
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
@@ -763,7 +819,6 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     process only. ``tq.init()`` ignores any config once a controller exists,
     so the client is attached from a copy of the controller's config.
     """
-    import ray
     from transfer_queue import interface as tq_interface
 
     controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
@@ -775,6 +830,48 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     conf = copy.deepcopy(conf)  # leave the controller's published config untouched
     conf.backend.MooncakeStore.global_segment_size = segment_size
     tq_interface._maybe_create_tq_client(conf)
+
+
+def _call_on_cuda_device(
+    device: torch.device, method: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    with torch.cuda.device(device):
+        return method(*args, **kwargs)
+
+
+def _bind_mooncake_cuda_device() -> None:
+    """Keep GDR staging and transfers on this worker's GPU instead of GPU 0.
+
+    CUDA's current device is per thread. TQ runs PUT on an executor thread and
+    GET on its own event-loop thread, and both start on GPU 0, so a worker that
+    sees every GPU on its node would allocate its GDR staging buffer, synchronize
+    and receive GET tensors on GPU 0 rather than on the GPU it set.
+    """
+    storage_client = tq.get_client().storage_manager.storage_client
+    if not hasattr(storage_client, "_gdr_staging"):
+        raise _tq_shape_drift_error(
+            "storage client no longer has a _gdr_staging attribute",
+            "GDR transfers cannot be bound to this worker's GPU",
+            "GDR staging attribute",
+        )
+    if storage_client._gdr_staging is None:
+        return
+    # TQ's client is a process singleton: a later adapter in this process must
+    # not retarget the binding or the staging buffer it may already own.
+    if (
+        isinstance(storage_client.put, functools.partial)
+        and storage_client.put.func is _call_on_cuda_device
+    ):
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    for name in ("put", "get"):
+        setattr(
+            storage_client,
+            name,
+            functools.partial(
+                _call_on_cuda_device, device, getattr(storage_client, name)
+            ),
+        )
 
 
 _STORAGE_UNITS_SC_ONLY = (
@@ -818,6 +915,35 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
 
     simple_storage_bootstrap.get_node_round_robin_scheduling_strategies = (
         pinned_strategies
+    )
+
+
+def _nixl_storage_node_ids(
+    placement: list[Literal["train", "inference"]] | Literal["all"],
+) -> list[str]:
+    """Ray node IDs for a NIXL storage_unit_placement.
+
+    ``all``: every alive GPU node; else the union of the named clusters
+    (``train`` / ``inference``).
+    """
+    from ray.util.placement_group import placement_group_table
+
+    from nemo_rl.data_plane.adapters.tq_nixl import alive_node_ids
+
+    if placement == "all":
+        return alive_node_ids("GPU")
+    prefixes = {
+        "train": ("sc_train_cluster", "sc_policy_cluster"),
+        "inference": ("sc_inference_cluster", "sc_policy_cluster"),
+    }
+    wanted = tuple(p for name in placement for p in prefixes[name])
+    return sorted(
+        {
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(wanted) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
     )
 
 
@@ -870,11 +996,22 @@ def _init_tq(
                 },
             },
         }
+        if simple_cfg.async_checkpoint:
+            # Load the SimpleStorage-only hook only when it is requested.
+            from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+                configure_simple_checkpoint,
+            )
+
+            configure_simple_checkpoint()
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
         ssd = simple_cfg.ssd_offload
         if ssd.enabled:
-            overlay["backend"]["SimpleStorage"]["ssd_offload"] = ssd.model_dump()
+            # TQ raises on an empty path: send the resolved folder.
+            overlay["backend"]["SimpleStorage"]["ssd_offload"] = {
+                **ssd.model_dump(),
+                "path": ssd.dir(),
+            }
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -922,11 +1059,13 @@ def _init_tq(
         _patch_mooncake_master_metrics_port(
             metrics_port, mooncake_ssd_offload.master_args(mooncake_cfg)
         )
+        metrics_url = f"http://{local_ip}:{metrics_port}/metrics"
         if mooncake_cfg.ssd_offload.enabled:
+            if mooncake_cfg.ssd_offload.path is None:
+                note_ssd_dir_fallback_once(LOGGER)
             # Stop the run if Mooncake ever deletes an SSD copy for space.
             mooncake_ssd_offload.watch_master_disk_evictions(
-                f"http://{local_ip}:{metrics_port}/metrics",
-                str(mooncake_cfg.ssd_offload.path),
+                metrics_url, mooncake_cfg.ssd_offload.dir()
             )
         overlay = {
             **controller_overlay,
@@ -942,6 +1081,10 @@ def _init_tq(
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:{metadata_port}",
                     "master_server_address": f"{local_ip}:{master_port}",
+                    # Read by the single controller every step
+                    # (mooncake_ssd_offload.step_metrics) from whichever process
+                    # it runs in; every client gets this block from the controller.
+                    "metrics_url": metrics_url,
                     # Runtime mode derived from the existing trainer settings,
                     # not a second user-facing checkpoint switch.
                     "checkpoint": {"enabled": checkpointing},
@@ -961,11 +1104,33 @@ def _init_tq(
                 hard_pin=not mooncake_cfg.ssd_offload.enabled,
                 offload={"enabled": False},
             )
+    elif backend == "nixl":
+        # The NIXL data plane's TransferQueue backend (adapters/tq_nixl.py): CPU NixlStorageUnit actors own
+        # pinned-DRAM slabs, every other process is a client doing one-sided
+        # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
+        # manager / client / bootstrap registries; the bootstrap provider
+        # starts the units and the BlobDirectory inside tq.init.
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
+        nixl_cfg = backend_config(cfg)
+        if nixl_cfg.ssd.enabled and nixl_cfg.ssd.path is None:
+            note_ssd_dir_fallback_once(LOGGER)
+        block = nixl_cfg.model_dump()
+        placement = block.pop("storage_unit_placement")
+        if not block.get("node_ids"):
+            block["node_ids"] = _nixl_storage_node_ids(placement)
+            if not block["node_ids"]:
+                raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")
+        overlay = {
+            **controller_overlay,
+            "backend": {"storage_backend": "NixlStore", "NixlStore": block},
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
     conf = OmegaConf.merge(base, overlay)
 
+    configure_controller_patch()
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
@@ -1010,6 +1175,11 @@ def _from_wire(td: TensorDict) -> TensorDict:
     the dense value then fails the ``is_nested`` check in
     ``codec.materialize`` and reaches ``get_multimodal_dict`` unreassembled.
     ``codec.materialize`` applies the same exclusion.
+
+    Fields padded per microbatch also stay nested, even for a single row.
+    The worker intentionally skips their batch-wide padding; densifying
+    them here would expose a short dense sequence to Megatron's batch
+    validation before microbatch padding can run.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
     # not keys(leaves_only=True) -- iterating the latter would silently drop
@@ -1030,6 +1200,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
                 isinstance(v, torch.Tensor)
                 and v.is_nested
                 and field_name not in PACKED_MULTIMODAL_FIELDS
+                and field_name not in MICROBATCH_PADDED_FIELDS
             ):
                 rows = list(v.unbind())
                 if rows and all(row.shape == rows[0].shape for row in rows[1:]):
@@ -1124,13 +1295,14 @@ class TQDataPlaneClient(DataPlaneClient):
             # Before the store is set up; a no-op unless this process owns memory.
             mooncake_ssd_offload.install(mooncake_cfg, segment_size)
 
+        if cfg["backend"] == "nixl":
+            # Workers attach with tq.init() and need TQ's registries to know
+            # "NixlStore" before the client's storage manager is built.
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
-        # directly rather than off any incidental per-backend flag.
-        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
-            backend_config(cfg).use_gdr
-        )
+        self._gdr_requested = gdr_enabled(cfg)
         self._gdr_put_confirmed = False
 
         if bootstrap:
@@ -1145,8 +1317,11 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         else:
             _connect_existing_with_segment_size(segment_size)
-        # TQ has built this process's store by now; a no-op unless it owns memory.
-        mooncake_ssd_offload.require_offloading_store()
+        if self._gdr_requested and torch.cuda.is_initialized():
+            _bind_mooncake_cuda_device()
+        if cfg["backend"] == "mooncake_cpu":
+            # TQ has built this process's store by now; a no-op unless it owns memory.
+            mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.
@@ -1458,10 +1633,12 @@ class TQDataPlaneClient(DataPlaneClient):
         return _from_wire(td)
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
-        """List TQ keys in ``partition_id`` without fetching tensor payloads."""
+        """List TQ keys in ``partition_id`` without fetching payloads or tags."""
         self._mark_data_operation_started()
-        listing = tq.kv_list(partition_id=partition_id)
-        return sorted(listing.get(partition_id, {}).keys())
+        controller = ray.get_actor(
+            "TransferQueueController", namespace="transfer_queue"
+        )
+        return list(ray.get(controller.nrl_list_keys.remote(partition_id)))
 
     def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         cleared_via_none = sample_ids is None
@@ -1491,6 +1668,31 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        if self._backend != "simple":
+            return None
+        simple_cfg = backend_config(self._cfg)
+        if not simple_cfg.async_checkpoint:
+            return None
+        # The capture implementation depends on pinned SimpleStorage internals.
+        from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+            capture_simple_checkpoint,
+        )
+
+        self._require_checkpointing_support()
+        _connect_existing()
+        return capture_simple_checkpoint(
+            checkpoint_dir,
+            num_storage_units=simple_cfg.num_storage_units,
+            metadata=metadata,
+            timeout_s=simple_cfg.checkpoint_io_timeout_s,
+        )
 
     def save_checkpoint(
         self,

@@ -21,5 +21,4 @@ comparing backend names in config values.
 VLLM_BACKEND = "vllm"
 SGLANG_BACKEND = "sglang"
 MEGATRON_BACKEND = "megatron"
-DYNAMO_BACKEND = "dynamo"
 TRTLLM_BACKEND = "trtllm"

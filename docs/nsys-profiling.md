@@ -20,9 +20,7 @@ Set the `NRL_NSYS_WORKER_PATTERNS` environment variable with a comma-separated l
 export NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*"
 ```
 
-Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its
-format is colon separated integers representing `start:stop`, where `start` is inclusive and `stop` is exclusive
-(same as slice syntax `arr[start:stop]`). Note that the `start` is 1-indexed, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
+Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its format is colon separated integers representing `start:stop`, where `start` is inclusive and `stop` is exclusive (same as slice syntax `arr[start:stop]`). Note that the `start` is 1-indexed, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
 
 ```bash
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
@@ -30,11 +28,7 @@ export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 
 ### Extra Nsys Options (Optional)
 
-Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of
-the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the
-flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win
-on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`,
-`capture-range-end`, `cuda-graph-trace`).
+Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`, `capture-range-end`, `cuda-graph-trace`).
 
 ```bash
 export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
@@ -45,8 +39,7 @@ Common additions:
 - `cuda-memory-usage`: track host/device memory allocations (`"true"`).
 - `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
 
-Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
-payload raises at startup so misconfiguration surfaces immediately.
+Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object payload raises at startup so misconfiguration surfaces immediately.
 
 ### Pattern Format
 

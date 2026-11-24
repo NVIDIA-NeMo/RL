@@ -464,25 +464,20 @@ class TimeoutChecker:
         self.previous_iteration_time: Optional[float] = None
         self.fit_last_save_time = fit_last_save_time
 
+    def seconds_until_save(self) -> Optional[float]:
+        """Seconds until the deadline is due, or ``None`` once it can no longer be."""
+        if self.last_saved or self.last_save_time == float("inf"):
+            return None
+        lead_time = 0.0
+        if self.fit_last_save_time and self.iteration_times:
+            lead_time += sum(self.iteration_times) / len(self.iteration_times)
+        elapsed_time = time.time() - self.start_time
+        return self.last_save_time - lead_time - elapsed_time
+
     def would_save(self) -> bool:
         """Return whether the deadline is due without consuming the signal."""
-        if self.last_saved:
-            return False
-
-        current_time = time.time()
-        elapsed_time = current_time - self.start_time
-
-        if self.fit_last_save_time and self.iteration_times:
-            average_iteration_time = sum(self.iteration_times) / len(
-                self.iteration_times
-            )
-            if elapsed_time + average_iteration_time >= self.last_save_time:
-                return True
-
-        if elapsed_time >= self.last_save_time:
-            return True
-
-        return False
+        remaining = self.seconds_until_save()
+        return remaining is not None and remaining <= 0
 
     def check_save(self):
         # Flush

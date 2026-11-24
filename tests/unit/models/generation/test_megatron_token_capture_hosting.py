@@ -15,6 +15,7 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 pytest.importorskip("megatron.core")
 
 from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.models.generation.megatron import megatron_worker  # noqa: E402
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -23,6 +24,13 @@ from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+# ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
+_PREFIX_BATCH_LIMITS = {
+    "prefix_write_max_rows": 256,
+    "prefix_write_max_tokens": 4_194_304,
+    "prefix_read_max_rows": 256,
+}
 
 
 @pytest.fixture
@@ -47,6 +55,19 @@ class _WorkerGroup:
         return self.replies
 
 
+def test_generation_refuses_generation_prefix_cuts():
+    """Setup refuses `prefix` with Megatron first; this backs it up per backend."""
+    generation = object.__new__(MegatronGeneration)
+
+    with pytest.raises(NotImplementedError, match="not implemented for Megatron"):
+        generation.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            generation_prefix_cuts_enabled=True,
+            **_PREFIX_BATCH_LIMITS,
+        )
+
+
 def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     generation = object.__new__(MegatronGeneration)
     generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
@@ -58,7 +79,12 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     )
 
     dp_cfg = {"backend": "simple"}
-    assert generation.setup_token_capture(dp_cfg, "rollout_staging") is None
+    assert (
+        generation.setup_token_capture(
+            dp_cfg, "rollout_staging", **_PREFIX_BATCH_LIMITS
+        )
+        is None
+    )
 
     assert worker_group.calls == [
         (
@@ -86,10 +112,32 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
     )
     assert (
         generation.setup_token_capture(
-            {"backend": "simple"}, "rollout_staging", capture_media=True
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            media_family="omni",
+            **_PREFIX_BATCH_LIMITS,
         )
         is spec
     )
+
+
+@pytest.mark.parametrize("media_family", ["pixtral", None])
+def test_generation_setup_token_capture_captures_omni_media_only(media_family):
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
+    worker_group = _WorkerGroup()
+    generation._policy = SimpleNamespace(worker_group=worker_group)
+
+    with pytest.raises(NotImplementedError, match="Omni media only"):
+        generation.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            media_family=media_family,
+            **_PREFIX_BATCH_LIMITS,
+        )
+    assert worker_group.calls == []
 
 
 def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
@@ -99,7 +147,9 @@ def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
     generation._policy = SimpleNamespace(worker_group=worker_group)
 
     with pytest.raises(ValueError, match="expose_http_server=true"):
-        generation.setup_token_capture({"backend": "simple"}, "rollout_staging")
+        generation.setup_token_capture(
+            {"backend": "simple"}, "rollout_staging", **_PREFIX_BATCH_LIMITS
+        )
 
     # The driver-side guard fires before any worker is asked to install hooks.
     assert worker_group.calls == []
@@ -128,8 +178,9 @@ def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) ->
     assert epochs == []
 
 
+@pytest.mark.parametrize("router_replay_enabled", [True, False])
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
-    monkeypatch, inference_loop
+    monkeypatch, inference_loop, router_replay_enabled
 ):
     installed_sinks = []
     installed_sources = []
@@ -151,8 +202,10 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
             self.source = source
 
     class _Stager:
-        def __init__(self, sink):
+        def __init__(self, sink, *, require_routed_experts, expected_route_dims):
             self.sink = sink
+            self.require_routed_experts = require_routed_experts
+            self.expected_route_dims = expected_route_dims
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
@@ -171,6 +224,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
         lambda: 0,
     )
+    # With router replay on, the worker sizes the stager's route check from the
+    # served model; the model itself is not built here.
+    gen_model = object()
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.router_replay.router_replay_dimensions_for_model",
+        lambda model: (4, 2) if model is gen_model else pytest.fail("wrong model"),
+    )
 
     worker = object.__new__(MegatronGenerationMixin)
     worker.dynamic_inference_engine = SimpleNamespace(
@@ -178,6 +238,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         prompt_preparer=None,
         is_mp_coordinator=True,
     )
+    monkeypatch.setattr(MegatronGenerationMixin, "_gen_model", lambda self: gen_model)
     loop, loop_thread = inference_loop
     worker._inference_loop = loop
     epochs = []
@@ -187,6 +248,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         )
     )
     worker._token_capture_enabled = False
+    worker._router_replay_enabled = router_replay_enabled
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
 
@@ -200,6 +262,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     )
     assert installed_sinks == [("dp", "rollout_staging", False, None)]
     assert installed_sources == [("dp", "rollout_staging", False)]
+    # Pins the wiring, not the constant: a hardcoded True/False fails one leg.
+    assert (
+        worker._request_payload_stager.require_routed_experts is router_replay_enabled
+    )
+    assert worker._request_payload_stager.expected_route_dims == (
+        (4, 2) if router_replay_enabled else None
+    )
 
     worker.set_rollout_weight_version(7)
     # The client's ZMQ socket is not thread safe and its listener task runs on
@@ -213,6 +282,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         is_mp_coordinator=False,
     )
     follower._token_capture_enabled = False
+    follower._router_replay_enabled = router_replay_enabled
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
     assert follower.setup_token_capture({}, "rollout_staging") is None
@@ -233,6 +303,7 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
         is_mp_coordinator=True,
     )
     worker._token_capture_enabled = False
+    worker._router_replay_enabled = False
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
     return worker
@@ -349,3 +420,66 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
+
+
+@pytest.mark.parametrize("router_replay_enabled", [True, False])
+def test_initialize_inference_engine_repoints_router_registry_before_engine_setup(
+    monkeypatch, router_replay_enabled
+):
+    """A colocated reference-model build empties MInf's router registry; the
+    worker must repoint it at the served model before building the engine."""
+
+    class _StopBeforeEngine(Exception):
+        pass
+
+    gen_model = object()
+    calls = []
+
+    def _engine_setup(*_a, **_k):
+        calls.append("engine_setup")
+        raise _StopBeforeEngine
+
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.router_replay.reset_global_router_replay_instances_for_model",
+        lambda model: calls.append(("reset", model)),
+    )
+    monkeypatch.setattr(
+        "megatron.core.utils.get_attr_wrapped_model", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        megatron_worker,
+        "MambaInferenceStateConfig",
+        SimpleNamespace(from_model=_engine_setup),
+    )
+    monkeypatch.setattr(MegatronGenerationMixin, "_gen_model", lambda self: gen_model)
+    monkeypatch.setattr(
+        MegatronGenerationMixin,
+        "_get_megatron_inference_wrapper_cls",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        MegatronGenerationMixin,
+        "_inference_model_and_media_parts",
+        lambda self, _cls: (SimpleNamespace(config=SimpleNamespace()), None),
+    )
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._inference_engine_initialized = False
+    worker._router_replay_enabled = router_replay_enabled
+
+    with pytest.raises(_StopBeforeEngine):
+        worker._initialize_inference_engine(
+            {
+                "buffer_size_gb": 1,
+                "num_cuda_graphs": 1,
+                "block_size_tokens": 16,
+                "enable_chunked_prefill": False,
+                "use_cuda_graphs_for_non_decode_steps": False,
+                "max_tokens": 16,
+                "kv_cache_management_mode": "persist",
+                "materialize_only_last_token_logits": True,
+                "num_speculative_tokens": 0,
+            }
+        )
+
+    expected = [("reset", gen_model)] if router_replay_enabled else []
+    assert calls == expected + ["engine_setup"]

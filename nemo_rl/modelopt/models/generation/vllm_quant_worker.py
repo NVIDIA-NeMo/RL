@@ -83,8 +83,14 @@ def _configure_quant_engine_kwargs(
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
         )
-        # Expert fakequant needs a decomposed MoE path; explicit user config still wins.
-        llm_kwargs.setdefault("moe_backend", "triton")
+        # Expert fake quantization requires the decomposed Triton MoE path.
+        moe_backend = llm_kwargs.setdefault("moe_backend", "triton")
+        if cfg["quant_cfg"] and moe_backend != "triton":
+            raise ValueError(
+                "ModelOpt fake quantization requires moe_backend='triton', "
+                f"got {moe_backend!r}. Set "
+                "policy.generation.vllm_kwargs.moe_backend=triton."
+            )
         os.environ.pop("VLLM_MODELOPT_REAL_QUANT", None)
         os.environ.pop("VLLM_QUANT_CFG", None)
         if cfg["quant_cfg"]:

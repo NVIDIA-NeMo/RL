@@ -48,6 +48,14 @@ INIT_TOTAL_CATEGORY = "init/total"
 #: ``rl.worker_group``; telemetry reads it back when setting a worker up.
 WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
+#: Wall-clock axis the Single-Controller logs beside every event dict and plots
+#: it on in W&B; the rollout save span reads it as its end time.
+TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
+
+#: Trainer step the Single-Controller logs beside every event dict; the rollout
+#: save span reads it as ``rl.iteration``.
+TELEMETRY_TRAIN_STEP_KEY = "train_step"
+
 #: Keys ``algorithms/utils.py`` writes the efficiency ratio under and telemetry
 #: reads back. Named here, not at either end, because a rename on one side
 #: alone would leave the metric reading nothing with no error.

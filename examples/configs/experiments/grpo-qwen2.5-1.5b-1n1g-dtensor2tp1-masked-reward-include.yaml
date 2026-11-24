@@ -1,0 +1,11 @@
+# Pair of the masked-reward-exclude config: differs only in grpo.masked_reward_policy.
+# include is the exemplar default; it is set explicitly so the pair is self-describing.
+# Both files turn on overlong filtering: grpo_math_1B.yaml puts no non-voting row
+# inside a trainable group otherwise (the math environment never sets mask_sample,
+# top-p/top-k are off), so the pair would train identically under either policy.
+# With it, truncated rollouts vote only under include.
+defaults: ../grpo_math_1B.yaml
+
+grpo:
+  masked_reward_policy: include
+  overlong_filtering: true

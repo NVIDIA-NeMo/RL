@@ -16,3 +16,6 @@ async_rl:
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+  generation_fleet_health:
+    # Native MCore refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null

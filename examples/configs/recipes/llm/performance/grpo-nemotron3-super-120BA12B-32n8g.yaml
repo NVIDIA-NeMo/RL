@@ -48,7 +48,7 @@ policy:
       gpu_memory_utilization: 0.7
       async_engine: true
     vllm_kwargs:
-      moe_backend: flashinfer_trtllm
+      moe_backend: triton
       # The utilization-derived 24.91 GiB KV cache leaves too little headroom
       # to wake the colocated Megatron policy. Explicit bytes take precedence
       # over gpu_memory_utilization for KV-cache sizing.

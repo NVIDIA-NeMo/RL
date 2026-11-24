@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
+from dataclasses import dataclass
 from typing import Literal, Optional, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
@@ -38,6 +39,15 @@ GROUP_ID_TAG = "group_id"
 # Each row's whole NeMo-Gym result as a JSON string, for the training-data
 # dump. A column, not a tag: tags ride every metadata RPC.
 GYM_FULL_RESULT_FIELD = "gym_full_result"
+
+# Per-response inverse valid-token mass for equal prompt-group loss reduction.
+GROUP_TOKEN_MEAN_WEIGHT = "group_token_mean_inverse_tokens"
+
+# Per-row key in `KVBatchMeta.tags` holding the row's attribution key (the
+# NeMo-Gym agent name for flat rows, the task_id.taskset for task rows). The
+# token-capture finalizer stamps it when grpo.agent_overrides is set; the
+# SingleController advantage stage reads it to pick the row's settings.
+AGENT_NAME_TAG = "agent_name"
 
 # The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
 # `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
@@ -160,12 +170,30 @@ ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
 ROUTE_ENCODING_NONE = 0
 ROUTE_ENCODING_ENVELOPE = 1
 ROUTE_ENCODING_LIST = 2
+ROUTE_ENCODING_TENSOR = 3
+
+# Wire codes for a staged row's ``capture_mode`` column, shared by the sink's
+# per-row and direct batch encoders and the source that decodes them.
+CAPTURE_MODE_TO_CODE = {"text": 0, "token_in": 1}
+CAPTURE_CODE_TO_MODE = {code: mode for mode, code in CAPTURE_MODE_TO_CODE.items()}
+
+# Staging-key prefix of generation-cut chunk rows; the prefix writer accepts
+# only these keys.
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
 
 # Deferred route storage. Canonical rows carry one strict encoded route plan
 # per tag; policy workers omit the absent canonical route column and assemble
 # it from staging immediately before previous-policy logprob or training.
 ROUTE_PLAN_TAG = "route_assembly_plan"
 ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
+
+# Sampler top-k per generated token (policy.generation.top_logprobs > 0), consumed
+# by loss_fn.score_centering: int32 ids and float32 log-probs, both ``[..., k]``.
+# Staging rows hold one call's generated positions; canonical rows are
+# token-aligned with zeros on prompt and tool tokens.
+SAMPLER_TOPK_TOKEN_IDS_FIELD = "sampler_topk_token_ids"
+SAMPLER_TOPK_LOGPROBS_FIELD = "sampler_topk_logprobs"
+SAMPLER_TOPK_FIELDS = (SAMPLER_TOPK_TOKEN_IDS_FIELD, SAMPLER_TOPK_LOGPROBS_FIELD)
 
 
 def fields_with_optional_routed_experts(
@@ -207,3 +235,42 @@ def fields_with_optional_opd_full(
     if teacher_index_field is not None and teacher_index_field not in out:
         out.append(teacher_index_field)
     return out
+
+
+@dataclass(frozen=True)
+class LogicalRowTag:
+    """Required ownership metadata on real and execution-padding forest rows."""
+
+    dispatch_group_id: str
+    logical_rollout_id: str | None
+    logical_slot: int | None
+    logical_group_size: int
+    segment_index: int | None
+    segment_count: int
+    is_execution_padding: bool
+
+
+def forest_segment_id(owner_id: str, segment_index: int) -> str:
+    """Canonical identity of a physical row owned by one logical rollout."""
+    return f"{owner_id}_s{segment_index}"
+
+
+def forest_row_ids(
+    group_id: str,
+    owner_ids: Sequence[str],
+    segment_counts: Sequence[int],
+    *,
+    execution_row_multiple: int,
+) -> tuple[str, ...]:
+    """One publication/cleanup plan: owner segments followed by execution padding."""
+    if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+        raise ValueError("execution_row_multiple must be a positive integer")
+    real_ids = tuple(
+        forest_segment_id(owner, index)
+        for owner, count in zip(owner_ids, segment_counts, strict=True)
+        for index in range(count)
+    )
+    return real_ids + tuple(
+        f"{group_id}_pad{index}"
+        for index in range(-len(real_ids) % execution_row_multiple)
+    )
