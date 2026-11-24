@@ -24,6 +24,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -37,7 +38,6 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
-from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_widths,
     validate_megatron_dynamo_generation,
