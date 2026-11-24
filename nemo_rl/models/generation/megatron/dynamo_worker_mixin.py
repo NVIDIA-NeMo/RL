@@ -33,12 +33,17 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
 
-def _role_from_generation_config(generation: Mapping[str, Any]) -> Role | None:
+def _role_from_generation_config(generation: Mapping[str, Any] | None) -> Role | None:
     """The engine role ``MegatronDynamoGeneration`` wrote into ``generation``, if any.
+
+    ``generation`` may be absent or null: training-only workers (SFT, DPO)
+    carry no generation config and have no role.
 
     Raises:
         ValueError: For a role that is neither ``prefill`` nor ``decode``.
     """
+    if not generation:
+        return None
     role = generation.get("_disaggregation_role")
     if role is None:
         return None
@@ -104,11 +109,11 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
     @property
     def _disaggregation_role(self) -> Role | None:
         """``"prefill"`` or ``"decode"`` for an engine behind Dynamo; ``None`` otherwise."""
-        return _role_from_generation_config(self.cfg["generation"])
+        return _role_from_generation_config(self.cfg.get("generation"))
 
     def _check_generation_requirements(self, config: "PolicyConfig") -> None:
         # Before the model loads, not at the first refit that builds the engine.
-        if _role_from_generation_config(config["generation"]) is not None:
+        if _role_from_generation_config(config.get("generation")) is not None:
             require_megatron_dynamo_integration()
         super()._check_generation_requirements(config)
 

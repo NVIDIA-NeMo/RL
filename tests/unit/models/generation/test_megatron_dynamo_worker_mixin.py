@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import builtins
 import dataclasses
 import inspect
 import sys
@@ -124,6 +125,42 @@ def test_no_role_hooks_behave_like_the_plain_worker(engine_modules, monkeypatch)
         plain.return_value
     )
     handoff.assert_not_called()
+
+
+_NO_GENERATION = {
+    "absent": {},
+    "null": {"generation": None},
+    "empty": {"generation": {}},
+}
+
+
+@pytest.mark.parametrize("cfg", list(_NO_GENERATION.values()), ids=list(_NO_GENERATION))
+def test_a_training_only_worker_has_no_role_and_imports_no_integration(
+    engine_modules, monkeypatch, cfg
+):
+    """SFT/DPO workers carry no generation config: the hooks must not trip on it."""
+    plain, handoff = engine_modules
+    imported = []
+    real_import = builtins.__import__
+
+    def watch(name, *args, **kwargs):
+        if name.startswith("megatron.inference"):
+            imported.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", watch)
+    worker = object.__new__(_Worker)
+    worker.cfg = dict(cfg)
+
+    assert worker._disaggregation_role is None
+    worker._check_generation_requirements(dict(cfg))
+    assert worker._inference_config_overrides() == {}
+    assert worker._coordinator_kwargs() == {}
+    assert worker._build_dynamic_inference_engine(MagicMock(), MagicMock()) is (
+        plain.return_value
+    )
+    handoff.assert_not_called()
+    assert imported == []
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
