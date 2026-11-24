@@ -25,15 +25,15 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 
-cfg: RAGEnvConfig = {
-    "dataset_name": "rahular/simple-wikipedia",
-    "dataset_split": "train",
-    "text_column": "text",
-    "num_results": 1,
-    "k1": 1.5,
-    "b": 0.75,
-    "device": "cpu",
-}
+cfg = RAGEnvConfig(
+    dataset_name="rahular/simple-wikipedia",
+    dataset_split="train",
+    text_column="text",
+    num_results=1,
+    k1=1.5,
+    b=0.75,
+    device="cpu",
+)
 
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
