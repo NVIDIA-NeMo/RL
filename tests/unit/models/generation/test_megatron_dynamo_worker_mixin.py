@@ -159,9 +159,7 @@ def _policy_worker_module():
 def test_the_policy_worker_carries_the_dynamo_hooks_ahead_of_the_plain_ones():
     module = _policy_worker_module()
     mro = module.MegatronPolicyWorkerImpl.__mro__
-    assert mro.index(MegatronDynamoGenerationMixin) < mro.index(
-        MegatronGenerationMixin
-    )
+    assert mro.index(MegatronDynamoGenerationMixin) < mro.index(MegatronGenerationMixin)
     assert not hasattr(module, "MegatronDynamoPolicyWorker")
 
 
@@ -356,7 +354,9 @@ def test_the_installed_inference_config_takes_the_role_kwargs(monkeypatch, cls, 
 
 
 @pytest.mark.parametrize(("cls", "role"), _HOSTS)
-def test_engine_build_goes_through_the_role_hook(monkeypatch, engine_modules, cls, role):
+def test_engine_build_goes_through_the_role_hook(
+    monkeypatch, engine_modules, cls, role
+):
     plain, handoff = engine_modules
     monkeypatch.setattr(megatron_worker, "InferenceConfig", lambda **kwargs: kwargs)
     for path, fake in (

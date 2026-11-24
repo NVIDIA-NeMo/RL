@@ -636,7 +636,8 @@ def test_engine_width_not_a_whole_number_of_nodes_names_the_role(env):
 def test_engine_wider_than_a_pinned_segment_names_the_role(env):
     pins = [{f"nvl-{i}": 0.001} for i in range(8)]
     with pytest.raises(
-        ValueError, match=r"4 nodes.*segment of 2.*mcore_generation_config\.prefill_engine"
+        ValueError,
+        match=r"4 nodes.*segment of 2.*mcore_generation_config\.prefill_engine",
     ):
         _wide(env, segment_size=2, node_resource_constraints=pins)
     assert env.log == []

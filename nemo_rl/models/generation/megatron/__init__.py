@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
     MCoreGenerationSpecificArgs,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron.dynamo_config import dynamo_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,

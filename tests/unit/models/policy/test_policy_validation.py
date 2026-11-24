@@ -559,7 +559,9 @@ def test_every_megatron_engine_role_uses_the_one_policy_worker(
 
     worker_builder, _ = _construct_megatron_policy(config)
 
-    assert worker_builder.call_args.args[0] == _MEGATRON_WORKERS + "MegatronPolicyWorker"
+    assert (
+        worker_builder.call_args.args[0] == _MEGATRON_WORKERS + "MegatronPolicyWorker"
+    )
 
 
 def test_a_worker_extension_is_kept_for_a_dynamo_engine() -> None:
