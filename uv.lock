@@ -1738,14 +1738,14 @@ wheels = [
 
 [[package]]
 name = "fastokens"
-version = "0.3.2"
+version = "0.3.6"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ca/3f/4ee9fc097929f968488ec5ebafd9e8a46e274d249f93ae9b54083bcca69d/fastokens-0.3.2.tar.gz", hash = "sha256:ec05db1572579da4033dc2b326abf9635d5897770fb835f40972f83e50e3fb29", size = 751735, upload-time = "2026-09-14T07:50:35.456Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/12/53/d6e8392536767682cba76cf627599646a43b24c6e79ebab2df9f2fb88a62/fastokens-0.3.6.tar.gz", hash = "sha256:348739900fc5655eb69c79c678f94647a4dbff370cc6a0882d9b41a6f378de5d", size = 975027, upload-time = "2026-11-05T15:50:58.159Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/31/037aa44e32d173d03e53f2f51fc7bd0f0e5cc21acd62d3fba869c50baeb7/fastokens-0.3.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d077e3b0bd04cc3da6d0f6ac9fff7b9ea1ae95c6a08fee5226d77bbc3764911c", size = 3419118, upload-time = "2026-09-14T07:50:21.709Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/2c/b5e9aa3887dc8605a78f4b9ad479fd1adda9d67ce33c2bf94a8688a09da8/fastokens-0.3.2-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:cbb29fae028d39a2020d01dfe587e1774a516b6d28641b70e83a285d460bdfb8", size = 3426723, upload-time = "2026-09-14T07:50:14.133Z" },
-    { url = "https://files.pythonhosted.org/packages/9b/99/3d54e5fefe4e7bc4681377216d5519ee4e8e71fe6d6cfb792a951882d63e/fastokens-0.3.2-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:54a2b96c336ee0d5ea4d93b672a77f39e2f6f5eff3e5d76d528858d18694f2d5", size = 3510430, upload-time = "2026-09-14T07:50:27.532Z" },
-    { url = "https://files.pythonhosted.org/packages/2e/57/eb32f03ec104858ecb90af3bde1bc0df5f6abf5ff3a9b0149c70aeb9706b/fastokens-0.3.2-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:9ea2fc3aa9f9d9d30a3e723844d9a79547a49bc8e2778aeacdb4150a73091aa7", size = 3764203, upload-time = "2026-09-14T07:50:33.893Z" },
+    { url = "https://files.pythonhosted.org/packages/31/e5/eb0f52d76352d6eff2418c321d46cf80d9edc1f2a33f120dedd825562854/fastokens-0.3.6-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0dfde41535f5922499eb7b7f2cf572ca8a129618da1792a395dd3545bfae4129", size = 3813833, upload-time = "2026-11-05T15:50:44.565Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/5a/2ca01618649afb1b93f38412d31416dc60bc1ff5b78851e3d4f429c76582/fastokens-0.3.6-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:9636eee53af4ce23cb2e5cc2c66b16b278d2919f73a415f1563fb649807d5902", size = 3818652, upload-time = "2026-11-05T15:50:37.03Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/67/51a6924b048e0bf7851d51f7683e43d4e72c5242ad2c255470cb88060dc9/fastokens-0.3.6-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:0abbfaf4320373fcbdb49bc6d7b2b53d3fe125357481940f4f6d0746b90f8df3", size = 3899749, upload-time = "2026-11-05T15:50:50.116Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/9a/a4ae49a5fa814248f86c198a76a246287dac5ce69d4b17c11434bff3bcd4/fastokens-0.3.6-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:64e6c1a19647f309d4718de372756920d3fec566c4c3a1ac86db61c43cc3771e", size = 4162525, upload-time = "2026-11-05T15:50:56.326Z" },
 ]
 
 [[package]]
