@@ -1000,15 +1000,27 @@ class TestApplyMoeConfig:
     def test_moe_router_enable_expert_bias_is_applied_only_when_configured(self):
         from nemo_rl.models.megatron.setup import _apply_moe_config
 
-        # A quantile-balancing checkpoint keeps its bias with this flag off.
-        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=False)
+        # An omitted key keeps the checkpoint's value, whatever it is.
+        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=True)
         config = {"megatron_cfg": self._base_moe_megatron_cfg()}
 
         _apply_moe_config(model_cfg, config)
+        assert model_cfg.moe_router_enable_expert_bias is True
+
+        config["megatron_cfg"]["moe_router_enable_expert_bias"] = False
+        _apply_moe_config(model_cfg, config)
         assert model_cfg.moe_router_enable_expert_bias is False
 
-        config["megatron_cfg"]["moe_router_enable_expert_bias"] = True
-        _apply_moe_config(model_cfg, config)
+    def test_moe_router_enable_expert_bias_skips_teachers_without_allowlist(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=True)
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_router_enable_expert_bias"] = False
+        megatron_cfg["_provider_override_allowlist"] = []
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
         assert model_cfg.moe_router_enable_expert_bias is True
 
     def test_moe_grouped_gemm_absent_keeps_default(self):

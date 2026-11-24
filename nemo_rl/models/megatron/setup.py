@@ -1380,8 +1380,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"
     ]
-    if "moe_router_enable_expert_bias" in config["megatron_cfg"]:
-        model_cfg.moe_router_enable_expert_bias = config["megatron_cfg"][
+    megatron_cfg = config["megatron_cfg"]
+    if "moe_router_enable_expert_bias" in megatron_cfg and provider_override_allowed(
+        megatron_cfg, "moe_router_enable_expert_bias"
+    ):
+        model_cfg.moe_router_enable_expert_bias = megatron_cfg[
             "moe_router_enable_expert_bias"
         ]
 
