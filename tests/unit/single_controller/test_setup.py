@@ -587,26 +587,33 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("shared_tp", "prefill", "decode", "segment_size"),
+    ("shared_tp", "prefill", "decode", "inference_nodes", "segment_size"),
     [
-        # Every engine TP 4: the 12-GPU replica spans two nodes, but only one
+        # Every engine TP 4: two 12-GPU replicas fill three nodes, but only one
         # engine needs NVLink, so a segment is one node.
-        (4, {}, {}, 1),
+        (4, {}, {}, 3, 1),
         # Per-role widths, not the shared TP 2, size the segment: a TP 8 prefill
         # engine fills one node.
         (
             2,
             {"tensor_model_parallel_size": 8},
             {"tensor_model_parallel_size": 4},
+            2,
             1,
         ),
         # A TP 16 prefill engine spans two 8-GPU nodes, so a segment is two.
-        (2, {"tensor_model_parallel_size": 16}, {}, 2),
+        (
+            2,
+            {"tensor_model_parallel_size": 16},
+            {"tensor_model_parallel_size": 8},
+            4,
+            2,
+        ),
     ],
     ids=["uniform_tp4", "prefill_tp8_decode_tp4", "prefill_tp16"],
 )
 def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
-    monkeypatch, shared_tp, prefill, decode, segment_size
+    monkeypatch, shared_tp, prefill, decode, inference_nodes, segment_size
 ):
     """Behind Dynamo the NVLink segment is the widest engine, not the replica."""
     from tests.unit.models.generation.test_megatron_dynamo_config import (
@@ -619,17 +626,20 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
     generation["mcore_generation_config"]["tensor_model_parallel_size"] = shared_tp
     generation["colocated"] = {
         "enabled": False,
-        "resources": {"gpus_per_node": 8, "num_nodes": 2},
+        "resources": {"gpus_per_node": 8, "num_nodes": inference_nodes},
     }
     master_config.policy["megatron_cfg"] = dict(MEGATRON_POLICY["megatron_cfg"])
     master_config.policy["generation"] = generation
-    master_config.cluster = ClusterConfig(num_nodes=4, gpus_per_node=8, segment_size=1)
+    cluster_nodes = 2 + inference_nodes
+    master_config.cluster = ClusterConfig(
+        num_nodes=cluster_nodes, gpus_per_node=8, segment_size=1
+    )
     segment_calls = []
 
     def fake_prepare_segment_topology(segment_size, num_nodes, *, topology=None, role):
         segment_calls.append((role, segment_size, num_nodes))
         if topology is None:
-            topology = {f"node{i}": ("nvlink_domain", i) for i in range(4)}
+            topology = {f"node{i}": ("nvlink_domain", i) for i in range(cluster_nodes)}
         node_ids = list(topology)
         return [{}] * num_nodes, node_ids[num_nodes:], topology
 
@@ -642,7 +652,10 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
 
     _, inference_cluster, _, _ = sc_setup_mod._build_clusters(master_config)
 
-    assert segment_calls == [("training", 1, 2), ("inference", segment_size, 2)]
+    assert segment_calls == [
+        ("training", 1, 2),
+        ("inference", segment_size, inference_nodes),
+    ]
     assert inference_cluster.segment_size == segment_size
 
 

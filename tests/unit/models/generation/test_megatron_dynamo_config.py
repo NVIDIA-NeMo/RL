@@ -29,7 +29,7 @@ from nemo_rl.models.generation.megatron.config import merged_inference_megatron_
 from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_width,
     engine_widths,
-    replica_width,
+    reject_megatron_dynamo_outside_single_controller,
     role_overrides,
     validate_megatron_dynamo_generation,
 )
@@ -136,8 +136,9 @@ def test_role_layouts_never_reach_megatron_cfg() -> None:
 
 @pytest.mark.parametrize("backend", ["sglang", "trtllm", "dynamo"])
 def test_dynamo_switch_is_refused_for_backends_without_a_dynamo_path(backend) -> None:
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
     with pytest.raises(ValueError, match=f"does not apply to backend='{backend}'"):
-        resolve_generation_class({"backend": backend, "dynamo": True})
+        configure_generation_config({"backend": backend, "dynamo": True}, tokenizer)
 
 
 def test_dynamo_switch_resolves_to_megatron_generation() -> None:
@@ -161,7 +162,6 @@ def test_engines_take_their_width_from_the_policy_layout() -> None:
     policy["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 4
     widths = engine_widths(policy)
     assert widths == {"prefill": 4, "decode": 4}
-    assert replica_width(policy) == 12
     layout = resolve_disagg_layout(policy["generation"])
     roles, engine_gpus, replicas = plan_engines(
         24,
@@ -212,7 +212,6 @@ def test_prefill_and_decode_may_differ_in_layout(
     widths = engine_widths(policy)
     assert widths == expected_widths
     replica = expected_widths["prefill"] + 2 * expected_widths["decode"]
-    assert replica_width(policy) == replica
     roles, _, _ = plan_engines(
         roles_for_gpus,
         layout=resolve_disagg_layout(generation),
@@ -403,6 +402,17 @@ def test_megatron_generation_refuses_role_layouts_without_dynamo(role_key) -> No
         MegatronGeneration.validate_settings(_master_config(generation))
 
 
+@pytest.mark.parametrize("role_key", ["prefill_engine", "decode_engine"])
+def test_legacy_entrypoints_refuse_role_layouts_without_dynamo(role_key) -> None:
+    """Legacy entrypoints never run ``validate_settings``; without this check the
+    per-role layouts would be dropped and the run would use the shared layout."""
+    generation = _megatron_config(
+        dynamo=False, **{role_key: {"tensor_model_parallel_size": 8}}
+    )
+    with pytest.raises(ValueError, match="ignored without it"):
+        reject_megatron_dynamo_outside_single_controller(generation)
+
+
 def test_dynamo_cfg_is_the_shared_dynamo_schema() -> None:
     """Megatron reads the same ``dynamo_cfg`` block as vLLM, Gym fields included."""
     validate_megatron_dynamo_generation(
@@ -429,7 +439,6 @@ def test_nvlink_domain_span_is_the_widest_engine() -> None:
             decode_engine={"tensor_model_parallel_size": 1},
         )
     )
-    assert replica_width(policy) == 6
     assert MegatronGeneration.nvlink_domain_span(policy) == 4  # type: ignore[arg-type]
     # Decode wider than prefill: the span must follow the wider role.
     wide_decode = _policy(

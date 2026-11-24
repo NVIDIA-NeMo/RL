@@ -34,13 +34,13 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
-    ENGINE_ROLE_KEYS,
     MCoreGenerationConfig,
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
 from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_widths,
+    reject_role_layouts_without_dynamo,
     validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -271,12 +271,8 @@ class MegatronGeneration(GenerationInterface):
                 "served only behind Dynamo. Set dynamo to true, or set "
                 "disaggregation.enabled to false."
             )
-        elif any(key in mcore_cfg for key in ENGINE_ROLE_KEYS):
-            raise ValueError(
-                "policy.generation.mcore_generation_config.prefill_engine / "
-                "decode_engine size Megatron engines behind Dynamo and are ignored "
-                "without it. Set policy.generation.dynamo=true, or remove them."
-            )
+        else:
+            reject_role_layouts_without_dynamo(policy_config["generation"])
 
     @classmethod
     def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:

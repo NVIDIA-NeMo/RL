@@ -36,8 +36,6 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 
 Role = Literal["prefill", "decode"]
 ROLES: tuple[Role, Role] = ("prefill", "decode")
-# Backends whose generation class reads ``generation.disaggregation``.
-DISAGG_BACKENDS: tuple[str, ...] = ("megatron", "trtllm")
 
 
 def as_dict(raw: Any) -> dict[str, Any]:
