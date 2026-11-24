@@ -3460,7 +3460,10 @@ def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
-def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch):
+@pytest.mark.parametrize("keep_train_buffers", [False, True])
+def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(
+    monkeypatch, keep_train_buffers
+):
     """Restore and restage the shared buffer before MXFP8 parameter gather."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -3476,16 +3479,14 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_logprob = False
-    worker.should_disable_forward_pre_hook = True
-    worker._forward_pre_hook_enabled = lambda: True
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
     worker._log_gpu_mem = lambda *_args, **_kwargs: None
     worker.move_model = lambda model, device, **kwargs: (
         move_calls.append((device, kwargs)) or model
     )
     stage_calls = []
-    worker._disable_forward_pre_hook_until_next_train_step = (
-        lambda *, param_sync=False: stage_calls.append(param_sync)
+    worker._copy_main_params_to_param_buffer = (
+        lambda zero_grad_buffer=False: stage_calls.append(zero_grad_buffer)
     )
 
     class _AllocatorWakeup:
@@ -3495,11 +3496,13 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
-    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(
+        worker, keep_train_buffers=keep_train_buffers
+    )
 
     assert model.eval_called
     assert move_calls == [("cuda", {"move_grads": True})]
-    assert stage_calls == [True]
+    assert stage_calls == ([] if keep_train_buffers else [True])
 
 
 def test_disable_forward_pre_hook_stages_masters_before_param_gather(monkeypatch):
