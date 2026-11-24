@@ -99,6 +99,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _first_prompt_token_ids,
     _nemo_gym_group_metrics,
     _tensorize_by_key,
     apply_reward_penalties,
@@ -1866,16 +1867,8 @@ class AsyncNemoGymRolloutImpl:
             )
             # Receipt results carry no prompt tokens; the finalizer rebuilds them.
             if not receipt_mode:
-                first_prompts = {
-                    tuple(
-                        token
-                        for message in result["input_message_log"]
-                        for token in torch.as_tensor(message["token_ids"]).tolist()
-                    )
-                    for result in completed_results
-                }
                 rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = len(
-                    first_prompts
+                    {_first_prompt_token_ids(result) for result in completed_results}
                 )
                 # One dispatched group is one logical prompt group.
                 rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = 1

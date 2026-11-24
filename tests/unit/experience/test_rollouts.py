@@ -3864,3 +3864,11 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert single.rollout_metrics["baseline_groups/logical_groups"] == 1
     assert single.rollout_metrics["baseline_groups/samples"] == 1
     assert not warnings()
+
+    # A prompt that differs only by a trailing pad id (0) is a distinct prompt.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        padded = _postprocess_rollouts([[1, 5], [1, 5, 0]], agent_name="padded")
+    assert padded.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    [record] = warnings()
+    assert "attribution key(s) ['padded']" in record.getMessage()

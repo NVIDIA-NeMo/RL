@@ -3240,6 +3240,18 @@ def _nemo_gym_group_metrics(
     return metrics
 
 
+def _first_prompt_token_ids(result: dict) -> tuple[int, ...]:
+    """Return the unpadded token ids of a NeMo-Gym result's first prompt.
+
+    Both NeMo-Gym rollout paths count distinct first prompts by this tuple.
+    """
+    return tuple(
+        token
+        for message in result["input_message_log"]
+        for token in torch.as_tensor(message["token_ids"]).tolist()
+    )
+
+
 # Responses ``incomplete_details.reason`` values that mean the final model call
 # ran out of tokens. NeMo-Gym normalizes every length stop to
 # ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
@@ -3530,20 +3542,19 @@ def _postprocess_single_nemo_gym_group(
     input_ids = batched_flat["token_ids"]
     # Count the distinct first prompts, and warn when the rollouts of one logical
     # prompt group (one _ng_group_id; rows without the key form one group) differ.
-    unique_first_prompts, first_prompt_ids = torch.unique(
-        input_ids, dim=0, return_inverse=True
-    )
-    distinct_first_prompts = int(unique_first_prompts.shape[0])
-    prompt_ids_by_group: dict[str | None, set[int]] = defaultdict(set)
-    for row, prompt_id in zip(nemo_gym_rows, first_prompt_ids.tolist()):
-        prompt_ids_by_group[row.get(NEMO_GYM_GROUP_ID_KEY)].add(prompt_id)
-    logical_groups = len(prompt_ids_by_group)
+    prompts_by_group: dict[str | None, set[tuple[int, ...]]] = defaultdict(set)
+    for row, result in zip(nemo_gym_rows, results):
+        prompts_by_group[row.get(NEMO_GYM_GROUP_ID_KEY)].add(
+            _first_prompt_token_ids(result)
+        )
+    distinct_first_prompts = len(set().union(*prompts_by_group.values()))
+    logical_groups = len(prompts_by_group)
     rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = (
         distinct_first_prompts
     )
     rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = logical_groups
     rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(results)
-    if any(len(prompt_ids) > 1 for prompt_ids in prompt_ids_by_group.values()):
+    if any(len(prompts) > 1 for prompts in prompts_by_group.values()):
         unreported_keys = sorted(
             {result["attribution_key"] for result in results}
             - _DISTINCT_FIRST_PROMPT_WARNED
