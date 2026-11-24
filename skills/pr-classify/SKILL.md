@@ -96,7 +96,7 @@ Leave out the callout when nothing is `unknown`, and leave out `· aux: …` whe
     "proof_needed": {"value": ["functionality", "convergence"], "reason": "...", "basis": "...", "set_by": null, "agent_value": ["functionality", "convergence"]}
   },
   "categories": {"main": ["generation", "fix"], "aux": ["lowprec", "refit"]},
-  "unknown": ["complexity"]
+  "unknown": []
 }
 ```
 -->
@@ -106,4 +106,4 @@ Leave out the callout when nothing is `unknown`, and leave out `· aux: …` whe
 
 ## Local use
 
-A maintainer can run this skill by hand on any PR: `gh pr diff <N> -R NVIDIA-NeMo/RL` and `gh pr view <N> -R NVIDIA-NeMo/RL --json title,body,labels`, plus `gh api repos/NVIDIA-NeMo/RL/issues/<N>/timeline` for who set each label, then follow the steps and print the comment instead of posting it.
+A maintainer can run this skill by hand on any PR: `gh pr diff <N> -R NVIDIA-NeMo/RL` and `gh pr view <N> -R NVIDIA-NeMo/RL --json title,body,labels`, plus `gh api --paginate --slurp repos/NVIDIA-NeMo/RL/issues/<N>/timeline` for who set each label, then follow the steps and print the comment instead of posting it.

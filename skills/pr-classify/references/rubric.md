@@ -79,7 +79,7 @@ Should the author have talked with a maintainer before starting the work?
 
 `yes`:
 - New config surface, a new worker or actor type, changing who owns some state, cross-module refactors, a new public API.
-- A PR big enough that a large refactor is possible, or where the right shape is not obvious, e.g. a first integration of a new serving stack (#5056, about Dynamo).
+- A PR big enough that a large refactor is possible, or where the right shape is not obvious, e.g. a first integration of a new serving stack such as Dynamo.
 - A new metric whose definition is open, e.g. whether batch age is counted per step or per token (#5049).
 - The intended effect depends on a mechanism the author may not understand (#5036: a streaming cap that did nothing at first because no slots opened).
 - It adds many environment variables, or a new class that could have been agreed on first (#5001).
