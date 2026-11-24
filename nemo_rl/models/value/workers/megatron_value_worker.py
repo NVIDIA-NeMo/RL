@@ -69,6 +69,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
+    validate_forest_routers,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -97,9 +98,6 @@ from nemo_rl.models.megatron.train import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.megatron_policy_worker import (
-    validate_forest_routers,
-)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
