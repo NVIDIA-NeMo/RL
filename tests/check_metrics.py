@@ -39,13 +39,10 @@ def max(value):
     return builtins.max(float(v) for v in value.values())
 
 
-def all_finite(value, required_steps=0):
-    """Check all recorded values and optionally require steps 1 through required_steps."""
-    if not value or any(
-        str(step) not in value for step in range(1, required_steps + 1)
-    ):
-        return False
-    return builtins.all(math.isfinite(float(v)) for v in value.values())
+def all_finite(value):
+    """Return whether a metric is present and all recorded values are finite."""
+    values = [float(v) for v in value.values()]
+    return bool(values) and builtins.all(math.isfinite(value) for value in values)
 
 
 def ratio_above(value, threshold):

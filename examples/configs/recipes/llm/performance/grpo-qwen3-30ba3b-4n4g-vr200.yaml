@@ -1,4 +1,6 @@
 defaults: ./grpo-qwen3-30ba3b-4n4g.yaml
+policy:
+  logprob_batch_size: 16
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-vr200
 logger:

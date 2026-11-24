@@ -15,8 +15,6 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 # ===== BEGIN CONFIG =====
-# Keep the ordinary rollout snapshots, checkpoints and metrics separate.
-PERF_RUN_SUFFIX=-eagle3-k1
 NUM_NODES=32
 GPUS_PER_NODE=4
 SEGMENT_SIZE=16     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.
@@ -26,7 +24,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=100
 # ===== END CONFIG =====
 
-source "$SCRIPT_DIR/common.env"
+source "$SCRIPT_DIR/vr200_grpo.env"
 # disable NVLS to avoid OOM issue
 export NCCL_NVLS_ENABLE=0
 

@@ -1,6 +1,6 @@
 defaults: ./grpo-qwen3-235b-32n4g.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200-eagle3-k3
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-eagle3-k3-vr200
 policy:
   megatron_cfg:
     # Recompute the attention core and retain other activations.
@@ -23,6 +23,6 @@ policy:
         draft_load_config:
           load_format: safetensors
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-vr200-eagle3-k3
+  log_dir: logs/grpo-qwen3-235b-32n4g-eagle3-k3-vr200
   wandb:
-    name: grpo-qwen3-235b-32n4g-vr200-eagle3-k3
+    name: grpo-qwen3-235b-32n4g-eagle3-k3-vr200
