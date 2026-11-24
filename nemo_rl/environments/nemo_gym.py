@@ -2335,16 +2335,19 @@ Depending on your data shape, you may want to change these values."""
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
         chain.
 
-        Poisoning is fail-closed with one carve-out. A failure row whose
-        reason is in Gym's ``UNSERVED_CALL_FAILURE_REASONS`` is a call that
-        never returned a completion: the inference engine refused the
-        request before generating (e.g. the prompt no longer fit the model's
-        context window), or the request finished without staged coordinates
-        (the ledger commit precedes the response leaving the server; e.g. a
-        call cancelled mid-flight when the harness ends the session at its
-        budget). Such a call can never be a lineage parent (it has no row to
-        resolve against), so its row is structurally off-chain and does not
-        poison; if the *terminal* request itself died this way, the
+        Poisoning is fail-closed with one carve-out. A call with a failure
+        row whose reason is in Gym's ``UNSERVED_CALL_FAILURE_REASONS``, and
+        no other failure row, returned no completion the inference engine
+        generated. Its row is either ``engine_refused_request`` (the engine
+        refused the request and the Model Server passed the refusal on to
+        the agent) or ``request_finished_without_staged_coordinates`` (the
+        request finished without worker commit coordinates, e.g. a call
+        cancelled mid-flight when the harness ends the session at its
+        budget, or a context-window refusal that the Model Server answered
+        with an empty completion of its own). Such a call can never be a
+        lineage parent (it has no committed ledger row, or the agent never
+        received its completion), so its row is structurally off-chain and
+        does not poison; if the *terminal* request itself died this way, the
         missing-terminal-row check below still masks the rollout. Every
         other failure reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
