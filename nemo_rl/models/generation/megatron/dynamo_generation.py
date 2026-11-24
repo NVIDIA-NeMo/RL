@@ -34,6 +34,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local
+from nemo_rl.models.generation.disagg_layout import ROLES, Role
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -43,18 +44,15 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
     MegatronDynamoCfg,
-    MegatronDynamoRole,
-    disaggregation_cfg,
-    engine_roles,
-    engine_widths,
     megatron_dynamo_cfg,
+    plan_megatron_engines,
+    role_overrides,
     validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -64,13 +62,14 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
+    from nemo_rl.weight_sync.membership import RefitMembership
 
 LOGGER = logging.getLogger(__name__)
 
 
 def role_policy_config(
     policy_config: Mapping[str, Any],
-    role: MegatronDynamoRole,
+    role: Role,
     overrides: Mapping[str, int],
 ) -> dict[str, Any]:
     """The policy config a worker of one role builds its engine from.
@@ -78,7 +77,7 @@ def role_policy_config(
     A deep copy of ``policy_config`` with the role in
     ``generation._dynamo_role`` (what makes the worker build the handoff
     engine for that role) and ``overrides`` (the role's
-    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` keys) merged into
+    ``mcore_generation_config.prefill_engine`` / ``decode_engine`` keys) merged into
     ``generation.mcore_generation_config``, which is where the dedicated
     inference policy takes its layout from. ``generation.dynamo`` is turned
     off: each engine is a plain Megatron engine sized by its own layout, and
@@ -88,7 +87,7 @@ def role_policy_config(
     Args:
         policy_config: The full ``policy`` config.
         role: ``prefill`` or ``decode``.
-        overrides: Keys from ``MegatronDynamoCfg.role_overrides``; empty for
+        overrides: Keys from ``dynamo_config.role_overrides``; empty for
             a role that keeps the shared ``mcore_generation_config``.
 
     Returns:
@@ -115,8 +114,36 @@ def cluster_node_ip() -> str:  # pragma: no cover
     return _get_node_ip_local()
 
 
-def _seconds_left(deadline: float) -> float:
-    return max(0.0, deadline - time.monotonic())
+def _deadline(timeout_s: float | None) -> float | None:
+    """Monotonic deadline ``timeout_s`` from now; ``None`` means no deadline."""
+    return None if timeout_s is None else time.monotonic() + timeout_s
+
+
+def _seconds_left(deadline: float | None) -> float | None:
+    """Time left before ``deadline``, never negative; ``None`` waits indefinitely."""
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _wait_on_engine(
+    refs: list[ray.ObjectRef], *, deadline: float | None, what: str, instance_id: str
+) -> list[Any]:
+    """``ray.get`` under ``deadline``; a timeout becomes a ``RuntimeError`` naming the engine.
+
+    Not a ``TimeoutError``: the SingleController treats any ``TimeoutError``
+    raised inside a refit as its own refit budget running out and reports a
+    generic abort without the engine's name. Ray's ``GetTimeoutError`` is
+    one, so it is chained as the cause instead.
+
+    Raises:
+        RuntimeError: When the deadline passes before every ref is ready.
+    """
+    try:
+        return ray.get(refs, timeout=_seconds_left(deadline))
+    except ray.exceptions.GetTimeoutError as error:
+        raise RuntimeError(
+            f"{what} on Megatron engine {instance_id} did not finish before its "
+            "deadline"
+        ) from error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,7 +166,7 @@ class MegatronDynamoEngine:
         leader: The worker leading the engine's single DP shard.
     """
 
-    role: MegatronDynamoRole
+    role: Role
     world_size: int
     instance_id: str
     node_ip: str
@@ -151,7 +178,7 @@ class MegatronDynamoEngine:
         cls,
         generation: MegatronGeneration,
         *,
-        role: MegatronDynamoRole,
+        role: Role,
         world_size: int,
         instance_id: str,
         node_ip: str,
@@ -264,7 +291,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     its own one-node virtual cluster and built with ``skip_weight_load=True`` so
     its inference engine comes up at the first weight refit. Every engine has
     the layout the policy config gives plus its role's
-    ``dynamo_cfg.prefill_engine`` / ``decode_engine`` overrides, so prefill and
+    ``mcore_generation_config.prefill_engine`` / ``decode_engine`` overrides, so prefill and
     decode engines may differ in TP and PP (the KV handoff reshards between
     them). An engine's role, carried in its config, also picks the engine
     variant and KV-transfer agents its ranks build.
@@ -272,10 +299,9 @@ class MegatronDynamoGeneration(GenerationInterface):
     This object is also the engines' refit side: every refit call the trainer
     makes here (collective init, prepare the weights, transfer, suspend,
     prepare the KV cache, resume) is fanned out over the engines' Ray workers
-    in engine order. Rank placement comes from the shared ``RefitMembership``
-    arithmetic: engine ``i`` starts at the trainers plus the widths of the
-    engines before it, so a prefill engine at TP 4 may sit next to decode
-    engines at TP 2. After a failed suspend the fleet attempts a best-effort
+    in engine order. Engine ``i`` joins the refit group at the trainers plus
+    the widths of the engines before it, so a prefill engine at TP 4 may sit
+    next to decode engines at TP 2. After a failed suspend the fleet attempts a best-effort
     resume of every engine and the original error still propagates. The object
     owns no policy and no worker group of its own.
 
@@ -376,10 +402,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._port_range_low = cluster.port_range_low
         self._port_range_high = cluster.port_range_high
         self._node_resource_constraints = cluster.node_resource_constraints
-        # Every control call is bounded: suspend and resume by their timeout_s
-        # (control_timeout_s when None), one deadline per call, and
-        # prepare_refit_info by control_timeout_s.
-        self._control_timeout_s = float(self._dynamo_cfg.control_timeout_s)
         # One record per engine, in launch (refit rank) order; what refit calls use.
         self._engine_records: list[MegatronDynamoEngine] = []
         # The owning objects, in the same order; empty on a copy.
@@ -389,8 +411,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._is_client_copy = False
 
         validate_megatron_dynamo_generation(self.cfg)
-        widths = engine_widths(self._policy_config)
-        roles = engine_roles(disaggregation_cfg(self.cfg), cluster.world_size(), widths)
+        roles, widths = plan_megatron_engines(self._policy_config, cluster.world_size())
         try:
             self._start_engines(roles, widths)
         except Exception:
@@ -483,21 +504,24 @@ class MegatronDynamoGeneration(GenerationInterface):
         call: Callable[[MegatronDynamoEngine], list[ray.ObjectRef]],
         *,
         what: str,
-        deadline: float,
+        deadline: float | None,
     ) -> None:
         """Run ``call`` on every listed engine at once; raise the first failure.
 
-        The failure keeps its type (callers recover from ``RayActorError``) and
-        gains a note naming the engine and the step.
+        A missed deadline is a ``RuntimeError`` naming the engine (see
+        :func:`_wait_on_engine`). Any other failure keeps its type (callers
+        recover from ``RayActorError``) and gains a note naming the engine and
+        the step.
         """
         pending = [(index, call(self._engine_records[index])) for index in indices]
         for index, futures in pending:
+            instance_id = self._engine_records[index].instance_id
             try:
-                ray.get(futures, timeout=_seconds_left(deadline))
-            except Exception as error:
-                error.add_note(
-                    f"{what} failed on engine {self._engine_records[index].instance_id}"
+                _wait_on_engine(
+                    futures, deadline=deadline, what=what, instance_id=instance_id
                 )
+            except Exception as error:
+                error.add_note(f"{what} failed on engine {instance_id}")
                 raise
 
     def _attempt(
@@ -506,19 +530,20 @@ class MegatronDynamoGeneration(GenerationInterface):
         call: Callable[[MegatronDynamoEngine], list[ray.ObjectRef]],
         *,
         what: str,
-        deadline: float,
+        deadline: float | None,
         errors: list[str],
     ) -> list[int]:
         """Run ``call`` on every listed engine at once; return the ones that succeeded."""
         pending = [(index, call(self._engine_records[index])) for index in indices]
         succeeded: list[int] = []
         for index, futures in pending:
+            instance_id = self._engine_records[index].instance_id
             try:
-                ray.get(futures, timeout=_seconds_left(deadline))
-            except Exception as error:
-                errors.append(
-                    f"{self._engine_records[index].instance_id}: {what}: {error!r}"
+                _wait_on_engine(
+                    futures, deadline=deadline, what=what, instance_id=instance_id
                 )
+            except Exception as error:
+                errors.append(f"{instance_id}: {what}: {error!r}")
             else:
                 succeeded.append(index)
         return succeeded
@@ -527,45 +552,24 @@ class MegatronDynamoGeneration(GenerationInterface):
     # Refit collective
     # ------------------------------------------------------------------
 
-    def check_full_fleet(self, membership: RefitMembership) -> None:
-        """Reject any membership but every engine, in order: the engine set is fixed.
+    def set_refit_membership(self, membership: "RefitMembership") -> None:
+        """Accept only every engine: the engine set is fixed.
 
-        Engine ``i``'s prefix is the sum of the widths before it, and its width
-        must be the one its record reports.
+        ``RefitMembership`` describes equal-width shards, so its
+        ``workers_per_shard`` cannot describe engines of different widths and
+        is not read. Each refit call computes the engines' ranks from their
+        records instead (:meth:`engine_rank_offsets`); nothing is stored.
+
+        Raises:
+            NotImplementedError: For a membership that leaves an engine out.
         """
-        widths = self.shard_widths
-        full_fleet: dict[int, int] = {}
-        prefix = 0
-        for index, width in enumerate(widths):
-            full_fleet[index] = prefix
-            prefix += width
-        if (
-            membership.shard_prefixes != full_fleet
-            or membership.workers_per_shard != widths
-        ):
+        every_engine = list(range(self.num_engines))
+        if membership.surviving_shards != every_engine:
             raise NotImplementedError(
                 "Megatron engines behind Dynamo are a fixed fleet; refit membership "
-                f"must be every engine {full_fleet} with ranks {list(widths)}, got "
-                f"{membership.shard_prefixes} with {list(membership.workers_per_shard)}."
+                f"must be every engine {every_engine}, got "
+                f"{membership.surviving_shards}."
             )
-
-    def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
-        """Every engine, each a DP shard of its own TP x PP ranks after the trainers."""
-        return desired_membership(
-            absent_shards=[],
-            dp_size=self.num_engines,
-            total_gen_workers=self.inference_world_size,
-            train_world_size=train_world_size,
-            shard_widths=self.shard_widths,
-        )
-
-    def set_refit_membership(self, membership: RefitMembership) -> None:
-        """Check the membership; the engine set is fixed, so it must be every engine.
-
-        Nothing is stored: every refit call recomputes the full-fleet membership
-        from the engine records, so there is no per-call membership to keep.
-        """
-        self.check_full_fleet(membership)
 
     def init_collective(
         self,
@@ -597,7 +601,6 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"NCCL world_size={world_size} does not match expected {expected} "
                 f"(train={train_world_size} + engines={self.inference_world_size})"
             )
-        self.check_full_fleet(self.full_fleet_membership(train_world_size))
         offsets = self.engine_rank_offsets(train_world_size)
         futures: list[ray.ObjectRef] = []
         if self.uses_native_refit:
@@ -634,11 +637,12 @@ class MegatronDynamoGeneration(GenerationInterface):
         The trainers take ranks ``0 .. train_world_size - 1``; engine ``i``
         starts right after the trainers and the engines before it.
         """
-        membership = self.full_fleet_membership(train_world_size)
-        return [
-            membership.train_world_size + membership.shard_prefixes[index]
-            for index in range(self.num_engines)
-        ]
+        offsets: list[int] = []
+        rank = train_world_size
+        for width in self.shard_widths:
+            offsets.append(rank)
+            rank += width
+        return offsets
 
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
@@ -658,7 +662,8 @@ class MegatronDynamoGeneration(GenerationInterface):
             range(self.num_engines),
             lambda record: record.prepare_refit_info(info_ref),
             what="prepare_refit_info",
-            deadline=time.monotonic() + self._control_timeout_s,
+            # No deadline of its own, as on the other generation backends.
+            deadline=None,
         )
         return None
 
@@ -688,14 +693,16 @@ class MegatronDynamoGeneration(GenerationInterface):
             range(self.num_engines),
             lambda record: record.set_rollout_weight_version(version),
             what="set_rollout_weight_version",
-            deadline=time.monotonic() + self._control_timeout_s,
+            deadline=None,
         )
 
     # ------------------------------------------------------------------
     # Fence around the transfer
     # ------------------------------------------------------------------
 
-    def _restore_engines(self, indices: Sequence[int], *, deadline: float) -> list[str]:
+    def _restore_engines(
+        self, indices: Sequence[int], *, deadline: float | None
+    ) -> list[str]:
         """Resume ``indices``; return the failures."""
         errors: list[str] = []
         self._attempt(
@@ -715,15 +722,20 @@ class MegatronDynamoGeneration(GenerationInterface):
 
         If any step fails or the deadline passes, the fleet attempts a
         best-effort resume of every engine and the original error still
-        propagates, with any resume failures added to it as notes. A worker
-        that failed mid-transition may need the next refit to recover.
+        propagates, with any resume failures added to it as notes. The resume
+        shares the suspend's deadline: if the suspend used it up, the resumes
+        are still sent but not waited for, and the note says they were not
+        confirmed in time.
 
         Args:
-            timeout_s: One deadline for the whole suspend; ``None`` uses
-                ``dynamo_cfg.control_timeout_s``.
+            timeout_s: One deadline for the suspend and any resume after it;
+                ``None`` waits indefinitely, as on ``MegatronGeneration``.
+
+        Raises:
+            RuntimeError: When an engine misses the deadline; the message
+                names the engine.
         """
-        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
-        deadline = time.monotonic() + timeout_s
+        deadline = _deadline(timeout_s)
         indices = list(range(self.num_engines))
         try:
             self._call_engines(
@@ -733,11 +745,9 @@ class MegatronDynamoGeneration(GenerationInterface):
                 deadline=deadline,
             )
         except Exception as error:
-            # The weights are unchanged, so a plain resume puts each engine back
-            # in service. A fresh deadline: the suspend may have used up its own.
-            restore_errors = self._restore_engines(
-                indices, deadline=time.monotonic() + self._control_timeout_s
-            )
+            # The weights are unchanged, so a resume puts each engine back in
+            # service. Same deadline: the caller's budget covers the restore too.
+            restore_errors = self._restore_engines(indices, deadline=deadline)
             if restore_errors:
                 error.add_note(
                     "resuming engines after the failed suspend also failed: "
@@ -756,13 +766,12 @@ class MegatronDynamoGeneration(GenerationInterface):
         tags = kwargs.get("tags")
         if tags is None:
             return True
-        timeout_s = kwargs.get("timeout_s")
-        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         self._call_engines(
             range(self.num_engines),
             lambda record: record.prepare_for_generation(tags=list(tags)),
             what=f"prepare_for_generation({list(tags)})",
-            deadline=time.monotonic() + timeout_s,
+            # The caller's timeout_s; None waits indefinitely.
+            deadline=_deadline(kwargs.get("timeout_s")),
         )
         return True
 
@@ -772,12 +781,15 @@ class MegatronDynamoGeneration(GenerationInterface):
         Every engine is attempted even if another fails, so one bad engine
         does not keep the rest down.
 
+        Args:
+            timeout_s: One deadline for every engine's resume; ``None`` waits
+                indefinitely.
+
         Raises:
-            RuntimeError: Any engine failed to resume.
+            RuntimeError: Any engine failed to resume or missed the deadline.
         """
-        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         errors = self._restore_engines(
-            range(self.num_engines), deadline=time.monotonic() + timeout_s
+            range(self.num_engines), deadline=_deadline(timeout_s)
         )
         if errors:
             raise RuntimeError(
@@ -829,38 +841,27 @@ class MegatronDynamoGeneration(GenerationInterface):
     # Engine lifecycle
     # ------------------------------------------------------------------
 
-    def _start_engines(
-        self,
-        roles: Sequence[MegatronDynamoRole],
-        widths: Mapping[MegatronDynamoRole, int],
-    ) -> None:
-        """Bring up one engine per role, in role order.
+    def _start_engines(self, roles: Sequence[Role], widths: Sequence[int]) -> None:
+        """Bring up one engine per planned entry, in plan order.
 
         Args:
             roles: ``prefill`` / ``decode`` per engine, from
-                ``dynamo_config.engine_roles``; the order is the refit rank order.
-            widths: GPU ranks an engine of each role spans, from
-                ``dynamo_config.engine_widths``.
+                ``dynamo_config.plan_megatron_engines``; the order is the refit
+                rank order.
+            widths: GPU ranks each engine spans, parallel to ``roles``.
 
         Raises:
             ValueError: On an engine wider than a node, or more engines than
                 the node pins hold.
             RuntimeError: When an engine's GPUs land on more than one node.
         """
-        roles = list(roles)
-        # Distinct roles in first-seen order; typed so the per-role lookups
-        # below keep the role literal.
-        distinct_roles: list[MegatronDynamoRole] = []
-        for role in roles:
-            if role not in distinct_roles:
-                distinct_roles.append(role)
-        for role in distinct_roles:
-            if widths[role] > self._num_gpus_per_node:
+        for role, width in zip(roles, widths, strict=True):
+            if width > self._num_gpus_per_node:
                 raise ValueError(
-                    f"A Megatron {role} engine spans {widths[role]} GPUs "
+                    f"A Megatron {role} engine spans {width} GPUs "
                     f"but nodes have {self._num_gpus_per_node}; multi-node "
                     "engines are not supported behind Dynamo. Lower "
-                    f"policy.generation.dynamo_cfg.{role}_engine or "
+                    f"policy.generation.mcore_generation_config.{role}_engine or "
                     "mcore_generation_config tensor_model_parallel_size x "
                     "pipeline_model_parallel_size."
                 )
@@ -873,8 +874,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         pin_index_by_engine: list[int] = []
         node_index = 0
         used_on_node = 0
-        for role in roles:
-            width = widths[role]
+        for width in widths:
             if used_on_node + width > self._num_gpus_per_node:
                 node_index += 1
                 used_on_node = 0
@@ -882,7 +882,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             used_on_node += width
         nodes_needed = node_index + 1
         if constraints is not None and nodes_needed > len(constraints):
-            widths_by_role = {role: widths[role] for role in distinct_roles}
+            widths_by_role = dict(zip(roles, widths, strict=True))
             raise ValueError(
                 f"{len(roles)} Megatron engines of widths {widths_by_role} GPUs tile "
                 f"{nodes_needed} nodes of {self._num_gpus_per_node} GPUs, more "
@@ -890,17 +890,17 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         # Each role's engines are built from the policy config with that
         # role and its overrides.
-        policy_config_by_role: dict[str, dict[str, Any]] = {}
-        for role in distinct_roles:
-            policy_config_by_role[role] = role_policy_config(
-                self._policy_config, role, self._dynamo_cfg.role_overrides(role)
+        policy_config_by_role: dict[str, dict[str, Any]] = {
+            role: role_policy_config(
+                self._policy_config, role, role_overrides(self.cfg, role)
             )
+            for role in ROLES
+        }
         role_counts: dict[str, int] = {}
-        for engine_index, role in enumerate[MegatronDynamoRole](roles):
+        for engine_index, (role, width) in enumerate(zip(roles, widths, strict=True)):
             ordinal = role_counts.get(role, 0)
             role_counts[role] = ordinal + 1
             instance_id = f"{role}-{ordinal}"
-            width = widths[role]
             engine_policy_config = cast("PolicyConfig", policy_config_by_role[role])
             cluster = RayVirtualCluster(
                 name=f"dynamo_{self._fleet_id}_{instance_id}",

@@ -22,15 +22,15 @@ from types import SimpleNamespace
 import pytest
 import ray
 import torch
-from ray.exceptions import GetTimeoutError
+from ray.exceptions import GetTimeoutError, RayActorError
 
 import nemo_rl.models.generation.megatron.dynamo_generation as generation_module
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.megatron.dynamo_config import (
-    dynamo_enabled,
     engine_width,
-    megatron_dynamo_cfg,
+    role_overrides,
 )
 from nemo_rl.models.generation.megatron.dynamo_generation import (
     MegatronDynamoEngine,
@@ -52,7 +52,6 @@ _IDS = ["prefill-0", "decode-0", "decode-1"]
 # Short names for the refit log: instance id -> entry prefix.
 _SHORT = {"prefill-0": "p0", "decode-0": "d0", "decode-1": "d1"}
 _NAMES = list(_SHORT.values())
-_CONTROL_TIMEOUT_S = 600.0
 
 # The fakes the module under test is patched with; set by the ``env`` fixture.
 # Workers reach it by name so they stay picklable.
@@ -343,11 +342,7 @@ def _widths(width: int) -> dict[str, int]:
 
 
 def _with_layout(prefill: dict | None = None, decode: dict | None = None) -> dict:
-    generation = _megatron_config()
-    generation["dynamo_cfg"].update(
-        prefill_engine=prefill or {}, decode_engine=decode or {}
-    )
-    return generation
+    return _megatron_config(prefill_engine=prefill or {}, decode_engine=decode or {})
 
 
 # ---------------------------------------------------------------------------
@@ -493,12 +488,13 @@ def test_role_policy_config_merges_overrides_into_a_copy(
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_prefill_max_requests_caps_only_prefill(role):
     generation = _megatron_config()
-    generation["mcore_generation_config"] = {"max_requests": 64}
-    generation["dynamo_cfg"]["prefill_engine"] = {"max_requests": 256}
+    generation["mcore_generation_config"].update(
+        max_requests=64, prefill_engine={"max_requests": 256}
+    )
     shared = {**MEGATRON_POLICY, "generation": generation}
 
     engine_config = generation_module.role_policy_config(
-        shared, role, megatron_dynamo_cfg(generation).role_overrides(role)
+        shared, role, role_overrides(generation, role)
     )
 
     expected = 256 if role == "prefill" else 64
@@ -514,11 +510,13 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
     prefill/decode replica instead of its own width.
     """
     generation = _megatron_config()
-    generation["dynamo_cfg"]["prefill_engine"] = {"tensor_model_parallel_size": 4}
+    generation["mcore_generation_config"]["prefill_engine"] = {
+        "tensor_model_parallel_size": 4
+    }
     shared = {**MEGATRON_POLICY, "generation": generation}
 
     engine_config = generation_module.role_policy_config(
-        shared, role, megatron_dynamo_cfg(generation).role_overrides(role)
+        shared, role, role_overrides(generation, role)
     )
 
     assert not dynamo_enabled(engine_config["generation"])
@@ -543,7 +541,7 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
             {},
             {"tensor_model_parallel_size": 16},
             34,
-            r"decode engine spans 16 GPUs.*decode_engine",
+            r"decode engine spans 16 GPUs.*mcore_generation_config\.decode_engine",
             id="named_role",
         ),
     ],
@@ -660,7 +658,7 @@ def test_rejects_colocation_and_a_cluster_that_does_not_fit_the_replica(env):
         )
     generation_config = _megatron_config()
     generation_config["disaggregation"]["num_prefill_engines"] = 2
-    with pytest.raises(ValueError, match="not a multiple of one replica"):
+    with pytest.raises(ValueError, match="does not divide the 4 inference GPUs"):
         env.generation(generation_config, world_size=4)
     assert env.log == []
 
@@ -782,12 +780,7 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
     shard_widths = (prefill_tp, 2, 2)
     assert generation.shard_widths == shard_widths
     assert generation.inference_world_size == sum(shard_widths)
-    full = generation.full_fleet_membership(train_world_size=8)
-    assert full.shard_prefixes == dict(enumerate(prefixes))
-    assert full.workers_per_shard == shard_widths
-    generation.check_full_fleet(full)
-    # The full fleet is the one membership set_refit_membership accepts.
-    generation.set_refit_membership(full)
+    assert generation.engine_rank_offsets(8) == [8 + prefix for prefix in prefixes]
 
     assert generation.prepare_refit_info({"w": ((1,), "float32")}) is None
     futures = generation.init_collective(
@@ -807,9 +800,9 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
         + [f"{name}.update" for name in _NAMES]
         + [f"{name}.set_rollout_weight_version(3)" for name in _NAMES]
     )
-    # prepare_refit_info is bounded by the control timeout.
-    timeouts = env.refit_timeouts()
-    assert timeouts and all(t <= _CONTROL_TIMEOUT_S for t in timeouts)
+    # prepare_refit_info and set_rollout_weight_version take no deadline of
+    # their own, as on the other generation backends.
+    assert env.refit_timeouts() == []
     with pytest.raises(ValueError, match=f"does not match expected {world_size}"):
         generation.init_collective("10.0.0.9", 1234, world_size - 1, train_world_size=8)
     with pytest.raises(ValueError, match="must not be None"):
@@ -833,8 +826,24 @@ def test_refit_sequence_runs_every_phase_on_every_engine(env):
     log.clear()
     generation.resume_after_refit()
     assert log == [f"{name}.resume" for name in _NAMES]
-    # Every wait on an engine is bounded by the control timeout.
-    assert all(t <= _CONTROL_TIMEOUT_S for t in env.refit_timeouts())
+    # No timeout_s: no deadline, as on MegatronGeneration.
+    assert env.ray.get_timeouts and env.refit_timeouts() == []
+
+
+def test_a_caller_timeout_bounds_every_wait_of_that_call(env):
+    generation = env.started()
+    generation.suspend_for_refit(timeout_s=30.0)
+    generation.prepare_for_generation(tags=["kv_cache"], timeout_s=20.0)
+    generation.resume_after_refit(timeout_s=10.0)
+    timeouts = env.ray.get_timeouts
+    assert len(timeouts) == 3 * len(_NAMES)
+    suspend, prepare, resume = (
+        timeouts[i : i + len(_NAMES)] for i in range(0, len(timeouts), len(_NAMES))
+    )
+    # One deadline per call: each later engine gets what the earlier ones left.
+    assert all(0 < t <= 30.0 for t in suspend) and suspend == sorted(suspend)[::-1]
+    assert all(0 < t <= 20.0 for t in prepare)
+    assert all(0 < t <= 10.0 for t in resume)
 
 
 @pytest.mark.parametrize("engine", ["p0", "d1"], ids=["prefill", "decode"])
@@ -854,19 +863,49 @@ def test_a_failed_suspend_resumes_every_engine(env, engine):
 def test_a_hung_engine_call_times_out_and_the_engines_are_resumed(env):
     generation = env.started()
     env.engine("d0").faults["suspend_for_refit"] = "hang"
-    with pytest.raises(GetTimeoutError) as caught:
+    with pytest.raises(
+        RuntimeError, match="suspend_for_refit on Megatron engine decode-0"
+    ) as caught:
         generation.suspend_for_refit(timeout_s=0.5)
+    # Not a TimeoutError: the SingleController would take that for its own
+    # refit budget and drop the engine's name.
+    assert not isinstance(caught.value, TimeoutError)
+    assert isinstance(caught.value.__cause__, GetTimeoutError)
     assert "suspend_for_refit failed on engine decode-0" in "".join(
         caught.value.__notes__
     )
     assert [entry for entry in env.log if entry.endswith(".resume")] == [
         f"{name}.resume" for name in _NAMES
     ]
-    # The suspend waits share one deadline no longer than timeout_s; the
-    # restore that follows gets a fresh control-timeout deadline.
+    # The suspend and the restore after it share one deadline of timeout_s:
+    # the restore gets only what the suspend left, never a fresh budget.
     timeouts = env.refit_timeouts()
-    suspend_waits = timeouts[: -len(_NAMES)]
-    assert suspend_waits and all(t <= 0.5 for t in suspend_waits)
+    # p0's and d0's suspend waits (d0 times out), then one resume wait per engine.
+    assert len(timeouts) == 2 + len(_NAMES)
+    assert all(t <= 0.5 for t in timeouts)
+    assert timeouts == sorted(timeouts)[::-1]
+
+
+def test_a_restore_after_a_timed_out_suspend_is_reported_when_unconfirmed(env):
+    generation = env.started()
+    env.engine("d0").faults["suspend_for_refit"] = "hang"
+    env.engine("d0").faults["resume_after_refit"] = "hang"
+    with pytest.raises(RuntimeError, match="suspend_for_refit") as caught:
+        generation.suspend_for_refit(timeout_s=0.5)
+    notes = "".join(caught.value.__notes__)
+    assert "resuming engines after the failed suspend also failed" in notes
+    assert "resume_after_refit on Megatron engine decode-0 did not finish" in notes
+
+
+def test_a_dead_engine_still_raises_ray_actor_error(env):
+    """The controller recovers from RayActorError, so its type is kept."""
+    generation = env.started()
+    env.engine("d1").faults["suspend_for_refit"] = RayActorError()
+    with pytest.raises(RayActorError) as caught:
+        generation.suspend_for_refit(timeout_s=5.0)
+    assert "suspend_for_refit failed on engine decode-1" in "".join(
+        caught.value.__notes__
+    )
 
 
 def test_failed_restore_is_reported_on_the_original_error(env):
@@ -892,45 +931,33 @@ def test_resume_attempts_every_engine_and_reports_all_failures(env):
     ]
 
 
-@pytest.mark.parametrize(
-    ("prefill_tp", "membership", "match"),
-    [
-        pytest.param(
-            2,
-            dict(absent_shards=[1], dp_size=3, total_gen_workers=6),
-            "fixed fleet",
-            id="partial",
-        ),
-        # An evenly sharded membership would start the decode engines at the
-        # wrong ranks next to a wider prefill engine.
-        pytest.param(
-            4,
-            dict(absent_shards=[], dp_size=3, total_gen_workers=6),
-            r"ranks \[4, 2, 2\]",
-            id="uniform_prefixes_against_mixed_widths",
-        ),
-        # Same prefixes but a width that is not the engine's is refused too.
-        pytest.param(
-            4,
-            dict(
-                absent_shards=[], dp_size=3, total_gen_workers=8, shard_widths=(4, 3, 1)
-            ),
-            "fixed fleet",
-            id="mismatched_widths",
-        ),
-    ],
-)
-def test_refit_membership_must_be_every_engine_in_order(
-    env, prefill_tp, membership, match
-):
+def test_rank_offsets_continue_across_replicas(env):
+    """A second replica's engines start after the first replica's, not at the trainers."""
+    env.nodes = ["10.0.0.1"] * 3 + ["10.0.0.2"] * 3
     generation = env.started(
-        generation_config=_with_layout({"tensor_model_parallel_size": prefill_tp}),
-        world_size=prefill_tp + 4,
+        generation_config=_with_layout({"tensor_model_parallel_size": 4}),
+        world_size=16,
     )
-    generation.check_full_fleet(generation.full_fleet_membership(train_world_size=8))
-    with pytest.raises(NotImplementedError, match=match):
+    assert generation.shard_widths == (4, 2, 2, 4, 2, 2)
+    assert generation.engine_rank_offsets(8) == [8, 12, 14, 16, 20, 22]
+    # The offsets tile the generation block with no gap or overlap.
+    offsets = generation.engine_rank_offsets(8)
+    ends = [o + w for o, w in zip(offsets, generation.shard_widths, strict=True)]
+    assert offsets[1:] == ends[:-1] and ends[-1] == 8 + 16
+
+
+def test_refit_membership_must_be_every_engine(env):
+    generation = env.started()
+    generation.set_refit_membership(
+        desired_membership(
+            absent_shards=[], dp_size=3, total_gen_workers=6, train_world_size=8
+        )
+    )
+    with pytest.raises(NotImplementedError, match=r"fixed fleet.*got \[0, 2\]"):
         generation.set_refit_membership(
-            desired_membership(train_world_size=8, **membership)
+            desired_membership(
+                absent_shards=[1], dp_size=3, total_gen_workers=6, train_world_size=8
+            )
         )
 
 

@@ -1280,16 +1280,13 @@ class VllmGeneration(GenerationInterface):
         membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
-            shard_offsets = [
-                (shard_idx, shard_idx * per_shard) for shard_idx in range(self.dp_size)
-            ]
+            shard_indices = range(self.dp_size)
         else:
-            shard_offsets = [
-                (shard_idx, membership.worker_offset(shard_idx))
-                for shard_idx in membership.shard_prefixes
-            ]
+            per_shard = membership.workers_per_shard
+            shard_indices = membership.shard_prefixes
         leaders = []
-        for shard_idx, leader_idx in shard_offsets:
+        for shard_idx in shard_indices:
+            leader_idx = shard_idx * per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
                     f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
@@ -1334,7 +1331,7 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in rank_prefixes.items():
-            leader_idx = membership.worker_offset(shard_idx)
+            leader_idx = shard_idx * membership.workers_per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
                     f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
@@ -2030,7 +2027,7 @@ class VllmGeneration(GenerationInterface):
         workers = self.worker_group.workers
         futures: list[ray.ObjectRef] = []
         for shard_idx, rank_prefix in rank_prefixes.items():
-            leader = workers[membership.worker_offset(shard_idx)]
+            leader = workers[shard_idx * membership.workers_per_shard]
             futures.append(
                 getattr(leader, method_name).remote(
                     rank_prefix=rank_prefix,

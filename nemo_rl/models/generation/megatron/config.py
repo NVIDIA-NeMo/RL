@@ -13,13 +13,24 @@
 # limitations under the License.
 
 from collections.abc import Mapping
-from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NotRequired,
+    Optional,
+    TypedDict,
+    cast,
+)
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.megatron.dynamo_config import MegatronDynamoCfg
 
 
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
@@ -58,12 +69,36 @@ class MultimodalPromptConfigOverrides(BaseModel):
     content_part_order: Optional[Literal["preserve", "media_first"]] = None
 
 
+class EngineLayoutOverrides(BaseModel, extra="forbid"):
+    """``mcore_generation_config`` keys a prefill or decode engine sets for itself.
+
+    A field left ``None`` keeps the shared ``mcore_generation_config`` value.
+    The KV handoff reshards the cache between the two sides, so prefill and
+    decode engines may span different numbers of GPUs.
+    """
+
+    tensor_model_parallel_size: PositiveInt | None = None
+    pipeline_model_parallel_size: PositiveInt | None = None
+    # Cap on the requests one engine holds at once. A prefill engine keeps each
+    # finished prompt in a request slot until a decode engine claims it, so
+    # with every decode slot busy a shared cap also throttles prefill; set it
+    # here to size prefill's slots on their own.
+    max_requests: PositiveInt | None = None
+
+
+# Per-role keys of mcore_generation_config: they size one prefill or
+# decode engine behind Dynamo and never reach a model's megatron_cfg.
+ENGINE_ROLE_KEYS = ("prefill_engine", "decode_engine")
+
+
 class MCoreGenerationSpecificArgs(TypedDict):
     """Megatron fields related only to inference.
 
     Any fields not declared here but declared in the training-side config can be overwritten.
     For example, Megatron inference might want `transformer_impl: "inference_optimized"`,
     while Megatron training might want `transformer_impl: "transformer_engine"`.
+    `prefill_engine` and `decode_engine` are the exception: they are popped before
+    the merge and never reach `megatron_cfg`.
     """
 
     expose_http_server: bool
@@ -190,6 +225,11 @@ class MCoreGenerationSpecificArgs(TypedDict):
     fp8_cfg: NotRequired[Fp8Config]
     # Megatron Bridge provider fields without a first-class NeMo-RL setting.
     model_overrides: NotRequired[dict[str, Any]]
+    # Per-role layouts and request caps of the prefill and decode engines behind Dynamo
+    # (policy.generation.dynamo=true), on top of the layout above; as
+    # trtllm_cfg keeps its own prefill_engine / decode_engine.
+    prefill_engine: NotRequired[EngineLayoutOverrides]
+    decode_engine: NotRequired[EngineLayoutOverrides]
 
 
 class MCoreGenerationConfig(GenerationConfig):
@@ -201,10 +241,11 @@ class MCoreGenerationConfig(GenerationConfig):
     mcore_generation_config: MCoreGenerationSpecificArgs
     # Serve prefill/decode engines through a managed Dynamo frontend. The
     # engines are dedicated inference policies, one per role per replica, laid
-    # out by `disaggregation`; `dynamo_cfg` tunes the frontend, the timeouts and
-    # the per-role layouts (see megatron.dynamo_config.MegatronDynamoCfg).
+    # out by `disaggregation` and sized by mcore_generation_config's
+    # prefill_engine / decode_engine; `dynamo_cfg` tunes the frontend and the
+    # timeouts.
     dynamo: NotRequired[bool]
-    dynamo_cfg: NotRequired[dict[str, Any]]
+    dynamo_cfg: NotRequired["MegatronDynamoCfg"]
     # Not a user key: MegatronDynamoGeneration sets it on each engine's own copy
     # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
     # worker whose config carries it builds the prefill/decode handoff engine.
@@ -229,6 +270,8 @@ def merged_inference_megatron_cfg(
         **(generation_config.get("mcore_generation_config") or {}),
         **(overrides or {}),
     }
+    for role_key in ENGINE_ROLE_KEYS:
+        gen_overrides.pop(role_key, None)
     overrides = dict(gen_overrides)
     explicit_cp = overrides.pop("context_parallel_size", None)
     if explicit_cp is not None and explicit_cp != 1:
