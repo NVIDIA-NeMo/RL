@@ -76,6 +76,15 @@ assert_not_grep \
     "PD disaggregation is only wired for the HTTP/NeMo-Gym rollout" \
     "$RUN_LOG" \
     "Rollouts took the direct engine path instead of the disagg frontends"
+# The metric gates below read the same with or without disaggregation, so
+# grep for the frontend paths degrading silently. The SHADOW check only
+# samples while NRL_TOKENIZE_SHADOW_RATE > 0 (the recipe sets 0.1).
+assert_not_grep "frontend-tokenize SHADOW MISMATCH" "$RUN_LOG" \
+    "Frontend-rendered prompt ids differ from the engine's own render"
+assert_not_grep "frontend tokenize failed" "$RUN_LOG" \
+    "Frontend rendering failed and fell back to the prefill engine"
+assert_not_grep "reach the disaggregation frontend without" "$RUN_LOG" \
+    "Gym sent no conversation_id; prefill routing fell back to the first message"
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
@@ -87,7 +96,7 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # mismatch grows with the weight drift on this workload's shared prompt prefix,
 # with or without disaggregation; the first 10 steps stay below 1.03.
 uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/token_mult_prob_error"]) < 1.1' \
-    "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.1" \
-    'mean(data["train/gen_kl_error"]) < 0.02' \
-    'max(data["train/reward"]) > 0'
+    'median(data["train/token_mult_prob_error"]) < 1.05' \
+    "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.05" \
+    'mean(data["train/gen_kl_error"]) < 0.005' \
+    'mean(data["train/reward"]) > 0.1'

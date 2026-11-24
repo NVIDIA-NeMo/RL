@@ -105,7 +105,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             init_kwargs["bundle_indices"] = bundle_indices[1]
             # The placement-group index completes the engine's identity, which
             # the worker uses to find its own entry in trtllm_cfg's
-            # _engine_roles map (see TrtllmGeneration._engine_key). Local
+            # _engine_roles map (see disagg_layout.engine_key). Local
             # bundle indices alone are ambiguous across per-node PGs, which
             # each restart numbering at 0.
             init_kwargs["bundle_pg_idx"] = bundle_indices[0]

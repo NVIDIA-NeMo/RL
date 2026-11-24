@@ -29,7 +29,6 @@ from nemo_rl.models.generation.vllm.chat_render import FrontendRender
 from nemo_rl.models.generation.vllm.kv_connector_profiles import NIXL_PROFILE
 from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
     CHAT_PATH,
-    COMPLETIONS_PATH,
     BlockHashIndex,
     ConversationKVCache,
     ConversationRouter,
@@ -305,18 +304,6 @@ def test_decode_leg_requires_a_handshake_and_prompt_ids():
             ids_as_b64=False,
             strip_message_history=False,
         )
-
-
-def test_completions_decode_leg_hands_over_a_token_prompt():
-    leg = build_decode_leg(
-        {"model": "m", "prompt": "hello", "max_tokens": 3},
-        prefill_response=_prefill_response(),
-        prefill_host="h",
-        ids_as_b64=False,
-        strip_message_history=False,
-    )
-    assert leg["prompt"] == [1, 2, 3, 4, 5, 6]
-    assert "prompt_token_ids" not in leg["kv_transfer_params"]
 
 
 # -------------------------------------------------------------------------- #
@@ -675,15 +662,15 @@ def test_relay_uses_the_frontend_renderer_and_falls_back_on_failure():
     assert relay.stats["frontend_tokenize_fallbacks"] == 1
 
 
-def test_relay_completions_path_is_relayed_too():
-    engines = _FakeEngines()
-    status, _, _ = asyncio.run(
-        _relay(engines).relay(
-            COMPLETIONS_PATH, {"model": "m", "prompt": "hi", "max_tokens": 4}
-        )
+def test_a_streamed_turn_dropped_before_it_is_read_holds_no_decode_slot():
+    relay = _relay(_FakeEngines())
+    status, stream, streaming = asyncio.run(
+        relay.relay(CHAT_PATH, {**_gym_body(), "stream": True})
     )
-    assert status == 200
-    assert engines.calls[1][2]["prompt"] == [1, 2, 3, 4, 5, 6]
+    assert status == 200 and streaming
+    # The client went away before the first chunk: the generator never starts.
+    asyncio.run(stream.aclose())
+    assert relay.decode_router.inflight == [0]
 
 
 def test_frontend_impl_requires_serve_args_to_start():

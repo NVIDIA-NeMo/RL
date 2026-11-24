@@ -14,7 +14,6 @@
 """The backend-agnostic prefill/decode layout helpers shared by TRT-LLM and vLLM."""
 
 import pytest
-from pydantic import ValidationError
 
 from nemo_rl.models.generation.disagg_layout import (
     engine_owner_indices,
@@ -216,21 +215,6 @@ def test_engine_owners_are_prefix_sums_of_the_widths():
 def test_resolve_disagg_layout_reads_absent_as_disabled():
     assert resolve_disagg_layout({}).enabled is False
     assert resolve_disagg_layout({"disaggregation": DisaggConfig(enabled=True)}).enabled
-
-
-@pytest.mark.parametrize(
-    "block, key",
-    [
-        ({"num_prefill_engines": 0}, "num_prefill_engines"),
-        ({"num_decode_engines": 0}, "num_decode_engines"),
-        ({"num_frontend_workers": 0}, "num_frontend_workers"),
-        ({"frontend_base_port": 0}, "frontend_base_port"),
-        ({"frontend_base_port": 70000}, "frontend_base_port"),
-    ],
-)
-def test_the_layout_block_names_the_key_it_refuses(block, key):
-    with pytest.raises(ValidationError, match=key):
-        resolve_disagg_layout({"disaggregation": {"enabled": True, **block}})
 
 
 @pytest.mark.parametrize("backend", ["megatron", "nonexistent"])

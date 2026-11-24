@@ -681,7 +681,7 @@ class BaseVllmGenerationWorker:
             self.cfg, self.engine_cfg, disaggregated=self._disagg_role is not None
         )
         if self._disagg_role is not None:
-            seed = self._apply_disagg_engine_identity(seed)
+            seed = self._apply_disagg_engine_identity()
         # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
         # processor and re-applies them on the GPU in the vision tower's dtype. The
         # policy side normalizes on the CPU in fp32 through the same HF processor, so
@@ -941,7 +941,7 @@ class BaseVllmGenerationWorker:
             label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0
         )
 
-    def _apply_disagg_engine_identity(self, seed: Optional[int]) -> Optional[int]:
+    def _apply_disagg_engine_identity(self) -> int:
         """Take over the per-engine identity the driver assigned under disaggregation.
 
         ``configure_worker`` derives the engine's seed, VLLM_PORT slot and vLLM

@@ -4959,3 +4959,40 @@ def test_release_kv_transfer_pins_rejects_engines_without_a_pin_table(monkeypatc
     monkeypatch.setattr(backend, "has_kv_transfer_group", lambda: False)
     with pytest.raises(RuntimeError, match="has none"):
         ext.release_kv_transfer_pins()
+
+
+@pytest.mark.vllm
+def test_nixl_reaps_the_leases_release_kv_transfer_pins_zeroes(monkeypatch):
+    # release_kv_transfer_pins relies on vLLM's private lease table: a zeroed
+    # deadline must be reported as sent at the connector's next get_finished.
+    import time
+    from collections import defaultdict
+    from unittest import mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        NixlBaseConnectorWorker,
+    )
+
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    worker = NixlBaseConnectorWorker.__new__(NixlBaseConnectorWorker)
+    worker._reqs_to_send = {"r": time.perf_counter() + 480}
+    worker._reqs_to_process = {"r"}
+    worker.consumer_notification_counts_by_req = defaultdict(int)
+    worker.expected_consumer_notifications_by_req = {}
+    worker.xfer_stats = mock.Mock()
+    monkeypatch.setattr(backend, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(
+        backend,
+        "get_kv_transfer_group",
+        lambda: SimpleNamespace(connector_worker=worker),
+    )
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+
+    assert ext.release_kv_transfer_pins() == 1
+    done: set[str] = set()
+    worker._reap_expired_send_leases(done)  # what get_transfer_results runs each step
+    assert done == {"r"}
+    assert not worker._reqs_to_send and not worker._reqs_to_process

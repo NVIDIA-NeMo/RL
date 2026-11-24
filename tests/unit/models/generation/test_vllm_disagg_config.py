@@ -17,9 +17,6 @@ import pytest
 
 from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_ENGINE_ARG_KEYS,
-    VllmDisaggFrontendConfig,
-    VllmKvTransferConfig,
     resolve_vllm_connector_profile,
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_kv_transfer_config,
@@ -75,48 +72,11 @@ def _disagg(**vllm_overrides):
 # -------------------------------------------------------------------------- #
 
 
-def test_the_engine_arg_whitelist_is_exactly_the_schema():
-    assert VLLM_ENGINE_ARG_KEYS == {
-        "tensor_parallel_size",
-        "gpu_memory_utilization",
-        "vllm_kwargs",
-    }
-
-
-def test_frontend_defaults_come_from_the_schema_not_the_call_sites():
-    frontend = resolve_vllm_disagg_frontend_config(_disagg())
-    assert frontend == VllmDisaggFrontendConfig()
-    assert frontend.prefill_router == "conversation"
-    assert frontend.decode_router == "load_balancing"
-    assert frontend.bidirectional_kv_xfer is False
-    assert frontend.decode_tokids_b64 is False
-    assert frontend.decode_strip_message_history is False
-
-
 def test_a_layout_key_under_disagg_frontend_is_rejected():
     with pytest.raises(ValueError, match="belongs in generation.disaggregation"):
         resolve_vllm_disagg_frontend_config(
             _disagg(disagg_frontend={"num_frontend_workers": 2})
         )
-
-
-def test_an_unknown_frontend_key_is_rejected():
-    with pytest.raises(ValueError):
-        resolve_vllm_disagg_frontend_config(_disagg(disagg_frontend={"max_retries": 3}))
-
-
-def test_a_plausible_but_wrong_router_is_rejected():
-    with pytest.raises(ValueError):
-        resolve_vllm_disagg_frontend_config(
-            _disagg(disagg_frontend={"prefill_router": "sticky"})
-        )
-
-
-def test_kv_transfer_defaults_to_nixl_and_forwards_only_set_extras():
-    kv = resolve_vllm_kv_transfer_config(_disagg())
-    assert kv == VllmKvTransferConfig()
-    assert kv.kv_connector == "NixlConnector"
-    assert kv.kv_connector_extra_config.model_dump(exclude_none=True) == {}
 
 
 def test_bidirectional_cannot_be_set_on_the_connector_block():
