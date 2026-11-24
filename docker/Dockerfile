@@ -811,8 +811,18 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
             --index "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}" \
             --index-strategy unsafe-best-match \
             "${vllm_venv_overrides[@]}"
-        "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" -c \
-            'import torch, vllm, transformers.audio_utils; print("vllm venv override:", vllm.__version__, torch.__version__, torch.version.cuda)'
+        # flashinfer points Triton at the ptxas on PATH (the base image's CUDA toolkit)
+        # unless TRITON_PTXAS_BLACKWELL_PATH is already set. That ptxas can be older than
+        # the overridden torch needs, so keep Triton on the ptxas its own wheel ships.
+        venv_python="${NEMO_RL_VENV_DIR}/${venv_name}/bin/python"
+        venv_site="$("${venv_python}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        venv_ptxas="${venv_site}/triton/backends/nvidia/bin/ptxas-blackwell"
+        if [[ -x "${venv_ptxas}" ]]; then
+            echo "import os; os.environ.setdefault('TRITON_PTXAS_BLACKWELL_PATH', '${venv_ptxas}')" \
+                > "${venv_site}/nemo_rl_vllm_venv_override.pth"
+        fi
+        "${venv_python}" -c \
+            'import os, torch, vllm, transformers.audio_utils; print("vllm venv override:", vllm.__version__, torch.__version__, torch.version.cuda, os.environ.get("TRITON_PTXAS_BLACKWELL_PATH"))'
     done < /opt/actor_venvs.tsv
 fi
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in

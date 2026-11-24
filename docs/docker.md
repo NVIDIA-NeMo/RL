@@ -89,6 +89,8 @@ docker buildx build -f docker/Dockerfile \
 
 The value is a comma-separated list of exact pins. Override torch together with its companion packages (torchvision, torchaudio): torchaudio refuses to import next to a torch built for a different CUDA version. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX` (default: the PyTorch cu134 index).
 
+When the overridden venv has a Triton wheel with its own `ptxas-blackwell`, the build also sets `TRITON_PTXAS_BLACKWELL_PATH` to it for that venv (through a `.pth` file, unless the variable is already set). Otherwise flashinfer points Triton at the base image's `ptxas`, which can be too old for the GPU the overridden torch targets.
+
 The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.
 
 ## Stripping the uv Cache
