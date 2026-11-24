@@ -81,7 +81,7 @@ A template that fails any of these stops the server from starting. The turn-clos
 
 ## Trying it on a Gym recipe
 
-The interface has not been run on a multi-turn Gym recipe yet. To try it on the SWE smoke recipe that [Captured TITO](captured-tito.md#swe-compatibility-smoke) describes, keep that guide's setup and add these overrides to the launch command:
+The interface has run a two-step SWE smoke; the [design document](../design-docs/tito.md#swe-smoke) has the numbers. To run it on the SWE smoke recipe that [Captured TITO](captured-tito.md#swe-compatibility-smoke) describes, keep that guide's setup and add these overrides to the launch command:
 
 ```
 policy.generation.vllm_cfg.tito_model=null policy.generation.vllm_cfg.tito_interface=true

@@ -319,10 +319,10 @@ The value of the design is therefore: a contract where there was a side effect, 
 
 | Phase | Scope | Acceptance | Status |
 | --- | --- | --- | --- |
-| 0 | Root-reason counts and re-rooted token counts on the existing path | Distribution measured on the SWE recipe. This sizes the benefit of every later phase. | Metrics implemented. Not yet measured on a recipe. |
-| 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation, not on a rollout. |
-| 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations; the SWE recipe has not been run. |
-| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Not started. The matching rules live in Gym. |
+| 0 | Root-reason counts and re-rooted token counts on the existing path | Distribution measured on the SWE recipe. This sizes the benefit of every later phase. | Metrics implemented. Measured on a two-step SWE smoke only; see [SWE smoke](#swe-smoke). |
+| 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation and by training rows built from the route in a unit test. |
+| 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations. The SWE smoke ran two steps with identical root statistics in the first step; prompts were not compared token by token there. |
+| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Not started. The matching rules live in Gym, and the smoke shows no root reason that a rule change would recover. |
 | 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Not started. The Megatron chat endpoint lives in Megatron-LM. |
 
 ## Implementation status
@@ -345,6 +345,21 @@ What has been verified:
 | Same server: the second prompt submitted to the core route returns the same tokens and log probabilities as the chat route | Passed |
 | Same server: the existing merged-prefix test with the interface on and off | Same expected tokens on both paths |
 | Core route with Gym's capture: a root call and its continuation linearize into one training row | Tokens, loss mask, and log probabilities as expected |
+
+### SWE smoke
+
+Two GRPO steps of the SWE-bench Verified smoke recipe (Qwen3-0.6B, one prompt, two generations per prompt, seed 42), once with the interface off and once with it on. Both runs finished without a bridge error.
+
+| Step | Arm | Calls | Token-in | `first_call` roots | `no_prefix_match` roots | `finalize/rerooted_tokens` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | Off | 10 | 6 | 2 | 2 | 11504 |
+| 1 | On | 10 | 6 | 2 | 2 | 11504 |
+| 2 | Off | 2 | 0 | 2 | 0 | 0 |
+| 2 | On | 9 | 7 | 2 | 0 | 0 |
+
+The first step is the same in both arms, as expected when the two paths build the same prompts. The second step differs in how many calls the agent made, which this sample cannot attribute to the interface: sampling is not deterministic across runs and each step has two rollouts. The loss and gradient norm were zero in both arms, so the smoke shows that data flows through training and nothing about learning.
+
+The only root reason other than `first_call` was `no_prefix_match`, which no design that accepts text histories can recover. This sample gives no reason to change the root policy, and it is too small to rule one out.
 
 What the first implementation leaves out:
 
@@ -426,8 +441,8 @@ Yes. The design is built on it. The TITO path is the token capture path with one
 
 ## Not yet verified
 
-- No root-reason distribution has been measured, so the share of token shift this design removes is unknown.
-- The interface has not been run on a multi-turn Gym recipe. Throughput and the root rate under it are unmeasured.
+- No root-reason distribution has been measured at a useful sample size, so the share of token shift this design removes is unknown.
+- The interface has run only a two-step SWE smoke. Throughput is unmeasured, and the root-reason distribution comes from four rollouts.
 - Only the Qwen3 template has been qualified. Qualification is what establishes the bridge for any other template.
 - The bridge assumes every turn-close token ends a turn. A recipe whose `stop_token_ids` include a token that the template also emits inside a turn is not supported, and qualification does not detect it.
 - vLLM's own render, generate, and derender routes were read in the v0.33.0 source. The implementation calls the engine directly and does not use them.
