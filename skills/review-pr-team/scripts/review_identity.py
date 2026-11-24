@@ -378,6 +378,24 @@ def _gh(*args: str) -> str:
         )
 
 
+def _login() -> str | None:
+    """The reviewer's GitHub login, or None for a bot app token.
+
+    App tokens, such as the one Autobot reviews with, get HTTP 403 on `GET /user`: there is no
+    user behind them, so the review can never be a self-review. Any other failure (not logged
+    in, network, rate limit) is a broken setup and stops the review.
+    """
+    try:
+        return _gh("api", "user", "--jq", ".login").strip()
+    except subprocess.CalledProcessError as e:
+        if "HTTP 403" in (e.stderr or ""):
+            return None
+        sys.exit(
+            "Could not read your GitHub user with `gh api user`:\n"
+            f"{(e.stderr or '').strip()}\nRun `gh auth status` (or `gh auth login`) and retry."
+        )
+
+
 def _pr(pr: int) -> dict:
     info = json.loads(
         _gh("pr", "view", str(pr), "-R", REPO, "--json", "author,headRefOid")
@@ -416,8 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "footer" and not re.fullmatch(r"[0-9a-f]{40}", args.head or ""):
         parser.error("footer needs --head with the full SHA of the reviewed commit")
 
+    me = _login()
     pr = _pr(args.pr)
-    me = _gh("api", "user", "--jq", ".login").strip()
     kind = "self" if me == pr["author"]["login"] else "expert"
     ident = detect()
 
@@ -431,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(
-        f"Review kind: {kind} ({me}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
+        f"Review kind: {kind} ({me or 'bot-app-token'}); {ident.label()}, model {ident.model}, effort {ident.effort}; "
         f"review-pr-team rev {skill_revision()}"
     )
     repo_root = subprocess.run(
@@ -456,7 +474,9 @@ def main(argv: list[str] | None = None) -> int:
             f"Run /review-pr-team {args.pr} in a fresh Claude Code or Codex session with an allowed model."
         )
         return 3
-    if ident.transcript is None:
+    if me is None:
+        print("OK (bot-app-token)")
+    elif ident.transcript is None:
         print(
             "WARNING: no session log found, so same-session edits could not be checked"
         )
