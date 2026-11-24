@@ -1110,8 +1110,6 @@ def _patch_vllm_routed_experts_capture_router_fallback(
     return True
 
 
-
-
 def _radio_has_identity_checkpoint(model_config: "ModelConfig") -> bool:
     """Verify the original checkpoint's optional, absent identity LayerScales."""
     config = model_config.hf_config
@@ -1365,6 +1363,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_lilicorr_split_refit(patch_logger)
+    _patch_vllm_dflash_inplace_kv_buffers(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1496,6 +1495,82 @@ def _patch_vllm_lilicorr_split_refit(logger) -> None:
         write_back(content)
     logger.info("Patched LiLiCorr for split refits, dummy starts and in-place buffers.")
 
+
+_DFLASH_KV_BUFFERS_OLD = """    def _build_context_kv_buffers(
+        self,
+        layers_attn: list[nn.Module],
+        has_bias: bool,
+    ) -> None:
+        self._hidden_norm_weight = self.hidden_norm.weight.data
+"""
+_DFLASH_KV_BUFFERS_NEW = """    def _build_context_kv_buffers(
+        self,
+        layers_attn: list[nn.Module],
+        has_bias: bool,
+    ) -> None:
+        \"\"\"NeMo RL: rebuild, then refill the existing buffers IN PLACE.
+
+        The gpu model runner records the context K/V precompute inside the
+        drafter's FULL CUDA graph, so the graph holds these buffers' storage.
+        Every load_weights (each refit bucket) rebuilds them; rebinding new
+        tensors would leave the graph reading freed memory.
+        \"\"\"
+        names = ("_fused_kv_weight", "_fused_kv_bias", "_k_norm_weights")
+        previous = {name: getattr(self, name, None) for name in names}
+        self._nrl_build_context_kv_buffers(layers_attn, has_bias)
+        for name in names:
+            old, new = previous[name], getattr(self, name)
+            if (
+                old is not None
+                and new is not None
+                and old.shape == new.shape
+                and old.dtype == new.dtype
+                and old.device == new.device
+            ):
+                # Built during CUDA graph capture, so these are inference
+                # tensors; a refit runs outside InferenceMode.
+                with torch.inference_mode():
+                    old.copy_(new)
+                setattr(self, name, old)
+
+    def _nrl_build_context_kv_buffers(
+        self,
+        layers_attn: list[nn.Module],
+        has_bias: bool,
+    ) -> None:
+        self._hidden_norm_weight = self.hidden_norm.weight.data
+"""
+
+
+def _patch_vllm_dflash_inplace_kv_buffers(logger) -> None:
+    """Keep DFlash's fused context-K/V buffers at fixed addresses across refits.
+
+    vLLM 0.33's DFlash drafter rebuilds ``_fused_kv_weight``, ``_fused_kv_bias``
+    and ``_k_norm_weights`` with ``torch.cat``/``torch.stack`` on every
+    ``load_weights``. The gpu model runner captures the context K/V precompute
+    inside the drafter's FULL CUDA graph (``cudagraph_mode`` FULL_AND_PIECEWISE),
+    so after the first RL refit the graph replays against freed storage:
+    ``CUDA_ERROR_ILLEGAL_ADDRESS from cuGraphLaunch`` in
+    ``DFlashSpeculator.propose``. PIECEWISE runs the draft eagerly and never hit
+    it. Refill the buffers in place, as the LiLiCorr patch does for its head.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/qwen3_dflash.py")
+    except RuntimeError:
+        logger.info("vLLM has no DFlash drafter; skipping DFlash KV-buffer patch.")
+        return
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if _DFLASH_KV_BUFFERS_NEW in content:
+            return
+        if content.count(_DFLASH_KV_BUFFERS_OLD) != 1:
+            raise RuntimeError(
+                "DFlash KV-buffer patch requires the vLLM 0.33 qwen3_dflash.py or "
+                f"its patched form: {file_to_patch}"
+            )
+        write_back(content.replace(_DFLASH_KV_BUFFERS_OLD, _DFLASH_KV_BUFFERS_NEW, 1))
+    logger.info("Patched DFlash to refill its fused context-K/V buffers in place.")
+
+
 def _apply_vllm_patches(
     *,
     extra_env_vars: list[str] | None = None,
@@ -1515,6 +1590,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_lilicorr_split_refit(patch_logger)
+    _patch_vllm_dflash_inplace_kv_buffers(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
