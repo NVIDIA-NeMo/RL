@@ -99,9 +99,19 @@ class LiLiCorrLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor, attention_bias: torch.Tensor) -> torch.Tensor:
         """Pre-norm attention with an additive bias, then the MLP."""
         attn_input = self.attn_norm(hidden_states)
-        attn_output, _ = self.attn(
-            attn_input, attn_input, attn_input, attn_mask=attention_bias, need_weights=False
-        )
+        if attn_input.shape[0] == 0:
+            # A context-parallel rank can own no anchors in a microbatch, which leaves
+            # it an empty lattice. nn.MultiheadAttention cannot reshape an empty mask
+            # (the -1 dimension is ambiguous), and its output would be empty anyway.
+            # Tie the attention parameters and the bias (whose slot-bias parameters reach
+            # the loss only through this call) in at zero, so this rank still produces
+            # (zero) gradients for them, as its peers do, before the gradient reduction.
+            tie = sum(p.sum() for p in self.attn.parameters()) + attention_bias.sum()
+            attn_output = attn_input + 0.0 * tie
+        else:
+            attn_output, _ = self.attn(
+                attn_input, attn_input, attn_input, attn_mask=attention_bias, need_weights=False
+            )
         hidden_states = hidden_states + attn_output
         return hidden_states + self.mlp(self.mlp_norm(hidden_states))
 
@@ -403,8 +413,12 @@ class LiLiCorrHead(nn.Module):
         )
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_bias=attention_bias)
-        hidden_states = self.output_norm(hidden_states).reshape(bsz, n_blocks, n_slots, topk, -1)
-        anchor_state = self.anchor_norm(anchor_state).reshape(bsz, n_blocks, -1)
+        # Explicit widths, not -1: an empty lattice (no anchors on this rank) has zero
+        # elements, and torch cannot infer a -1 dimension from an empty tensor.
+        hidden_states = self.output_norm(hidden_states).reshape(
+            bsz, n_blocks, n_slots, topk, self.hidden_size
+        )
+        anchor_state = self.anchor_norm(anchor_state).reshape(bsz, n_blocks, self.hidden_size)
 
         anchor_for_candidate = anchor_state[:, :, None, None, :].expand_as(hidden_states)
         factor_hidden = F.silu(
