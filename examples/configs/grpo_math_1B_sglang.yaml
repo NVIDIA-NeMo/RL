@@ -70,8 +70,8 @@ policy:
         # Comma-separated IB devices for the transport; null lets it pick.
         ib_device: null
         # Router policy per role; power_of_two cannot start with zero workers.
-        prefill_policy: cache_aware
-        decode_policy: round_robin
+        prefill_router: cache_aware
+        decode_router: round_robin
         # Decode engines use the chunk cache; SGLang marks radix there experimental.
         decode_enable_radix_cache: false
       # Fault tolerance: probe serving health during generation and check engine

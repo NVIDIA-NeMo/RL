@@ -230,8 +230,8 @@ class SGLangGeneration(GenerationInterface):
         pd_args = None
         if self._disagg_cfg.enabled:
             pd_args = {
-                "prefill_policy": self._pd_cfg.prefill_policy,
-                "decode_policy": self._pd_cfg.decode_policy,
+                "prefill_policy": self._pd_cfg.prefill_router,
+                "decode_policy": self._pd_cfg.decode_router,
             }
         router_endpoints: list[tuple[str, int]] = []
         for _ in range(num_routers):

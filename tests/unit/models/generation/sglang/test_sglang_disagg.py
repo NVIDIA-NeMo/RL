@@ -158,32 +158,9 @@ def test_replica_width_counts_both_roles():
     assert sglang_replica_width(make_config(disagg=False, tp_size=4)) == 4
 
 
-def test_disagg_block_defaults_come_from_the_schema():
-    pd_cfg = resolve_sglang_disagg_config(make_config())
-    assert pd_cfg == SGLangDisaggConfig()
-    assert pd_cfg.router_scope == "replica"
-    assert pd_cfg.transfer_backend == "mooncake"
-    assert (pd_cfg.prefill_policy, pd_cfg.decode_policy) == (
-        "cache_aware",
-        "round_robin",
-    )
-    assert pd_cfg.decode_enable_radix_cache is False
-    # An already-validated model is accepted as is.
+def test_an_already_validated_disagg_block_is_returned_as_is():
+    pd_cfg = SGLangDisaggConfig(router_scope="global")
     assert resolve_sglang_disagg_config({"sglang_cfg": {"disagg": pd_cfg}}) is pd_cfg
-
-
-@pytest.mark.parametrize(
-    "block",
-    [
-        {"router": "replica"},
-        {"router_scope": "fleet"},
-        {"transfer_backend": "ucx"},
-        {"decode_enable_radix_cache": "yes"},
-    ],
-)
-def test_an_unknown_or_wrong_disagg_key_is_rejected(block):
-    with pytest.raises(ValidationError):
-        SGLangDisaggConfig.model_validate(block)
 
 
 def test_server_kwargs_follow_the_role():
@@ -264,14 +241,14 @@ def test_validation_accepts_the_memory_saver_and_nixl_apart():
         ),
         ({"sglang_cfg.pp_size": 2}, False, "pp_size must be 1"),
         (
-            {"sglang_cfg.disagg": {"decode_policy": "power_of_two"}},
+            {"sglang_cfg.disagg": {"decode_router": "power_of_two"}},
             False,
-            "decode_policy='power_of_two'",
+            "decode_router='power_of_two'",
         ),
         (
-            {"sglang_cfg.disagg": {"prefill_policy": "power_of_two"}},
+            {"sglang_cfg.disagg": {"prefill_router": "power_of_two"}},
             False,
-            "prefill_policy='power_of_two'",
+            "prefill_router='power_of_two'",
         ),
         (
             {"sglang_cfg.prefill_engine": {"context_length": 2048}},

@@ -186,14 +186,15 @@ class SGLangDisaggConfig(BaseModel, extra="forbid", strict=True):
     # ``--disaggregation-ib-device``: comma-separated IB devices for the
     # transport; None lets the transport pick.
     ib_device: str | None = None
-    # Per-role router policies (``--prefill-policy`` / ``--decode-policy``).
+    # Per-role router policies (``--prefill-policy`` / ``--decode-policy``),
+    # under the key names the vLLM frontend block uses.
     # NeMo RL sends token ids only, so cache_aware has no text to match and
     # picks the least-loaded engine; a prompt's samples share a replica through
     # NeMo RL's own per-router dispatch. power_of_two is refused: sglang-router
     # checks it against the workers configured at startup, and NeMo RL
     # registers its engines after the router is up.
-    prefill_policy: SGLangRouterPolicy = "cache_aware"
-    decode_policy: SGLangRouterPolicy = "round_robin"
+    prefill_router: SGLangRouterPolicy = "cache_aware"
+    decode_router: SGLangRouterPolicy = "round_robin"
     # ``--disaggregation-decode-enable-radix-cache``: SGLang marks it
     # experimental; off, decode engines use the chunk cache.
     decode_enable_radix_cache: bool = False
@@ -629,10 +630,10 @@ def validate_sglang_disaggregation(config: SGLangConfig, *, use_nemo_gym: bool) 
             "backend does not support pipeline parallelism yet."
         )
     for role in ("prefill", "decode"):
-        policy = getattr(pd_cfg, f"{role}_policy")
+        policy = getattr(pd_cfg, f"{role}_router")
         if policy == "power_of_two":
             raise ValueError(
-                f"sglang_cfg.disagg.{role}_policy='power_of_two' cannot start: "
+                f"sglang_cfg.disagg.{role}_router='power_of_two' cannot start: "
                 "sglang-router 0.3.2 validates it against the workers configured "
                 "at startup (at least two of the role), and NeMo RL registers its "
                 "engines after the router is up. Use round_robin or cache_aware."

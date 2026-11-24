@@ -202,8 +202,8 @@ policy:
       disagg:                         # defaults on SGLangDisaggConfig
         router_scope: replica         # replica | global
         transfer_backend: mooncake    # mooncake | nixl | mooncake_tcp
-        prefill_policy: cache_aware   # random | round_robin | cache_aware
-        decode_policy: round_robin
+        prefill_router: cache_aware   # random | round_robin | cache_aware
+        decode_router: round_robin
 ```
 
 Engines are laid out per replica as on the other backends (`nemo_rl/models/generation/sglang/utils/layout.py`); widths may differ per role. With `router_scope: replica` every replica gets its own router, so a request's KV never leaves the replica's placement domain, and NeMo RL spreads prompts over the routers: the samples of one prompt share a router, and so a replica, and a new prompt goes to the usable router with the fewest requests in flight; a router whose replica has lost an engine is skipped (`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`). Inside a router, `cache_aware` does not pick the prefill engine by prefix: NeMo RL sends token ids only, so the policy has no text to match and takes the least-loaded engine. `global` pools every engine behind one router, which balances decode fleet-wide at the price of cross-replica KV transfers. Routers start with empty pools and the engines register with their role and, for prefill, their bootstrap port; `power_of_two` is refused because sglang-router 0.3.2 validates it against the workers configured at startup.
