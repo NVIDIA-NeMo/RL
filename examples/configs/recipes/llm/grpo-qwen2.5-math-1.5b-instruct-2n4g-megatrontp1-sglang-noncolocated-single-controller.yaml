@@ -1,11 +1,11 @@
-# SingleController counterpart of grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-noncolocated.yaml
-# on one node: 4 trainer GPUs, and two tp_size 2 SGLang engines on the other 4. Unlike that
+# SingleController counterpart of grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated.yaml:
+# 4 trainer GPUs on one node, and two tp_size 2 SGLang engines on the other node's 4. Unlike that
 # synchronous recipe, generation runs one version ahead (max_lookahead_versions: 1 from the SC exemplar).
 defaults: ../../grpo_math_1B_sglang_single_controller.yaml
 grpo:
   max_num_steps: 450
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatrontp1-sglang-noncolocated-single-controller
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated-single-controller
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
   tokenizer:
@@ -32,10 +32,11 @@ policy:
 data:
   max_input_seq_length: 512
 logger:
-  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatrontp1-sglang-noncolocated-single-controller
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated-single-controller
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatrontp1-sglang-noncolocated-single-controller
+    name: grpo-qwen2.5-math-1.5b-instruct-2n4g-megatrontp1-sglang-noncolocated-single-controller
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
+  num_nodes: 2
