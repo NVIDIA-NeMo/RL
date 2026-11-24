@@ -695,16 +695,39 @@ class TestEnvHealthCheck:
         )
         assert never_resolves, "the health check was never actually polled"
 
-    def test_environments_without_a_health_check_are_skipped(self):
+    def test_environments_other_than_nemo_gym_are_not_asked(self):
         """Only NeMo-Gym has subprocess servers to lose; math envs must not trip this."""
+        asked = []
+
+        class _Handle:
+            health_check = SimpleNamespace(
+                remote=lambda: _completed(asked.append("math"))
+            )
+
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            # Any reported problem would end the pump with an error.
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={"math": _Handle()},
+        )
+        asyncio.run(_run_full_ticks(ctrl, 2))
+        assert asked == [], "an environment other than nemo_gym was asked"
+
+    def test_a_nemo_gym_entry_without_a_health_check_is_reported(self):
+        """An entry that cannot be asked is a problem, not a healthy environment."""
         ctrl = _make_controller(
             stats=RolloutStats(),
             inflight=0,
             stall_timeout_s=1000.0,
             gym_subprocess_check=True,
-            env_handles={"math": SimpleNamespace()},
+            env_handles={"nemo_gym": SimpleNamespace()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        problems = asyncio.run(ctrl._check_env_health(timeout_s=5.0))
+        assert len(problems) == 1, problems
+        assert "instance 'nemo_gym' reported unhealthy" in problems[0]
 
     def test_the_check_can_be_disabled(self):
         class _Handle:
@@ -716,10 +739,12 @@ class TestEnvHealthCheck:
             stats=RolloutStats(),
             inflight=0,
             stall_timeout_s=1000.0,
+            # Any reported problem would end the pump with an error.
+            stall_action="abort",
             gym_subprocess_check=False,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
 
     def test_an_unhealthy_actor_of_a_shard_set_is_named_by_its_instance_label(self):
         """A shard set is not an actor, so each actor it holds is asked and named."""
@@ -771,6 +796,25 @@ class TestEnvHealthCheck:
             "environment 'nemo_gym' instance 'search' reported unhealthy: "
             "Process `search` finished unexpectedly!"
         ]
+
+    def test_a_dead_actor_is_reported_by_its_instance_label(self):
+        """A dead actor is reported like any other problem, not raised.
+
+        NemoGym actors are never restarted. Once one dies, every later call raises
+        Ray's ActorDiedError, which is not a RuntimeError. Raised out of the check,
+        it would end the run even under stall_action="warn".
+        """
+        dead = _gym_actor(lambda: _failed(ray.exceptions.ActorDiedError()))
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            gym_subprocess_check=True,
+            env_handles={"nemo_gym": NemoGymShardSet(handles={"search": [dead]})},
+        )
+        problems = asyncio.run(ctrl._check_env_health(timeout_s=5.0))
+        assert len(problems) == 1, problems
+        assert "instance 'search' reported unhealthy" in problems[0]
 
     def test_a_shard_set_of_healthy_actors_reports_nothing(self):
         asked = []
