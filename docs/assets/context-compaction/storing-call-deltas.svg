@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="550" viewBox="0 0 1040 550" role="img" aria-labelledby="title desc"><title id="title">2. Store deltas; reconstruct one row</title><desc id="desc">Root c1 and delta c2 store three tokens each. A parent link joins them into one six-token row; brackets show inherited, new and total lengths.</desc>
+<!-- Visual conventions adapted from Terry Kong’s PR #4124 review illustrations. -->
+<rect width="1040" height="550" fill="#0d1117" rx="12"/>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif}.mono{font-family:Menlo,monospace}</style>
+<defs><marker id="arr-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#a7b0bc"/></marker></defs>
+<defs><marker id="arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#58a6ff"/></marker></defs>
+<defs><marker id="arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#bc8cff"/></marker></defs>
+<defs><marker id="arr-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#d29922"/></marker></defs>
+<defs><marker id="arr-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#3fb950"/></marker></defs>
+<text x="28" y="39" font-size="25" fill="#e6edf3" font-weight="700">2. Store deltas; reconstruct one row</text>
+<text x="28" y="83" font-size="18" fill="#bc8cff" font-weight="700">Captured records in TQ</text>
+<rect x="118" y="103" width="286" height="146" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+<text x="134" y="129" font-size="18" fill="#bc8cff" font-weight="700">c1 · root</text>
+<text x="134" y="152" font-size="15" fill="#a7b0bc">parent: none</text>
+<rect x="638" y="103" width="286" height="146" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+<text x="654" y="129" font-size="18" fill="#bc8cff" font-weight="700">c2 · delta</text>
+<text x="654" y="152" font-size="15" fill="#a7b0bc">parent: c1</text>
+<path d="M637 145L405 145" fill="none" stroke="#bc8cff" stroke-width="1.7" marker-end="url(#arr-purple)"/>
+<text x="520" y="127" font-size="14" fill="#bc8cff" text-anchor="middle">parent link</text>
+<rect x="154" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="186.0" y="196.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">10</text>
+<text x="186" y="232" font-size="15" fill="#58a6ff" text-anchor="middle">P</text>
+<rect x="226" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="258.0" y="196.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">11</text>
+<text x="258" y="232" font-size="15" fill="#58a6ff" text-anchor="middle">P</text>
+<rect x="298" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="330.0" y="196.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">1001</text>
+<text x="330" y="232" font-size="15" fill="#3fb950" text-anchor="middle">A1</text>
+<rect x="674" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="706.0" y="196.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">20</text>
+<text x="706" y="232" font-size="15" fill="#58a6ff" text-anchor="middle">O2</text>
+<rect x="746" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="778.0" y="196.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">21</text>
+<text x="778" y="232" font-size="15" fill="#58a6ff" text-anchor="middle">O2</text>
+<rect x="818" y="170" width="64" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="850.0" y="196.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">1002</text>
+<text x="850" y="232" font-size="15" fill="#3fb950" text-anchor="middle">A2</text>
+<path d="M261 250V286H412V321" fill="none" stroke="#bc8cff" stroke-width="1.7" marker-end="url(#arr-purple)"/>
+<path d="M781 250V286H628V321" fill="none" stroke="#bc8cff" stroke-width="1.7" marker-end="url(#arr-purple)"/>
+<text x="520" y="280" font-size="15" fill="#a7b0bc" text-anchor="middle">join accepted records</text>
+<text x="127" y="350" font-size="18" fill="#3fb950" font-weight="700">Training row</text>
+<rect x="308" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="340.0" y="353.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">10</text>
+<text x="340" y="390" font-size="15" fill="#58a6ff" text-anchor="middle">P</text>
+<rect x="380" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="412.0" y="353.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">11</text>
+<text x="412" y="390" font-size="15" fill="#58a6ff" text-anchor="middle">P</text>
+<rect x="452" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="484.0" y="353.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">1001</text>
+<text x="484" y="390" font-size="15" fill="#3fb950" text-anchor="middle">A1</text>
+<rect x="524" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="556.0" y="353.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">20</text>
+<text x="556" y="390" font-size="15" fill="#58a6ff" text-anchor="middle">O2</text>
+<rect x="596" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="628.0" y="353.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">21</text>
+<text x="628" y="390" font-size="15" fill="#58a6ff" text-anchor="middle">O2</text>
+<rect x="668" y="327" width="64" height="40" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="700.0" y="353.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">1002</text>
+<text x="700" y="390" font-size="15" fill="#3fb950" text-anchor="middle">A2</text>
+<path d="M308 399V407H516V399" fill="none" stroke="#bc8cff" stroke-width="1.7"/>
+<text x="412.0" y="431" font-size="15" fill="#bc8cff" text-anchor="middle">prev_len = 3</text>
+<path d="M524 399V407H732V399" fill="none" stroke="#d29922" stroke-width="1.7"/>
+<text x="628.0" y="431" font-size="15" fill="#d29922" text-anchor="middle">delta_len = 3</text>
+<path d="M308 444V452H732V444" fill="none" stroke="#a7b0bc" stroke-width="1.7"/>
+<text x="520.0" y="476" font-size="15" fill="#a7b0bc" text-anchor="middle">cum_len = 6</text>
+<rect x="28" y="492" width="28" height="26" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="42.0" y="511.0" font-size="18" fill="#58a6ff" font-weight="700" text-anchor="middle">0</text>
+<text x="65" y="511" font-size="14" fill="#a7b0bc">context / no loss</text>
+<rect x="292" y="492" width="28" height="26" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+<text x="306.0" y="511.0" font-size="18" fill="#3fb950" font-weight="700" text-anchor="middle">1</text>
+<text x="330" y="511" font-size="14" fill="#a7b0bc">selected generated token / loss</text>
+<text x="28" y="532" font-size="12" fill="#a7b0bc">Illustrative tokens · visual conventions adapted from Terry Kong</text>
+</svg>

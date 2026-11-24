@@ -209,7 +209,7 @@ def main(is_vlm: bool = False):
 
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     print("Applied CLI overrides")
 
     # Print config
@@ -218,10 +218,8 @@ def main(is_vlm: bool = False):
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
-        print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
-        )
+    if config.checkpointing.enabled:
+        print(f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}")
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited

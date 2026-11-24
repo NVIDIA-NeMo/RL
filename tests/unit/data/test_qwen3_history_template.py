@@ -20,20 +20,21 @@ import pickle
 from pathlib import Path
 
 import pytest
+import torch
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
+from nemo_rl.data.cross_tokenizer.native_chat import _render_and_tokenize_chat
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.processors import chat_kd_processor
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
-    CrossTokenizerCollator,
-    CrossTokenizerCollatorConfig,
-)
-from nemo_rl.data.xtoken.native_chat import _render_and_tokenize_chat
 
 ROOT = Path(__file__).resolve().parents[3]
 REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
@@ -345,6 +346,63 @@ def test_stock_qwen_ordinary_chat_trains_only_final_repeated_answer(
     if not cross_tokenizer:
         assert "teacher_0_input_ids" not in batch
         assert "alignment_0_pair_valid" not in batch
+
+
+@pytest.mark.parametrize("cross_tokenizer", [False, True])
+def test_stock_qwen_ce_covers_final_assistant_turn(
+    stock_qwen_tokenizer: PreTrainedTokenizerBase, cross_tokenizer: bool
+) -> None:
+    student = copy.deepcopy(stock_qwen_tokenizer)
+    teacher = copy.deepcopy(stock_qwen_tokenizer) if cross_tokenizer else None
+    datum = {
+        "message_log": [
+            {"role": "user", "content": "Please repeat Same answer"},
+            {"role": "assistant", "content": "Same answer"},
+            {"role": "user", "content": "Repeat it again"},
+            {"role": "assistant", "content": "Same answer"},
+        ],
+        "message_loss_mask": [0, 1, 0, 1],
+        "loss_multiplier": 1.0,
+        "idx": 71,
+    }
+
+    def collate(**options: bool):
+        collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(mode="chat"),
+            student_tokenizer=student,
+            teacher_tokenizers=[teacher],
+            aligners=[
+                TokenAligner(student, teacher, "unused.pt") if cross_tokenizer else None
+            ],
+            ctx_length_student=1024,
+            ctx_length_teachers=[1024],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
+            make_seq_div_by_student=64,
+            make_seq_div_by_teachers=[64],
+            **options,
+        )
+        return collator([copy.deepcopy(datum)])
+
+    default = collate()
+    batch = collate(ce_covers_assistant_turn=True)
+    input_ids = batch["input_ids"][0]
+    assert (
+        student.decode(input_ids[batch["token_mask"][0].bool()].tolist())
+        == "<|im_start|>assistant\n<think>\n\n</think>\n\nSame answer<|im_end|>\n"
+    )
+    assert (
+        student.decode(input_ids[batch["kd_token_mask"][0].bool()].tolist())
+        == "Same answer<|im_end|>"
+    )
+    assert torch.equal(batch["kd_token_mask"], default["token_mask"])
+    assert set(batch.keys()) == set(default.keys()) | {"kd_token_mask"}
+    for key, value in default.items():
+        if key == "token_mask":
+            continue
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(batch[key], value), key
+        else:
+            assert batch[key] == value, key
 
 
 def _native_collator(student, teacher, *, same_tokenizer=False):

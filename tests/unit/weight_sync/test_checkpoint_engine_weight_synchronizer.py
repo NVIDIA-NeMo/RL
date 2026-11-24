@@ -146,6 +146,7 @@ def _checkpoint_sync(
     )
     gen = _mock_generation(cfg={"vllm_cfg": {"async_engine": async_engine}})
     gen.dp_size = 2
+    gen.vllm_dp_size = 1
     gen.worker_group = _CheckpointWorkerGroup()
     return CheckpointEngineWeightSynchronizer(policy, gen, checkpoint_engine_config)
 
@@ -301,6 +302,17 @@ class TestCheckpointEngineWeightSynchronizer:
             "checkpoint_engine_rpc",
             "finalize_checkpoint_engine",
         )
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_checkpoint_engine_uses_instance_rank_prefixes(self, mock_ray):
+        sync = _checkpoint_sync(mock_ray)
+        sync._generation.dp_size = 4
+        sync._generation.vllm_dp_size = 2
+
+        sync._ensure_checkpoint_engine_ready()
+
+        method_args = sync._generation.worker_group.calls[-1][2]
+        assert [args[0] for args in method_args] == [0, 0, 2, 2]
 
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_release_after_refit_reprepares_each_sync(self, mock_ray):

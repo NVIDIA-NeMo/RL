@@ -39,7 +39,7 @@ It contains ~19,480 multiple-choice rows totalling ~9.72 GB across seven source 
 NeMo RL exposes the dataset under `dataset_name: audiomcq`. The wrapper performs an eager head-row asset probe at construction time, so a missing or partial snapshot fails fast with a clear error before any Ray actor or model spins up. To pre-stage:
 
 ```
-huggingface-cli download Harland/AudioMCQ-StrongAC-GeminiCoT --repo-type=dataset
+hf download Harland/AudioMCQ-StrongAC-GeminiCoT --repo-type=dataset
 ```
 
 Because the upstream manifest only ships a native `train` split, the wrapper synthesizes a deterministic held-out validation slice from `split_validation_size` + `seed` — the same train-and-validate-from-train convention used by AVQA. The 7B and 30B yamls set `data.train.split_validation_size` to an absolute count (256, matching `grpo.max_val_samples`); the held-out rows are exposed as the validation set and excluded from training (no leakage), and no separate `data.validation` entry is needed.

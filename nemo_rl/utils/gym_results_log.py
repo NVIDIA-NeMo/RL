@@ -178,10 +178,18 @@ def compact_gym_result(
         out["response"] = ref_tools(response)
 
     trajectory = out.get("ng_trajectory")
-    if isinstance(trajectory, Mapping) and trajectory.get("model_calls"):
+    projected_ids: set[str] = set()
+    if isinstance(trajectory, Mapping) and isinstance(
+        trajectory.get("model_calls"), list
+    ):
         calls = []
         for call in trajectory["model_calls"]:
+            if not isinstance(call, Mapping):
+                calls.append(call)
+                continue
             call = dict(call)
+            if isinstance(call_id := call.get("model_call_id"), str) and call_id:
+                projected_ids.add(call_id)
             request = call.get("request")
             if isinstance(request, Mapping):
                 request = ref_tools(request)
@@ -204,10 +212,17 @@ def compact_gym_result(
         out["ng_trajectory"] = {**trajectory, "model_calls": calls}
 
     capture = out.get("ng_model_call_capture")
-    if isinstance(capture, Mapping) and "calls" in capture:
-        out["ng_model_call_capture"] = {
-            k: v for k, v in capture.items() if k != "calls"
-        }
+    if isinstance(capture, Mapping) and isinstance(capture.get("calls"), list):
+        # Gym may omit the trajectory or project only some of the captured calls.
+        if all(
+            isinstance(call, Mapping)
+            and isinstance(call.get("model_call_id"), str)
+            and call["model_call_id"] in projected_ids
+            for call in capture["calls"]
+        ):
+            out["ng_model_call_capture"] = {
+                k: v for k, v in capture.items() if k != "calls"
+            }
 
     return _drop_nulls(out)
 

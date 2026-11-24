@@ -525,15 +525,20 @@ def test_route_fragments_survive_nccl_leader_broadcast(tmp_path):
     )
 
 
-def _nested_round_trip_body(rank: int):
+def _nested_round_trip_body(rank: int, *, source_device: str):
+    # A CUDA-sourced field must stay on each rank's own GPU, not the source's.
+    device = torch.device("cuda", rank) if source_device == "cuda" else "cpu"
     rows = [3, 1, 4]
     expected = {
         "input_ids": torch.nested.as_nested_tensor(
-            [torch.arange(n) + 10 * i for i, n in enumerate(rows)], layout=torch.jagged
+            [torch.arange(n) + 10 * i for i, n in enumerate(rows)],
+            layout=torch.jagged,
+            device=device,
         ),
         "routes_like": torch.nested.as_nested_tensor(
             [torch.full((n, 2), -i, dtype=torch.int16) for i, n in enumerate(rows)],
             layout=torch.jagged,
+            device=device,
         ),
         "hidden": torch.nested.as_nested_tensor(
             [
@@ -541,8 +546,9 @@ def _nested_round_trip_body(rank: int):
                 for n in rows
             ],
             layout=torch.jagged,
+            device=device,
         ),
-        "input_lengths": torch.tensor(rows),
+        "input_lengths": torch.tensor(rows, device=device),
     }
     data = BatchedDataDict(dict(expected)) if rank == 0 else None
     out = _broadcast_batched_data_dict(
@@ -556,16 +562,19 @@ def _nested_round_trip_body(rank: int):
         if value.is_nested:
             assert got.is_nested and got.layout == value.layout, key
             for got_row, row in zip(got.unbind(), value.unbind()):
-                assert torch.equal(got_row.cpu(), row), key
+                assert torch.equal(got_row.cpu(), row.cpu()), key
         else:
-            assert torch.equal(got.cpu(), value), key
+            assert torch.equal(got.cpu(), value.cpu()), key
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="two CUDA devices are required for NCCL broadcast",
 )
-def test_nested_tensors_survive_nccl_leader_broadcast(tmp_path):
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_nested_tensors_survive_nccl_leader_broadcast(tmp_path, source_device):
     _run_two_ranks(
-        _nested_round_trip_body, str(tmp_path / "init_nested"), backend="nccl"
+        partial(_nested_round_trip_body, source_device=source_device),
+        str(tmp_path / "init_nested"),
+        backend="nccl",
     )

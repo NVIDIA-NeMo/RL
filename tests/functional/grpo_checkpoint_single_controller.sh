@@ -6,7 +6,9 @@
 #
 # Covered: the SingleController (SC) path saves and restores a full
 # checkpoint across a training restart: model weights/optimizer + training
-# state, dataloader position, and the replay buffer. Two runs share one
+# state, dataloader position, and the replay buffer. Deferred finalize
+# (async_rl.defer_async_checkpoint_finalize) is on, so saves are published at a
+# later step boundary, the next save, or exit. Two runs share one
 # checkpoint_dir and one config (same max_num_steps, so Megatron train_iters
 # stays consistent across the restart):
 #   Run 1 sets a tiny checkpointing.checkpoint_must_save_by so the timeout
@@ -27,10 +29,11 @@ EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 CKPT_DIR=$EXP_DIR/ckpts
+SSD_DIR=$EXP_DIR/ssd  # absolute, node-local in CI
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR
-mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
+mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR $SSD_DIR
 
 # The windowed (over-sampled) sampler; its per-policy key is not in the
 # exemplar's in_order sampler block, hence the '+' append prefix.
@@ -55,11 +58,17 @@ TRAIN_CMD=(
     data_plane.enabled=true
     data_plane.impl=transfer_queue
     data_plane.backend=simple
+    # SSD offload on, so the data plane is saved and resumed with values on SSD:
+    # every token-level field of this run is >= 1 KiB.
+    data_plane.simple.ssd_offload.enabled=true
+    data_plane.simple.ssd_offload.path=$SSD_DIR
+    data_plane.simple.ssd_offload.threshold_bytes=1024
     async_rl.sampler.name=windowed
     +async_rl.sampler.max_staleness_versions=1
     async_rl.min_groups_for_streaming_train=2
     async_rl.max_inflight_prompts=4
     async_rl.max_buffered_rollouts=4
+    async_rl.defer_async_checkpoint_finalize=true
 )
 
 cd $PROJECT_ROOT
@@ -101,6 +110,13 @@ if compgen -G "$CKPT_DIR/tmp_step_*" > /dev/null; then
     exit 1
 fi
 echo "✅ step_1 checkpoint complete (weights, dataloader, TQ replay), no tmp leftovers"
+# (A count, not `| grep -q`: under pipefail an early grep exit fails the pipe.)
+N_SSD=$(find "$STEP1/data_plane" -path "*.blobs/*" -type f | wc -l)
+if (( N_SSD == 0 )); then
+    echo "FAIL: step_1 data-plane checkpoint holds no SSD-offloaded values"
+    exit 1
+fi
+echo "✅ step_1 data plane was saved with $N_SSD values on SSD"
 
 if ! grep -q '"current_step": 1' "$STEP1/training_info.json"; then
     echo "FAIL: training_info.json does not record current_step=1"
@@ -134,6 +150,13 @@ if ! grep -qF "replay group(s) from checkpoint" $EXP_DIR/run2.log; then
     exit 1
 fi
 echo "✅ dataloader and replay buffer restored from checkpoint"
+
+# With deferred finalize, step_2 is published at a later step boundary
+# (keep_top_k: 3 keeps steps 1, 2 and 4).
+if [[ ! -d "$CKPT_DIR/step_2" ]]; then
+    echo "FAIL: run2 did not publish the deferred step_2 checkpoint"
+    exit 1
+fi
 
 STEP4=$CKPT_DIR/step_4
 if [[ ! -e "$STEP4/training_info.json" ]]; then

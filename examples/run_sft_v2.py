@@ -32,6 +32,7 @@ from nemo_rl.algorithms.sft_v2 import (
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.telemetry.instrumentation import (
+    current_trace_carrier,
     dispatch_with_trace_context,
     setup_span,
     startup_span,
@@ -92,7 +93,11 @@ def main() -> None:
                     )
                 with setup_span("workers"):
                     actor_args = setup_sft_v2(master_config, processor)
-            controller = SFTSingleControllerActor.remote(master_config, actor_args)
+            # __init__ builds the loaders, and Ray carries no context into a
+            # constructor, so the carrier goes over as an argument.
+            controller = SFTSingleControllerActor.remote(
+                master_config, actor_args, trace_carrier=current_trace_carrier()
+            )
             try:
                 result = ray.get(
                     dispatch_with_trace_context(controller.run_with_trace_context)

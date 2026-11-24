@@ -67,7 +67,7 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
 
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].aligner.projection_matrix_path` (null => same-vocab direct
     # KL; set => cross-tokenizer). The consistency check (a same-vocab teacher
@@ -79,9 +79,9 @@ def main() -> None:
     pprint.pprint(config)
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
-    if config.checkpointing["enabled"]:
+    if config.checkpointing.enabled:
         print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}",
+            f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}",
             flush=True,
         )
 

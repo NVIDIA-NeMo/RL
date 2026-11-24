@@ -157,6 +157,7 @@ class _StreamingSelf:
         self.cfg = {}
         self.head_server_config = object()
         self._token_capture_enabled = False
+        self._forest_training = False
         self._tokenizer = object()
         self._gym_results_cfg = {
             "dir": str(tmp_path),
@@ -204,7 +205,7 @@ def test_results_are_logged_raw_and_failures_name_their_rollouts(tmp_path):
         "response": {"output": [{"generation_token_ids": [5, 6]}]},
     }
 
-    def run_examples(examples, head_server_config):
+    def run_examples(examples, head_server_config, *, route_failures_to_sidecar):
         async def ok():
             return examples[0], raw
 
@@ -241,7 +242,7 @@ def test_results_are_logged_raw_and_failures_name_their_rollouts(tmp_path):
 
 
 def test_a_result_rl_cannot_postprocess_is_logged_then_raised(tmp_path):
-    def run_examples(examples, head_server_config):
+    def run_examples(examples, head_server_config, *, route_failures_to_sidecar):
         async def ok():
             return examples[0], {"reward": 0.0, "response": {"output": []}}
 
@@ -261,11 +262,12 @@ def test_a_result_rl_cannot_postprocess_is_logged_then_raised(tmp_path):
     assert [r["rollout_id"] for r in error_line["rollouts"]] == ["group_g0_a1"]
 
 
-def test_merged_model_calls_stay_out_of_the_result_rl_receives(tmp_path):
-    rollout_collection = pytest.importorskip("nemo_gym.rollout_collection")
-    if not hasattr(rollout_collection, "enrich_run_result"):
-        pytest.skip("this NeMo-Gym predates enrich_run_result")
-    from nemo_gym.base_responses_api_model import CaptureStore
+@pytest.mark.parametrize("with_task_index", [False, True])
+def test_merged_model_calls_stay_out_of_the_result_rl_receives(
+    tmp_path, with_task_index
+):
+    pytest.importorskip("nemo_gym")
+    from nemo_gym.models.model_call_capture import CaptureStore
 
     capture_dir = tmp_path / "calls"
     # Left over from an earlier dispatch of the same rollout id: cleared first.
@@ -275,7 +277,7 @@ def test_merged_model_calls_stay_out_of_the_result_rl_receives(tmp_path):
     raw = {"reward": 1.0, "response": {"output": []}}
     received = []
 
-    def run_examples(examples, head_server_config):
+    def run_examples(examples, head_server_config, *, route_failures_to_sidecar):
         async def ok():
             # The model server records the call while the rollout runs.
             CaptureStore(capture_dir).record(
@@ -304,10 +306,16 @@ def test_merged_model_calls_stay_out_of_the_result_rl_receives(tmp_path):
             "model_call_capture_dir": str(capture_dir),
         }
     }
-    asyncio.run(_drain(gym, [_row(0)]))
+    row = _row(0)
+    if with_task_index:
+        row["_ng_task_index"] = 0
+    asyncio.run(_drain(gym, [row]))
 
     [line] = _lines(gym._gym_results_log)
-    [call] = line["full_result"]["ng_trajectory"]["model_calls"]
+    if with_task_index:
+        [call] = line["full_result"]["ng_trajectory"]["model_calls"]
+    else:
+        [call] = line["full_result"]["ng_model_call_capture"]["calls"]
     assert call["model_call_id"] == "c1"
     assert call["request"]["input"][0]["content"] == "q"
     # The trainer-bound result is untouched, and the merged file is gone.

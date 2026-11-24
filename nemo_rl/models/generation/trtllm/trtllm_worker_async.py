@@ -212,11 +212,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # placement_bundle_indices / per_worker_gpu_share named params that
         # unconditionally overwrite kwargs["ray_placement_config"] — so we
         # must pass these as top-level kwargs, not via ray_placement_config.
-        print(
-            f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}, "
-            f"pg={pg}, bundle_specs={pg.bundle_specs}",
-            flush=True,
-        )
+        print(f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}", flush=True)
 
         # TRT-LLM expects one bundle-index list per placement group. A unified
         # PG can contain bundles on multiple nodes, allowing one TP replica to
@@ -229,6 +225,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=engine_cfg["precision"],
+            # Dummy weights skip a checkpoint read that the first training refit overwrites.
+            load_format=engine_cfg["load_format"],
             max_seq_len=engine_cfg["max_model_len"],
             max_batch_size=engine_cfg["max_batch_size"],
             max_num_tokens=engine_cfg["max_num_tokens"],
@@ -427,6 +425,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import (
+            check_fastokens_applied,
+            maybe_patch_fastokens,
+        )
+
+        # Apply fastokens inside this Ray actor before constructing the tokenizer.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
         from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
@@ -435,6 +441,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = check_fastokens_applied(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -449,12 +457,19 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
             },
+            # grpo.validate() stamps validation rollouts with this profile.
+            val_sampling_config={
+                "temperature": self.cfg["val_temperature"],
+                "top_p": self.cfg["val_top_p"],
+                "top_k": self.cfg["val_top_k"],
+            },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.engine_cfg.get(
                 "default_chat_template_kwargs"
             ),
             tool_parser=self.engine_cfg.get("tool_parser"),
             reasoning_parser=self.engine_cfg.get("reasoning_parser"),
+            chat_template=self.engine_cfg.get("chat_template"),
         )
         # host:port of the URL just returned; the disagg server is configured
         # with addresses, not URLs.
@@ -586,6 +601,75 @@ class TrtllmAsyncGenerationWorkerImpl:
             # Raise instead of returning False so the engine-side cause reaches
             # the caller.
             raise RuntimeError(f"TRT-LLM IPC weight update failed: {e!r}") from e
+
+    # ---- nccl_reshard (shard-to-shard) refit ------------------------------
+    async def init_nccl_reshard_comm_group_async(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        assert self.llm is not None
+        await self.llm.collective_rpc(
+            "init_nccl_reshard_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
+        assert self.llm is not None
+        await self.llm.collective_rpc(
+            "prepare_nccl_reshard_refit_info", args=(refit_info,)
+        )
+
+    async def nccl_reshard_refit_async(
+        self,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        drain: bool = True,
+        recompute_kv: bool = False,
+    ) -> bool:
+        """Receive one refit shard-to-shard on every GPU worker of this engine."""
+        assert self.llm is not None
+        try:
+            results = await self.llm.collective_rpc(
+                "nccl_reshard_refit",
+                kwargs={
+                    "refit_timeout_s": refit_timeout_s,
+                    "drain": drain,
+                    "recompute_kv": recompute_kv,
+                },
+            )
+            if not results:
+                print("Error: TRT-LLM nccl_reshard refit returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
+                print(
+                    "Error: TRT-LLM workers failed the nccl_reshard refit. "
+                    f"Results: {failed_workers}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during TRT-LLM nccl_reshard refit: {e}")
+            import traceback
+
+            traceback.print_exc()
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM nccl_reshard refit failed: {e!r}") from e
 
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None

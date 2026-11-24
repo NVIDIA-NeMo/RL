@@ -21,11 +21,16 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
-# Gym's run-body rollout id. Token capture stamps its gate id; otherwise the
-# row builder derives a unique one, so every rollout has one capture key.
+# Gym's run-body rollout id, shared between capture, logging and RL.
 NEMO_GYM_ROLLOUT_ID_KEY = "_ng_rollout_id"
 # Trainer weight version when the row was dispatched, for the Gym-results log.
 NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY = "_ng_dispatch_weight_version"
+# Names owned by Gym (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL), copied because their
+# readers cannot import nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat route also
+# serves workers built without nemo_gym (the ModelOpt workers). A test checks they still match.
+NEMO_GYM_MODEL_SAMPLING_KEY = "_ng_model_sampling"
+NEMO_GYM_MODEL_SAMPLING_HEADER = "x-ng-sampling"
+NEMO_GYM_MODEL_SAMPLING_NULL = "null"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
@@ -54,6 +59,9 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    # The environment's reward before effort shaping and reward penalties, which
+    # dynamic sampling filters on. ``None`` means nothing rewrote ``reward``.
+    reward_original: Optional[float] = None
 
 
 @dataclass

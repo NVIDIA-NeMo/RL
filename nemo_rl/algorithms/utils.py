@@ -32,6 +32,8 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
     should_use_deepseek_v4_chat_template,
 )
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
+from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.telemetry.vocabulary import (
     EFFICIENCY_PCT_KEY,
@@ -249,9 +251,7 @@ def calculate_trivial_reward_distributions(
     for prompt in torch.unique(prompts, dim=0):
         prompt_mask = (prompts == prompt).all(1)
         valid_rewards = rewards[prompt_mask & valid_mask.bool()]
-        is_trivial = valid_rewards.numel() <= 1 or (
-            valid_rewards.amin() == valid_rewards.amax()
-        )
+        is_trivial = rewards_carry_no_signal(valid_rewards.tolist())
         is_trivial_prompt_distribution[prompt_mask] = is_trivial
 
     return is_trivial_prompt_distribution
@@ -290,21 +290,6 @@ def compute_seq_logprob_errors(
     return errors, valid
 
 
-def masked_mean(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    dim: Optional[int] = None,
-    global_normalization_factor: Optional[torch.Tensor | float] = None,
-):
-    """Computes the mean of a microbatch, using a global statistic as the normalization factor."""
-    normalization_factor = (
-        torch.sum(mask, dim=dim)
-        if global_normalization_factor is None
-        else global_normalization_factor
-    )
-    return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
-
-
 def mask_filtered_logprobs_outside_tokens(
     logprobs: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -323,26 +308,6 @@ def mask_filtered_logprobs_outside_tokens(
         Log probabilities with zeros outside ``mask``.
     """
     return torch.where(mask.bool(), logprobs, 0.0)
-
-
-def masked_var(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    mean: Optional[torch.Tensor | float] = None,
-    unbiased: bool = True,
-) -> torch.Tensor:
-    if mean is None:
-        mean = masked_mean(values, mask)
-    centered_values = values - mean
-    variance = masked_mean(centered_values.pow(2), mask)
-
-    if unbiased:
-        normalization_factor = torch.sum(mask)
-        # A singleton has zero centered variance; avoid an undefined correction.
-        variance = variance * (
-            normalization_factor / (normalization_factor - 1).clamp(min=1)
-        )
-    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -454,6 +419,12 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def set_chat_template(chat_template: str) -> None:
+        """Keep placeholder-style processors synchronized with their tokenizer."""
+        tokenizer.chat_template = chat_template
+        if processor is not None and uses_image_placeholder(processor):
+            processor.chat_template = chat_template
+
     use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
     chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
     if chat_template_kwargs is not None:
@@ -468,7 +439,7 @@ def get_tokenizer(
     elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+            set_chat_template(COMMON_CHAT_TEMPLATES.passthrough_prompt_response)
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         elif tokenizer_config["chat_template"].endswith(".jinja"):
@@ -476,10 +447,10 @@ def get_tokenizer(
             template_path = tokenizer_config["chat_template"]
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
-                tokenizer.chat_template = f.read()
+                set_chat_template(f.read())
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            set_chat_template(tokenizer_config["chat_template"])
     else:
         print("No chat template provided, using tokenizer's default")
 
@@ -718,10 +689,6 @@ def print_performance_metrics(
                 break
             timeline = []
             length = len(metric_values)
-            if timeline_interval is not None:
-                count_zeros = lambda x: sum(v == 0 for v in x)
-                idle = count_zeros(metric_values) * timeline_interval
-                active = length * timeline_interval - idle
             if length > max_timeline_length:
                 resized_metric_values = resize_timeline(
                     metric_values, max_timeline_length
@@ -737,6 +704,9 @@ def print_performance_metrics(
                 )
                 timeline.append(m)
             if timeline_interval is not None:
+                count_zeros = lambda x: sum(v == 0 for v in x)
+                idle = count_zeros(metric_values) * timeline_interval
+                active = length * timeline_interval - idle
                 print(
                     f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)} (Active: {active:.2f} s, Idle: {idle:.2f} s)"
                 )
@@ -831,7 +801,7 @@ def print_performance_metrics(
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
-            if exposed_generation_time > 0.1
+            if exposed_generation_time < 0.1
             else exposed_generation_time
             / (
                 policy_training_time
