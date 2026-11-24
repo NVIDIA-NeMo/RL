@@ -404,14 +404,14 @@ The rollouts of one prompt group should start from the same first prompt. An age
 
 The rollouts that the metrics count depend on the rollout path:
 
-- **Synchronous GRPO, PPO, and distillation**, and their validation, process a whole batch in one call, so the metrics count over the batch. When every group shares its first prompt, `distinct_first_prompts` is at most `logical_groups`.
+- **Synchronous GRPO, PPO, and distillation**, and the validation of GRPO and distillation, process a whole batch in one call, so the metrics count over the batch. When every group shares its first prompt, `distinct_first_prompts` is at most `logical_groups`.
 - **Async GRPO and SingleController** compute the metrics for each prompt group, and a training step logs the mean of each metric over its groups. `logical_groups` is 1 there, and `distinct_first_prompts` is 1 when every group shares its first prompt.
 
 The synchronous paths and async GRPO also log a warning when the rollouts of at least one prompt group do not share the same first prompt. The warning names the attribution keys of those groups (the Agent name of a flat row, `task_id.taskset` of a materialized task) and is logged once per key in a process. A group of one rollout cannot differ, so a batch with one generation per prompt logs no warning. SingleController logs no warning.
 
 With token capture, the results of a SingleController group are receipts that carry no prompt tokens, and the group reports none of the three metrics.
 
-The diagnostic only reports. GRPO forms its baseline groups from prompt-group IDs, not from first-prompt tokens, so the grouping does not change.
+GRPO forms its baseline groups from prompt-group IDs, not from first-prompt tokens, so the grouping does not change.
 
 ## Data Format Translation
 

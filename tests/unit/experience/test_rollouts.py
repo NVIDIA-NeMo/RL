@@ -3797,7 +3797,10 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert distinct.rollout_metrics["baseline_groups/logical_groups"] == 1
     [record] = warnings()
     assert record.levelname == "WARNING"
-    assert "form 1 logical prompt group(s) with 2 distinct" in record.getMessage()
+    assert (
+        "2 NeMo-Gym rollouts form 1 logical prompt group(s) with 2 distinct"
+        in record.getMessage()
+    )
     assert "do not share the same first prompt" in record.getMessage()
     assert "attribution key(s) ['agent']" in record.getMessage()
 
