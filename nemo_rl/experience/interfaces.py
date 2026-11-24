@@ -58,6 +58,10 @@ class Completion:
     # The environment's reward before effort shaping and reward penalties, which
     # dynamic sampling filters on. ``None`` means nothing rewrote ``reward``.
     reward_original: Optional[float] = None
+    # Per-component rewards of a multi-reward environment, keyed
+    # ``reward/<name>``. Effort shaping and reward penalties change ``reward``
+    # but not these. ``None`` for a single-reward environment.
+    reward_components: Optional[dict[str, float]] = None
 
 
 @dataclass
