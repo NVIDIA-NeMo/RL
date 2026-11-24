@@ -69,6 +69,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
+    validate_forest_routers,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -570,6 +571,10 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
 
+    def validate_forest_execution_padding(self) -> None:
+        """Apply the policy's Forest router checks to the critic."""
+        validate_forest_routers(self.model)
+
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
             self.model.enable_forward_pre_hook()
@@ -755,12 +760,9 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 losses.append(torch.tensor(mb_losses).sum().item())
 
         if not eval_mode:
-            # Step LR scheduler once per train() call, not per global batch.
-            # Megatron's OptimizerParamScheduler.step takes an `increment` in
-            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
-            # passing increment=gbs cancels that scaling and one tick == one
-            # train() call regardless of batch size.
-            self.scheduler.step(increment=gbs)
+            # The schedule is sized in configured-batch samples, so one train()
+            # call ticks by the configured size even when gbs is the Forest row count.
+            self.scheduler.step(increment=self.cfg["train_global_batch_size"])
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)
@@ -984,7 +986,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             )
             lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
             wd = self.scheduler.get_wd()
-            self.scheduler.step(increment=state.gbs)
+            # One tick per step by the configured size, as in train().
+            self.scheduler.step(increment=self.cfg["train_global_batch_size"])
             normalizers = getattr(state.loss_fn, "metric_normalizations", {})
             mb_metrics = defaultdict(list)
             for metrics in state.metrics:
