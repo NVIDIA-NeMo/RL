@@ -14,7 +14,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -225,12 +225,14 @@ class DisaggConfig(BaseModel, extra="allow"):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
-    # Co-resident Megatron generation uses dedicated processes on the training GPUs. With the default MPS backend,
-    # this fraction determines the learner TE grouped-GEMM margin; both clients remain uncapped.
+    # Zero gives both co-resident clients full SM access. A positive fraction with
+    # mps_percentage caps the learner at the complementary share.
     engine_sm_fraction: NotRequired[float | None]
-    # Scheduling backend: "mps_gemm" (default, advisory learner GEMM budget),
-    # "mps_percentage" (learner cap), or "mps_static" (requires pre-created driver partitions).
+    # mps_percentage (default) or mps_static (pre-created driver partitions).
     sm_partition_backend: NotRequired[str | None]
+    # MPS client scheduling hints: 0 = normal, 1 = below normal. None inherits the worker environment.
+    learner_mps_priority: NotRequired[Literal[0, 1] | None]
+    inference_mps_priority: NotRequired[Literal[0, 1] | None]
     # Co-resident engine weights: "copy" (default; own copy, per-step refit copy) or "shared" (maps the learner's
     # weights where the local shards match; pauses only around the optimizer step).
     engine_weights: NotRequired[str | None]

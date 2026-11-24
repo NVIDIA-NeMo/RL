@@ -50,7 +50,6 @@ policy:
     env_vars:
       OMP_NUM_THREADS: '2'
       MKL_NUM_THREADS: '2'
-      CUDA_MPS_CLIENT_PRIORITY: '1'
     recompute_granularity: selective
     recompute_modules:
     - moe_act
@@ -95,16 +94,16 @@ policy:
       env_vars:
         OMP_NUM_THREADS: '2'
         MKL_NUM_THREADS: '2'
-        CUDA_MPS_CLIENT_PRIORITY: '0'
     # Separate engine processes, placed on the training GPUs by the MPS path.
     colocated:
       resources:
         gpus_per_node: null
         num_nodes: null
-      # Give both MPS clients and learner TE grouped GEMMs full SM access.
+      # Give both processes full SM access and favor inference during contention.
       engine_sm_fraction: 0.0
       engine_weights: shared
-      sm_partition_backend: mps_gemm
+      learner_mps_priority: 1
+      inference_mps_priority: 0
     refit_transport: ipc
 logger:
   log_dir: results/nemotron-nano-mps

@@ -241,6 +241,8 @@ policy:
       # null selects all GPUs. Every engine GPU must also be a learner GPU.
       learner_gpu_indices: null
       engine_gpu_indices: null
+      learner_mps_priority: null
+      inference_mps_priority: null
       resources:
         gpus_per_node: 1
         num_nodes: 1

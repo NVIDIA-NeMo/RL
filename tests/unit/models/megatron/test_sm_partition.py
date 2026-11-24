@@ -222,6 +222,30 @@ def test_actor_env():
     assert smp.actor_env(c, "learner", env={}) == {smp.MPS_PCT_ENV: "58"}
 
 
+@pytest.mark.parametrize("learner,inference", [(1, 0), (0, 1)])
+def test_actor_env_sets_independent_mps_priorities(
+    learner: int, inference: int
+) -> None:
+    cfg = _cfg(
+        **{
+            "generation.colocated.learner_mps_priority": learner,
+            "generation.colocated.inference_mps_priority": inference,
+            "generation.colocated.engine_sm_fraction": 0,
+            "generation.colocated.engine_gpu_indices": [4, 5, 6, 7],
+        }
+    )
+    del cfg["generation"]["colocated"]["sm_partition_backend"]
+    assert smp.actor_env(cfg, "learner", env=MPS) == {
+        **MPS,
+        smp.MPS_PCT_ENV: "100",
+        "CUDA_MPS_CLIENT_PRIORITY": str(learner),
+    }
+    assert smp.actor_env(cfg, "engine", env=MPS) == {
+        **MPS,
+        "CUDA_MPS_CLIENT_PRIORITY": str(inference),
+    }
+
+
 @pytest.mark.parametrize(
     "role,pct,seen,error",
     [
@@ -1016,121 +1040,6 @@ def test_uncapped_client_requires_daemon_registration(
     else:
         with pytest.raises(RuntimeError, match="not registered"):
             smp._check_uncapped_client("learner", "100", seen=152, full=152, rank=0)
-
-
-@pytest.mark.parametrize(
-    "fraction,target", [(0.0, 152), (0.21, 120), (0.42, 88), (0.63, 56), (0.999, 1)]
-)
-@pytest.mark.parametrize("backend", [None, "mps_gemm"])
-def test_gemm_budget_preserves_full_context(
-    monkeypatch: pytest.MonkeyPatch, fraction: float, target: int, backend: str | None
-) -> None:
-    config = _cfg(
-        **{
-            "generation.colocated.sm_partition_backend": "mps_gemm",
-            "generation.colocated.engine_sm_fraction": fraction,
-        }
-    )
-    if backend is None:
-        del config["generation"]["colocated"]["sm_partition_backend"]
-    smp.validate(config, env=MPS)
-    assert smp.actor_env(config, "learner", env=MPS) == {**MPS, smp.MPS_PCT_ENV: "100"}
-    assert smp.actor_env(config, "engine", env=MPS) == MPS
-    monkeypatch.setenv(smp.MPS_PCT_ENV, "100")
-    monkeypatch.setenv("NVTE_EXT_MARGIN_SM", "sentinel")
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(multi_processor_count=152),
-    )
-    monkeypatch.setattr(smp, "_device_sm_count", lambda: 152)
-    registrations = []
-
-    def registered(*args: object, **kwargs: object) -> dict:
-        registrations.append(args)
-        return {"mps_client_registered": True}
-
-    monkeypatch.setattr(smp, "_check_uncapped_client", registered)
-    info = smp.check_worker(config, "learner")
-    assert registrations
-    assert info["te_grouped_gemm_target_sms"] == target
-    assert os.environ["NVTE_EXT_MARGIN_SM"] == str(152 - target)
-    monkeypatch.delenv("NVTE_EXT_MARGIN_SM")
-    smp.check_worker(config, "engine")
-    assert "NVTE_EXT_MARGIN_SM" not in os.environ
-
-
-@pytest.mark.parametrize("key", ["NVTE_EXT_MARGIN_SM", "CUDA_MPS_SM_PARTITION"])
-@pytest.mark.parametrize("source", ["process", "worker"])
-def test_gemm_budget_rejects_conflicting_environment(key: str, source: str) -> None:
-    config = _cfg(**{"generation.colocated.sm_partition_backend": "mps_gemm"})
-    env = dict(MPS)
-    if source == "process":
-        env[key] = "0"
-    else:
-        config["megatron_cfg"]["env_vars"] = {key: "0"}
-    with pytest.raises(ValueError, match=key):
-        smp.validate(config, env=env)
-
-
-@pytest.mark.parametrize(
-    "learner_indices, engine_indices, expected",
-    [
-        (None, [1, 3], [False, True, False, True]),
-        ([6, 2, 5], [2, 4], [False, True, False]),
-        ([3, 1], [1, 3], [True, True]),
-        ([6, 2], [0, 1], [False, False]),
-        ([7, 3], None, [True, True]),
-        (None, None, [True, True, True, True]),
-    ],
-)
-def test_gemm_hint_follows_partial_gpu_overlap(
-    monkeypatch: pytest.MonkeyPatch,
-    learner_indices: list[int] | None,
-    engine_indices: list[int] | None,
-    expected: list[bool],
-) -> None:
-    config = _cfg(
-        **{
-            "generation.colocated.sm_partition_backend": "mps_gemm",
-            "generation.colocated.learner_gpu_indices": learner_indices,
-            "generation.colocated.engine_gpu_indices": engine_indices,
-        }
-    )
-    monkeypatch.setenv(smp.MPS_PCT_ENV, "100")
-    monkeypatch.setenv("NVTE_EXT_MARGIN_SM", "sentinel")
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _: SimpleNamespace(multi_processor_count=152),
-    )
-    monkeypatch.setattr(smp, "_device_sm_count", lambda: 152)
-    monkeypatch.setattr(smp, "_check_uncapped_client", lambda *a, **k: {})
-    for rank, shared in enumerate(expected):
-        # All workers may have the same node-local CUDA index. Logical ranks,
-        # rather than that index or raw placement-bundle IDs, decide overlap.
-        info = smp.check_worker(config, "learner", rank=rank)
-        assert info["shares_engine_gpu"] is shared
-        assert info["te_grouped_gemm_target_sms"] == (88 if shared else 152)
-        assert os.environ["NVTE_EXT_MARGIN_SM"] == ("64" if shared else "0")
-        assert os.environ[smp.MPS_PCT_ENV] == "100"
-
-
-@pytest.mark.parametrize("rank", [-1, 2])
-@pytest.mark.parametrize("engine_indices", [None, [2, 4]])
-def test_gemm_hint_rejects_rank_outside_learner_view(
-    rank: int, engine_indices: list[int] | None
-) -> None:
-    config = _cfg(
-        **{
-            "generation.colocated.learner_gpu_indices": [6, 2],
-            "generation.colocated.engine_gpu_indices": engine_indices,
-        }
-    )
-    with pytest.raises(ValueError, match="outside its GPU subset"):
-        smp._learner_shares_engine_gpu(config, rank=rank)
 
 
 def test_uncapped_client_retries_transient_control_failure(

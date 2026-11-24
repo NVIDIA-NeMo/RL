@@ -12,7 +12,15 @@ bash examples/run_nemotron_nano_mps.sh 'policy.generation.colocated.engine_gpu_i
 
 `learner_gpu_indices` and `engine_gpu_indices` specify each role’s logical GPU order within the same topology-sorted parent pool. A null list selects the entire parent pool independently for that role. Every engine GPU must also be a learner GPU, and each role must fill complete dense and expert model-parallel groups. For 16 learners and eight inference workers on the last eight GPUs, leave the learner list null and select engine indices 8 through 15. Reversing those selections fails validation. The conventional disjoint setup uses its existing resource split with `engine_sm_fraction` unset.
 
-The default `mps_gemm` backend gives both processes full SM access. The Nano recipe sets `engine_sm_fraction: 0.0`, giving learner GEMMs full access as well. With an explicit override of `0.42`, learner Transformer Engine grouped GEMMs on shared GPUs target approximately 58% of the SMs. Other kernels and learner-only GPUs retain full access. The `mps_percentage` backend applies a process-wide learner cap. Startup verifies uncapped learner registration with the MPS daemon. The Nano recipe sets the learner’s MPS client priority to low (`1`) and inference to normal (`0`).
+The Nano recipe gives both roles full SM access (`engine_sm_fraction: 0.0`). Under contention it favors inference by running its MPS client at normal priority (`0`) and the learner at below-normal priority (`1`). These are CUDA scheduling hints. Set either priority independently at launch. For example, to give both clients normal priority:
+
+```bash
+bash examples/run_nemotron_nano_mps.sh \
+    policy.generation.colocated.learner_mps_priority=0 \
+    policy.generation.colocated.inference_mps_priority=0
+```
+
+Each setting applies to every worker of that role, including under partial colocation. An unset priority inherits the worker environment. With the default `mps_percentage` backend a positive `engine_sm_fraction` caps the learner at the complementary percentage and leaves inference uncapped. Startup verifies uncapped learner registration with the MPS daemon.
 
 Set inference parallelism in `policy.generation.mcore_generation_config`. Inference requires CP1 and PP1. The `inference_optimized` experts require ETP1, and TP greater than one requires sequence parallelism with that implementation. Training CP greater than one requires `policy.sequence_packing.enabled: true` and `policy.megatron_cfg.use_fused_linear_logprobs: false`. Changing inference TP also changes data parallelism and aggregate rollout capacity. Streaming GRPO fits dispatches to the learner’s data-parallel and microbatch sizes. Forest training pads execution rows within each prompt group.
 

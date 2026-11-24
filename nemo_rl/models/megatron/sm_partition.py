@@ -13,8 +13,8 @@
 # limitations under the License.
 """GPU scheduling and same-GPU CUDA IPC weight sharing for co-resident Megatron.
 
-Each inference GPU also hosts a learner. The default MPS backend gives both
-processes full SM access and can apply a grouped-GEMM margin on shared GPUs.
+Each inference GPU also hosts a learner. MPS schedules the two processes
+according to their client priorities and configured SM limits.
 Compatible local parameters share storage. Private tensors are refreshed while
 inference is paused. See docs/design-docs/mps-parallelism-sharing.md for the
 placement constraints, publication protocol, and supported parallelism.
@@ -132,13 +132,6 @@ def validate(
             "policy.generation.colocated.engine_weights must be 'copy' or 'shared'"
         )
     backend = partition_backend(policy_cfg)
-    if backend == "mps_gemm":
-        worker_env = policy_cfg["megatron_cfg"].get("env_vars") or {}
-        for key in ("NVTE_EXT_MARGIN_SM", "CUDA_MPS_SM_PARTITION"):
-            if key in env or key in worker_env:
-                raise ValueError(
-                    f"mps_gemm manages its GEMM budget and requires full SM visibility; remove {key}"
-                )
     if backend == "mps_static" and frac == 0.0:
         raise ValueError("mps_static requires a positive engine_sm_fraction")
     if backend not in BACKENDS:
@@ -173,17 +166,16 @@ def validate(
 
 
 #: Worker scheduling backends selected by ``colocated.sm_partition_backend``.
-#: ``mps_gemm``: full SM access with a learner TE grouped-GEMM hint (default).
 #: ``mps_percentage``: learner active-thread cap; inference stays uncapped.
 #: ``mps_static``: pre-created partitions from NRL_MPS_SM_PARTITION_MAP;
 #: requires an R590+ daemon started with -S and remains hardware-unqualified.
-BACKENDS = ("mps_percentage", "mps_static", "mps_gemm")
+BACKENDS = ("mps_percentage", "mps_static")
 MPS_PARTITION_MAP_ENV = "NRL_MPS_SM_PARTITION_MAP"
 
 
 def partition_backend(policy_cfg: Any) -> str:
     gen = (policy_cfg or {}).get("generation") or {}
-    return (gen.get("colocated") or {}).get("sm_partition_backend") or "mps_gemm"
+    return (gen.get("colocated") or {}).get("sm_partition_backend") or "mps_percentage"
 
 
 def engine_weights_mode(policy_cfg: Any) -> str:
@@ -205,15 +197,6 @@ def mps_percentage(frac: float, role: Role) -> Optional[int]:
     return 100 - max(1, min(99, round(100 * frac)))
 
 
-def _worker_percentage(policy_cfg: Any, role: Role) -> Optional[int]:
-    backend = partition_backend(policy_cfg)
-    if backend == "mps_gemm":
-        return mps_percentage(0.0, role)
-    if backend == "mps_percentage":
-        return mps_percentage(engine_sm_fraction(policy_cfg), role)
-    return None
-
-
 def actor_env(
     policy_cfg: Any, role: Role, *, env: Optional[dict] = None
 ) -> dict[str, str]:
@@ -223,9 +206,13 @@ def actor_env(
         return {}
     env = os.environ if env is None else env
     out = {}
-    pct = _worker_percentage(policy_cfg, role)
-    if pct is not None:
-        out[MPS_PCT_ENV] = str(pct)
+    placement = policy_cfg["generation"]["colocated"]
+    key = "inference_mps_priority" if role == "engine" else "learner_mps_priority"
+    if (priority := placement.get(key)) is not None:
+        out["CUDA_MPS_CLIENT_PRIORITY"] = str(priority)
+    if partition_backend(policy_cfg) == "mps_percentage":
+        if (pct := mps_percentage(frac, role)) is not None:
+            out[MPS_PCT_ENV] = str(pct)
     for k in ("CUDA_MPS_PIPE_DIRECTORY", MPS_PARTITION_MAP_ENV):
         if env.get(k):
             out[k] = env[k]
@@ -255,7 +242,8 @@ def check_worker(
     policy_cfg: Any, role: Role, *, rank: int = 0
 ) -> Optional[dict[str, Any]]:
     """Verify MPS registration; ``rank`` follows the role's logical GPU order."""
-    if engine_sm_fraction(policy_cfg) is None:
+    frac = engine_sm_fraction(policy_cfg)
+    if frac is None:
         return None
     seen = torch.cuda.get_device_properties(
         torch.cuda.current_device()
@@ -275,7 +263,7 @@ def check_worker(
         print(f"[sm_partition] rank={rank} {info}", flush=True)
         return info
     pct = os.environ.get(MPS_PCT_ENV)
-    expected_pct = _worker_percentage(policy_cfg, role)
+    expected_pct = mps_percentage(frac, role)
     if (role == "engine" and pct not in (None, "100")) or (
         role == "learner" and pct != str(expected_pct)
     ):
@@ -290,16 +278,7 @@ def check_worker(
         return info
     full = _device_sm_count()
     if expected_pct == 100:
-        info = _check_uncapped_client(role, pct, seen=seen, full=full, rank=rank)
-        if partition_backend(policy_cfg) == "mps_gemm":
-            shares_engine_gpu = _learner_shares_engine_gpu(policy_cfg, rank=rank)
-            fraction = engine_sm_fraction(policy_cfg) if shares_engine_gpu else 0.0
-            margin = min(full - 1, max(0, round(full * fraction)))
-            os.environ["NVTE_EXT_MARGIN_SM"] = str(margin)
-            info["shares_engine_gpu"] = shares_engine_gpu
-            info["te_grouped_gemm_target_sms"] = full - margin
-            print(f"[sm_partition] rank={rank} {info}", flush=True)
-        return info
+        return _check_uncapped_client(role, pct, seen=seen, full=full, rank=rank)
     info = {"role": role, "mps_pct": pct, "sms_seen": seen, "sms_device": full}
     if seen >= full:
         raise RuntimeError(
@@ -307,21 +286,6 @@ def check_worker(
         )
     print(f"[sm_partition] rank={rank} {info}", flush=True)
     return info
-
-
-def _learner_shares_engine_gpu(policy_cfg: Any, *, rank: int) -> bool:
-    """Map a learner rank through its ordered view into the parent GPU cluster."""
-    placement = policy_cfg["generation"]["colocated"]
-    learner_indices = placement.get("learner_gpu_indices")
-    if rank < 0 or (learner_indices is not None and rank >= len(learner_indices)):
-        raise ValueError(f"Learner rank {rank} is outside its GPU subset")
-    engine_indices = placement.get("engine_gpu_indices")
-    if engine_indices is None:
-        return True
-    # RayVirtualCluster.subset and Policy preserve this logical order even
-    # when the parent's topology sort permutes physical placement bundles.
-    parent_index = rank if learner_indices is None else learner_indices[rank]
-    return parent_index in engine_indices
 
 
 def _check_uncapped_client(
