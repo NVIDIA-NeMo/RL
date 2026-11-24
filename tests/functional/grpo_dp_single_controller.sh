@@ -1,7 +1,7 @@
 #!/bin/bash
 # Lightweight e2e for examples/run_grpo_single_controller.py — exercises
 # setup_single_controller + SingleControllerActor
-# end-to-end. Same shape as tests/functional/grpo_dp_simple.sh (Qwen3-0.6B,
+# end-to-end. Same shape as tests/functional/grpo.sh (Qwen3-0.6B,
 # 2 GPUs, a handful of steps); data_plane.enabled=true is mandatory for SC.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
