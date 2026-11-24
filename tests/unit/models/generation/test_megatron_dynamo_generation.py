@@ -557,9 +557,20 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
         pytest.param([4, 4, 4], 8, None, [[0], [0], [1]], id="uniform_4"),
         pytest.param([4, 2, 2], 8, None, [[0], [0], [0]], id="mixed_fits_one_node"),
         pytest.param([8, 4, 4], 8, None, [[0], [1], [1]], id="mixed_spills"),
+        # A later small engine fills a node an earlier one left part-empty.
+        pytest.param([6, 4, 2], 8, None, [[0], [1], [0]], id="fills_earlier_gap"),
+        # Sub-node engines go widest first: two TP 2 prefill and two TP 6
+        # decode engines fit two 8-GPU nodes, not three.
+        pytest.param([2, 2, 6, 6], 8, 1, [[0], [1], [0], [1]], id="small_widest_first"),
+        # ...but launch order when that ends lower: four [2, 3, 3] replicas
+        # fill two 16-GPU nodes exactly; widest first would need a third.
+        pytest.param(
+            [2, 3, 3] * 4, 16, 1, [[0]] * 6 + [[1]] * 6, id="small_launch_order"
+        ),
         # A two-node TP 8 engine on 4-GPU nodes.
         pytest.param([8, 4, 4], 4, None, [[0, 1], [2], [3]], id="two_node_tp8"),
-        # Wide engines take whole fresh nodes; two replicas.
+        # Wide engines take whole nodes; two replicas fit either order, so
+        # launch order wins.
         pytest.param(
             [16, 8, 8, 16, 8, 8],
             4,
@@ -567,12 +578,21 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
             [[0, 1, 2, 3], [4, 5], [6, 7], [8, 9, 10, 11], [12, 13], [14, 15]],
             id="two_replicas",
         ),
-        # A wide engine after a part-filled node starts on the next node.
-        pytest.param([2, 8], 4, None, [[0], [1, 2]], id="wide_after_partial"),
-        # A small engine after a wide one starts on the node after it.
+        # Widest first strands one node here; launch order fits seven.
+        pytest.param(
+            [16, 16, 24], 8, 4, [[0, 1], [2, 3], [4, 5, 6]], id="wide_launch_order"
+        ),
+        # Wide engines are placed before sub-node ones, so a small engine
+        # launched first does not push a wide one off its node.
+        pytest.param([2, 8], 4, None, [[2], [0, 1]], id="wide_after_small"),
         pytest.param([8, 2, 2], 4, None, [[0, 1], [2], [2]], id="small_after_wide"),
         # A wide engine that would straddle a segment moves to the next one.
         pytest.param([12, 8], 4, 4, [[0, 1, 2], [4, 5]], id="no_segment_straddle"),
+        # Segments as wide as the widest engine (its NVLink span): two TP 8
+        # prefill + TP 4 decode replicas fit six nodes, not seven.
+        pytest.param(
+            [8, 4, 8, 4], 4, 2, [[0, 1], [4], [2, 3], [5]], id="mixed_replicas"
+        ),
     ],
 )
 def test_engine_node_slots(widths, gpus_per_node, nodes_per_segment, slots):
@@ -623,6 +643,69 @@ def test_engines_wider_than_a_node_take_whole_pinned_nodes(env):
     assert [r.world_size for r in generation.engine_handles] == [16, 8, 8]
     # The refit offsets follow the engine widths, multi-node or not.
     assert generation.engine_rank_offsets(8) == [8, 24, 32]
+
+
+def test_mixed_width_replicas_fit_segments_as_wide_as_the_widest_engine(env):
+    """Setup sizes node segments by the NVLink span, the widest engine (TP 8 =
+    two 4-GPU nodes); both replicas' engines fit the six pinned nodes."""
+    config = _megatron_config(
+        prefill_engine={"tensor_model_parallel_size": 8},
+        decode_engine={"tensor_model_parallel_size": 4},
+        disaggregation={
+            "enabled": True,
+            "num_prefill_engines": 1,
+            "num_decode_engines": 1,
+        },
+    )
+    span = MegatronGeneration.nvlink_domain_span(
+        {**MEGATRON_POLICY, "generation": config}  # type: ignore[arg-type]
+    )
+    assert span == 8
+    pins = [{f"nvl-{i}": 0.001} for i in range(6)]
+    env.nodes = [f"10.0.1.{i}" for i in range(4)]  # one host per engine
+    generation = env.generation(
+        config,
+        world_size=24,
+        num_gpus_per_node=4,
+        segment_size=span // 4,
+        node_resource_constraints=pins,
+    )
+
+    assert [c.kwargs["node_resource_constraints"] for c in env.clusters] == [
+        pins[0:2],
+        pins[4:5],
+        pins[2:4],
+        pins[5:6],
+    ]
+    assert [r.world_size for r in generation.engine_handles] == [8, 4, 8, 4]
+
+
+def test_engines_needing_more_nodes_than_pinned_are_refused(env):
+    """Refuse a fleet whose highest node index plus one exceeds its pins.
+
+    Three TP 12 decodes use nodes 0-8; three TP 8 prefills use [9, 10],
+    [12, 13] and [15, 16] (segments of three nodes), so 17 nodes versus 15
+    pins, though the last launched engine ends on node 8.
+    """
+    config = _megatron_config(
+        prefill_engine={"tensor_model_parallel_size": 8},
+        decode_engine={"tensor_model_parallel_size": 12},
+        disaggregation={
+            "enabled": True,
+            "num_prefill_engines": 1,
+            "num_decode_engines": 1,
+        },
+    )
+    pins = [{f"nvl-{i}": 0.001} for i in range(15)]
+    with pytest.raises(ValueError, match=r"tile 17 nodes .* than the 15 pinned"):
+        env.generation(
+            config,
+            world_size=60,
+            num_gpus_per_node=4,
+            segment_size=3,
+            node_resource_constraints=pins,
+        )
+    assert env.log == []
 
 
 def test_engine_width_not_a_whole_number_of_nodes_names_the_role(env):

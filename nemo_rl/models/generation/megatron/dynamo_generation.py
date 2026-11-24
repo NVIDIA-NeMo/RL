@@ -41,7 +41,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     reject_unenforceable_refit_deadline,
 )
-from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_cfg
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
     plan_megatron_engines,
@@ -92,8 +91,8 @@ def role_policy_config(
     """
     config = copy.deepcopy(dict(policy_config))
     generation: dict[str, Any] = dict(config["generation"])
-    # Off, or the engine's NVLink span would be a whole prefill/decode replica
-    # instead of its own width.
+    # Off, so each plain MegatronGeneration derives its NVLink span from its
+    # own layout rather than using the fleet's widest engine.
     generation["dynamo"] = False
     generation["_disaggregation_role"] = role
     if overrides:
@@ -108,14 +107,22 @@ def role_policy_config(
 def engine_node_slots(
     widths: Sequence[int], gpus_per_node: int, nodes_per_segment: int | None
 ) -> list[list[int]]:
-    """Inference-node indices each engine takes, in launch order.
+    """Inference-node indices each engine takes, listed in launch order.
 
-    An engine no wider than a node shares nodes with its neighbours: it starts
-    the next node when it does not fit in the GPUs the earlier engines left. A
-    wider engine takes ``width / gpus_per_node`` whole nodes, starting on a
-    fresh one. With ``nodes_per_segment`` set (the inference cluster's node
-    pins come in NVLink-domain segments of that many nodes), no engine crosses
-    a segment boundary, so every engine stays inside one NVLink domain.
+    An engine wider than a node takes ``width / gpus_per_node`` whole, empty
+    nodes; with ``nodes_per_segment`` set (the inference cluster's node pins
+    come in NVLink-domain segments of that many nodes), those nodes lie inside
+    one segment, so every engine stays inside one NVLink domain. Engines no
+    wider than a node share nodes.
+
+    Placement is greedy first-fit, not an optimal packing: wide engines first,
+    each on the lowest free run of nodes that fits, then sub-node engines, each
+    on the lowest node with enough free GPUs. Each pass runs in launch order
+    and in widest-first order (ties in launch order), and the combination
+    ending on the lowest node wins, launch order on a tie. Neither order alone
+    is enough: with segments of two 4-GPU nodes, launch order strands a node on
+    ``[8, 4, 8, 4]`` (seven nodes instead of six), while widest first needs a
+    third 16-GPU node for four ``[2, 3, 3]`` replicas that fill two.
 
     Args:
         widths: GPUs each engine spans, in launch order.
@@ -123,20 +130,15 @@ def engine_node_slots(
         nodes_per_segment: Nodes per pinned segment, or None without pins.
 
     Returns:
-        One list of node indices per engine.
+        One list of node indices per engine, in the order of ``widths``.
 
     Raises:
         ValueError: An engine wider than a node is not a whole number of
             nodes, or is wider than one segment.
     """
-    slots: list[list[int]] = []
-    node, used = 0, 0
-    for width in widths:
+    spans: dict[int, int] = {}
+    for index, width in enumerate(widths):
         if width <= gpus_per_node:
-            if used + width > gpus_per_node:
-                node, used = node + 1, 0
-            slots.append([node])
-            used += width
             continue
         if width % gpus_per_node != 0:
             raise ValueError(
@@ -145,20 +147,59 @@ def engine_node_slots(
                 "an engine wider than a node takes whole nodes."
             )
         span = width // gpus_per_node
-        start = node + 1 if used else node
-        if nodes_per_segment is not None:
-            if span > nodes_per_segment:
-                raise ValueError(
-                    f"A Megatron engine behind Dynamo spans {span} nodes, more than "
-                    f"one NVLink segment of {nodes_per_segment} nodes; engines "
-                    "wider than an NVLink domain are not supported."
-                )
-            segment_end = (start // nodes_per_segment + 1) * nodes_per_segment
-            if start + span > segment_end:
-                start = segment_end
-        slots.append(list(range(start, start + span)))
-        node, used = start + span, 0
-    return slots
+        if nodes_per_segment is not None and span > nodes_per_segment:
+            raise ValueError(
+                f"A Megatron engine behind Dynamo spans {span} nodes, more than "
+                f"one NVLink segment of {nodes_per_segment} nodes; engines "
+                "wider than an NVLink domain are not supported."
+            )
+        spans[index] = span
+    wide = list(spans)
+    small = [index for index in range(len(widths)) if index not in spans]
+
+    def place(wide_order: list[int], small_order: list[int]) -> list[list[int]]:
+        used: list[int] = []  # GPUs taken on each node so far
+        slots: dict[int, list[int]] = {}
+        for index in wide_order:
+            span, start = spans[index], 0
+            while True:
+                if nodes_per_segment is not None:
+                    segment_end = (start // nodes_per_segment + 1) * nodes_per_segment
+                    if start + span > segment_end:
+                        start = segment_end
+                        continue
+                busy = [
+                    n for n in range(start, start + span) if n < len(used) and used[n]
+                ]
+                if not busy:
+                    break
+                start = busy[-1] + 1
+            used.extend([0] * (start + span - len(used)))
+            for node in range(start, start + span):
+                used[node] = gpus_per_node
+            slots[index] = list(range(start, start + span))
+        for index in small_order:
+            node = 0
+            while node < len(used) and used[node] + widths[index] > gpus_per_node:
+                node += 1
+            used.extend([0] * (node + 1 - len(used)))
+            used[node] += widths[index]
+            slots[index] = [node]
+        return [slots[index] for index in range(len(widths))]
+
+    def widest_first(indices: list[int]) -> list[int]:
+        return sorted(indices, key=lambda i: -widths[i])  # stable: ties keep order
+
+    candidates = [
+        place(wide_order, small_order)
+        for wide_order in (wide, widest_first(wide))
+        for small_order in (small, widest_first(small))
+    ]
+    # min keeps the first of equals, so launch order wins a tie.
+    return min(
+        candidates,
+        key=lambda slots: max((max(nodes) for nodes in slots), default=-1),
+    )
 
 
 @ray.remote(num_cpus=0)
@@ -465,8 +506,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional[WeightSynchronizer] = None
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
-        # The engines take the policy config as-is; MegatronGeneration types it.
-        self._dynamo_cfg: DynamoCfg = dynamo_cfg(self.cfg)
         # Names these engines' placement groups apart from any other run's.
         self._fleet_id = uuid.uuid4().hex[:8]
         self._num_gpus_per_node = cluster.num_gpus_per_node
@@ -942,9 +981,9 @@ class MegatronDynamoGeneration(GenerationInterface):
             RuntimeError: When an engine's ranks do not land node by node as
                 planned.
         """
-        # Which inference nodes each engine takes: sub-node engines share
-        # nodes in launch order, wider ones take whole nodes inside one pinned
-        # segment (engine_node_slots).
+        # Which inference nodes each engine takes: wider-than-a-node engines
+        # take whole nodes inside one pinned segment, sub-node engines share
+        # what is left (engine_node_slots).
         constraints = self._node_resource_constraints
         nodes_per_segment = self._segment_size if constraints is not None else None
         # One engine at a time first, so a width that cannot be placed names
@@ -961,7 +1000,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         node_slots_by_engine = engine_node_slots(
             widths, self._num_gpus_per_node, nodes_per_segment
         )
-        nodes_needed = node_slots_by_engine[-1][-1] + 1
+        nodes_needed = 1 + max(max(slots) for slots in node_slots_by_engine)
         if constraints is not None and nodes_needed > len(constraints):
             widths_by_role = dict(zip(roles, widths, strict=True))
             raise ValueError(
