@@ -47,10 +47,8 @@ def _make_vocab_maps(seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     return target_ids, d2t, t2d
 
 
-def _tiny_dspark_model(d2t: torch.Tensor, t2d: torch.Tensor):
+def _tiny_block_draft_config(draft_vocab_size: int | None):
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-
-    from nemo_rl.models.automodel.draft.draft_qwen3 import Qwen3DSparkModel
 
     config = Qwen3Config(
         hidden_size=32,
@@ -72,12 +70,30 @@ def _tiny_dspark_model(d2t: torch.Tensor, t2d: torch.Tensor):
     config.num_anchors = 4
     config.markov_rank = 0
     config.enable_confidence_head = False
-    config.draft_vocab_size = DRAFT_VOCAB
-    model = Qwen3DSparkModel(config)
+    config.draft_vocab_size = draft_vocab_size
+    return config
+
+
+def _tiny_dspark_model(d2t: torch.Tensor, t2d: torch.Tensor):
+    from nemo_rl.models.automodel.draft.draft_qwen3 import Qwen3DSparkModel
+
+    model = Qwen3DSparkModel(_tiny_block_draft_config(DRAFT_VOCAB))
     with torch.no_grad():
         model.d2t.copy_(d2t)
         model.t2d.copy_(t2d)
     return model
+
+
+def test_dflash_explicit_full_vocab_has_no_mapping_in_refit_state():
+    from nemo_rl.models.automodel.draft.draft_qwen3 import Qwen3DSparkModel
+
+    config = _tiny_block_draft_config(TARGET_VOCAB)
+    config.sample_from_anchor = False
+    model = Qwen3DSparkModel(config)
+
+    assert model.lm_head.out_features == TARGET_VOCAB
+    assert model.draft_vocab_size is None
+    assert {"d2t", "t2d"}.isdisjoint(model.state_dict())
 
 
 def _tiny_eagle3_model(d2t: torch.Tensor, t2d: torch.Tensor):
