@@ -105,13 +105,17 @@ def _patch_vllm_compile_cache_per_device(logger) -> None:
 
     The code Inductor generates hard-codes the device index (``cuda:N``,
     ``torch.cuda._DeviceGuard(N)``), but vLLM names the cache folder after the
-    rank only. Since vllm#61211 (vLLM >= 0.32) the cache key ignores placement,
+    rank only. Since vllm#61211 (vLLM >= 0.33) the cache key ignores placement,
     so an engine on GPUs 2-3 finds the folder an engine on GPUs 0-1 wrote, loads
     code compiled for cuda:0/1 and fails with a CUDA error. With the device index
     in the name, each placement compiles and caches its own copy; the cache key
     and the other caches stay shared. Patches the AOT compile cache
     (compilation/decorators.py) and the torch.compile cache
     (compilation/backends.py), and raises if either no longer matches.
+
+    Applied by nemo_rl/utils/compile_cache.py on every node an engine runs on,
+    not by _apply_vllm_patches, and only when persistent compile caches are on.
+    Remove once vLLM puts the device index in the folder name or cache key.
     """
     old_snippet = 'f"rank_{rank}_{dp_rank}"'
     new_snippet = 'f"rank_{rank}_{dp_rank}_dev{torch.cuda.current_device()}"'

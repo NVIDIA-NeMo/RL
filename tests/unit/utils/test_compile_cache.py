@@ -151,6 +151,12 @@ def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
     assert local.read_text() == "changed here"
 
 
+def test_per_device_patch_is_found_by_name():
+    # compile_cache looks the patch up by this name; a rename must fail here.
+    patches = compile_cache._vllm_patches()
+    assert callable(patches["_patch_vllm_compile_cache_per_device"])
+
+
 def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
     monkeypatch.setattr(
         compile_cache,
