@@ -74,6 +74,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _apply_engine_start_settings,
     _AsyncLLMHTTPClient,
     _tune_actor_interpreter,
 )
@@ -268,7 +269,6 @@ basic_automodel_test_config: PolicyConfig = {
 }
 
 
-@pytest.mark.vllm
 def test_tune_actor_interpreter_applies_gil_and_gc_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,6 +314,33 @@ def test_tune_actor_interpreter_leaves_defaults_when_unset(
     _tune_actor_interpreter({})
 
 
+@pytest.mark.parametrize("budget_ms", [20, None])
+def test_apply_engine_start_settings_installs_yield_and_tunes_interpreter(
+    monkeypatch: pytest.MonkeyPatch, budget_ms: float | None
+) -> None:
+    install_yield = MagicMock()
+    tune_interpreter = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.install_output_loop_yield",
+        install_yield,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async._tune_actor_interpreter",
+        tune_interpreter,
+    )
+    engine = object()
+    vllm_cfg = {"output_loop_yield_budget_ms": budget_ms}
+
+    _apply_engine_start_settings(engine, vllm_cfg)
+
+    if budget_ms is None:
+        install_yield.assert_not_called()
+    else:
+        install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
+    tune_interpreter.assert_called_once_with(vllm_cfg)
+
+
+@pytest.mark.vllm
 def test_prepare_refit_info_skips_missing_metadata():
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.worker_group = MagicMock()

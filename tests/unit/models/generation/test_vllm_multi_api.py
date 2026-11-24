@@ -223,8 +223,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             listener = Mock()
             listener.getsockname.return_value = ("localhost", 8100)
             http_client = Mock()
-            install_yield = Mock()
-            tune_interpreter = Mock()
+            apply_engine_start_settings = Mock()
             modules = {
                 "ray": SimpleNamespace(is_initialized=lambda: False, init=Mock()),
                 "nemo_rl.models.generation.vllm.config": SimpleNamespace(
@@ -232,9 +231,6 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 ),
                 "nemo_rl.models.generation.vllm.video_utils": SimpleNamespace(
                     register_torchcodec_vllm_video_loader=register_video_loader
-                ),
-                "nemo_rl.models.generation.vllm.patches": SimpleNamespace(
-                    install_output_loop_yield=install_yield
                 ),
                 "vllm.v1.engine.async_llm": SimpleNamespace(
                     AsyncLLM=Mock(side_effect=make_engine)
@@ -248,7 +244,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 "nemo_rl.models.generation.vllm.vllm_worker_async": SimpleNamespace(
                     VllmAsyncGenerationWorkerImpl=Host,
                     _AsyncLLMHTTPClient=http_client,
-                    _tune_actor_interpreter=tune_interpreter,
+                    _apply_engine_start_settings=apply_engine_start_settings,
                 ),
                 "nemo_rl.telemetry.setup": SimpleNamespace(
                     init_telemetry_worker=init_telemetry,
@@ -280,8 +276,9 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             if video_config is None:
                 register_video_loader.assert_not_called()
             self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
-            install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
-            tune_interpreter.assert_called_once_with(hosts[0].cfg["vllm_cfg"])
+            apply_engine_start_settings.assert_called_once_with(
+                engine, hosts[0].cfg["vllm_cfg"]
+            )
             hosts[0].setup_token_capture.assert_awaited_once_with(
                 {"impl": "transfer_queue"},
                 "stage",

@@ -320,6 +320,7 @@ class MultiAPIServerPool:
         from nemo_rl.models.generation.vllm.config import resolve_vllm_video_config
         from nemo_rl.models.generation.vllm.vllm_worker_async import (
             VllmAsyncGenerationWorkerImpl,
+            _apply_engine_start_settings,
             _AsyncLLMHTTPClient,
         )
         from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
@@ -359,21 +360,7 @@ class MultiAPIServerPool:
                 client_count=count,
                 client_index=index,
             )
-            budget_ms = host.cfg["vllm_cfg"].get("output_loop_yield_budget_ms")
-            if budget_ms is not None:
-                # Keep the optional output-loop patch local to generation workers.
-                from nemo_rl.models.generation.vllm.patches import (
-                    install_output_loop_yield,
-                )
-
-                install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
-            # The owning frontend's GIL/GC settings, applied after engine startup
-            # so a GC freeze covers the engine's long-lived objects.
-            from nemo_rl.models.generation.vllm.vllm_worker_async import (
-                _tune_actor_interpreter,
-            )
-
-            _tune_actor_interpreter(host.cfg["vllm_cfg"])
+            _apply_engine_start_settings(engine, host.cfg["vllm_cfg"])
             host.llm = engine
             connection.send(("ok", None))
 

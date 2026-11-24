@@ -141,6 +141,19 @@ def _tune_actor_interpreter(vllm_cfg: VllmSpecificArgs) -> None:
         LOGGER.info("generation actor interpreter: %s", " ".join(applied))
 
 
+def _apply_engine_start_settings(engine: Any, vllm_cfg: VllmSpecificArgs) -> None:
+    """Apply the settings that need a started engine, in the owner and every child frontend."""
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is not None:
+        # Keep vLLM's output loops from monopolizing this process's event loop
+        # under a generation backlog (see install_output_loop_yield).
+        from nemo_rl.models.generation.vllm.patches import install_output_loop_yield
+
+        install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
+    # After engine startup, so a GC freeze covers the engine's long-lived objects.
+    _tune_actor_interpreter(vllm_cfg)
+
+
 # The captured model call the current HTTP request serves. Set when capture
 # begins the call, in the request's task, and read by the engine client when the
 # same task submits the call to the engine, which links the engine request ID to
@@ -680,21 +693,7 @@ class VllmAsyncGenerationWorkerImpl(
                 self.llm_async_engine_args, stat_loggers=self.stat_loggers
             )
 
-        # Keep vLLM's output loops from monopolizing this actor's event loop under a
-        # generation backlog (see install_output_loop_yield).
-        output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
-            "output_loop_yield_budget_ms"
-        )
-        if output_loop_yield_budget_ms is not None:
-            from nemo_rl.models.generation.vllm.patches import (
-                install_output_loop_yield,
-            )
-
-            install_output_loop_yield(
-                self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
-            )
-        # After engine startup, so a GC freeze covers the engine's long-lived objects.
-        _tune_actor_interpreter(self.cfg["vllm_cfg"])
+        _apply_engine_start_settings(self.llm, self.cfg["vllm_cfg"])
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
