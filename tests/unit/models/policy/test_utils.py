@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 import unittest.mock
+import warnings
 import weakref
 
 import pytest
@@ -32,6 +33,7 @@ from nemo_rl.models.policy.utils import (
     enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    make_empty_cache_best_effort_under_expandable_segments,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -154,15 +156,21 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         buffer_refs.append(weakref.ref(buffer))
         return buffer
 
+    def ipc_collect():
+        events.append("ipc_collect")
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
     def empty_cache():
         events.append("empty_cache")
+        assert events == ["ipc_collect", "empty_cache"]
         assert len(buffer_refs) == 2
         assert all(buffer_ref() is None for buffer_ref in buffer_refs)
 
     class ReleaseAwareSocket(_FakeIpcSocket):
         def send_pyobj(self, payload):
             if payload == IPCProtocol.COMPLETE:
-                assert events == ["empty_cache"]
+                assert events == ["ipc_collect", "empty_cache"]
                 assert all(buffer_ref() is None for buffer_ref in buffer_refs)
             super().send_pyobj(payload)
 
@@ -173,6 +181,7 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         "current_stream",
         lambda: unittest.mock.Mock(synchronize=lambda: None),
     )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     monkeypatch.setattr(
         "nemo_rl.models.policy.utils.get_handle_from_tensor",
@@ -192,8 +201,47 @@ def test_stream_weights_releases_buffers_before_complete_without_full_gc(
         worker_name="test_worker",
     )
 
-    assert events == ["empty_cache"]
+    assert events == ["ipc_collect", "empty_cache"]
     assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_collects_oversized_ipc_handle_before_empty_cache(
+    monkeypatch,
+):
+    tensor = torch.ones(2048, dtype=torch.float32)
+    events = []
+
+    def ipc_collect():
+        events.append("ipc_collect")
+
+    def empty_cache():
+        assert events[-1] == "ipc_collect"
+        events.append("empty_cache")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("oversized", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=_FakeIpcSocket(),
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    # An oversized-only stream never allocates the regular staging pair, so
+    # only the oversized transfer releases CUDA IPC storage.
+    assert events == ["ipc_collect", "empty_cache"]
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
@@ -651,3 +699,72 @@ def test_deterministic_env_vars_pin_cublas_and_transformer_engine():
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     }
+
+
+def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
+    """The guard must warn and skip, never call the real empty_cache: the
+    failing allocator call corrupts CUDA state even when its exception is
+    caught."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    calls = []
+
+    def _records():
+        calls.append(1)
+
+    try:
+        torch.cuda.empty_cache = _records
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is not _records
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.empty_cache()  # must not raise, must not call through
+        assert calls == []
+        assert any("expandable_segments" in str(w.message) for w in caught)
+        # idempotent: re-applying must not double-wrap
+        wrapped = torch.cuda.empty_cache
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is wrapped
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+
+    def _raises_other():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        torch.cuda.empty_cache = _raises_other
+        make_empty_cache_best_effort_under_expandable_segments()
+        torch.cuda.empty_cache()  # must not raise because it must not call through
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
+    """Patching a global torch API is opt-in: without NRL_BEST_EFFORT_EMPTY_CACHE=1
+    the guard leaves empty_cache alone even under expandable_segments."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NRL_BEST_EFFORT_EMPTY_CACHE", raising=False)
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original

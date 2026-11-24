@@ -1,6 +1,7 @@
 #!/bin/bash
-# Run native TQ recovery with the Mooncake CPU backend. Pass mooncake_units to
-# make CPU storage units the only memory owners.
+# Run native TQ recovery with the Mooncake CPU backend forced onto its SSD
+# offload. Pass mooncake_units to make CPU storage units the only memory owners,
+# with the default offload settings (nothing spills).
 
 set -eou pipefail
 

@@ -22,6 +22,74 @@ import torch
 pytestmark = pytest.mark.mcore
 
 
+@pytest.mark.parametrize(
+    "overrides,rejected",
+    [
+        ({}, False),
+        ({"moe_router_bias_update_rate": 0.001}, False),
+        ({"moe_expert_capacity_factor": 1.0}, True),
+        ({"moe_expert_rank_capacity_factor": 1.0}, True),
+        ({"moe_pad_experts_for_cuda_graph_inference": True}, True),
+        ({"moe_token_dropping": True}, True),
+        (
+            {
+                "moe_router_load_balancing_type": "seq_aux_loss",
+                "moe_aux_loss_coeff": 0.01,
+            },
+            True,
+        ),
+        ({"moe_router_load_balancing_type": "seq_aux_loss"}, False),
+        ({"routing_type": "sinkhorn"}, True),
+        ({"routing_type": "quantile_balancing"}, True),
+    ],
+)
+def test_forest_allows_bias_updates_but_keeps_other_router_guards(
+    monkeypatch, overrides, rejected
+):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as module
+
+    class Router:
+        pass
+
+    class TopKRouter(Router):
+        pass
+
+    config = SimpleNamespace(
+        moe_expert_capacity_factor=None,
+        moe_expert_rank_capacity_factor=None,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        moe_token_dropping=False,
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_router_bias_update_rate=0.0,
+    )
+    router = TopKRouter()
+    router.config = config
+    router.routing_type = overrides.get("routing_type", "none")
+    router.enable_expert_bias = True
+    router.frozen_expert_bias = False
+    for key, value in overrides.items():
+        if key != "routing_type":
+            setattr(config, key, value)
+    monkeypatch.setattr(module, "Router", Router)
+    monkeypatch.setattr(module, "TopKRouter", TopKRouter)
+    monkeypatch.setattr(
+        module,
+        "_unwrapped_chunks",
+        lambda _: [SimpleNamespace(modules=lambda: [router])],
+    )
+    worker = SimpleNamespace(model=object())
+    validate = module.MegatronPolicyWorkerImpl.validate_forest_execution_padding
+    if rejected:
+        with pytest.raises(ValueError, match="dropless per-token MoE routing"):
+            validate(worker)
+    else:
+        validate(worker)
+    assert config.moe_router_bias_update_rate == overrides.get(
+        "moe_router_bias_update_rate", 0.0
+    )
+
+
 def _processed(monkeypatch, multiple, enabled=True, lengths=True):
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.megatron import data as module
@@ -326,6 +394,56 @@ def test_delegated_packing_cannot_silently_drop_router_mask(monkeypatch):
             pad_individual_seqs_to_multiple_of=4,
             create_packed_seq_padding_mask=True,
         )
+
+
+@pytest.mark.parametrize("bias_updates", [False, True])
+def test_hybridep_self_packing_requests_mask_only_for_bias_updates(
+    monkeypatch, bias_updates
+):
+    """HybridEP with model-owned packing (e.g. Qwen3.5) and expert-bias updates off.
+
+    The iterator must not request a router padding mask the self-packing model
+    cannot carry; an expert-bias request is still rejected.
+    """
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import data as module
+
+    monkeypatch.setattr(BatchedDataDict, "to", lambda self, device: self)
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    batch = _packed_batch()
+    batch.micro_batch_indices = [[[0, 2]]]
+    batch.micro_batch_lengths = [[8]]
+    cfg = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        },
+        "sequence_packing": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 4,
+    }
+    iterator, *_ = module.get_microbatch_iterator(
+        batch,
+        cfg,
+        mbs=1,
+        straggler_timer=None,
+        seq_length_key="input_lengths",
+        delegate_pack_to_model=True,
+        create_router_padding_mask=bias_updates,
+    )
+    if bias_updates:
+        with pytest.raises(NotImplementedError, match="real-token validity"):
+            next(iterator)
+    else:
+        processed = next(iterator)
+        # The model still receives unpacked rows to pack itself, with no mask.
+        assert processed.padding_mask is None
+        assert processed.input_ids_cp_sharded.shape == (2, 8)
 
 
 @pytest.mark.parametrize("chunkwise", [False, True])

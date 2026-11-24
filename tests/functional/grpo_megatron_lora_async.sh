@@ -28,6 +28,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data.shuffle=false \
     policy.megatron_cfg.peft.enabled=true \
     policy.megatron_cfg.peft.dim=32 \
+    policy.generation.lora_refit_mode=merged \
     policy.train_global_batch_size=32 \
     policy.train_micro_batch_size=1 \
     policy.logprob_batch_size=32 \
@@ -51,4 +52,3 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/reward"]) > 0.03' \
     'max(data["train/gen_kl_error"]) < 0.001'
-

@@ -12,329 +12,119 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Validated configuration for the managed Dynamo generation backend."""
+"""Configuration for serving NeMo RL's vLLM workers behind Dynamo.
 
-import warnings
-from typing import Annotated, Any, Literal
+``policy.generation.dynamo: true`` on any vLLM config is the whole switch;
+``policy.generation.dynamo_cfg`` only tunes the frontend, and every field below
+carries its default. NeMo-Gym's chat calls are rendered and parsed with the
+native server's own settings (``vllm_cfg.http_server_serving_chat_kwargs``).
+"""
 
-from pydantic import (
-    BaseModel,
-    BeforeValidator,
-    PositiveFloat,
-    PositiveInt,
-    model_validator,
+import os
+from typing import Annotated, Any, Literal, Mapping
+
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
+
+from nemo_rl.telemetry.setup import (
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
 )
-
-# Must match vLLM's packed weight-transfer defaults exactly. The Dynamo
-# producer and consumer recompute chunk boundaries without negotiation. Verify
-# these values whenever Dynamo's pinned vLLM changes.
-VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
-VLLM_PACKED_NUM_BUFFERS = 2
-
-DYNAMO_VLLM_FLAGS: dict[str, str] = {
-    "tensor_parallel_size": "--tensor-parallel-size",
-    "pipeline_parallel_size": "--pipeline-parallel-size",
-    "gpu_memory_utilization": "--gpu-memory-utilization",
-    "max_model_len": "--max-model-len",
-    "kv_cache_dtype": "--kv-cache-dtype",
-    "load_format": "--load-format",
-    "precision": "--dtype",
-    "enforce_eager": "--enforce-eager",
-}
-
-_VLLM_CFG_STRUCTURAL = {
-    "env_vars",
-    "expert_parallel_size",
-}
-
-_VLLM_CFG_MOVED = {
-    "http_server_serving_chat_kwargs": (
-        "dynamo_cfg.worker_args.custom_jinja_template and tool_call_parser"
-    ),
-    "reasoning_parser_plugin": "dynamo_cfg.worker_args.reasoning_parser",
-    "tool_parser_plugin": "dynamo_cfg.worker_args.tool_call_parser",
-}
-
-_VLLM_CFG_UNSUPPORTED = {
-    # Applied inside NeMo RL's in-process vLLM worker; it cannot configure the
-    # managed ``dynamo.vllm`` subprocess.
-    "cap_max_tokens_to_context",
-    # Enforced by NeMo RL's own HTTP server; the managed Dynamo frontend checks
-    # no bearer token, so a truthy value is rejected below rather than warned.
-    "http_server_api_key_required",
-    "is_mx",
-    "num_first_layers_in_bf16",
-    "num_last_layers_in_bf16",
-    "skip_tokenizer_init",
-    "use_deep_gemm",
-}
-
-_VLLM_CFG_MANAGED_RUNTIME = {
-    "enable_vllm_metrics_logger",
-    "expose_http_server",
-    "logprobs_mode",
-    "vllm_metrics_logger_interval",
-}
-
-_VLLM_CFG_INAPPLICABLE = {
-    "async_engine",
-    "enable_return_routed_experts",
-    "http_refit_api_key_env_var",
-    "http_refit_server_port",
-    "use_tqdm",
-    "zmq_refit_server_port",
-}
-
-_VLLM_SINGLE_RANK_ONLY_FIELDS = {
-    "data_parallel_size",
-    "decode_context_parallel_size",
-    "prefill_context_parallel_size",
-}
-
-
-class DynamoWorkerArgs(BaseModel, extra="forbid"):
-    """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
-
-    tool_call_parser: str | None
-    reasoning_parser: str | None
-    exclude_tools_when_tool_choice_none: bool
-    enable_structural_tag: bool
-    structural_tag_scope: Literal["auto", "always"]
-    structural_tag_schema: Literal["auto", "strict"]
-    custom_jinja_template: str | None
-    endpoint_types: list[Literal["chat", "completions"]]
-    extra_cli_args: list[str]
-
-    @model_validator(mode="after")
-    def _validate_endpoint_types(self) -> "DynamoWorkerArgs":
-        if not self.endpoint_types:
-            raise ValueError("endpoint_types must contain at least one endpoint")
-        if len(self.endpoint_types) != len(set(self.endpoint_types)):
-            raise ValueError("endpoint_types must not contain duplicates")
-        return self
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):
-    """Structured arguments passed to the managed Dynamo frontend."""
+    """Arguments for the managed ``dynamo.frontend`` process."""
 
-    tokenizer: Literal["default", "fastokens"]
-    tokenizer_cache: bool
-    tokenizer_cache_bytes: PositiveInt
+    # "kv" routes each request to the engine holding most of its prefix, fed by
+    # the engines' vLLM KV-cache events. No "direct": it needs a worker ID on
+    # every request, and NeMo RL's rollouts name none.
     router_mode: Literal[
         "round-robin",
         "random",
-        "power-of-two",
         "kv",
-        "direct",
         "least-loaded",
         "device-aware-weighted",
-    ]
-    router_reset_states: bool
-    extra_cli_args: list[str]
+    ] = "kv"
+    # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
+    # pins each Gym session to one server; None disables it.
+    session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    # Entries are allocated as sessions start and reaped after the TTL, so the cap
+    # only bounds memory; a large run holds more sessions than Dynamo's own 65,536.
+    session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync; with router_mode kv, every
+    # router then sees the requests the others have in flight. NeMo-Gym keeps each
+    # session on one.
+    num_frontends: PositiveInt = 1
+    # Processes that render NeMo-Gym's chat calls and build their replies (the
+    # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
+    # uses one core. Every frontend runs its own. See
+    # docs/guides/dynamo-generation.md for sizing.
+    render_workers: PositiveInt = 8
+    extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
+    # the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":
+        # NeMo-Gym's chat calls are rendered and parsed by NeMo RL's chat
+        # engine, never by Dynamo's own renderer or chat processor.
+        for flag in (
+            "--dyn-chat-processor",
+            "--dyn-chat-processor-config",
+            "--custom-jinja-template",
+        ):
+            if any(arg.split("=", 1)[0] == flag for arg in self.extra_cli_args):
+                raise ValueError(
+                    f"dynamo_cfg.frontend_args.extra_cli_args may not set {flag}: "
+                    "NeMo RL's chat engine renders and parses chat calls with "
+                    "vllm_cfg.http_server_serving_chat_kwargs, as the native server "
+                    "does."
+                )
+        return self
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
-    """Driver-owned Dynamo service and worker-fleet configuration."""
+    """``policy.generation.dynamo_cfg``: the managed frontend."""
 
-    engine: Literal["vllm"]
-    startup_timeout_s: PositiveFloat
-    request_timeout_s: PositiveFloat
-    control_timeout_s: PositiveFloat
-    worker_args: DynamoWorkerArgs
-    frontend_args: DynamoFrontendArgs
-    metrics_include_prefixes: list[str] | None
-    metrics_exclude_prefixes: list[str] | None
+    # Bounds etcd/NATS/frontend start-up and every engine's registration.
+    startup_timeout_s: PositiveFloat = 600.0
+    # Deadline for one NeMo RL rollout through the frontend. None waits as long
+    # as generation takes, as native generate_async does; on the SingleController,
+    # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
+    # NeMo-Gym's own calls keep Gym's timeouts.
+    request_timeout_s: PositiveFloat | None = None
+    frontend_args: DynamoFrontendArgs = Field(default_factory=DynamoFrontendArgs)
 
 
-class DynamoVllmConfig(BaseModel, extra="allow"):
-    """Known vLLM settings consumed by ``dynamo.vllm``.
+def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:
+    """Whether ``policy.generation.dynamo`` is on for a vLLM generation config."""
+    return bool(generation_config.get("dynamo"))
 
-    Additional fields remain visible in ``model_extra`` so argument construction
-    can warn rather than silently dropping an inherited vLLM setting.
+
+def dynamo_cfg(generation_config: Mapping[str, Any]) -> DynamoCfg:
+    """The validated ``dynamo_cfg`` block; an absent block means all defaults."""
+    return DynamoCfg.model_validate(generation_config.get("dynamo_cfg") or {})
+
+
+def trace_export_env() -> dict[str, str]:
+    """Dynamo's trace-context switch, on when the engines trace natively.
+
+    Dynamo carries a call's trace context from the frontend to the engine only
+    while its OTLP export is on, and reads the switch when a process first loads
+    it, so the frontends and the vLLM workers need it in their environment from
+    the start. The condition is the one that turns on vLLM's own tracing
+    (``_maybe_enable_vllm_native_tracing``), so the engine has a tracer for the
+    trace headers it is handed. Dynamo reads the collector from the same
+    ``OTEL_EXPORTER_OTLP_*`` variables.
     """
-
-    async_engine: bool
-    tensor_parallel_size: PositiveInt
-    pipeline_parallel_size: PositiveInt
-    expert_parallel_size: PositiveInt
-    gpu_memory_utilization: float
-    max_model_len: PositiveInt
-    kv_cache_dtype: str
-    load_format: str
-    precision: str
-    enforce_eager: bool
-    expose_http_server: bool
-    enable_vllm_metrics_logger: bool
-    vllm_metrics_logger_interval: PositiveFloat
-    env_vars: dict[str, str] | None
-
-    @model_validator(mode="after")
-    def _validate_parallelism_and_precision(self) -> "DynamoVllmConfig":
-        if self.expert_parallel_size not in (1, self.tensor_parallel_size):
-            raise ValueError(
-                "backend='dynamo' requires expert_parallel_size to be 1 or "
-                "equal tensor_parallel_size"
-            )
-        if self.precision.lower() not in {
-            "bf16",
-            "bfloat16",
-        }:
-            raise ValueError(
-                f"policy.generation.vllm_cfg.precision={self.precision!r} is not "
-                "supported by backend='dynamo'; managed weight refit currently "
-                "supports BF16 generation only"
-            )
-        if self.kv_cache_dtype != "auto":
-            raise ValueError(
-                f"policy.generation.vllm_cfg.kv_cache_dtype={self.kv_cache_dtype!r} "
-                "is not supported by backend='dynamo'; use 'auto'"
-            )
-        extra = self.model_extra or {}
-        if extra.get("is_mx"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.is_mx is not supported by "
-                "backend='dynamo'; use backend='vllm' for MXFP8 generation"
-            )
-        if extra.get("http_server_api_key_required"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.http_server_api_key_required is not "
-                "supported by backend='dynamo'; the managed Dynamo frontend checks "
-                "no bearer token, so the exposed server would stay open"
-            )
-        if (
-            int(extra.get("num_first_layers_in_bf16") or 0) != 0
-            or int(extra.get("num_last_layers_in_bf16") or 0) != 0
-        ):
-            raise ValueError(
-                "mixed BF16/FP8 generation is not supported by backend='dynamo'; "
-                "use backend='vllm'"
-            )
-        logprobs_mode = extra.get("logprobs_mode")
-        if logprobs_mode not in (None, "processed_logprobs"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.logprobs_mode must be "
-                "'processed_logprobs' when backend='dynamo'; the managed "
-                "--enable-rl option selects processed rollout log probabilities"
-            )
-
-        configured_fields = self.model_fields_set | set(extra)
-        for key, replacement in _VLLM_CFG_MOVED.items():
-            if extra.get(key) is not None:
-                raise ValueError(
-                    f"policy.generation.vllm_cfg.{key} is not read by the "
-                    f"Dynamo backend; set {replacement} instead"
-                )
-        for key in sorted(_VLLM_CFG_UNSUPPORTED & configured_fields):
-            if not extra.get(key):
-                continue
-            warnings.warn(
-                f"policy.generation.vllm_cfg.{key} is ignored by backend='dynamo'",
-                stacklevel=2,
-            )
-        classified = (
-            set(DYNAMO_VLLM_FLAGS)
-            | _VLLM_CFG_STRUCTURAL
-            | set(_VLLM_CFG_MOVED)
-            | _VLLM_CFG_UNSUPPORTED
-            | _VLLM_CFG_MANAGED_RUNTIME
-            | _VLLM_CFG_INAPPLICABLE
-            | _VLLM_SINGLE_RANK_ONLY_FIELDS
-        )
-        unclassified = {
-            key for key in configured_fields if getattr(self, key, None) is not None
-        } - classified
-        if unclassified:
-            warnings.warn(
-                "vllm_cfg keys ignored by backend='dynamo': "
-                f"{sorted(unclassified)}. Add them to DYNAMO_VLLM_FLAGS or an "
-                "explicit not-forwarded classification.",
-                stacklevel=2,
-            )
-        return self
-
-
-def _require_nonempty_vllm_config(value: Any) -> Any:
-    if not isinstance(value, dict) or not value:
-        raise ValueError(
-            "policy.generation.vllm_cfg must be a nonempty mapping when "
-            "backend='dynamo'"
-        )
-    return value
-
-
-class DynamoConfig(BaseModel, extra="allow"):
-    """Validated boundary for ``policy.generation.backend=dynamo``."""
-
-    backend: Literal["dynamo"]
-    dynamo_cfg: DynamoCfg
-    vllm_cfg: Annotated[
-        DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
-    ]
-    vllm_kwargs: dict[str, Any]
-
-    @property
-    def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
-        return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
-
-    @model_validator(mode="after")
-    def _validate_backend_boundary(self) -> "DynamoConfig":
-        extra = self.model_extra or {}
-        # Shared GRPO YAML inheritance supplies mcore_generation_config and
-        # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
-        # synchronizer instead, so these two sections are intentionally ignored.
-        for backend_cfg in ("sglang_cfg", "trtllm_cfg"):
-            if extra.get(backend_cfg):
-                raise ValueError(
-                    f"policy.generation.{backend_cfg} is not valid when "
-                    "backend='dynamo'; Dynamo manages vLLM only"
-                )
-        colocated = extra.get("colocated")
-        if isinstance(colocated, dict) and colocated.get("enabled"):
-            raise ValueError(
-                "policy.generation.colocated.enabled must be false when "
-                "backend='dynamo'"
-            )
-        if extra.get("refit_transport") is not None:
-            raise ValueError(
-                "policy.generation.refit_transport must be null when "
-                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
-            )
-        for quantization_field in ("quant_cfg", "real_quant"):
-            if extra.get(quantization_field):
-                raise ValueError(
-                    f"policy.generation.{quantization_field} is not supported "
-                    "when backend='dynamo'"
-                )
-        speculative_config = self.vllm_kwargs.get("speculative_config") or (
-            self.vllm_cfg.model_extra or {}
-        ).get("speculative_config")
-        if speculative_config:
-            raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
-            )
-        if self.vllm_kwargs.get("quantization") is not None:
-            raise ValueError(
-                "policy.generation.vllm_kwargs.quantization is not supported "
-                "when backend='dynamo'"
-            )
-        vllm_extra = self.vllm_cfg.model_extra or {}
-        for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
-            for source, value in (
-                ("vllm_cfg", vllm_extra.get(field)),
-                ("vllm_kwargs", self.vllm_kwargs.get(field)),
-            ):
-                if value is not None and int(value) != 1:
-                    raise ValueError(
-                        f"policy.generation.{source}.{field} must be 1 when "
-                        "backend='dynamo'; managed refit rank geometry is TP × PP"
-                    )
-        stop_strings = extra.get("stop_strings")
-        if stop_strings is not None and len(stop_strings) > 32:
-            raise ValueError(
-                "policy.generation.stop_strings supports at most 32 values when "
-                "backend='dynamo'"
-            )
-        return self
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if telemetry_enabled_in_env() and vllm_native_tracing_requested() and endpoint:
+        return {"OTEL_EXPORT_ENABLED": "1"}
+    return {}

@@ -1,0 +1,13 @@
+# .github/autobot/review-config.yml
+review:
+  model: claude
+
+auto-review:
+  enabled: true
+  mode: comment
+
+approval:
+  enabled: true
+  eligible_teams:
+    - automation
+    - rl_autobot_approvers

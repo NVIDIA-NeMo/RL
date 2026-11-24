@@ -14,11 +14,12 @@
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List
 
 import ray
 import torch
 from datasets import load_dataset
+from pydantic import BaseModel
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -27,7 +28,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 
 
-class RAGEnvConfig(TypedDict):
+class RAGEnvConfig(BaseModel, extra="allow"):
     dataset_name: str  # Name of the dataset to load
     dataset_split: str  # Split of the dataset to use
     text_column: str  # Column name containing the text to retrieve
@@ -135,20 +136,21 @@ class BM25Retriever:
 class RAGEnvironment(EnvironmentInterface):
     """RAG environment that uses BM25 for document retrieval."""
 
-    def __init__(self, cfg: RAGEnvConfig):
-        self.cfg = cfg
+    def __init__(self, cfg: RAGEnvConfig | dict[str, Any]):
+        # MasterConfig.env is a plain dict, so validate where it is consumed.
+        self.cfg = RAGEnvConfig.model_validate(cfg)
 
         # Load dataset
-        dataset = load_dataset(cfg["dataset_name"], split=cfg["dataset_split"])
-        documents = [sample[cfg["text_column"]] for sample in dataset]
+        dataset = load_dataset(self.cfg.dataset_name, split=self.cfg.dataset_split)
+        documents = [sample[self.cfg.text_column] for sample in dataset]
 
         # Initialize BM25 retriever
         self.retriever = BM25Retriever(
             documents=documents,
-            num_result=cfg["num_results"],
-            k1=cfg["k1"],
-            b=cfg["b"],
-            device=cfg["device"],
+            num_result=self.cfg.num_results,
+            k1=self.cfg.k1,
+            b=self.cfg.b,
+            device=self.cfg.device,
         )
 
     def format_result(self, retrieved_docs: List[str]) -> str:

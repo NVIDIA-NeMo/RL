@@ -67,21 +67,21 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     check_outdated_config(config)
 
-    config = MasterConfig(**config)
+    config = MasterConfig.model_validate(config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
-    # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
-    # cross-tokenizer). The consistency check (a same-vocab teacher must
-    # actually share the student's vocab) needs the real tokenizers and lives
-    # in `setup()` — comparing tokenizer *names* here is wrong, e.g.
+    # `teachers[i].aligner.projection_matrix_path` (null => same-vocab direct
+    # KL; set => cross-tokenizer). The consistency check (a same-vocab teacher
+    # must actually share the student's vocab) needs the real tokenizers and
+    # lives in `setup()` — comparing tokenizer *names* here is wrong, e.g.
     # Llama-3.2-3B and Llama-3.2-1B have different names but the same vocab.
 
     print("Final config:")
     pprint.pprint(config)
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
-    if config.checkpointing["enabled"]:
+    if config.checkpointing.enabled:
         print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}",
+            f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}",
             flush=True,
         )
 

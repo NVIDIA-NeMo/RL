@@ -19,7 +19,6 @@ from functools import partial
 from typing import Any, Optional
 
 import numpy as np
-import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -30,7 +29,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -171,7 +170,7 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -500,7 +499,7 @@ def rm_train(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -534,7 +533,7 @@ def rm_train(
 
     policy.prepare_for_training()
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while current_epoch < max_num_epochs and (
         master_config.rm.max_num_steps == -1
@@ -617,8 +616,7 @@ def rm_train(
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -626,7 +624,7 @@ def rm_train(
                 )
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ## +1 because step is 0-indexed
@@ -654,7 +652,7 @@ def rm_train(
                         for k, v in val_metrics.items():
                             setattr(rm_save_state, k, v)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -703,9 +701,8 @@ def rm_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,

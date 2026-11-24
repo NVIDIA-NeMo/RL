@@ -64,6 +64,28 @@ def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
     )
 
 
+def _share_arguments(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Put each top-level argument in the object store once and return ObjectRefs in its place.
+
+    Every initializer then gets a small ObjectRef instead of its own pickled copy (the tokenizer is megabytes and
+    slow to pickle). Ray resolves top-level ObjectRef arguments before an actor's ``__init__`` runs, so the
+    receiving code sees the original values, and it keeps each object alive until those actors are created, so the
+    refs need not be kept. ``ray.put`` pickles inside Ray, so an actor handle in an argument (the ``RayQueue``) is
+    still freed normally.
+    """
+
+    def share(value: Any) -> Any:
+        # ray.put rejects an ObjectRef; pass it as before and Ray resolves it.
+        return value if isinstance(value, ray.ObjectRef) else ray.put(value)
+
+    return (
+        tuple(share(value) for value in args),
+        {key: share(value) for key, value in kwargs.items()},
+    )
+
+
 def _check_dp_leader_worker_indices(
     requested: list[int], tied_group_leaders: list[int]
 ) -> None:
@@ -593,6 +615,10 @@ class RayWorkerGroup:
         if initializer_env_vars:
             initializer_runtime_env["env_vars"] = initializer_env_vars
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        # Put in the object store once for all initializers instead of pickled once per initializer.
+        initializer_args, initializer_kwargs = _share_arguments(
+            remote_worker_builder.args, remote_worker_builder.kwargs
+        )
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
             # sits idle after creating workers and only exists for GC lifetime.
@@ -602,8 +628,8 @@ class RayWorkerGroup:
                     runtime_env=initializer_runtime_env,
                 ).remote(
                     remote_worker_builder.ray_actor_class_fqn,
-                    *remote_worker_builder.args,
-                    **remote_worker_builder.kwargs,
+                    *initializer_args,
+                    **initializer_kwargs,
                 )
             )
 

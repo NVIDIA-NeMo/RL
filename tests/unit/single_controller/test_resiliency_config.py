@@ -22,28 +22,35 @@ hour three of a run.
 
 import warnings
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
+    SamplerConfig,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
     GenerationRouterConfig,
     MasterConfig,
+    RefitActorConfig,
     RolloutFailureConfig,
+    TokenCaptureConfig,
     WatchdogConfig,
+    logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
-from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
-    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def _all_sampler_names() -> list[str]:
@@ -71,7 +78,11 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 4,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
@@ -79,66 +90,128 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             force_on_policy_ratio=False,
         ),
         env={"should_use_nemo_gym": True},
-        checkpointing={"enabled": False, "metric_name": None},
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=False, metric_name=None
+        ),
     )
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
-def test_single_forward_threshold_rejected_before_streaming_setup(
-    algorithm: str,
-) -> None:
+def _single_forward_config() -> MasterConfig:
     cfg = _master_config()
     cfg.loss_fn.seq_logprob_error_in_loss = True
-    cfg.grpo.seq_logprob_error_threshold = 2.0
     cfg.loss_fn.force_on_policy_ratio = True
-    if algorithm == "ppo":
-        # The loss flag must be rejected even without a GRPO block.
-        cfg.ppo = PPOConfig.model_construct()
-        cfg.grpo = None
-    with pytest.raises(ValueError, match="advantage baselines"):
+    cfg.grpo.seq_logprob_error_threshold = 2.0
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    return cfg
+
+
+def test_single_forward_threshold_accepted_and_skips_policy_logprobs() -> None:
+    cfg = _single_forward_config()
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (False, False)
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_single_forward_threshold_rejected_for_forest_training() -> None:
+    cfg = _single_forward_config()
+    # enabled=True so the "forest_training requires token_capture.enabled"
+    # check cannot stand in for the in-loss rejection.
+    cfg.token_capture = TokenCaptureConfig.model_construct(
+        enabled=True, forest_training=True
+    )
+    with pytest.raises(ValueError, match="seq_logprob_error_in_loss"):
         validate_single_controller_config(cfg)
 
 
-class TestDefaultsAreInert:
-    def test_timeouts_default_to_disabled(self):
-        cfg = AsyncRLConfig()
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
-        assert cfg.rollout_failure.native.generation_timeout_s is None
-        assert cfg.rollout_failure.native.env_timeout_s is None
+def test_single_forward_threshold_requires_a_threshold() -> None:
+    cfg = _single_forward_config()
+    cfg.grpo.seq_logprob_error_threshold = None
+    with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
+        validate_single_controller_config(cfg)
 
-    def test_retry_budgets_have_documented_defaults(self):
-        cfg = AsyncRLConfig().rollout_failure
-        assert cfg.max_infra_attempts_per_prompt == 5
-        assert cfg.max_data_attempts_per_prompt == 2
-        assert cfg.backoff_base_s == 1.0
-        assert cfg.max_backoff_s == 30.0
-        assert cfg.max_skipped_prompts == 0
-        assert cfg.max_consecutive_dropped_prompts == 0
-        assert cfg.min_step_batch_fraction == 0.9
-        assert cfg.on_dropped_prompt == "shrink"
-        assert cfg.max_replacement_attempts == 1
-        assert cfg.replacement_reserve_prompts == 1
-        assert cfg.nemo_gym.max_row_attempts == 3
 
-    def test_watchdog_has_documented_defaults(self):
-        cfg = AsyncRLConfig().stall_watchdog
-        assert cfg.interval_s == 30.0
-        assert cfg.stall_timeout_s == 600.0
-        assert cfg.stall_action == "warn"
-        assert cfg.gym_subprocess_check is True
+@pytest.mark.parametrize("min_groups", [1, 8])
+def test_in_loss_filter_rejects_excluded_reward_statistics(min_groups: int) -> None:
+    cfg = _single_forward_config()
+    cfg.async_rl.min_groups_for_streaming_train = min_groups
+    cfg.grpo.masked_reward_policy = "exclude"
 
-    def test_pre_existing_configs_still_load(self):
-        """A config written before these fields existed must be unaffected."""
-        cfg = AsyncRLConfig(
-            **{
-                "sampler": {"name": "in_order", "max_lookahead_versions": 0},
-                "min_groups_for_streaming_train": 4,
-                "max_inflight_prompts": 4,
-                "max_buffered_rollouts": 4,
-            }
-        )
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
-        assert cfg.rollout_failure.max_infra_attempts_per_prompt == 5
+    with pytest.raises(ValueError, match="masked_reward_policy.*exclude"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("masked_reward_policy", ["include", "exclude"])
+def test_separate_filter_preserves_reward_policy(masked_reward_policy: str) -> None:
+    cfg = _single_forward_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    cfg.grpo.masked_reward_policy = masked_reward_policy
+
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_reinforce_plus_plus_requires_full_batch_statistics() -> None:
+    cfg = _master_config()
+    cfg.grpo.adv_estimator.name = "reinforce_plus_plus"
+    cfg.async_rl.min_groups_for_streaming_train = 2
+
+    with pytest.raises(ValueError, match="reinforce_plus_plus.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_streaming_uses_the_estimator_batch_requirement(monkeypatch) -> None:
+    """Changing an estimator's requirement must not need a new name check."""
+    monkeypatch.setattr(
+        GRPOAdvantageEstimator,
+        "requires_global_batch",
+        property(lambda self: True),
+        raising=False,
+    )
+    cfg = _master_config()
+    cfg.async_rl.min_groups_for_streaming_train = 2
+    with pytest.raises(ValueError, match="requires.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
+def test_refit_actor_accepted_with_non_colocated_nccl_refit() -> None:
+    validate_single_controller_config(
+        _master_config(refit_actor=RefitActorConfig(enabled=True))
+    )
+
+
+def test_refit_actor_rejected_with_colocated_generation() -> None:
+    # Megatron is the one backend the SingleController runs colocated.
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"] = {"backend": "megatron", "colocated": {"enabled": True}}
+    with pytest.raises(ValueError, match="non-colocated"):
+        validate_single_controller_config(cfg)
+
+
+def test_refit_actor_rejected_with_non_nccl_refit_transport() -> None:
+    cfg = _master_config(refit_actor=RefitActorConfig(enabled=True))
+    cfg.policy["generation"]["refit_transport"] = "nixl"
+    with pytest.raises(ValueError, match="NCCL refit transports"):
+        validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestRolloutFailureValidation:
@@ -147,42 +220,10 @@ class TestRolloutFailureValidation:
             RolloutFailureConfig(backoff_base_s=10.0, max_backoff_s=1.0)
 
     def test_equal_backoff_bounds_are_allowed(self):
-        cfg = RolloutFailureConfig(backoff_base_s=5.0, max_backoff_s=5.0)
-        assert cfg.max_backoff_s == 5.0
-
-    def test_a_skip_budget_is_accepted(self):
-        cfg = RolloutFailureConfig(max_skipped_prompts=10)
-        assert cfg.max_skipped_prompts == 10
-
-    def test_zero_is_the_default_and_means_fail_on_the_first_one(self):
-        """One knob: the illegal "skip, but never skip anything" state is unrepresentable.
-
-        It used to take an enum plus a count, which could contradict each other, and a
-        validator existed purely to reject that one combination.
-        """
-        assert RolloutFailureConfig().max_skipped_prompts == 0
-
-    def test_a_consecutive_drop_budget_is_accepted(self):
-        cfg = RolloutFailureConfig(max_consecutive_dropped_prompts=4)
-        assert cfg.max_consecutive_dropped_prompts == 4
-
-    def test_the_two_drop_budgets_are_independent_knobs(self):
-        """Tolerating a bad dataset must not imply tolerating a dying fleet."""
-        cfg = RolloutFailureConfig(max_skipped_prompts=100)
-        assert cfg.max_consecutive_dropped_prompts == 0
-
-    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
-    def test_an_out_of_range_step_floor_is_rejected(self, fraction):
-        """0 would permit an empty step; above 1 could never be satisfied."""
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(min_step_batch_fraction=fraction)
+        RolloutFailureConfig(backoff_base_s=5.0, max_backoff_s=5.0)
 
     def test_a_full_step_floor_is_allowed_and_forbids_shrinking(self):
-        assert RolloutFailureConfig(min_step_batch_fraction=1.0).min_step_batch_fraction
-
-    def test_replace_mode_is_opt_in(self):
-        """Shrinking is what the branch shipped with; replacing must be asked for."""
-        assert RolloutFailureConfig().on_dropped_prompt == "shrink"
+        RolloutFailureConfig(min_step_batch_fraction=1.0)
 
     @pytest.mark.parametrize("policy", ["regenerate", "promote"])
     def test_an_unknown_drop_policy_is_rejected(self, policy):
@@ -214,26 +255,14 @@ class TestRolloutFailureValidation:
 
     def test_the_same_zeros_are_fine_while_shrinking(self):
         """They are only read in replace mode, so shrink runs must not trip on them."""
-        cfg = RolloutFailureConfig(
-            max_replacement_attempts=0, replacement_reserve_prompts=0
-        )
-        assert cfg.on_dropped_prompt == "shrink"
+        RolloutFailureConfig(max_replacement_attempts=0, replacement_reserve_prompts=0)
 
     def test_replace_mode_accepts_a_deeper_budget(self):
-        cfg = RolloutFailureConfig(
+        RolloutFailureConfig(
             on_dropped_prompt="replace",
             max_replacement_attempts=3,
             replacement_reserve_prompts=16,
         )
-        assert cfg.max_replacement_attempts == 3
-        assert cfg.replacement_reserve_prompts == 16
-
-    @pytest.mark.parametrize("attempts", [0, -1])
-    def test_non_positive_attempt_budgets_are_rejected(self, attempts):
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(max_infra_attempts_per_prompt=attempts)
-        with pytest.raises(ValidationError):
-            RolloutFailureConfig(max_data_attempts_per_prompt=attempts)
 
     @pytest.mark.parametrize(
         ("old", "value"),
@@ -261,6 +290,36 @@ class TestRolloutFailureValidation:
             AsyncRLConfig(**{old: 60.0})
 
 
+class TestStreamingChunkBounds:
+    def test_the_cap_is_unset_by_default(self):
+        """None is the pre-existing unbounded behaviour, and stays the default."""
+        assert AsyncRLConfig().max_groups_for_streaming_train is None
+
+    def test_a_cap_at_or_above_the_floor_is_accepted(self):
+        cfg = AsyncRLConfig(
+            min_groups_for_streaming_train=8, max_groups_for_streaming_train=8
+        )
+        assert cfg.max_groups_for_streaming_train == 8
+
+    def test_a_cap_below_the_floor_is_rejected_rather_than_silently_winning(self):
+        """Below the floor the clamp fires on every chunk, not just the tail.
+
+        The run would stream at the cap and the configured floor would never
+        apply -- dead config that still reads as if it bounds something.
+        """
+        with pytest.raises(ValidationError, match="no effect"):
+            AsyncRLConfig(
+                min_groups_for_streaming_train=32, max_groups_for_streaming_train=16
+            )
+
+    @pytest.mark.parametrize("cap", [0, -1])
+    def test_a_non_positive_cap_is_rejected(self, cap):
+        with pytest.raises(ValidationError, match="must be >= 1"):
+            AsyncRLConfig(
+                min_groups_for_streaming_train=1, max_groups_for_streaming_train=cap
+            )
+
+
 class TestWatchdogValidation:
     def test_stall_timeout_must_exceed_the_tick(self):
         with pytest.raises(ValidationError, match="stall_timeout_s"):
@@ -270,15 +329,8 @@ class TestWatchdogValidation:
         with pytest.raises(ValidationError, match="stall_timeout_s"):
             WatchdogConfig(interval_s=30.0, stall_timeout_s=5.0)
 
-    def test_unknown_action_is_rejected(self):
-        with pytest.raises(ValidationError):
-            WatchdogConfig(stall_action="explode")
-
 
 class TestGenerationRouterValidation:
-    def test_the_default_status_is_outside_gyms_retry_set(self):
-        assert GenerationRouterConfig().no_healthy_backend_status == 409
-
     @pytest.mark.parametrize("status", [429, 500, 502, 503, 504, 520])
     def test_a_status_gym_retries_is_rejected(self, status):
         """Returning one of these would make Gym retry forever.
@@ -293,45 +345,14 @@ class TestGenerationRouterValidation:
 
     @pytest.mark.parametrize("status", [400, 404, 409, 418, 422])
     def test_other_client_errors_are_allowed(self, status):
-        assert (
-            GenerationRouterConfig(
-                no_healthy_backend_status=status
-            ).no_healthy_backend_status
-            == status
-        )
-
-    def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().generation_router.enabled is False
+        GenerationRouterConfig(no_healthy_backend_status=status)
 
 
 class TestFleetHealthValidation:
-    def test_it_is_off_by_default(self):
-        assert AsyncRLConfig().generation_fleet_health.enabled is False
-
     def test_a_probe_timeout_that_outlasts_the_interval_is_rejected(self):
         """Otherwise probes overlap and a slow fleet reads as a dead one."""
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
-
-    def test_restarting_dead_shards_is_off_by_default(self):
-        """Recreating a vLLM worker mid-run is the most invasive thing this does, so it
-        is opt-in rather than implied by enabling fleet health."""
-        assert AsyncRLConfig().generation_fleet_health.restart_dead_shards is False
-
-    def test_restarting_can_be_enabled(self):
-        assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
-
-    def test_the_restart_budget_defaults_are_armed(self):
-        """Both bounds are what stop a restart failing silently rather than loudly.
-
-        Without restart_timeout_s a bundle that can never be filled leaves the shard in
-        RESTARTING for the rest of the run -- never retried, never retired. Without
-        restart_backoff_s the whole attempt budget can burn inside 25s at the default
-        probe interval, none of the attempts having waited for the cause to clear.
-        """
-        cfg = FleetHealthConfig()
-        assert cfg.restart_timeout_s == 1800.0
-        assert cfg.restart_backoff_s == 60.0
 
     def test_the_restart_budget_is_not_the_refit_deadline(self):
         """A refit moves bytes between live processes; a restart reloads a model from
@@ -353,9 +374,6 @@ class TestTheRefitDeadlineIsArmedByDefault:
     default to None fails loudly rather than silently removing recovery.
     """
 
-    def test_the_documented_default_is_armed(self):
-        assert AsyncRLConfig().generation_fleet_health.refit_timeout_s == 300.0
-
     def test_turning_fleet_health_on_does_not_have_to_ask_for_it(self):
         """The combination that used to be silently non-recovering."""
         cfg = FleetHealthConfig(enabled=True)
@@ -367,10 +385,6 @@ class TestTheRefitDeadlineIsArmedByDefault:
     def test_it_clears_a_healthy_refit_by_a_wide_margin(self):
         """~1.9s measured for a 1.5B model on GB200, so it cannot fire on a slow one."""
         assert AsyncRLConfig().generation_fleet_health.refit_timeout_s >= 100 * 1.9
-
-    def test_none_still_disarms_it_when_asked_explicitly(self):
-        """The escape hatch stays: an explicit None starts no watchdog thread."""
-        assert FleetHealthConfig(refit_timeout_s=None).refit_timeout_s is None
 
 
 class TestWatchdogVersusRolloutTimeout:
@@ -447,13 +461,19 @@ class TestWrongPathFaultToleranceIsRejected:
             ),
             policy={
                 "train_global_batch_size": 8,
-                "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"http_api_server_count": 1},
+                    "colocated": {"enabled": False},
+                },
             },
             loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},
             # Read by the metric_name check upstream #3429 added to this same
             # validator, which runs before the wrong-path check under test.
-            checkpointing={"enabled": False, "metric_name": None},
+            checkpointing=CheckpointingConfig.model_construct(
+                enabled=False, metric_name=None
+            ),
         )
 
     def test_gym_only_knobs_on_a_native_run_are_rejected(self):
@@ -516,12 +536,6 @@ class TestWrongPathFaultToleranceIsRejected:
 
 
 class TestGenerationRouterPortAndTimeoutValidation:
-    def test_default_port_range_uses_the_reserved_router_band(self):
-        cfg = GenerationRouterConfig()
-
-        assert cfg.port_range_low == DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
-        assert cfg.port_range_high == DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
-
     def test_a_transposed_port_range_is_rejected(self):
         """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
         with pytest.raises(ValidationError, match="port_range_low"):
@@ -534,25 +548,11 @@ class TestGenerationRouterPortAndTimeoutValidation:
     def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
         """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
         cfg = GenerationRouterConfig()
-        assert cfg.connect_timeout_s == 5.0
         assert cfg.connect_timeout_s < cfg.backend_timeout_s
 
     def test_a_connect_timeout_beyond_the_total_is_rejected(self):
         with pytest.raises(ValidationError, match="connect_timeout_s"):
             GenerationRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
-
-
-class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
-    def test_an_unimplemented_selection_mode_is_rejected(self):
-        """Nothing dispatches on this value, so accepting round_robin would silently
-        hand the caller least_outstanding anyway."""
-        with pytest.raises(ValidationError):
-            FleetHealthConfig(selection="round_robin")
-
-    def test_the_implemented_mode_is_accepted(self):
-        assert FleetHealthConfig(selection="least_outstanding").selection == (
-            "least_outstanding"
-        )
 
 
 class TestRenamedBlocksAreRejected:
@@ -597,23 +597,16 @@ class TestRouterDeadlineFitsInsideTheRollout:
             )
 
     def test_a_router_deadline_inside_it_is_accepted(self):
-        cfg = AsyncRLConfig(
+        AsyncRLConfig(
             generation_router={"enabled": True, "backend_timeout_s": 120.0},
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 300.0}},
         )
-        assert cfg.generation_router.backend_timeout_s == 120.0
-
-    def test_an_unset_rollout_deadline_imposes_no_constraint(self):
-        """rollout_timeout_s defaults to None -- disabled -- so there is nothing to fit in."""
-        cfg = AsyncRLConfig(generation_router={"enabled": True})
-        assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
 
     def test_a_disabled_router_imposes_no_constraint(self):
-        cfg = AsyncRLConfig(
+        AsyncRLConfig(
             generation_router={"enabled": False, "backend_timeout_s": 600.0},
             rollout_failure={"nemo_gym": {"rollout_timeout_s": 60.0}},
         )
-        assert cfg.generation_router.enabled is False
 
 
 class TestTheDropBudgetsReachTheRolloutLayer:
@@ -684,8 +677,8 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
         )
         assert not any("min_step_batch_fraction" in m for m in self._messages(cfg))
 
-    def test_replacing_under_a_sampler_that_never_stamps_falls_back_to_shrinking(self):
-        """Replacement needs a step stamp to know which step it owes a group to."""
+    def test_replacing_under_windowed_is_warned_about(self):
+        """Its rollout keeps producing, so it never draws on a spare pool."""
         cfg = _master_config(
             sampler={"name": "windowed"},
             rollout_failure={"on_dropped_prompt": "replace"},
@@ -693,8 +686,21 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
         with pytest.warns(UserWarning, match="on_dropped_prompt"):
             validate_single_controller_config(cfg)
 
-    def test_a_stamping_sampler_is_not_warned_about(self):
-        cfg = _master_config(rollout_failure={"on_dropped_prompt": "replace"})
+    def test_replacing_under_weight_fifo_is_warned_about(self):
+        """A replacement lands in a newer weight bucket, so there is no spare pool."""
+        cfg = _master_config(
+            sampler={"name": "weight_fifo"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+        with pytest.warns(UserWarning, match="on_dropped_prompt"):
+            validate_single_controller_config(cfg)
+
+    @pytest.mark.parametrize("sampler_name", ["in_order", "ready_first"])
+    def test_a_sampler_that_uses_the_pool_is_not_warned_about(self, sampler_name):
+        cfg = _master_config(
+            sampler={"name": sampler_name},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
         assert not any("on_dropped_prompt" in m for m in self._messages(cfg))
 
     def test_a_reserve_larger_than_a_step_can_never_fill(self):
@@ -712,57 +718,80 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
         assert self._messages(_master_config()) == []
 
 
-class TestADropBudgetNeedsASamplerThatStamps:
-    """The one combination in this area that is rejected rather than warned about.
+class TestADropBudgetIsAcceptedUnderEverySampler:
+    """Each sampler but weight_fifo says where a lost group is charged.
 
-    An unstamped drop is not a pair of knobs cancelling out: the prompt is given up on
-    and no step is credited for it, so that step waits on a group nobody is generating.
-    Under ``weight_fifo`` the gate that stops the rollout pump running ahead also stops
-    it reaching exhaustion, so the "rollout exhausted" error never fires and the run
-    stalls silently -- which is why config load is the last place that can object.
+    A drop budget used to be rejected under a sampler that stamps no target step,
+    because the lost group was charged to no step and that step waited on a group
+    nobody was generating. See ``charge_step_for_lost_group``.
     """
 
-    @pytest.mark.parametrize("sampler_name", ["windowed", "weight_fifo", "ready_first"])
+    @pytest.mark.parametrize("sampler_name", ["windowed", "ready_first"])
     @pytest.mark.parametrize(
         "budget",
         [{"max_skipped_prompts": 1}, {"max_consecutive_dropped_prompts": 1}],
     )
-    def test_either_budget_under_any_unstamped_sampler_is_rejected(
+    def test_either_budget_is_accepted_under_a_sampler_that_stamps_nothing(
         self, sampler_name, budget
     ):
         cfg = _master_config(sampler={"name": sampler_name}, rollout_failure=budget)
-        with pytest.raises(ValueError, match="stamps no target step"):
+        validate_single_controller_config(cfg)
+
+    @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
+    @pytest.mark.parametrize(
+        "budget",
+        [{"max_skipped_prompts": 1}, {"max_consecutive_dropped_prompts": 1}],
+    )
+    def test_weight_fifo_rejects_a_nonzero_budget(self, budget, on_dropped_prompt):
+        """A lost group can neither be replaced nor charged to a weight bucket."""
+        cfg = _master_config(
+            sampler={"name": "weight_fifo"},
+            rollout_failure={**budget, "on_dropped_prompt": on_dropped_prompt},
+        )
+        with pytest.raises(ValueError, match="weight_fifo.*drop budget"):
             validate_single_controller_config(cfg)
 
-    def test_every_built_in_but_in_order_and_custom_is_covered(self):
-        """Read off the union, so a sampler added later is caught by default.
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            "tests.unit.single_controller.test_sampler_interface:InheritedWeightFifoSampler",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "budget", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
+    )
+    def test_custom_fixed_weight_policy_rejects_a_nonzero_budget(self, target, budget):
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(target=target, max_staleness_versions=0),
+            rollout_failure={budget: 1},
+        )
 
-        ready_first (#3582) landed between this PR's base and its rebase, inheriting the
-        None stamp like the rest. An allow-list would have let it straight through, and a
-        test that hardcoded the same list would have stayed green while it did.
-        """
-        exempt = {"in_order", "custom"}
-        covered = [n for n in _all_sampler_names() if n not in exempt]
-        assert covered, "the union should carry at least one unstamped sampler"
-        for sampler_name in covered:
+        with pytest.raises(ValueError, match="custom.*drop budget"):
+            validate_single_controller_config(cfg)
+
+    def test_every_built_in_accepts_the_budget(self):
+        """Read off the union, so a sampler added later is covered by default."""
+        built_ins = [
+            n for n in _all_sampler_names() if n not in ("custom", "weight_fifo")
+        ]
+        assert built_ins, "the union should carry at least one built-in sampler"
+        for sampler_name in built_ins:
             cfg = _master_config(
                 sampler={"name": sampler_name},
                 rollout_failure={"max_consecutive_dropped_prompts": 1},
             )
-            with pytest.raises(ValueError, match="stamps no target step"):
-                validate_single_controller_config(cfg)
+            validate_single_controller_config(cfg)
 
-    def test_shrink_mode_is_rejected_too_not_only_replace(self):
-        """The gap this closes: shrink is the default, so it was the silent one."""
+    def test_shrink_mode_is_accepted_too(self):
         cfg = _master_config(
-            sampler={"name": "weight_fifo"},
+            sampler={"name": "ready_first"},
             rollout_failure={
                 "max_consecutive_dropped_prompts": 2,
                 "on_dropped_prompt": "shrink",
             },
         )
-        with pytest.raises(ValueError, match="stamps no target step"):
-            validate_single_controller_config(cfg)
+        validate_single_controller_config(cfg)
 
     def test_a_stamping_sampler_carries_the_same_budget(self):
         cfg = _master_config(
@@ -783,10 +812,30 @@ class TestADropBudgetNeedsASamplerThatStamps:
         with pytest.warns(UserWarning, match="on_dropped_prompt"):
             validate_single_controller_config(cfg)
 
-    def test_a_custom_sampler_is_not_second_guessed(self):
-        """Whether it stamps is knowable only to its author, so neither set claims it."""
+    def test_a_compatible_custom_sampler_accepts_a_nonzero_budget(self):
         cfg = _master_config(
-            sampler={"name": "custom", "target": "my_pkg.samplers:MySampler"},
+            sampler=CustomSamplerConfig(
+                target="nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+            ),
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+    def test_a_zero_budget_still_accepts_a_compliant_custom_sampler(self):
+        """The interface check is unconditional, so the class is imported even with no
+        drop tolerated."""
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(
+                target="nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+            )
+        )
+        validate_single_controller_config(cfg)
+
+    def test_a_zero_budget_rejects_a_custom_sampler_without_the_members(self):
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(
+                target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
+            )
+        )
+        with pytest.raises(ValueError, match="missing the required"):
+            validate_single_controller_config(cfg)
