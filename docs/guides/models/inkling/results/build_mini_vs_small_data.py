@@ -52,6 +52,15 @@ for rid in run_ids:  # later runs win on overlapping steps
             train.setdefault(s, {}).update(t)
         if v:
             val.setdefault(s, {}).update(v)
+# Step-0 baseline: AIME eval of the untrained Mini weights, from a separate 1-step job
+# (W&B run name grpo-inkling2-mini-baseline-eval-step0, Slurm 9239197, val_at_start).
+val.setdefault(0, {}).update(
+    {
+        "validation/accuracy": 0.2578125,
+        "validation/avg_length": 2759.8,
+        "timing/validation/total_validation_time": 104.5,
+    }
+)
 mini = {
     "label": "Inkling 2 Mini · SGLang BF16 · sync · 2 nodes colocated",
     "training": [

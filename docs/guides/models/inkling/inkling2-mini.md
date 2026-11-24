@@ -148,7 +148,7 @@ dashed: Inkling 2 Mini.**
 
 | Measurement | Inkling 2 Small | Inkling 2 Mini |
 | --- | --- | --- |
-| AIME 2024 accuracy, step 0 (base model) | 39.06% | not evaluated |
+| AIME 2024 accuracy, step 0 (base model) | 39.06% | 25.78% |
 | AIME 2024 accuracy, step 10 | 64.84% | 28.91% |
 | AIME 2024 accuracy, step 20 | 78.91% | 33.20% |
 | AIME 2024 accuracy, step 40 | 78.91% | 41.41% |
@@ -176,9 +176,9 @@ How to read the comparison:
   torch dispatcher). The recipe settings (data, batch, LR, loss, sequence limits)
   are the same, so the curves compare how the models learn from the same task,
   not their step time.
-- **No base-model reference for Mini.** Mini's first evaluation is after 10
-  training steps, so the step-10 gap to Small includes ten steps of training
-  that Small's step 0 does not.
+- **Mini's step 0 is a separate job.** The base-model AIME evaluation (25.78%,
+  2,760-token mean response length) comes from a one-step run with
+  `grpo.val_at_start=true` and checkpointing off, not from the training chain.
 - **Generation KL** is the logged generation/training log-probability
   discrepancy, not a reference-policy KL loss. Mini's stays below 0.0013
   throughout.

@@ -183,7 +183,7 @@ def main() -> None:
     xmax = 10 * ((last_step + 9) // 10)
     for ax, (group, key, title, ylabel, scale) in zip(axes.flat, PANELS):
         for name, exp in data.items():
-            rows = [r for r in exp[group] if key in r]
+            rows = [r for r in exp[group] if r.get(key) is not None]
             style = STYLES[name]
             ax.plot(
                 [r["nemo_rl/step"] for r in rows],
@@ -231,7 +231,7 @@ def main() -> None:
         0.055,
         0.018,
         "Raw logged values, no smoothing; each experiment is a chain of 2 h jobs resumed from checkpoints. Same recipe for both.\n"
-        "AIME: 256 of the 960 rows, one response each. Step 0 (base-model eval) is available for Small only.",
+        "AIME: 256 of the 960 rows, one response each.",
         color="#475569",
         fontsize=10,
         linespacing=1.6,
