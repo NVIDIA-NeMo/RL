@@ -810,46 +810,149 @@ class MegatronGenerationMixin:
         self._inference_engine_asleep = False
 
     def _sleep(self) -> None:
-        """Pause + suspend the engine. No-op if already asleep."""
-        if self._inference_engine_asleep:
-            return
+        """Pause + suspend the engine. No-op on an engine that is already suspended.
+
+        Driven by the engine's own state, not by the asleep flag, so a call
+        after a failed one picks up where that one stopped: an engine left
+        PAUSED is suspended, and one left SUSPENDED is not suspended twice (a
+        second SUSPEND outside PAUSED ends Megatron's engine loop). Every rank
+        takes the barrier, whatever state it found.
+        """
         future = asyncio.run_coroutine_threadsafe(
             self._sleep_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
+        # The engine is suspended whatever the barrier below does.
         self._inference_engine_asleep = True
+        torch.distributed.barrier()
         print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _sleep_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.pause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
+    async def _wait_for_engine_state(self, state: EngineState) -> None:
+        """Wait until the engine reaches ``state``, or fail if its loop has stopped.
 
-        if torch.distributed.get_rank() == 0:
+        A stopped engine loop (an assert inside a state transition ends it)
+        never reaches another state, so the wait would never return.
+        """
+        engine = self.dynamic_inference_engine
+        loop_task = engine.engine_loop_task
+        waiter = asyncio.ensure_future(engine.wait_until(state))
+        await asyncio.wait({waiter, loop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if waiter.done():
+            waiter.result()
+            return
+        waiter.cancel()
+        self._raise_engine_loop_stopped(f"waiting for {state.name}")
+
+    def _raise_engine_loop_stopped(self, doing: str) -> None:
+        engine = self.dynamic_inference_engine
+        loop_task = engine.engine_loop_task
+        error = (
+            None
+            if loop_task.cancelled() or not loop_task.done()
+            else loop_task.exception()
+        )
+        raise RuntimeError(
+            f"[Rank {self.rank}] the inference engine loop has stopped in state "
+            f"{engine.state.name} while {doing}"
+        ) from error
+
+    def _check_engine_loop_running(self, doing: str) -> None:
+        loop_task = getattr(self.dynamic_inference_engine, "engine_loop_task", None)
+        if loop_task is None:
+            raise RuntimeError(
+                f"[Rank {self.rank}] the inference engine loop was never started "
+                f"({doing})"
+            )
+        if loop_task.done():
+            self._raise_engine_loop_stopped(doing)
+
+    async def _sleep_engine(self) -> None:
+        """Bring the engine from wherever it is to SUSPENDED.
+
+        Only rank zero sends PAUSE and SUSPEND; every rank waits for the
+        states they lead to. Megatron flips a stable state only after a world
+        barrier, so every rank sees the same stable states.
+        """
+        engine = self.dynamic_inference_engine
+        if getattr(engine, "engine_loop_task", None) is None:
+            # Built but never started: it serves nothing, so nothing to suspend.
+            return
+        self._check_engine_loop_running("suspending")
+        is_sender = torch.distributed.get_rank() == 0
+        if engine.state == EngineState.UNPAUSING:
+            await self._wait_for_engine_state(EngineState.RUNNING)
+        if engine.state == EngineState.RUNNING:
+            if is_sender:
+                self.inference_client.pause_engines()
+            await self._wait_for_engine_state(EngineState.PAUSED)
+        elif engine.state == EngineState.PAUSING:
+            await self._wait_for_engine_state(EngineState.PAUSED)
+        elif engine.state == EngineState.RESUMING:
+            # RESUMED is an event, not a resting state: the engine is back in PAUSED.
+            await self._wait_for_engine_state(EngineState.RESUMED)
+        if engine.state == EngineState.SUSPENDING:
+            await self._wait_for_engine_state(EngineState.SUSPENDED)
+            return
+        if engine.state == EngineState.SUSPENDED:
+            return
+        if engine.state != EngineState.PAUSED:
+            raise RuntimeError(
+                f"[Rank {self.rank}] cannot suspend the inference engine from "
+                f"state {engine.state.name}"
+            )
+        if is_sender:
             self.inference_client.suspend_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
+        await self._wait_for_engine_state(EngineState.SUSPENDED)
 
     def _wake(self) -> None:
-        """Resume + unpause the engine. No-op if already awake."""
-        if not self._inference_engine_asleep:
-            return
+        """Resume + unpause the engine. No-op on an engine that is already running.
+
+        Driven by the engine's own state, not by the asleep flag, so an engine
+        a failed suspend left PAUSED or SUSPENDED is put back in service too.
+        Every rank takes the barrier, whatever state it found.
+        """
         future = asyncio.run_coroutine_threadsafe(
             self._wake_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
+        # The engine is running whatever the barrier below does.
         self._inference_engine_asleep = False
+        torch.distributed.barrier()
         print(f"[Rank {self.rank}] resumed inference engine")
 
-    async def _wake_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.resume_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
+    async def _wake_engine(self) -> None:
+        """Bring the engine from wherever it is to RUNNING.
 
-        if torch.distributed.get_rank() == 0:
+        Only rank zero sends RESUME and UNPAUSE; every rank waits for the
+        states they lead to.
+        """
+        engine = self.dynamic_inference_engine
+        self._check_engine_loop_running("resuming")
+        is_sender = torch.distributed.get_rank() == 0
+        if engine.state == EngineState.RUNNING:
+            return
+        if engine.state == EngineState.UNPAUSING:
+            await self._wait_for_engine_state(EngineState.RUNNING)
+            return
+        if engine.state == EngineState.SUSPENDING:
+            await self._wait_for_engine_state(EngineState.SUSPENDED)
+        if engine.state == EngineState.SUSPENDED:
+            if is_sender:
+                self.inference_client.resume_engines()
+            # RESUMED is an event, not a resting state: the engine is back in PAUSED.
+            await self._wait_for_engine_state(EngineState.RESUMED)
+        elif engine.state == EngineState.RESUMING:
+            await self._wait_for_engine_state(EngineState.RESUMED)
+        elif engine.state == EngineState.PAUSING:
+            await self._wait_for_engine_state(EngineState.PAUSED)
+        if engine.state != EngineState.PAUSED:
+            raise RuntimeError(
+                f"[Rank {self.rank}] cannot resume the inference engine from "
+                f"state {engine.state.name}"
+            )
+        if is_sender:
             self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+        await self._wait_for_engine_state(EngineState.RUNNING)
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""

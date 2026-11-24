@@ -305,9 +305,11 @@ class MegatronDynamoGeneration(GenerationInterface):
     prepare the KV cache, resume) is fanned out over the engines' Ray workers
     in engine order. Engine ``i`` joins the refit group at the trainers plus
     the widths of the engines before it, so a prefill engine at TP 4 may sit
-    next to decode engines at TP 2. After a failed suspend the fleet attempts a best-effort
-    resume of every engine and the original error still propagates. The object
-    owns no policy and no worker group of its own.
+    next to decode engines at TP 2. After a failed suspend the fleet resumes
+    every engine, including one that stopped partway (each worker resumes from
+    the state its engine is actually in); the original error still
+    propagates, with any resume failure attached. The object owns no policy
+    and no worker group of its own.
 
     Pickling keeps the engine records (plain data plus the workers' actor
     handles) and drops the owning objects, so the SingleController actor's copy
@@ -724,10 +726,12 @@ class MegatronDynamoGeneration(GenerationInterface):
         The caller prepares the weights afterwards, as the Megatron weight
         synchronizer does for one dedicated engine.
 
-        If any step fails or the deadline passes, the fleet attempts a
-        best-effort resume of every engine and the original error still
-        propagates, with any resume failures added to it as notes. The resume
-        shares the suspend's deadline: if the suspend used it up, the resumes
+        If any step fails or the deadline passes, the fleet resumes every
+        engine and the original error still propagates, with any resume
+        failures added to it as notes. Each worker resumes from the state its
+        engine is actually in, so an engine the failed suspend left paused or
+        suspended goes back into service too. The resume shares the suspend's
+        deadline: if the suspend used it up, the resumes
         are still sent but not waited for, and the note says they were not
         confirmed in time.
 
