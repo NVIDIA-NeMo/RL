@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from nemo_rl.models.generation.vllm.draft_utils import (
     draft_module_sharing_disable_required,
+    load_draft_weights_with_stable_kv_buffers,
 )
 
 
@@ -61,3 +65,30 @@ def test_draft_module_sharing_disable_required(
 def test_draft_module_sharing_disable_required_no_speculative_config():
     config = {"vllm_cfg": {"load_format": "dummy"}, "vllm_kwargs": {}}
     assert draft_module_sharing_disable_required(config) is False
+
+
+def test_draft_refit_preserves_captured_context_kv_storage():
+    class Draft:
+        def __init__(self):
+            with torch.inference_mode():
+                self.model = SimpleNamespace(
+                    _fused_kv_weight=torch.zeros(2, 3),
+                    _fused_kv_bias=None,
+                    _k_norm_weights=torch.zeros(2, 3),
+                )
+
+        def load_weights(self, weights):
+            self.model._fused_kv_weight = dict(weights)["kv"].clone()
+            self.model._k_norm_weights = dict(weights)["norm"].clone()
+
+    draft = Draft()
+    captured_kv = draft.model._fused_kv_weight
+    captured_norm = draft.model._k_norm_weights
+    for refit_value in (1, 2):
+        kv = torch.full_like(captured_kv, refit_value)
+        norm = torch.full_like(captured_norm, refit_value + 2)
+        load_draft_weights_with_stable_kv_buffers(draft, [("kv", kv), ("norm", norm)])
+        assert draft.model._fused_kv_weight is captured_kv
+        assert draft.model._k_norm_weights is captured_norm
+        torch.testing.assert_close(captured_kv, kv)
+        torch.testing.assert_close(captured_norm, norm)
