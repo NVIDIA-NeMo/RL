@@ -390,7 +390,7 @@ def test_radio_defaults_never_use_a_stale_base_checkpoint(tmp_path, indexed):
 
 
 _IDENTITY_RADIO = SimpleNamespace(model_type="radio", initializer_factor=1.0)
-_REVISION = "e5e9932441de940c9a62185c870ea5bcd4cd24e2"
+_REVISION = "a" * 40  # any immutable 40-hex commit
 
 
 def _write_index(path, *vision_keys):
