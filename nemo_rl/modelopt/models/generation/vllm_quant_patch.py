@@ -296,7 +296,6 @@ def _process_moe_reload(
 def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
     """Keep CUDA-graph scale storage stable across native ModelOpt MoE reloads."""
     # These backend types are optional outside vLLM's real-quant worker.
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptFp8MoEMethod,
@@ -318,11 +317,11 @@ def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
                     f"backend {method.nvfp4_backend.name}. Choose a supported MoE backend."
                 )
         elif isinstance(method, ModelOptFp8MoEMethod):
-            # Static FP8 on these backends also creates unregistered reciprocals.
-            # Other FP8 backends keep their native storage lifecycle unchanged.
-            if method.fp8_backend not in (
-                Fp8MoeBackend.FLASHINFER_CUTLASS,
-                Fp8MoeBackend.HPC,
+            # Only FP8 backends whose config holds derived reciprocal scales need
+            # this; others keep their native storage lifecycle unchanged.
+            config = method.moe_quant_config
+            if config is None or (
+                config.a1_gscale is None and config.a2_gscale is None
             ):
                 continue
         else:

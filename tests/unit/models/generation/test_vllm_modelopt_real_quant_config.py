@@ -591,30 +591,66 @@ def test_real_quant_fp8_moe_scales_survive_native_reload(
 
 
 @pytest.mark.vllm
-def test_real_quant_other_fp8_moe_backends_keep_native_processing() -> None:
+@pytest.mark.parametrize(
+    "moe_quant_config",
+    [None, types.SimpleNamespace(a1_gscale=None, a2_gscale=None)],
+    ids=["no-config", "no-reciprocal-scales"],
+)
+def test_real_quant_fp8_moe_without_reciprocal_scales_keeps_native_processing(
+    moe_quant_config,
+) -> None:
     # Optional native dependencies are installed only in the vLLM test environment.
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8MoEMethod
 
     from nemo_rl.modelopt.models.generation import (
         vllm_quant_patch as patch_mod,
     )
 
-    for backend in set(Fp8MoeBackend) - {
-        Fp8MoeBackend.FLASHINFER_CUTLASS,
-        Fp8MoeBackend.HPC,
-    }:
-        layer = torch.nn.Module()
-        method = object.__new__(ModelOptFp8MoEMethod)
-        method.fp8_backend = backend
-        method.process_weights_after_loading = object()
-        layer.quant_method = method
-        original_process = method.process_weights_after_loading
+    layer = torch.nn.Module()
+    method = object.__new__(ModelOptFp8MoEMethod)
+    method.moe_quant_config = moe_quant_config
+    method.process_weights_after_loading = object()
+    layer.quant_method = method
+    original_process = method.process_weights_after_loading
 
-        patch_mod._preserve_moe_reload_scales(layer)
+    patch_mod._preserve_moe_reload_scales(layer)
 
-        assert method.process_weights_after_loading is original_process
-        assert not layer._buffers
+    assert method.process_weights_after_loading is original_process
+    assert not layer._buffers
+
+
+@pytest.mark.vllm
+def test_real_quant_worker_prepares_unwrapped_model_after_load(monkeypatch):
+    from nemo_rl.modelopt.models.generation import vllm_quant_patch as patch_mod
+    from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
+
+    model = torch.nn.Linear(1, 1)
+    worker = object.__new__(patch_mod.RealQuantWorker)
+    worker.model_runner = types.SimpleNamespace(model=None)
+    calls = []
+
+    def fake_load_model(self, *, load_dummy_weights=False):
+        calls.append(("load", load_dummy_weights))
+        self.model_runner.model = types.SimpleNamespace(unwrap=lambda: model)
+
+    monkeypatch.setattr(NixlVllmWorker, "load_model", fake_load_model)
+    for helper in (
+        "_make_nvfp4_moe_input_scales_writable",
+        "_preserve_moe_reload_scales",
+    ):
+        monkeypatch.setattr(
+            patch_mod,
+            helper,
+            lambda target, helper=helper: calls.append((helper, target)),
+        )
+
+    worker.load_model(load_dummy_weights=True)
+
+    assert calls == [
+        ("load", True),
+        ("_make_nvfp4_moe_input_scales_writable", model),
+        ("_preserve_moe_reload_scales", model),
+    ]
 
 
 @pytest.mark.vllm
@@ -800,6 +836,7 @@ def _with_generation(**changes):
     [
         (_real_quant_policy_cfg(megatron_cfg={"enabled": False}), "megatron_cfg"),
         (_real_quant_policy_cfg(quant_cfg=None), "policy.quant_cfg"),
+        (_with_generation(quant_cfg="nvfp4"), "generation.quant_cfg must be null"),
         (
             _with_generation(
                 vllm_kwargs={
@@ -816,6 +853,7 @@ def _with_generation(**changes):
     ids=[
         "dtensor",
         "no-quant-cfg",
+        "generation-quant-cfg",
         "speculative",
         "kv-cache-dtype",
         "fp8-precision",

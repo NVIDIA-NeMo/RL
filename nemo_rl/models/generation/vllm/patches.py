@@ -518,16 +518,12 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         elif old_snippet in updated:
             updated = updated.replace(old_snippet, new_snippet, 1)
         else:
-            # Without the fill loop the parameters stay at dummy init, so refuse
-            # to write a half-applied patch and make the reason loud.
-            logger.warning(
+            # Without the fill loop the parameters stay at dummy init.
+            raise RuntimeError(
                 "Could not apply vLLM RADIO LayerScale loader patch: the "
-                "load_weights tail anchor was not found in %s. LayerScale "
-                "parameters would keep their dummy initialization; expect a "
-                "degraded vision tower and inflated token_mult_prob_error.",
-                file_to_patch,
+                f"load_weights tail anchor was not found in {file_to_patch}. "
+                "LayerScale parameters would keep their dummy initialization."
             )
-            return
         write_back(updated)
 
     logger.info(

@@ -487,16 +487,15 @@ def test_vision_loader_patches_upgrade_existing_outputs(
     assert model_file.read_text() == final
 
 
-def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+def test_radio_layerscale_patch_raises_on_unknown_source(monkeypatch, tmp_path):
     radio_source = tmp_path / "radio.py"
     radio_source.write_text("class RadioModel:\n    pass\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(radio_source))
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match="load_weights tail anchor was not found"):
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.vllm

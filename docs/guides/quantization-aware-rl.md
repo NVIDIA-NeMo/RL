@@ -30,10 +30,10 @@ The following table records prior recipe campaigns and the validation level reac
 | QA-GRPO real quantization rollout | Mixed MXFP8/W4A16 | `examples/modelopt/quant_configs/mxfp8_attention_nvfp4_mlp.yaml` with `policy.generation.real_quant: true` | ✅ Completed 150-step native-loader run (manual) | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-mxfp8-nvfp4-mixed.yaml` |
 | QA-GRPO real quantization rollout | Grouped-MoE W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | ✅ Two-step Qwen3.5 native-loader run | `examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml` with TP1/CP1/EP16 policy and TP4 rollout overrides |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | Historical convergence; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
-| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` | Historical hybrid MoE/Mamba convergence; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
+| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml` with `policy.generation.real_quant: true` | Historical hybrid MoE/Mamba convergence; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
 | QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | Historical 300-step Qwen3-30B-A3B run; native-loader revalidation pending | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
 
-The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to supported MLP/MoE weights while its authored quantizer selection keeps sensitive paths in BF16.
+The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The `nvfp4_experts_weightonly.yaml` recipe, used for Nano3 real-quant rollout, applies W4A16 to routed experts only and keeps Mamba, attention and shared experts in BF16.
 
 ## Dynamic FP8 KV Cache
 
@@ -173,11 +173,11 @@ ModelOpt derives the canonical configuration from `policy.quant_cfg`, and vLLM s
 
 For the pinned vLLM 0.33.0 loader, see the [ModelOpt schema support table](../design-docs/modelopt-real-quant-architecture.md#formats). `FP8_PER_CHANNEL_PER_TOKEN` and `FP8_PB_WO` cover dense linear layers only in uniform schemas; inside mixed schemas, `FP8_PB_WO` also covers MoE when all block-FP8 MoE layers share one group size. ModelOpt can export MXFP4 beyond GPT-OSS; the limitation is consuming that schema through this real-quant rollout/refit path, not ModelOpt export itself. vLLM's separate GPT-OSS MXFP4 weight-only loader is not interchangeable with this path. Loader support is source-checked; only the validation matrix above describes empirically validated workflows.
 
-For Nano3 W4A16 real-quant rollout, use the Nano3 weight-only policy recipe. The recipe itself selects supported tensors and leaves sensitive paths in BF16:
+For Nano3 W4A16 real-quant rollout, use the routed-expert weight-only policy recipe. It quantizes only routed experts and leaves Mamba, attention and shared experts in BF16:
 
 ```yaml
 policy:
-  quant_cfg: examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
 
   generation:
     backend: vllm
@@ -288,7 +288,7 @@ For an initial sanity check, compare the first `Generation KL Error` with the BF
 | `Using rollout logprobs` appears | The run is bypassing policy/reference logprob computation | Do not use rollout logprobs for real-quant validation |
 | First-step W4A16 `Generation KL Error` is much higher than BF16 | Stale resume state, a stale converted Megatron checkpoint on the Megatron path, or a refit/export mismatch | Use a fresh training checkpoint directory; on Megatron also move aside the converted startup checkpoint; confirm packed tensors are streamed |
 | `negative scales` warning appears | Invalid or stale NVFP4 scale tensors reached vLLM | Use a fresh checkpoint directory and verify `policy.quant_cfg` resolves to a supported NVFP4 recipe |
-| Nano3 first-step KL is high while dense W4A16 is healthy | The policy recipe quantized a Nano3-sensitive path or the exported payload does not match the native vLLM layout | Use `nano3_nvfp4_weightonly.yaml` as `policy.quant_cfg` and inspect the first refit |
+| Nano3 first-step KL is high while dense W4A16 is healthy | The policy recipe quantized a Nano3-sensitive path or the exported payload does not match the native vLLM layout | Use `nvfp4_experts_weightonly.yaml` as `policy.quant_cfg` and inspect the first refit |
 | CUDA invalid argument during refit or generation | vLLM consumed malformed packed tensors or stale IPC state | Restart from a fresh job and inspect the first real-quant refit logs |
 
 ## Quantization-Aware Distillation (On-Policy QAD)

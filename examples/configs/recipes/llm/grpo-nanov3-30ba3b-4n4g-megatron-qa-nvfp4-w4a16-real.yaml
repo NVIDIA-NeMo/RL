@@ -8,7 +8,7 @@ policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: ${policy.model_name}
-  # Match rollout's BF16 Mamba/shared-expert exclusions on the policy side.
+  # Routed-expert-only W4A16: Mamba, attention and shared experts stay BF16 in training and rollout.
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
   generation:
     quant_cfg: null

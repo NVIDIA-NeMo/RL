@@ -496,11 +496,17 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if plan is not None:
             return plan
 
+        from megatron.bridge.models.conversion.modelopt_utils import (
+            check_exportable_quantizers,
+        )
+
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         # The canonical planner reads scales from the owning weights and excludes
         # quantizer modules before Bridge validates the HF parameter mappings.
         with draft_model_detached([self.model]):
+            # Fail instead of rolling out without quantizers the export drops (e.g. KV cache).
+            check_exportable_quantizers([self.model])
             plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
         self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan

@@ -113,7 +113,7 @@ def _make_real_quant_worker():
             "vllm_cfg": {"kv_cache_dtype": "auto"},
         },
     }
-    worker.model = object()
+    worker.model = torch.nn.Module()
     worker.draft_model = None
     worker.refit_conversion_tasks = [
         SimpleNamespace(
@@ -479,6 +479,18 @@ def test_real_quant_config_rejects_non_auto_kv_cache():
 
     with pytest.raises(ValueError, match="kv_cache_dtype=auto"):
         worker.get_real_quantization_config()
+
+
+@requires_weight_folding
+def test_real_quant_config_rejects_quantizers_the_export_drops():
+    from modelopt.torch.quantization.nn import TensorQuantizer
+
+    worker = _make_real_quant_worker()
+    worker.model.k_bmm_quantizer = TensorQuantizer()
+
+    with pytest.raises(RuntimeError, match="k_bmm_quantizer"):
+        worker.get_real_quantization_config()
+    assert worker.megatron_bridge.calls == []
 
 
 @requires_weight_folding

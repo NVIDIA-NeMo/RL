@@ -40,6 +40,12 @@ def validate_real_quant_policy_config(policy_config: PolicyConfig) -> None:
             "policy.quant_cfg must be set when policy.generation.real_quant=true"
         )
     generation_config = cast("VllmConfig", policy_config["generation"])
+    if generation_config.get("quant_cfg") is not None:
+        raise ValueError(
+            "policy.generation.quant_cfg must be null when "
+            "policy.generation.real_quant=true; policy.quant_cfg alone selects "
+            "the rollout format"
+        )
     vllm_cfg = generation_config["vllm_cfg"]
     vllm_kwargs = generation_config.get("vllm_kwargs") or {}
     speculative_config = vllm_kwargs.get("speculative_config") or {}
