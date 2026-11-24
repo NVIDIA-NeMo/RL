@@ -428,7 +428,11 @@ def test_a_user_supplied_engine_role_is_refused_by_both_classes(dynamo) -> None:
     run, so the role is caught with Dynamo on and off; the derived per-engine
     configs that carry a role never pass through validate_settings.
     """
-    generation = {**_megatron_config(), "dynamo": dynamo, "_dynamo_role": "prefill"}
+    generation = {
+        **_megatron_config(),
+        "dynamo": dynamo,
+        "_disaggregation_role": "prefill",
+    }
     with pytest.raises(ValueError, match="set per engine by MegatronDynamoGeneration"):
         resolve_generation_class(generation).validate_settings(
             _master_config(generation)

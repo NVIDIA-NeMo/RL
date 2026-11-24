@@ -549,13 +549,13 @@ def test_every_megatron_engine_role_uses_the_one_policy_worker(
 ) -> None:
     """A prefill or decode engine behind Dynamo is a plain MegatronPolicyWorker.
 
-    Its Dynamo hooks act on ``generation._dynamo_role`` inside the worker, so
+    Its Dynamo hooks act on ``generation._disaggregation_role`` inside the worker, so
     there is no second actor class (or venv) to pick.
     """
     config = create_megatron_config("test-model", tp=1)
     config["generation"]["backend"] = "megatron"
     if role is not None:
-        config["generation"]["_dynamo_role"] = role
+        config["generation"]["_disaggregation_role"] = role
 
     worker_builder, _ = _construct_megatron_policy(config)
 
@@ -568,7 +568,7 @@ def test_a_worker_extension_is_kept_for_a_dynamo_engine() -> None:
     """An extension built on MegatronPolicyWorkerImpl keeps the Dynamo hooks."""
     config = create_megatron_config("test-model", tp=1)
     config["generation"]["backend"] = "megatron"
-    config["generation"]["_dynamo_role"] = "decode"
+    config["generation"]["_disaggregation_role"] = "decode"
 
     with (
         patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
@@ -595,7 +595,7 @@ def test_a_worker_extension_is_kept_for_a_dynamo_engine() -> None:
 def test_policy_rejects_quantization_on_a_dynamo_engine() -> None:
     config = create_megatron_config("test-model", tp=1)
     config["generation"]["backend"] = "megatron"
-    config["generation"]["_dynamo_role"] = "prefill"
+    config["generation"]["_disaggregation_role"] = "prefill"
     config["quant_cfg"] = {"algorithm": "fp8"}
 
     with pytest.raises(ValueError, match="quant_cfg is not supported"):

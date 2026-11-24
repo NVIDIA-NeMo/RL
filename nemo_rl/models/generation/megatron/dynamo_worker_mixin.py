@@ -39,12 +39,12 @@ def _role_from_generation_config(generation: Mapping[str, Any]) -> Role | None:
     Raises:
         ValueError: For a role that is neither ``prefill`` nor ``decode``.
     """
-    role = generation.get("_dynamo_role")
+    role = generation.get("_disaggregation_role")
     if role is None:
         return None
     if role not in ROLES:
         raise ValueError(
-            "policy.generation._dynamo_role must be 'prefill' or 'decode' when "
+            "policy.generation._disaggregation_role must be 'prefill' or 'decode' when "
             f"set, got {role!r}; MegatronDynamoGeneration sets it per engine"
         )
     return role
@@ -89,7 +89,7 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
 
     Composed into ``MegatronPolicyWorkerImpl`` ahead of
     ``MegatronGenerationMixin``, so every Megatron worker carries it. A worker
-    whose config has no ``generation._dynamo_role`` (training, plain
+    whose config has no ``generation._disaggregation_role`` (training, plain
     inference) gets the plain behaviour: every override here falls back to
     ``super()`` when the role is unset. ``MegatronDynamoGeneration`` sets the
     role per engine; it picks the state-handoff engine variant and its KV
@@ -102,7 +102,7 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
     cfg: dict[str, Any]
 
     @property
-    def _dynamo_role(self) -> Role | None:
+    def _disaggregation_role(self) -> Role | None:
         """``"prefill"`` or ``"decode"`` for an engine behind Dynamo; ``None`` otherwise."""
         return _role_from_generation_config(self.cfg["generation"])
 
@@ -113,7 +113,7 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
         super()._check_generation_requirements(config)
 
     def _inference_config_overrides(self) -> dict[str, Any]:
-        role = self._dynamo_role
+        role = self._disaggregation_role
         if role is None:
             return super()._inference_config_overrides()
         # Prefill and decode engines are separate process groups, so the
@@ -127,7 +127,7 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
         controller: "TextGenerationController",
         context: "DynamicInferenceContext",
     ) -> "DynamicInferenceEngine":
-        role = self._dynamo_role
+        role = self._disaggregation_role
         if role is None:
             return super()._build_dynamic_inference_engine(controller, context)
         # Prefill/decode behind Dynamo: the state-handoff engine pins prefill
@@ -146,7 +146,7 @@ class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
         return engine
 
     def _coordinator_kwargs(self) -> dict[str, Any]:
-        if self._dynamo_role is None:
+        if self._disaggregation_role is None:
             return super()._coordinator_kwargs()
         # The peer role's engines connect to this coordinator from other
         # processes and nodes.

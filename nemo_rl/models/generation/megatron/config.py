@@ -249,7 +249,7 @@ class MCoreGenerationConfig(GenerationConfig):
     # Not a user key: MegatronDynamoGeneration sets it on each engine's own copy
     # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
     # worker whose config carries it builds the prefill/decode handoff engine.
-    _dynamo_role: NotRequired[Literal["prefill", "decode"]]
+    _disaggregation_role: NotRequired[Literal["prefill", "decode"]]
 
 
 def merged_inference_megatron_cfg(

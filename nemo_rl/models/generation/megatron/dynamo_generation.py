@@ -73,7 +73,7 @@ def role_policy_config(
     """The policy config a worker of one role builds its engine from.
 
     A deep copy of ``policy_config`` with the role in
-    ``generation._dynamo_role`` (what makes the worker build the handoff
+    ``generation._disaggregation_role`` (what makes the worker build the handoff
     engine for that role) and ``overrides`` (the role's
     ``mcore_generation_config.prefill_engine`` / ``decode_engine`` keys) merged into
     ``generation.mcore_generation_config``, which is where the dedicated
@@ -96,7 +96,7 @@ def role_policy_config(
     # Off, or the engine's NVLink span would be a whole prefill/decode replica
     # instead of its own width.
     generation["dynamo"] = False
-    generation["_dynamo_role"] = role
+    generation["_disaggregation_role"] = role
     if overrides:
         generation["mcore_generation_config"] = {
             **(generation.get("mcore_generation_config") or {}),
@@ -201,13 +201,13 @@ def _wait_on_engine(
 
 
 @dataclasses.dataclass(frozen=True)
-class MegatronDynamoEngine:
-    """One running Megatron engine, as the refit side sees it: its record and worker handles.
+class MegatronDynamoEngineHandle:
+    """A handle to one running Megatron engine: what the refit side drives it through.
 
     Holds plain data and actor handles only. ``MegatronGeneration`` (through
     its ``Policy``) and the ``RayVirtualCluster`` behind its worker group both
     shut the engine down when garbage collected, so any process that unpickled
-    either and then dropped it would kill the engine. This record never does;
+    either and then dropped it would kill the engine. This handle never does;
     the ``MegatronDynamoGeneration`` that built the engine owns its lifetime,
     and the SingleController actor's copy drives the engine through the handles.
 
@@ -229,7 +229,7 @@ class MegatronDynamoEngine:
     leader: "ActorHandle"
 
     @classmethod
-    def of(
+    def from_generation(
         cls,
         generation: MegatronGeneration,
         *,
@@ -237,8 +237,8 @@ class MegatronDynamoEngine:
         world_size: int,
         instance_id: str,
         node_ip: str,
-    ) -> "MegatronDynamoEngine":
-        """The record of a running engine, read off the ``MegatronGeneration`` that owns it.
+    ) -> "MegatronDynamoEngineHandle":
+        """The handle of a running engine, read off the ``MegatronGeneration`` that owns it.
 
         Args:
             generation: The engine's owning object; its worker group supplies
@@ -250,7 +250,7 @@ class MegatronDynamoEngine:
                 coordinator listens.
 
         Returns:
-            A record holding the workers in rank order and the single DP shard's leader.
+            A handle holding the workers in rank order and the single DP shard's leader.
         """
         group = generation.worker_group
         workers = tuple(group.workers)
@@ -368,7 +368,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     propagates, with any resume failure attached. The object owns no policy
     and no worker group of its own.
 
-    Pickling keeps the engine records (plain data plus the workers' actor
+    Pickling keeps the engine handles (plain data plus the workers' actor
     handles) and drops the owning objects, so the SingleController actor's copy
     drives refits without being able to shut an engine down.
 
@@ -471,13 +471,13 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._node_resource_constraints = cluster.node_resource_constraints
         # Nodes per pinned NVLink segment; engines never cross one.
         self._segment_size = cluster.segment_size
-        # One record per engine, in launch (refit rank) order; what refit calls use.
-        self._engine_records: list[MegatronDynamoEngine] = []
+        # One handle per engine, in launch (refit rank) order; what refit calls use.
+        self._engine_handles: list[MegatronDynamoEngineHandle] = []
         # The owning objects, in the same order; empty on a copy.
         self._engines: list[MegatronGeneration] = []
         self._clusters: list[RayVirtualCluster] = []
         # True on a copy that was unpickled (the SingleController actor's).
-        self._is_client_copy = False
+        self._is_pickled_copy = False
 
         validate_megatron_dynamo_generation(self.cfg)
         roles, widths = plan_megatron_engines(self._policy_config, cluster.world_size())
@@ -495,34 +495,34 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Leave the owning objects behind when shipped to an actor.
 
         A copy that dropped a ``MegatronGeneration`` or a ``RayVirtualCluster``
-        would shut the engine down, so the copy keeps the engine records (plain
+        would shut the engine down, so the copy keeps the engine handles (plain
         data plus worker handles) and drives refits through them.
         """
         state = self.__dict__.copy()
         state["_engines"] = []
         state["_clusters"] = []
         state["_tokenizer"] = None
-        state["_is_client_copy"] = True
+        state["_is_pickled_copy"] = True
         return state
 
     @property
-    def is_client_copy(self) -> bool:
+    def is_pickled_copy(self) -> bool:
         """True on an unpickled copy, which drives the engines but owns none."""
-        return self._is_client_copy
+        return self._is_pickled_copy
 
     # ------------------------------------------------------------------
     # Geometry, workers and liveness
     # ------------------------------------------------------------------
 
     @property
-    def engine_records(self) -> list[MegatronDynamoEngine]:
-        """One record per engine, in launch (refit shard) order."""
-        return list(self._engine_records)
+    def engine_handles(self) -> list[MegatronDynamoEngineHandle]:
+        """One handle per engine, in launch (refit shard) order."""
+        return list(self._engine_handles)
 
     @property
     def shard_widths(self) -> tuple[int, ...]:
-        """Ranks each engine spans, in record (refit shard) order."""
-        return tuple(record.world_size for record in self._engine_records)
+        """Ranks each engine spans, in handle (refit shard) order."""
+        return tuple(handle.world_size for handle in self._engine_handles)
 
     @property
     def inference_world_size(self) -> int:
@@ -532,7 +532,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     @property
     def num_engines(self) -> int:
         """How many engines run, each a refit shard of its own."""
-        return len(self._engine_records)
+        return len(self._engine_handles)
 
     def get_inference_world_size(self) -> int | None:
         """Ranks across the engines: their widths summed."""
@@ -561,7 +561,7 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
         """Liveness of the worker leading engine ``shard_idx`` (its rank zero)."""
-        return self._engine_records[shard_idx].liveness_ref()
+        return self._engine_handles[shard_idx].liveness_ref()
 
     # ------------------------------------------------------------------
     # Fan-out over the engines
@@ -570,7 +570,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     def _call_engines(
         self,
         indices: Sequence[int],
-        call: Callable[[MegatronDynamoEngine], list[ray.ObjectRef]],
+        call: Callable[[MegatronDynamoEngineHandle], list[ray.ObjectRef]],
         *,
         what: str,
         deadline: float | None,
@@ -582,9 +582,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         recover from ``RayActorError``) and gains a note naming the engine and
         the step.
         """
-        pending = [(index, call(self._engine_records[index])) for index in indices]
+        pending = [(index, call(self._engine_handles[index])) for index in indices]
         for index, futures in pending:
-            instance_id = self._engine_records[index].instance_id
+            instance_id = self._engine_handles[index].instance_id
             try:
                 _wait_on_engine(
                     futures, deadline=deadline, what=what, instance_id=instance_id
@@ -596,17 +596,17 @@ class MegatronDynamoGeneration(GenerationInterface):
     def _attempt(
         self,
         indices: Sequence[int],
-        call: Callable[[MegatronDynamoEngine], list[ray.ObjectRef]],
+        call: Callable[[MegatronDynamoEngineHandle], list[ray.ObjectRef]],
         *,
         what: str,
         deadline: float | None,
         errors: list[str],
     ) -> list[int]:
         """Run ``call`` on every listed engine at once; return the ones that succeeded."""
-        pending = [(index, call(self._engine_records[index])) for index in indices]
+        pending = [(index, call(self._engine_handles[index])) for index in indices]
         succeeded: list[int] = []
         for index, futures in pending:
-            instance_id = self._engine_records[index].instance_id
+            instance_id = self._engine_handles[index].instance_id
             try:
                 _wait_on_engine(
                     futures, deadline=deadline, what=what, instance_id=instance_id
@@ -627,7 +627,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         ``RefitMembership`` describes equal-width shards, so its
         ``workers_per_shard`` cannot describe engines of different widths and
         is not read. Each refit call computes the engines' ranks from their
-        records instead (:meth:`engine_rank_offsets`); nothing is stored.
+        handles instead (:meth:`engine_rank_offsets`); nothing is stored.
 
         Raises:
             NotImplementedError: For a membership that leaves an engine out.
@@ -677,9 +677,9 @@ class MegatronDynamoGeneration(GenerationInterface):
             refit_backend = mcore_cfg["refit_backend"]
             # validate_megatron_dynamo_generation admits only these two.
             assert refit_backend == "nccl" or refit_backend == "gloo", refit_backend
-            for record, offset in zip(self._engine_records, offsets, strict=True):
+            for handle, offset in zip(self._engine_handles, offsets, strict=True):
                 futures.extend(
-                    record.init_collective_mcore_generation(
+                    handle.init_collective_mcore_generation(
                         ip,
                         port,
                         world_size,
@@ -691,9 +691,9 @@ class MegatronDynamoGeneration(GenerationInterface):
                     )
                 )
             return futures
-        for record, offset in zip(self._engine_records, offsets, strict=True):
+        for handle, offset in zip(self._engine_handles, offsets, strict=True):
             futures.extend(
-                record.init_collective(
+                handle.init_collective(
                     ip,
                     port,
                     world_size,
@@ -704,7 +704,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         return futures
 
     def engine_rank_offsets(self, train_world_size: int) -> list[int]:
-        """Refit-group rank of each engine's rank zero, in record order.
+        """Refit-group rank of each engine's rank zero, in handle order.
 
         The trainers take ranks ``0 .. train_world_size - 1``; engine ``i``
         starts right after the trainers and the engines before it.
@@ -732,7 +732,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         info_ref = ray.put(state_dict_info)
         self._call_engines(
             range(self.num_engines),
-            lambda record: record.prepare_refit_info(info_ref),
+            lambda handle: handle.prepare_refit_info(info_ref),
             what="prepare_refit_info",
             # No deadline of its own, as on the other generation backends.
             deadline=None,
@@ -752,18 +752,18 @@ class MegatronDynamoGeneration(GenerationInterface):
         futures: list[ray.ObjectRef] = []
         if self.uses_native_refit:
             reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
-            for record in self._engine_records:
-                futures.extend(record.swap_weights_via_reshard())
+            for handle in self._engine_handles:
+                futures.extend(handle.swap_weights_via_reshard())
             return futures
-        for record in self._engine_records:
-            futures.extend(record.update_weights_from_collective(refit_timeout_s))
+        for handle in self._engine_handles:
+            futures.extend(handle.update_weights_from_collective(refit_timeout_s))
         return futures
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the policy epoch every engine stamps on its requests."""
         self._call_engines(
             range(self.num_engines),
-            lambda record: record.set_rollout_weight_version(version),
+            lambda handle: handle.set_rollout_weight_version(version),
             what="set_rollout_weight_version",
             deadline=None,
         )
@@ -779,7 +779,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         errors: list[str] = []
         self._attempt(
             indices,
-            lambda record: record.resume_after_refit(),
+            lambda handle: handle.resume_after_refit(),
             what="resume_after_refit",
             deadline=deadline,
             errors=errors,
@@ -814,7 +814,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         try:
             self._call_engines(
                 indices,
-                lambda record: record.suspend_for_refit(),
+                lambda handle: handle.suspend_for_refit(),
                 what="suspend_for_refit",
                 deadline=deadline,
             )
@@ -842,7 +842,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             return True
         self._call_engines(
             range(self.num_engines),
-            lambda record: record.prepare_for_generation(tags=list(tags)),
+            lambda handle: handle.prepare_for_generation(tags=list(tags)),
             what=f"prepare_for_generation({list(tags)})",
             # The caller's timeout_s; None waits indefinitely.
             deadline=_deadline(kwargs.get("timeout_s")),
@@ -993,8 +993,8 @@ class MegatronDynamoGeneration(GenerationInterface):
                 skip_weight_load=True,
             )
             self._engines.append(engine)
-            self._engine_records.append(
-                MegatronDynamoEngine.of(
+            self._engine_handles.append(
+                MegatronDynamoEngineHandle.from_generation(
                     engine,
                     role=role,
                     world_size=width,
@@ -1058,9 +1058,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         Best effort and idempotent: every failure is logged and the teardown
         continues. A copy that owns no engine does nothing.
         """
-        if self._is_client_copy:
+        if self._is_pickled_copy:
             return True
-        # Includes engines that failed before their record existed.
+        # Includes engines that failed before their handle existed.
         for index in range(len(self._engines)):
             self._stop_engine(index)
         for cluster in self._clusters:
@@ -1068,7 +1068,7 @@ class MegatronDynamoGeneration(GenerationInterface):
                 cluster.shutdown()
             except Exception:
                 LOGGER.exception("Could not remove an engine placement group")
-        self._engine_records.clear()
+        self._engine_handles.clear()
         self._engines.clear()
         self._clusters.clear()
         return True

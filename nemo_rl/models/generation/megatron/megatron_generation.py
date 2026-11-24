@@ -235,9 +235,9 @@ class MegatronGeneration(GenerationInterface):
         # MegatronDynamoGeneration; those derived configs never come back
         # through here, so a role in the user's config is always a stray one
         # that would hand the trainer's policy the Dynamo engine worker.
-        if "_dynamo_role" in policy_config["generation"]:
+        if "_disaggregation_role" in policy_config["generation"]:
             raise ValueError(
-                "policy.generation._dynamo_role is set per engine by "
+                "policy.generation._disaggregation_role is set per engine by "
                 "MegatronDynamoGeneration; remove it from the config"
             )
 

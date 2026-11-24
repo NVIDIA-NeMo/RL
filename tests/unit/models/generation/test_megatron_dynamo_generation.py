@@ -33,7 +33,7 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     role_overrides,
 )
 from nemo_rl.models.generation.megatron.dynamo_generation import (
-    MegatronDynamoEngine,
+    MegatronDynamoEngineHandle,
     MegatronDynamoGeneration,
     engine_node_slots,
 )
@@ -235,7 +235,7 @@ class _FakeEngine:
 
     @property
     def role(self) -> str:
-        return self.kwargs["config"]["generation"]["_dynamo_role"]
+        return self.kwargs["config"]["generation"]["_disaggregation_role"]
 
     def shutdown(self):
         self.shutdown_calls += 1
@@ -350,7 +350,7 @@ def _with_role(policy_config: dict, role: str) -> dict:
         "generation": {
             **policy_config["generation"],
             "dynamo": False,
-            "_dynamo_role": role,
+            "_disaggregation_role": role,
         },
     }
 
@@ -372,12 +372,12 @@ def _with_layout(prefill: dict | None = None, decode: dict | None = None) -> dic
 def test_builds_one_cluster_and_engine_per_role(env):
     generation = env.generation()
 
-    records = generation.engine_records
-    assert [r.instance_id for r in records] == _IDS
-    assert [r.role for r in records] == _ROLES
-    assert [r.node_ip for r in records] == _NODES
-    assert all(r.world_size == 2 for r in records)
-    assert generation.engine_records is not generation.engine_records
+    handles = generation.engine_handles
+    assert [r.instance_id for r in handles] == _IDS
+    assert [r.role for r in handles] == _ROLES
+    assert [r.node_ip for r in handles] == _NODES
+    assert all(r.world_size == 2 for r in handles)
+    assert generation.engine_handles is not generation.engine_handles
     assert generation.shard_widths == (2, 2, 2)
     assert generation.inference_world_size == 6
     assert generation.get_inference_world_size() == 6
@@ -450,15 +450,15 @@ def _layout(engine_config: dict) -> tuple[int, int]:
     ids=["prefill_tp4", "decode_pp2"],
 )
 def test_each_role_builds_with_its_own_layout(env, prefill, decode, widths, layouts):
-    """Cluster width, record width and engine config follow the role."""
+    """Cluster width, handle width and engine config follow the role."""
     generation_config = _with_layout(prefill, decode)
     shared = {**MEGATRON_POLICY, "generation": generation_config}
     replica = widths["prefill"] + 2 * widths["decode"]
 
     generation = env.generation(generation_config, world_size=replica)
 
-    records = generation.engine_records
-    assert [r.world_size for r in records] == [widths[role] for role in _ROLES]
+    handles = generation.engine_handles
+    assert [r.world_size for r in handles] == [widths[role] for role in _ROLES]
     assert [c.kwargs["bundle_ct_per_node_list"] for c in env.clusters] == [
         [widths[role]] for role in _ROLES
     ]
@@ -499,7 +499,7 @@ def test_role_policy_config_merges_overrides_into_a_copy(
     merged = generation_module.role_policy_config(shared, "decode", overrides)
 
     assert _layout(merged) == layout
-    assert merged["generation"]["_dynamo_role"] == "decode"
+    assert merged["generation"]["_disaggregation_role"] == "decode"
     assert shared == before
     assert merged["generation"] is not shared["generation"]
 
@@ -616,7 +616,7 @@ def test_engines_wider_than_a_node_take_whole_pinned_nodes(env):
         pins[4:6],
         pins[6:8],
     ]
-    assert [r.world_size for r in generation.engine_records] == [16, 8, 8]
+    assert [r.world_size for r in generation.engine_handles] == [16, 8, 8]
     # The refit offsets follow the engine widths, multi-node or not.
     assert generation.engine_rank_offsets(8) == [8, 24, 32]
 
@@ -645,7 +645,7 @@ def test_engine_wider_than_a_pinned_segment_names_the_role(env):
 
 def test_multi_node_engine_records_rank_zero_node(env):
     generation = _wide(env)
-    assert [r.node_ip for r in generation.engine_records] == [
+    assert [r.node_ip for r in generation.engine_handles] == [
         f"{env.nodes[0]}-n0",
         f"{env.nodes[1]}-n0",
         f"{env.nodes[2]}-n0",
@@ -669,7 +669,7 @@ def test_multi_node_engine_reads_a_unified_placement_group_in_rank_order(env):
         4 * rank + offset for offset in (1, 0, 3, 2) for rank in range(4)
     ]
     generation = _wide(env)
-    assert generation.engine_records[0].node_ip == "h0"
+    assert generation.engine_handles[0].node_ip == "h0"
 
 
 def test_multi_node_engine_on_too_few_hosts_is_rejected(env):
@@ -828,7 +828,7 @@ def test_shutdown_stops_every_engine_then_its_cluster(
     assert env.log == expected_log
     for error in errors:
         assert error in caplog.text
-    assert generation.engine_records == [] and generation.num_engines == 0
+    assert generation.engine_handles == [] and generation.num_engines == 0
     env.log.clear()
     assert generation.shutdown() is True
     assert env.log == []
@@ -839,16 +839,16 @@ def test_shutdown_stops_every_engine_then_its_cluster(
 # ---------------------------------------------------------------------------
 
 
-def test_records_hold_only_worker_handles_never_the_generation(env):
+def test_handles_hold_only_worker_handles_never_the_generation(env):
     # A copy holding the MegatronGeneration would shut the engine down when it
     # is garbage collected; the refit path keeps only the workers' handles.
     generation = env.started()
-    for record, engine in zip(generation.engine_records, env.engines, strict=True):
-        assert isinstance(record, MegatronDynamoEngine)
+    for handle, engine in zip(generation.engine_handles, env.engines, strict=True):
+        assert isinstance(handle, MegatronDynamoEngineHandle)
         workers = engine.worker_group.workers
-        assert record.workers == tuple(workers)
-        assert record.leader is workers[0]
-    assert set(MegatronDynamoEngine.__dataclass_fields__) == {
+        assert handle.workers == tuple(workers)
+        assert handle.leader is workers[0]
+    assert set(MegatronDynamoEngineHandle.__dataclass_fields__) == {
         "role",
         "world_size",
         "instance_id",
@@ -863,13 +863,13 @@ def test_pickled_copy_drives_the_engines_but_owns_none(env):
 
     clone = pickle.loads(pickle.dumps(generation))
 
-    assert clone.is_client_copy and not generation.is_client_copy
-    # The records travel: plain fields as they were, the workers as handles.
-    assert [(r.role, r.instance_id, r.node_ip) for r in clone.engine_records] == [
-        (r.role, r.instance_id, r.node_ip) for r in generation.engine_records
+    assert clone.is_pickled_copy and not generation.is_pickled_copy
+    # The handles travel: plain fields as they were, the workers as handles.
+    assert [(r.role, r.instance_id, r.node_ip) for r in clone.engine_handles] == [
+        (r.role, r.instance_id, r.node_ip) for r in generation.engine_handles
     ]
-    assert [[(w.short, w.rank) for w in r.workers] for r in clone.engine_records] == [
-        [(w.short, w.rank) for w in r.workers] for r in generation.engine_records
+    assert [[(w.short, w.rank) for w in r.workers] for r in clone.engine_handles] == [
+        [(w.short, w.rank) for w in r.workers] for r in generation.engine_handles
     ]
     assert clone.shard_widths == (2, 2, 2)
     assert clone._engines == [] and clone._clusters == [] and clone._tokenizer is None

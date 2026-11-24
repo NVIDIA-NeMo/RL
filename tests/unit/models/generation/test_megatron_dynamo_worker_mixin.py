@@ -40,7 +40,7 @@ def _bare_worker(role, cls=_Worker):
     worker = object.__new__(cls)
     worker.cfg = {"generation": {}}
     if role is not None:
-        worker.cfg["generation"]["_dynamo_role"] = role
+        worker.cfg["generation"]["_disaggregation_role"] = role
     return worker
 
 
@@ -115,7 +115,7 @@ def test_no_role_hooks_behave_like_the_plain_worker(engine_modules, monkeypatch)
     worker = _bare_worker(role=None)
     controller, context = MagicMock(), MagicMock()
 
-    assert worker._dynamo_role is None
+    assert worker._disaggregation_role is None
     worker._check_generation_requirements(worker.cfg)
     assert checks == []
     assert worker._inference_config_overrides() == {}
@@ -136,14 +136,16 @@ def test_an_engine_role_runs_the_early_megatron_lm_check(monkeypatch, role):
     )
     # The hook reads the constructor's config: self.cfg is not set yet.
     worker = object.__new__(_Worker)
-    worker._check_generation_requirements({"generation": {"_dynamo_role": role}})
+    worker._check_generation_requirements(
+        {"generation": {"_disaggregation_role": role}}
+    )
     assert checks == ["checked"]
 
 
 def test_an_unknown_engine_role_is_refused():
     worker = _bare_worker(role="aggregated")
     with pytest.raises(ValueError, match="must be 'prefill' or 'decode'"):
-        worker._dynamo_role
+        worker._disaggregation_role
     with pytest.raises(ValueError, match="must be 'prefill' or 'decode'"):
         worker._check_generation_requirements(worker.cfg)
 
@@ -181,7 +183,7 @@ def test_the_early_check_runs_before_the_worker_loads_anything(monkeypatch):
         raise AssertionError("the worker started loading before the check")
 
     monkeypatch.setattr(module, "maybe_enable_msc", must_not_run)
-    config = {"generation": {"_dynamo_role": "decode"}}
+    config = {"generation": {"_disaggregation_role": "decode"}}
     with pytest.raises(Stop):
         ExtensionWorker(config, None, worker_sharding_annotations=None)
     assert seen == [config]
@@ -193,7 +195,7 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
     worker = _bare_worker(role=role)
     controller, context = MagicMock(), MagicMock()
 
-    assert worker._dynamo_role == role
+    assert worker._disaggregation_role == role
     # The peer role lives in other processes: NIXL carries the handoff and the
     # coordinator must listen on a routable address. The role reaches
     # Megatron-LM, which drops the Mamba prefix cache for decode.
