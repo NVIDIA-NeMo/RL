@@ -3703,20 +3703,23 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
 
 
 def _postprocess_rollouts(
-    first_prompts, group_ids=None, agent_name="agent", taskset=None
+    first_prompts, group_ids=None, agent_name="agent", taskset=None, agent_names=None
 ):
     """Postprocess one group whose first prompts are the given token lists.
 
     ``group_ids`` mirrors what ``_prepare_nemo_gym_rows`` stamps on each row;
     ``None`` entries leave the key off, as rows from a direct caller arrive.
     ``taskset`` builds materialized task rows, which carry no ``agent_ref``.
+    ``agent_names`` names the agent of each row; ``agent_name`` names all of them.
     """
     if group_ids is None:
         group_ids = [None] * len(first_prompts)
+    if agent_names is None:
+        agent_names = [agent_name] * len(first_prompts)
     rows = []
-    for group_id in group_ids:
+    for group_id, row_agent_name in zip(group_ids, agent_names):
         if taskset is None:
-            row = {"agent_ref": {"name": agent_name}}
+            row = {"agent_ref": {"name": row_agent_name}}
         else:
             row = {
                 "task_id": {"taskset": taskset, "task_id": "first"},
@@ -3872,3 +3875,23 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert padded.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
     [record] = warnings()
     assert "attribution key(s) ['padded']" in record.getMessage()
+
+    # A batch of two agents reports only the agent whose group is split, so the
+    # other agent's first split still warns.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        mixed = _postprocess_rollouts(
+            [[1, 5], [1, 6], [1, 7], [1, 7]],
+            group_ids=["a", "a", "b", "b"],
+            agent_names=["broken", "broken", "healthy", "healthy"],
+        )
+    assert mixed.rollout_metrics["baseline_groups/distinct_first_prompts"] == 3
+    assert mixed.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert mixed.rollout_metrics["baseline_groups/samples"] == 4
+    [record] = warnings()
+    assert "attribution key(s) ['broken']" in record.getMessage()
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        _postprocess_rollouts([[1, 7], [1, 8]], agent_name="healthy")
+    [record] = warnings()
+    assert "attribution key(s) ['healthy']" in record.getMessage()

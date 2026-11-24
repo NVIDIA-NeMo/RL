@@ -3554,23 +3554,26 @@ def _postprocess_single_nemo_gym_group(
     )
     rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = logical_groups
     rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(results)
-    if any(len(prompts) > 1 for prompts in prompts_by_group.values()):
-        unreported_keys = sorted(
-            {result["attribution_key"] for result in results}
-            - _DISTINCT_FIRST_PROMPT_WARNED
+    unreported_keys = sorted(
+        {
+            result["attribution_key"]
+            for row, result in zip(nemo_gym_rows, results)
+            if len(prompts_by_group[row.get(NEMO_GYM_GROUP_ID_KEY)]) > 1
+        }
+        - _DISTINCT_FIRST_PROMPT_WARNED
+    )
+    if unreported_keys:
+        _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_keys)
+        logger.warning(
+            "%d NeMo-Gym rollouts form %d logical prompt group(s) with %d "
+            "distinct first prompts; rollouts within at least one group do not "
+            "share a prompt prefix. Check that per-rollout identifiers are not changing "
+            "the agent harness prompt (attribution key(s) %s; reported once per key).",
+            len(results),
+            logical_groups,
+            distinct_first_prompts,
+            unreported_keys,
         )
-        if unreported_keys:
-            _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_keys)
-            logger.warning(
-                "%d NeMo-Gym rollouts form %d logical prompt group(s) with %d "
-                "distinct first prompts; rollouts within at least one group do not "
-                "share a prompt prefix. Check that per-rollout identifiers are not changing "
-                "the agent harness prompt (attribution key(s) %s; reported once per key).",
-                len(results),
-                logical_groups,
-                distinct_first_prompts,
-                unreported_keys,
-            )
 
     final_batch = BatchedDataDict[DatumSpec](
         {
