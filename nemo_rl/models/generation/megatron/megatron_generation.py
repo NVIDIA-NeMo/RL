@@ -271,10 +271,7 @@ class MegatronGeneration(GenerationInterface):
                 "served only behind Dynamo. Set dynamo to true, or set "
                 "disaggregation.enabled to false."
             )
-        elif any(
-            key in policy_config["generation"]["mcore_generation_config"]
-            for key in ENGINE_ROLE_KEYS
-        ):
+        elif any(key in mcore_cfg for key in ENGINE_ROLE_KEYS):
             raise ValueError(
                 "policy.generation.mcore_generation_config.prefill_engine / "
                 "decode_engine size Megatron engines behind Dynamo and are ignored "
