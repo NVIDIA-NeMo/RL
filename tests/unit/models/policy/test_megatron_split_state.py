@@ -696,6 +696,45 @@ class TestTrainMicrobatch:
         assert mask[1].sum().item() == pytest.approx(257.0)
         assert w.model.config.mtp_grad_scale_func is None
 
+    @pytest.mark.parametrize("in_loss", [False, True])
+    def test_adds_mtp_row_ids_only_with_in_loss_filtering(
+        self, mock_module_symbols, monkeypatch, in_loss
+    ):
+        """In-loss filtering needs each MTP position's row to mask its gradient."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron import mtp_grad_mask
+
+        monkeypatch.setattr(mtp_grad_mask, "HAVE_MTP_GRAD_MASK", True)
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
+        batch = _fake_batch()
+        loss_fn = _in_loss_seq_filter_loss_fn() if in_loss else w._test_loss_fn
+        w.begin_train_step(loss_fn=loss_fn)
+        w.train_microbatch(batch)
+
+        if in_loss:
+            row_ids = batch["mtp_row_ids"]
+            assert row_ids.shape == batch["mtp_loss_mask"].shape
+            assert row_ids[:, 0].tolist() == [float(i) for i in range(1, 9)]
+        else:
+            assert "mtp_row_ids" not in batch
+
+    def test_old_megatron_rejects_mtp_with_in_loss_filtering(
+        self, mock_module_symbols, monkeypatch
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.models.megatron import mtp_grad_mask
+
+        monkeypatch.setattr(mtp_grad_mask, "HAVE_MTP_GRAD_MASK", False)
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        with pytest.raises(ValueError, match="MTPLossGradMask"):
+            w.train_microbatch(_fake_batch())
+        w.abort_train_step()
+
     def test_skips_mtp_mask_and_scale_when_disabled(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
