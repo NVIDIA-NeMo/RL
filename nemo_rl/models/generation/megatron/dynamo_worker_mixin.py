@@ -13,6 +13,7 @@
 # limitations under the License.
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
+import dataclasses
 from typing import TYPE_CHECKING, Any
 
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
@@ -31,8 +32,17 @@ def require_megatron_dynamo_integration() -> None:
     """Fail before model setup if this Megatron-LM cannot serve an engine behind Dynamo.
 
     The engine is only built at the first refit, after the model has loaded, so
-    a missing integration would otherwise surface late.
+    a missing integration would otherwise surface late. Two things are
+    checked: the Dynamo integration package, and an ``InferenceConfig`` with
+    ``disaggregation_role``, which every prefill/decode engine passes (a
+    decode engine uses it to drop the Mamba prefix-cache budget its KV
+    handoff refuses).
+
+    Raises:
+        RuntimeError: When either is missing.
     """
+    # Deferred: Megatron-LM is only importable on the workers, and the Dynamo
+    # integration only exists in recent Megatron-LM.
     try:
         import megatron.inference.integrations.dynamo.dynamic_engine  # noqa: F401
     except ImportError as e:
@@ -40,6 +50,16 @@ def require_megatron_dynamo_integration() -> None:
             "A Megatron engine behind Dynamo needs a Megatron-LM with the Dynamo "
             "integration (megatron.inference.integrations.dynamo)"
         ) from e
+    from megatron.core.inference.config import InferenceConfig
+
+    if "disaggregation_role" not in {
+        field.name for field in dataclasses.fields(InferenceConfig)
+    }:
+        raise RuntimeError(
+            "Megatron prefill/decode engines behind Dynamo need a Megatron-LM whose "
+            "InferenceConfig has disaggregation_role; this one is older. Use a "
+            "newer Megatron-LM or remove policy.generation.dynamo."
+        )
 
 
 class MegatronDynamoGenerationMixin:

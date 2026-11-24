@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import sys
 import types
 from unittest.mock import MagicMock
@@ -118,3 +119,29 @@ def test_dynamo_worker_requires_the_megatron_dynamo_integration(monkeypatch):
     monkeypatch.setitem(sys.modules, module, None)
     with pytest.raises(RuntimeError, match="megatron.inference.integrations.dynamo"):
         require_megatron_dynamo_integration()
+
+
+def test_dynamo_worker_requires_an_inference_config_with_the_role(monkeypatch):
+    """An older Megatron-LM fails at the early check, not at the first refit."""
+    module = "megatron.inference.integrations.dynamo.dynamic_engine"
+    monkeypatch.setitem(sys.modules, module, types.ModuleType(module))
+
+    @dataclasses.dataclass
+    class OldInferenceConfig:
+        kv_transport_backend: str = "nixl"
+
+    monkeypatch.setattr(
+        "megatron.core.inference.config.InferenceConfig", OldInferenceConfig
+    )
+    with pytest.raises(RuntimeError, match="InferenceConfig has disaggregation_role"):
+        require_megatron_dynamo_integration()
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_inference_config_accepts_every_dynamo_override(role):
+    """The installed Megatron-LM takes every key the role hooks add."""
+    from megatron.core.inference.config import InferenceConfig
+
+    fields = {field.name for field in dataclasses.fields(InferenceConfig)}
+    overrides = _bare_worker(role=role)._inference_config_overrides()
+    assert set(overrides) <= fields
