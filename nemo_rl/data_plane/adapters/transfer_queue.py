@@ -1128,11 +1128,10 @@ def _init_tq(
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
+    conf = OmegaConf.merge(base, overlay)
     metrics_port = cfg.get("metrics_port")
     if metrics_port is not None:
-        overlay["metrics"] = {"enabled": True, "port": metrics_port}
-
-    conf = OmegaConf.merge(base, overlay)
+        OmegaConf.update(conf, "metrics", {"enabled": True, "port": metrics_port})
 
     configure_controller_patch()
     # pyrefly: ignore  # bad-argument-type
