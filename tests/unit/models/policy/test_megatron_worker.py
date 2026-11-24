@@ -2245,9 +2245,8 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     _disable_opd_full(worker)
     worker.model = object()
-    worker.optimizer = object()
+    worker.optimizer = None
     worker.optimizer_cpu_offload = False
-    worker.offload_optimizer_for_refit = False
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
@@ -2362,7 +2361,6 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     worker.model = object()
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
-    worker.should_disable_forward_pre_hook = False
     worker.offload_optimizer_for_refit = offload_optimizer
     worker.fp8_cfg = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
@@ -2383,6 +2381,46 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
     assert moved == (["cpu"] if offload_optimizer else [])
+
+
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_megatron_offload_before_refit_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches
+):
+    """clear_memory_caches_before_refit releases the policy's RoPE/MoE caches."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cleared = []
+    model = object()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = model
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.finalize_async_save = lambda: None
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: model
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(
+        megatron_policy_worker, "clear_transient_megatron_caches", cleared.append
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert cleared == ([model] if clear_caches else [])
 
 
 def _optimizer_for_state(state, *, chained):
@@ -2551,14 +2589,8 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     move_kwargs = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
     _disable_opd_full(worker)
-
-    class _FakeDDP(_FakeTrainableModel):
-        def reset_param_sync_dispatch_state(self):
-            events.append("reset_param_sync_dispatch_state")
-
-    worker.model = _FakeDDP()
+    worker.model = _FakeTrainableModel()
     worker.model.eval = lambda: events.append("eval")
-    worker.should_disable_forward_pre_hook = True
     worker.cfg = {"megatron_cfg": {}}
     if generation_backend:
         worker.cfg["generation"] = {"backend": generation_backend}
@@ -2587,10 +2619,6 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
         lambda *args, **kwargs: events.append("memory_reserved") or 0,
     )
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
-    monkeypatch.setattr(
-        "nemo_rl.models.policy.workers.megatron_policy_worker.DistributedDataParallel",
-        _FakeDDP,
-    )
 
     MegatronPolicyWorkerImpl.offload_after_refit(worker)
 
@@ -2598,13 +2626,6 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert events.index("finalize_async_save") < events.index("move_model")
     assert events.index("eval") < events.index("move_model")
     assert move_kwargs[0]["move_params"] is expect_move_params
-    assert "offload_before_refit" in events
-    if shared_buffer:
-        assert "reset_param_sync_dispatch_state" not in events
-    else:
-        assert events.index("offload_before_refit") < events.index(
-            "reset_param_sync_dispatch_state"
-        )
     assert move_kwargs[0]["move_grads"] is expect_move_grads
 
 
@@ -3356,7 +3377,6 @@ def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.should_disable_forward_pre_hook = False
     model = SimpleNamespace(eval=MagicMock())
     worker.model = model
     worker.move_model = MagicMock(return_value=model)
@@ -3460,10 +3480,7 @@ def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
-@pytest.mark.parametrize("keep_train_buffers", [False, True])
-def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(
-    monkeypatch, keep_train_buffers
-):
+def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch):
     """Restore and restage the shared buffer before MXFP8 parameter gather."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -3485,8 +3502,8 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(
         move_calls.append((device, kwargs)) or model
     )
     stage_calls = []
-    worker._copy_main_params_to_param_buffer = (
-        lambda zero_grad_buffer=False: stage_calls.append(zero_grad_buffer)
+    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
+        stage_calls.append(zero_grad_buffer)
     )
 
     class _AllocatorWakeup:
@@ -3496,37 +3513,11 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(
     monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
-    MegatronPolicyWorkerImpl.prepare_for_lp_inference(
-        worker, keep_train_buffers=keep_train_buffers
-    )
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
 
     assert model.eval_called
     assert move_calls == [("cuda", {"move_grads": True})]
-    assert stage_calls == ([] if keep_train_buffers else [True])
-
-
-def test_disable_forward_pre_hook_stages_masters_before_param_gather(monkeypatch):
-    """The logprob gather must publish restaged masters, not the zeroed shared buffer."""
-    from nemo_rl.models.policy.workers import megatron_policy_worker
-
-    events = []
-
-    class FakeDDP:
-        remove_forward_pre_hook_handles = {"module": object()}
-
-        def disable_forward_pre_hook(self, param_sync=True):
-            events.append(("gather", param_sync))
-
-    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
-    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
-    worker.model = FakeDDP()
-    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
-        events.append(("stage", zero_grad_buffer))
-    )
-
-    worker.disable_forward_pre_hook(param_sync=True)
-
-    assert events == [("stage", True), ("gather", True)]
+    assert stage_calls == [True]
 
 
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
@@ -7025,46 +7016,6 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
         cluster.shutdown()
 
 
-@pytest.mark.parametrize("clear_caches", [True, False])
-def test_megatron_offload_before_refit_clears_transient_caches_when_configured(
-    monkeypatch, clear_caches
-):
-    """clear_memory_caches_before_refit releases the policy's RoPE/MoE caches."""
-    from nemo_rl.models.policy.workers import megatron_policy_worker
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    cleared = []
-    model = object()
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    _disable_opd_full(worker)
-    worker.model = model
-    worker.optimizer = None
-    worker.optimizer_cpu_offload = False
-    worker.fp8_cfg = None
-    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
-    worker.finalize_async_save = lambda: None
-    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
-    worker.move_model = lambda model, device, move_params, move_grads: model
-
-    class _AllocatorWakeup:
-        def cuda(self):
-            pass
-
-    monkeypatch.setattr(
-        megatron_policy_worker, "clear_transient_megatron_caches", cleared.append
-    )
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
-
-    MegatronPolicyWorkerImpl.offload_before_refit(worker)
-
-    assert cleared == ([model] if clear_caches else [])
-
-
 def test_reshard_group_rebuild_replaces_only_requested_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7175,7 +7126,9 @@ class TestWarmupFirstPass:
         import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
         def get_logprobs(*, data, require_router_replay, keep_on_gpu=False):
-            # Mirrors get_logprobs: only the replica leader gets the host copy.
+            # Stub of get_logprobs' return contract: without keep_on_gpu only the
+            # replica leader gets logprobs. The real gating is tested in
+            # TestReplicatedLogprobResult (test_megatron_split_state.py).
             if not keep_on_gpu and not is_leader:
                 return {}
             return {"logprobs": torch.full(data["input_ids"].shape, -0.5)}

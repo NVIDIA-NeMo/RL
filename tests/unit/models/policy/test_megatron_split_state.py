@@ -194,7 +194,6 @@ def _make_worker(loss_type):
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
     w.rank = 0
-    w.should_disable_forward_pre_hook = False
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
     w._log_gpu_mem = MagicMock()
@@ -2313,17 +2312,13 @@ class TestReplicatedLogprobResult:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.cfg.update(
-            {
-                "logprob_batch_size": 1,
-                "sequence_packing": {"enabled": True},
-            }
-        )
+        w.cfg["logprob_batch_size"] = 1
         w.timer = MagicMock()
         return w
 
-    @pytest.mark.parametrize("keep_on_gpu", [False, True])
-    @pytest.mark.parametrize("is_leader", [False, True])
+    @pytest.mark.parametrize(
+        ("is_leader", "keep_on_gpu"), [(True, False), (False, False), (False, True)]
+    )
     def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader, keep_on_gpu):
         w = self._worker()
         w._is_replica_leader = MagicMock(return_value=is_leader)
@@ -2350,7 +2345,6 @@ class TestReplicatedLogprobResult:
                 side_effect=lambda tensors: tensors,
             ) as broadcast,
             patch(f"{WORKER_MOD}.torch.empty_like") as empty_like,
-            patch(f"{WORKER_MOD}.torch.cuda.current_stream") as current_stream,
         ):
             cpu_logprobs = MagicMock()
             empty_like.return_value = cpu_logprobs
@@ -2358,7 +2352,7 @@ class TestReplicatedLogprobResult:
 
         broadcast.assert_called_once()
         if keep_on_gpu:
-            # Warm-up trains on these on every rank, so non-leaders need them too.
+            # Warm-up trains on these on every rank, so a non-leader gets them too.
             torch.testing.assert_close(
                 result["logprobs"], torch.tensor([[1.0, 2.0, 3.0, 0.0]])
             )
@@ -2378,15 +2372,15 @@ class TestReplicatedLogprobResult:
         else:
             assert not result
             empty_like.assert_not_called()
-        current_stream.assert_not_called()
 
-    @pytest.mark.parametrize("has_inner_result", [False, True])
-    def test_reference_logprobs_accept_empty_nonleader_result(self, has_inner_result):
+    @pytest.mark.parametrize("is_leader", [False, True])
+    def test_reference_logprobs_follow_the_replica_leader(self, is_leader):
         from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
         w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=is_leader)
         inner = BatchedDataDict()
-        if has_inner_result:
+        if is_leader:
             inner["logprobs"] = torch.tensor([[1.0, 2.0]])
 
         with (
@@ -2395,7 +2389,20 @@ class TestReplicatedLogprobResult:
         ):
             result = w.get_reference_policy_logprobs(data=MagicMock())
 
-        if has_inner_result:
+        if is_leader:
             torch.testing.assert_close(result["reference_logprobs"], inner["logprobs"])
         else:
             assert not result
+
+    def test_reference_logprobs_missing_on_leader_raise(self):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=True)
+
+        with (
+            patch.object(w, "use_reference_model", return_value=nullcontext()),
+            patch.object(w, "get_logprobs", return_value=BatchedDataDict()),
+            pytest.raises(KeyError, match="logprobs"),
+        ):
+            w.get_reference_policy_logprobs(data=MagicMock())

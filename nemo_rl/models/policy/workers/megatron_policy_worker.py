@@ -1923,7 +1923,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
-        if "logprobs" not in reference_logprobs:
+        # get_logprobs returns logprobs only on the model-parallel replica leader.
+        if not self._is_replica_leader():
             return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
@@ -5291,15 +5292,6 @@ class MegatronPolicyWorkerImpl(
         )
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()
-
-        # Forced refit sync marks BF16 buckets as dispatched. After replacing
-        # their storage, the next forward must start a new parameter-gather epoch.
-        if (
-            self.should_disable_forward_pre_hook
-            and isinstance(self.model, DistributedDataParallel)
-            and not keep_shared_buffer
-        ):
-            self.model.reset_param_sync_dispatch_state()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
