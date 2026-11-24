@@ -582,7 +582,7 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 | Behavior | Metrics |
 | --- | --- |
 | **Follows `normalization`** — global token mean, sequence mean, or group token mean | `loss`, `kl_penalty` |
-| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `token_abs_logprob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
 | **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
 
@@ -841,7 +841,7 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` and `gen_prev_logprob_mismatch_tokens` to monitor training–generation logprob mismatch.
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error`, `token_abs_logprob_error`, and `gen_prev_logprob_mismatch_tokens` to monitor training–generation logprob mismatch.
 `loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
@@ -855,6 +855,14 @@ Intuitively, this measures the average multiplicative probability error for samp
 
 ### Mismatched Logprob Token Count
 `gen_prev_logprob_mismatch_tokens` counts the valid tokens whose generation logprob differs from the training logprob; a NaN counts as a difference. It is a raw count, not normalized by tokens or sequences. A run with zero train/generation mismatch reports 0 on every step, including differences too small to move `gen_kl_error` away from 0.
+
+### Absolute Token Logprob Error
+
+`token_abs_logprob_error` averages the absolute difference between the previous policy's logprob and the generation logprob for the sampled token, in nats. Each of the $n$ valid tokens has equal weight.
+
+$$
+\text{token-abs-logprob-error} = \frac{1}{n}\sum_{i=1}^{n} \left|\log p_{\mathrm{prev},i} - \log p_{\mathrm{gen},i}\right|
+$$
 
 ### KL Divergence Error
 This feature is controlled by the following metrics:
