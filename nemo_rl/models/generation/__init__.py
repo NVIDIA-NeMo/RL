@@ -239,16 +239,6 @@ def configure_generation_config(
                     "sleeps while the policy trains, and the Dynamo frontend would "
                     "keep routing requests to it."
                 )
-            vllm_cfg = config["vllm_cfg"]
-            if vllm_cfg["expert_parallel_size"] > vllm_cfg["tensor_parallel_size"]:
-                # Data parallelism inside vLLM: above DP rank 0, vLLM rejects the
-                # per-engine ipc:// KV-event endpoint (dynamo_kv_events_config).
-                raise ValueError(
-                    "policy.generation.dynamo=true does not serve data parallelism "
-                    "inside vLLM yet (vllm_cfg.expert_parallel_size > "
-                    "tensor_parallel_size). Set expert_parallel_size <= "
-                    "tensor_parallel_size, or remove policy.generation.dynamo."
-                )
             if not config["vllm_cfg"]["async_engine"]:
                 # Dynamo serves the engine's AsyncLLM, so turning the async engine
                 # on is the switch; settings Dynamo cannot serve are rejected above.

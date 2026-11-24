@@ -111,20 +111,28 @@ _MAIN_ATTENTION_KINDS = (
 
 
 def dynamo_kv_events_config(
-    cfg: DynamoCfg, *, prefix_caching: bool
+    cfg: DynamoCfg, *, prefix_caching: bool, data_parallel: bool
 ) -> Optional[dict[str, Any]]:
     """The ``kv_events_config`` that feeds Dynamo's KV router.
 
     None unless the frontend routes by KV and the engine caches prefixes: vLLM
     publishes block events only for the blocks its prefix cache stores.
+    ``data_parallel`` says the engine is one rank of a vLLM data-parallel group
+    (expert parallelism wider than tensor parallelism).
     """
     if cfg.frontend_args.router_mode != "kv" or not prefix_caching:
         return None
+    if data_parallel:
+        # vLLM offsets the endpoint by the engine's rank, which it does for tcp
+        # only; it leaves port 0 alone and binds a free port on the node's IP.
+        endpoint = "tcp://*:0"
+    else:
+        # A random abstract-namespace socket per engine (dynamo-integration.md).
+        endpoint = f"ipc://@nemo-rl-kv-events-{os.urandom(8).hex()}"
     return {
         "enable_kv_cache_events": True,
         "publisher": "zmq",
-        # A random abstract-namespace socket per engine (dynamo-integration.md).
-        "endpoint": f"ipc://@nemo-rl-kv-events-{os.urandom(8).hex()}",
+        "endpoint": endpoint,
     }
 
 
@@ -210,6 +218,8 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         self._host = host
         self._llm = host.llm
         self._max_model_len = self._llm.vllm_config.model_config.max_model_len
+        # Above 0 only for a later rank of a vLLM data-parallel group.
+        self._dp_rank = self._llm.vllm_config.parallel_config.data_parallel_rank
 
     def _handlers(self) -> dict[str, RequestHandler]:
         return {
@@ -304,6 +314,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 total_kv_blocks=cache.num_gpu_blocks,
                 max_num_seqs=scheduler.max_num_seqs,
                 max_num_batched_tokens=scheduler.max_num_batched_tokens,
+                # The router keys this engine's KV events and load by its rank.
+                data_parallel_start_rank=self._dp_rank,
+                data_parallel_size=1,
             ),
         )
 
@@ -565,15 +578,15 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         await self._llm.abort(context.id())
 
     async def kv_event_sources(self) -> list[KvEventSource]:
-        kv_events = self._llm.vllm_config.kv_events_config
-        if kv_events is None or not kv_events.enable_kv_cache_events:
-            return []
-        # A user's own kv_events_config can keep vLLM's wildcard default
-        # (tcp://*:5557): vLLM binds it, but a subscriber cannot connect to "*".
-        return [ZmqSource(endpoint=kv_events.endpoint.replace("*", "127.0.0.1"))]
+        # vLLM reports the endpoint each publisher bound, under the rank it stamps
+        # on its events. It binds a wildcard host, which no subscriber can connect to.
+        return [
+            ZmqSource(endpoint=source.endpoint.replace("*", "127.0.0.1"), dp_rank=rank)
+            for rank, source in self._llm.get_kv_event_sources().items()
+        ]
 
     def component_metrics_dp_ranks(self) -> list[int]:
-        return [0]
+        return [self._dp_rank]
 
     def attach_snapshot_publisher(self, publisher: Any) -> None:
         SnapshotStatLogger.publisher = publisher

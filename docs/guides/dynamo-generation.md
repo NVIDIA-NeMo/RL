@@ -23,6 +23,7 @@ With `dynamo: true`:
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and registers with the frontends from inside its own worker process. Setup waits until every frontend routes to every engine.
 - With NeMo-Gym (`vllm_cfg.expose_http_server: true`), each frontend starts its render workers at launch and builds them while the engines load, from the settings one engine sends before it loads. Gym's first calls then do not wait for them. Other runs start none.
 - vLLM publishes KV-cache events only for blocks its prefix cache stores. With `vllm_cfg.enable_prefix_caching: false`, the engines publish none, and the KV router routes on load alone.
+- With `vllm_cfg.expert_parallel_size > tensor_parallel_size`, each vLLM data-parallel rank of an expert-parallel group is an engine of its own behind the frontends, as it is natively. Those engines publish their KV-cache events on a TCP port of the node's IP, which vLLM reads from the node's default route. On a node without one, set `VLLM_HOST_IP`.
 - Shutdown stops the services after the engines.
 
 ## Configure
@@ -97,7 +98,6 @@ Startup rejects these with `dynamo: true`:
 - `async_rl.generation_router`: each frontend already routes to the whole fleet.
 - `bad_words` in `extra_body` or `sampling_overrides` on the policy model (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend answers every request carrying it with HTTP 400. Startup checks only this overlay, not Gym's own YAMLs.
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
-- `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
 - `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines on 0.0.0.0 and checks no bearer token.
 - `vllm_cfg.http_api_server_count` above 1: NeMo-Gym's calls go through the Dynamo frontend, so the extra vLLM HTTP frontends would serve none of them. `frontend_args.render_workers` sets how many processes render chat calls behind Dynamo.
 - `frontend_args.router_mode: direct`: it needs a worker ID on every request, and NeMo RL's rollouts name none.
