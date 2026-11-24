@@ -1285,10 +1285,7 @@ def grpo_train_sync(
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
-                # Pre-filter total_reward, first train_prompts_size rows across
-                # DS iterations. Falls back to the trained rows if
-                # apply_dynamic_sampling didn't provide it (mid-step path).
-                # Used by the metrics and the per-step print below.
+                # Pre-filter total_reward, first train_prompts_size rows of the step.
                 unfiltered_rewards = (
                     unfiltered_rewards_for_logging
                     if unfiltered_rewards_for_logging is not None
