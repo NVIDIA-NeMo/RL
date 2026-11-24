@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -23,8 +22,6 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     MasterConfig,
     _build_async_grpo_train_data,
-    _initial_grpo_save_state,
-    async_grpo_train,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -52,7 +49,7 @@ def session_data(_unit_test_data):
     yield _unit_test_data
 
 
-def _make_async_master_config(data_plane=None) -> MasterConfig:
+def _make_async_master_config() -> MasterConfig:
     return MasterConfig.model_construct(
         **{
             "policy": {
@@ -69,7 +66,6 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
                     max_generation_failures=0,
                 )
             ),
-            "data_plane": data_plane,
         }
     )
 
@@ -178,23 +174,3 @@ def test_build_async_grpo_train_data_uses_policy_dtype_without_expanding_dedup(
     assert sum(cast_pixels.logical_segment_counts_by_row()) == 4
     assert cast_pixels.tensors[0].dtype == expected_dtype
     assert pixels.tensors[0].dtype == torch.float32
-
-
-def test_async_grpo_r3_data_plane_directs_to_single_controller():
-    master_config = _make_async_master_config(data_plane={"enabled": True})
-
-    with pytest.raises(NotImplementedError, match="SingleController entrypoint"):
-        async_grpo_train(
-            MagicMock(),
-            MagicMock(),
-            MagicMock(),
-            None,
-            MagicMock(),
-            MagicMock(),
-            {"math": MagicMock()},
-            None,
-            MagicMock(),
-            MagicMock(),
-            _initial_grpo_save_state(),
-            master_config,
-        )

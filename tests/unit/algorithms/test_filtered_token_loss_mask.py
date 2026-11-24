@@ -433,7 +433,7 @@ def test_megatron_prev_logprobs_preserve_shared_mask(monkeypatch, top_k):
     assert "token_mask" not in result
 
 
-@pytest.mark.parametrize("driver", ["grpo", "grpo_sync", "ppo"])
+@pytest.mark.parametrize("driver", ["grpo", "ppo"])
 @pytest.mark.parametrize("filtering_on", [False, True])
 @pytest.mark.parametrize("bad_logprob", [-torch.inf, torch.inf, torch.nan])
 def test_sequence_rejection_ignores_only_filtered_negative_infinity(
@@ -455,16 +455,6 @@ def test_sequence_rejection_ignores_only_filtered_negative_infinity(
             data, torch.ones(1), 2.0, filtering_on=filtering_on
         )
         masked = metrics["num_masked_seqs"]
-    elif driver == "grpo_sync":
-        from nemo_rl.algorithms.grpo_sync import _compute_seq_logprob_error_metrics
-
-        data["sample_mask"], metrics = _compute_seq_logprob_error_metrics(
-            **data,
-            rewards=torch.ones(1),
-            seq_logprob_error_threshold=2.0,
-            filtering_on=filtering_on,
-        )
-        masked = metrics["num_masked_seqs_by_logprob_error"]
     else:
         from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
 

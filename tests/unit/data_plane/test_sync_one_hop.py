@@ -20,23 +20,17 @@ Coverage:
   * Per-sample key lifecycle — ``kv_first_write`` mints keys, every
     subsequent ``shard_meta_for_dp`` slice references the SAME key set
     (verl pattern, no re-minting).
-  * Slice-only dynamic sampling — filter / cache-merge / overflow-slice
-    on per-sample tensors plus ``meta.sample_ids``.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
-from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GROUP_ID_TAG
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -45,19 +39,6 @@ from ._rollout_shapes import (
     make_rollout_batch,
     register_train_partition,
 )
-
-
-def _fake_policy(client):
-    """Minimal stand-in for ``TQPolicy`` exposing only ``discard_samples``.
-
-    ``_apply_dynamic_sampling`` calls ``policy.discard_samples(uids, partition)``
-    to drop filtered rows; we delegate to the noop client's ``clear_samples``.
-    """
-    return SimpleNamespace(
-        discard_samples=lambda sample_ids, partition_id: client.clear_samples(
-            sample_ids=sample_ids, partition_id=partition_id
-        )
-    )
 
 
 def _final_batch(n: int = 4) -> BatchedDataDict:
@@ -210,313 +191,8 @@ def test_kv_clear_uses_meta_keys_minted_at_rollout():
         )
 
 
-# ── Slice-only dynamic sampling logic ─────────────────────────────────
-#
-# These exercise the private ``_apply_dynamic_sampling`` helper in
-# grpo_sync.py without requiring a full trainer to spin up.
-
-
-def _make_driver_carry(rewards: list[float], stds: list[float]) -> BatchedDataDict:
-    n = len(rewards)
-    return BatchedDataDict(
-        {
-            "total_reward": torch.tensor(rewards, dtype=torch.float32),
-            "std": torch.tensor(stds, dtype=torch.float32),
-            "baseline": torch.zeros(n),
-            "input_lengths": torch.tensor([8] * n, dtype=torch.long),
-            "loss_multiplier": torch.ones(n),
-            "truncated": torch.zeros(n, dtype=torch.bool),
-            "length": torch.tensor([8] * n, dtype=torch.long),
-        }
-    )
-
-
-def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
-    """Stage n keys in TQ so clear_samples has something to remove."""
-    register_train_partition(client, num_samples=n)
-    fb = _final_batch(n)
-    uids = [f"{prefix}{i}" for i in range(n)]
-    return kv_first_write(
-        fb, sample_ids=keys_from_uids(uids), dp_client=client, partition_id="train"
-    )
-
-
-def _stamp_filter_tags(
-    meta: KVBatchMeta,
-    stds: list[float],
-    is_trivial_prompt_distribution: list[bool] | None = None,
-) -> KVBatchMeta:
-    """Mirror the driver's exact reward-variation filter into ``meta.tags``."""
-    if is_trivial_prompt_distribution is None:
-        is_trivial_prompt_distribution = [std == 0.0 for std in stds]
-    meta.tags = [
-        {
-            "std": float(std),
-            "is_trivial_prompt_distribution": is_trivial_prompt,
-        }
-        for std, is_trivial_prompt in zip(stds, is_trivial_prompt_distribution)
-    ]
-    return meta
-
-
-def test_group_tags_survive_dynamic_sampling_cache_and_overflow():
-    """Distinct UUIDs remain distinct after survivor concatenation and slicing."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-    from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
-
-    client = NoOpDataPlaneClient()
-    pending_meta = pending_carry = None
-    pending_rewards = []
-    for iteration, (groups, rewards, trivial) in enumerate(
-        [
-            (
-                ["discard", "discard", "first", "first"],
-                [0.0, 0.0, 0.0, 2.0],
-                [True, True, False, False],
-            ),
-            (
-                ["second", "second", "overflow", "overflow"],
-                [10.0, 14.0, 0.0, 2.0],
-                [False] * 4,
-            ),
-        ],
-        start=1,
-    ):
-        meta = _seed_meta(client, f"batch-{iteration}-", 4)
-        meta.stamp_tags(
-            {GROUP_ID_TAG: groups, "is_trivial_prompt_distribution": trivial}
-        )
-        pending_meta, pending_carry, pending_rewards, complete, _, _ = (
-            _apply_dynamic_sampling(
-                meta=meta,
-                driver_carry=_make_driver_carry(rewards, [1.0] * 4),
-                pending_meta=pending_meta,
-                pending_carry=pending_carry,
-                pending_unfiltered_rewards=pending_rewards,
-                train_prompts_size=4,
-                num_gen_batches=iteration,
-                max_gen_batches=2,
-                policy=_fake_policy(client),
-            )
-        )
-        assert complete == (iteration == 2)
-    assert row_group_ids(pending_meta) == ["first", "first", "second", "second"]
-    assert pending_meta.sample_ids == [
-        "batch-1-2_g0",
-        "batch-1-3_g0",
-        "batch-2-0_g0",
-        "batch-2-1_g0",
-    ]
-    baseline, _, _ = calculate_baseline_and_std_per_prompt(
-        group_index_column(row_group_ids(pending_meta)),
-        pending_carry["total_reward"],
-        torch.ones(4),
-        leave_one_out_baseline=False,
-    )
-    torch.testing.assert_close(baseline, torch.tensor([1.0, 1.0, 12.0, 12.0]))
-
-
-def test_apply_dynamic_sampling_filters_zero_std():
-    """Drops uids whose std == 0 and clears their TQ payload."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=4)
-    _stamp_filter_tags(meta, [0.5, 0.0, 0.5, 0.0])
-    sd = _make_driver_carry([1.0, 2.0, 3.0, 4.0], [0.5, 0.0, 0.5, 0.0])
-
-    pm, ps, pur, complete, ds_metrics, _ = _apply_dynamic_sampling(
-        meta=meta,
-        driver_carry=sd,
-        pending_meta=None,
-        pending_carry=None,
-        pending_unfiltered_rewards=[],
-        train_prompts_size=4,
-        num_gen_batches=1,
-        max_gen_batches=10,
-        policy=_fake_policy(client),
-    )
-    # Only 2 survivors → not complete (need 4).
-    assert complete is False
-    assert pm is not None and len(pm.sample_ids) == 2
-    # Surviving uids' total_reward is 1.0 and 3.0 (kept indices [0, 2]).
-    assert torch.equal(ps["total_reward"], torch.tensor([1.0, 3.0]))
-    assert ps["filtered_reward"] is ps["total_reward"] or torch.equal(
-        ps["filtered_reward"], ps["total_reward"]
-    )
-
-    # Dropped uids' TQ payload was cleared.
-    import pytest
-
-    with pytest.raises(KeyError):
-        client.get_samples(
-            sample_ids=[meta.sample_ids[1]],
-            partition_id="train",
-            select_fields=["input_ids"],
-        )
-    # Surviving uids' payload is still alive.
-    survivors = client.get_samples(
-        sample_ids=[meta.sample_ids[0], meta.sample_ids[2]],
-        partition_id="train",
-        select_fields=["input_ids"],
-    )
-    assert survivors["input_ids"].shape == (2, 8)
-
-
-def test_apply_dynamic_sampling_filters_trivial_float_noise():
-    """Exact reward equality wins over a tiny positive std caused by roundoff."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=2)
-    _stamp_filter_tags(meta, [1e-7, 1e-7], [True, True])
-    driver_carry = _make_driver_carry([1.0, 1.0], [1e-7, 1e-7])
-
-    pending_meta, _, _, complete, _, _ = _apply_dynamic_sampling(
-        meta=meta,
-        driver_carry=driver_carry,
-        pending_meta=None,
-        pending_carry=None,
-        pending_unfiltered_rewards=[],
-        train_prompts_size=2,
-        num_gen_batches=1,
-        max_gen_batches=10,
-        policy=_fake_policy(client),
-    )
-
-    assert pending_meta is None
-    assert complete is False
-
-
-def test_apply_dynamic_sampling_keeps_entire_mixed_loo_group():
-    """A full-prompt mask retains every row in a mixed [y, x, ...] group."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-    from nemo_rl.algorithms.utils import (
-        calculate_trivial_reward_distributions,
-    )
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=8)
-    rewards = torch.tensor([0.0] + [0.95] * 7)
-    prompt_is_trivial = calculate_trivial_reward_distributions(
-        torch.zeros(8, 1, dtype=torch.long),
-        rewards,
-        torch.ones_like(rewards),
-    )
-    assert prompt_is_trivial.tolist() == [False] * 8
-    _stamp_filter_tags(
-        meta,
-        [0.0004567453] + [0.36] * 7,
-        prompt_is_trivial.tolist(),
-    )
-    driver_carry = _make_driver_carry(rewards.tolist(), [0.0004567453] + [0.36] * 7)
-
-    pending_meta, pending_carry, _, complete, _, _ = _apply_dynamic_sampling(
-        meta=meta,
-        driver_carry=driver_carry,
-        pending_meta=None,
-        pending_carry=None,
-        pending_unfiltered_rewards=[],
-        train_prompts_size=8,
-        num_gen_batches=1,
-        max_gen_batches=10,
-        policy=_fake_policy(client),
-    )
-
-    assert complete is True
-    assert pending_meta is not None and len(pending_meta.sample_ids) == 8
-    assert pending_carry is not None
-    torch.testing.assert_close(pending_carry["filtered_reward"], rewards)
-
-
-def test_apply_dynamic_sampling_completes_when_train_size_reached():
-    """When pending cache reaches train_prompts_size, returns complete."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=4)
-    _stamp_filter_tags(meta, [0.5, 0.5, 0.5, 0.5])
-    sd = _make_driver_carry([1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5])
-
-    pm, ps, _, complete, ds_metrics, unfiltered = _apply_dynamic_sampling(
-        meta=meta,
-        driver_carry=sd,
-        pending_meta=None,
-        pending_carry=None,
-        pending_unfiltered_rewards=[],
-        train_prompts_size=4,
-        num_gen_batches=1,
-        max_gen_batches=10,
-        policy=_fake_policy(client),
-    )
-    assert complete is True
-    assert pm is not None and len(pm.sample_ids) == 4
-    assert ds_metrics["dynamic_sampling_num_gen_batches"] == 1
-    # Unfiltered rewards mirror the input (no filtering happened).
-    assert torch.equal(unfiltered, torch.tensor([1.0, 2.0, 3.0, 4.0]))
-
-
-def test_apply_dynamic_sampling_overflow_slices_and_clears():
-    """When the cache exceeds train_prompts_size, slice + clear_samples discards."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=6)
-    _stamp_filter_tags(meta, [0.5] * 6)
-    sd = _make_driver_carry([1.0] * 6, [0.5] * 6)
-
-    pm, ps, _, complete, ds_metrics, _ = _apply_dynamic_sampling(
-        meta=meta,
-        driver_carry=sd,
-        pending_meta=None,
-        pending_carry=None,
-        pending_unfiltered_rewards=[],
-        train_prompts_size=4,  # only need 4; 2 should be discarded
-        num_gen_batches=1,
-        max_gen_batches=10,
-        policy=_fake_policy(client),
-    )
-    assert complete is True
-    assert len(pm.sample_ids) == 4
-    assert ds_metrics.get("dynamic_sampling_num_discarded_valid_samples") == 2
-    # Discarded uids (last 2) cleared from TQ.
-    import pytest
-
-    with pytest.raises(KeyError):
-        client.get_samples(
-            sample_ids=[meta.sample_ids[4]],
-            partition_id="train",
-            select_fields=["input_ids"],
-        )
-
-
-def test_apply_dynamic_sampling_raises_on_max_gen_batches():
-    """Exceeding dynamic_sampling_max_gen_batches must raise loudly."""
-    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
-
-    client = NoOpDataPlaneClient()
-    meta = _seed_meta(client, "u", n=2)
-    _stamp_filter_tags(meta, [0.0, 0.0])
-    sd = _make_driver_carry([1.0, 2.0], [0.0, 0.0])  # all dropped
-
-    import pytest
-
-    with pytest.raises(ValueError, match=r"max_gen_batches"):
-        _apply_dynamic_sampling(
-            meta=meta,
-            driver_carry=sd,
-            pending_meta=None,
-            pending_carry=None,
-            pending_unfiltered_rewards=[],
-            train_prompts_size=4,
-            num_gen_batches=11,
-            max_gen_batches=10,  # exceeded
-            policy=_fake_policy(client),
-        )
-
-
 # ── Multi-stage TQ lifecycle on a realistic batch ──
-# Walks the same sequence the production sync trainer runs:
+# Walks the per-step sequence:
 #   1. register_partition → 2. kv_first_write (seed) → 3. stamp filter tags
 #   → 4. worker logprob delta-writes → 5. driver advantage delta-write
 #   → 6. full read of train fields → 7. clear_samples at step-end.
@@ -525,7 +201,7 @@ def test_apply_dynamic_sampling_raises_on_max_gen_batches():
 
 
 def test_full_sync_step_lifecycle_on_realistic_batch() -> None:
-    """End-to-end TQ lifecycle test mirroring grpo_train_sync's per-step flow."""
+    """End-to-end TQ lifecycle test on a realistic batch."""
 
     _PARTITION = "train"
     client = NoOpDataPlaneClient()

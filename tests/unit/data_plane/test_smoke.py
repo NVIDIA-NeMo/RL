@@ -23,37 +23,6 @@ from __future__ import annotations
 import inspect
 
 
-def test_sync_utils_module_imports() -> None:
-    """Catches FQN drift after the algorithms.sync_utils consolidation."""
-    from nemo_rl.experience.sync_rollout_actor import (
-        SyncRolloutActor,
-        kv_first_write,
-    )
-
-    # ``SyncRolloutActor`` is wrapped by ``@ray.remote`` into
-    # ``ActorClass(SyncRolloutActor)`` — the wrapper has no
-    # ``__name__`` attribute. Check via ``repr`` instead.
-    assert "SyncRolloutActor" in repr(SyncRolloutActor)
-    assert callable(kv_first_write)
-
-
-def test_sync_rollout_actor_registered_under_vllm_tier() -> None:
-    """Multinode runs depend on this — without it, tensordict missing on
-    worker nodes (real bug seen in job 11614968)."""
-    from nemo_rl.distributed.ray_actor_environment_registry import (
-        get_actor_python_env,
-    )
-    from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-
-    fqn = "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
-    env = get_actor_python_env(fqn)
-    # Same tier as vLLM workers / AsyncTrajectoryCollector / ReplayBuffer.
-    # Allow either the resolved exec path or the SYSTEM-override sentinel.
-    assert env in (PY_EXECUTABLES.VLLM, PY_EXECUTABLES.SYSTEM), (
-        f"unexpected env tier for {fqn}: {env!r}"
-    )
-
-
 def test_kvbatchmeta_schema_unchanged() -> None:
     """Schema break check — KVBatchMeta is the cross-process boundary;
     adding/removing a field silently would break adapters that pickle it."""
@@ -101,65 +70,4 @@ def test_dataplane_client_abc_surface() -> None:
     }
     assert expected_methods.issubset(actual_methods), (
         f"DataPlaneClient ABC missing methods: {expected_methods - actual_methods}"
-    )
-
-
-def test_async_and_sync_actors_share_env_tier() -> None:
-    """Sync should mirror async's env tier — both drive vLLM and write
-    tensordict to TQ, so they need the same VLLM venv."""
-    from nemo_rl.distributed.ray_actor_environment_registry import (
-        get_actor_python_env,
-    )
-
-    sync_env = get_actor_python_env(
-        "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor"
-    )
-    async_env = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
-    assert sync_env == async_env, (
-        f"Sync vs async env tier drift: sync={sync_env!r}, async={async_env!r}"
-    )
-
-
-def test_sync_rollout_actor_masks_match_grpo() -> None:
-    """TQ flattening masks assistant history and trains only generated turns."""
-    import torch
-
-    from nemo_rl.experience.sync_rollout_actor import (
-        _flatten_rollout_message_log_for_tq,
-    )
-
-    message_logs = [
-        [
-            {"role": "user", "content": "first", "token_ids": torch.tensor([1, 2])},
-            {
-                "role": "assistant",
-                "content": "history",
-                "token_ids": torch.tensor([3, 4]),
-            },
-            {"role": "user", "content": "next", "token_ids": torch.tensor([5])},
-            {
-                "role": "assistant",
-                "content": "generated",
-                "token_ids": torch.tensor([6, 7]),
-                "generation_logprobs": torch.tensor([0.1, 0.2]),
-            },
-        ]
-    ]
-
-    flat, input_lengths = _flatten_rollout_message_log_for_tq(
-        message_logs,
-        pad_token_id=0,
-        make_sequence_length_divisible_by=1,
-    )
-
-    assert input_lengths.tolist() == [7]
-    assert torch.equal(
-        flat["token_loss_mask"],
-        torch.tensor([[0, 0, 0, 0, 0, 1, 1]]),
-    )
-    assert torch.allclose(
-        flat["generation_logprobs"],
-        torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2]]),
     )
