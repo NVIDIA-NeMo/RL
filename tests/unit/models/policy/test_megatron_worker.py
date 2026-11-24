@@ -3502,6 +3502,30 @@ def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch)
     assert stage_calls == [True]
 
 
+def test_disable_forward_pre_hook_stages_masters_before_param_gather(monkeypatch):
+    """The logprob gather must publish restaged masters, not the zeroed shared buffer."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    events = []
+
+    class FakeDDP:
+        remove_forward_pre_hook_handles = {"module": object()}
+
+        def disable_forward_pre_hook(self, param_sync=True):
+            events.append(("gather", param_sync))
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.model = FakeDDP()
+    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
+        events.append(("stage", zero_grad_buffer))
+    )
+
+    worker.disable_forward_pre_hook(param_sync=True)
+
+    assert events == [("stage", True), ("gather", True)]
+
+
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
     """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

@@ -2354,8 +2354,9 @@ class TestReplicatedLogprobResult:
         w.timer = MagicMock()
         return w
 
+    @pytest.mark.parametrize("keep_on_gpu", [False, True])
     @pytest.mark.parametrize("is_leader", [False, True])
-    def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader):
+    def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader, keep_on_gpu):
         w = self._worker()
         w._is_replica_leader = MagicMock(return_value=is_leader)
         worker_logprobs = torch.tensor([[1.0, 2.0, 3.0]])
@@ -2385,10 +2386,16 @@ class TestReplicatedLogprobResult:
         ):
             cpu_logprobs = MagicMock()
             empty_like.return_value = cpu_logprobs
-            result = w.get_logprobs(data=MagicMock())
+            result = w.get_logprobs(data=MagicMock(), keep_on_gpu=keep_on_gpu)
 
         broadcast.assert_called_once()
-        if is_leader:
+        if keep_on_gpu:
+            # Warm-up trains on these on every rank, so non-leaders need them too.
+            torch.testing.assert_close(
+                result["logprobs"], torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+            )
+            empty_like.assert_not_called()
+        elif is_leader:
             source_logprobs = empty_like.call_args.args[0]
             torch.testing.assert_close(
                 source_logprobs, torch.tensor([[1.0, 2.0, 3.0, 0.0]])

@@ -1279,6 +1279,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     if device == "cpu" and v.is_cuda:
                         # Avoid pageable-host staging during CUDA offload.
                         # Publish the state only after its copy has completed.
+                        # Torch caches freed pinned blocks, so host RSS stays
+                        # up after onload; later offloads reuse them.
                         destination = torch.empty_like(v, device="cpu", pin_memory=True)
                         destination.copy_(v, non_blocking=False)
                         state[k] = destination
