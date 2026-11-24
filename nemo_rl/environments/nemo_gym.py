@@ -76,6 +76,11 @@ from nemo_rl.environments.nemo_gym_shards import (
     parse_shard_plan,
 )
 from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.experience.failures import (
+    GymTransportError,
+    RolloutDataFailure,
+    http_status_is_infra,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -83,11 +88,6 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
-)
-from nemo_rl.experience.failures import (
-    GymTransportError,
-    RolloutDataFailure,
-    http_status_is_infra,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
