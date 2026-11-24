@@ -28,28 +28,15 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
 
 if TYPE_CHECKING:
     from megatron.bridge.training.config import CheckpointConfig
-    from megatron.core.resharding.utils import ParameterMetadata
 
 Role = Literal["engine", "learner"]
 MPS_PCT_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
-_FOREACH_COPY_MAX_BYTES = 512 * 1024
-
-
-@dataclass(frozen=True)
-class RefitSlices:
-    """Local learner views that populate one private inference weight."""
-
-    shape: tuple[int, ...]
-    parts: tuple[tuple[torch.Tensor, tuple[slice, ...]], ...]
-
-
-RefitSource = torch.Tensor | RefitSlices
 
 
 @dataclass(frozen=True)
@@ -386,25 +373,6 @@ def refit_core(model: Any) -> torch.nn.Module:
     return unwrap_model(model)
 
 
-def export_refit_handles(named: Iterable[tuple[str, torch.Tensor]]) -> dict[str, tuple]:
-    """Learner side, once: picklable CUDA IPC handles of its local refit tensors, by name."""
-    from torch.multiprocessing.reductions import reduce_tensor
-
-    return {name: reduce_tensor(t.detach()) for name, t in named}
-
-
-def storage_fingerprint(named: Iterable[tuple[str, torch.Tensor]]) -> str:
-    """Identify exported tensor addresses and layouts without reading GPU memory."""
-    import hashlib
-
-    h = hashlib.sha1()
-    for name, t in named:
-        h.update(
-            f"{name}:{t.data_ptr()}:{tuple(t.shape)}:{t.stride()}:{t.dtype}:{t.device};".encode()
-        )
-    return h.hexdigest()
-
-
 @dataclass(frozen=True)
 class ParallelismLayout:
     """Resolved parameter ownership dimensions used for worker placement."""
@@ -543,95 +511,6 @@ def engine_rank_gpus(
     return placement
 
 
-def refit_metadata(core: torch.nn.Module) -> list[ParameterMetadata]:
-    """Extract native logical shard coordinates for this rank's refit tensors."""
-    # Megatron is optional outside policy and generation workers.
-    from megatron.core.resharding.planner import _extract_module_metadata
-
-    return _extract_module_metadata(
-        core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {}
-    )
-
-
-def open_refit_handles(handles: dict[str, tuple]) -> dict[str, torch.Tensor]:
-    """Engine side, once: map the learner's tensors into this process (views of the learner's memory, by name)."""
-    return {name: rebuild(*args) for name, (rebuild, args) in handles.items()}
-
-
-def bind_shared(
-    src: dict[str, RefitSource],
-    named_dst: Iterable[tuple[str, torch.Tensor]],
-    leaf_ids: set[int],
-) -> dict[str, float]:
-    """Bind compatible inference parameters to learner CUDA IPC storage.
-
-    Engine side, once, before the engine's first forward: point every engine tensor whose local shard equals the
-    learner's (same shape and dtype, contiguous, and a module's own parameter, not a derived view) at the
-    learner's memory. Returns the tensors / bytes bound. The engine may still re-home a bound tensor later (MCore
-    concatenates expert weights into its own buffer on the first inference forward); ``copy_refit`` copies whatever
-    no longer aliases its source, so a binding is a memory saving, never a correctness assumption.
-    """
-    dst = dict(named_dst)
-    _check_names(src, dst)
-    bound = 0
-    for name, d in dst.items():
-        s = src[name]
-        if s.shape != d.shape:
-            raise ValueError(
-                f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)"
-            )
-        # A strided view is never bound: TE GEMMs read weights as dense (TE 2.15 is silently wrong on strided ones).
-        # Persistent buffers can change during backward, before the optimizer pause.
-        if (
-            isinstance(s, torch.Tensor)
-            and isinstance(d, torch.nn.Parameter)
-            and s.dtype == d.dtype
-            and s.is_contiguous()
-            and id(d) in leaf_ids
-        ):
-            d.data = s
-            bound += 1
-    return {"tensors_bound": bound, "tensors": len(dst)}
-
-
-def _check_names(src: dict[str, RefitSource], dst: dict[str, torch.Tensor]) -> None:
-    if dst.keys() != src.keys():
-        missing, extra = sorted(set(dst) - set(src)), sorted(set(src) - set(dst))
-        raise ValueError(
-            "co-resident refit: engine tensors differ by name from the planned local sources: "
-            f"engine-only {missing[:8]} ({len(missing)}), learner-only {extra[:8]} ({len(extra)})"
-        )
-
-
-def _contiguous_expert_stack(weights: list[torch.Tensor]) -> Optional[torch.Tensor]:
-    """View equally shaped experts as one stack only when their storage is already packed in order."""
-    if not weights:
-        return None
-    first = weights[0]
-    if (
-        type(first) not in (torch.Tensor, torch.nn.Parameter)
-        or first.ndim != 2
-        or first.dtype not in (torch.bfloat16, torch.float16, torch.float32)
-    ):
-        return None
-    storage = first.untyped_storage()
-    for index, weight in enumerate(weights):
-        if (
-            type(weight) not in (torch.Tensor, torch.nn.Parameter)
-            or weight.shape != first.shape
-            or weight.dtype != first.dtype
-            or weight.device != first.device
-            or not weight.is_contiguous()
-            or weight.untyped_storage().data_ptr() != storage.data_ptr()
-            or weight.untyped_storage().nbytes() != storage.nbytes()
-            or weight.storage_offset() != first.storage_offset() + index * first.numel()
-        ):
-            return None
-    return first.as_strided(
-        (len(weights), *first.shape), (first.numel(), *first.stride())
-    )
-
-
 def _reverse_expert_parameter_order(
     linear: torch.nn.Module, *, num_experts: int
 ) -> bool:
@@ -737,114 +616,3 @@ def prepare_shared_expert_layout(
         f"[sm_partition] expert projections prepared before DDP: {linears}", flush=True
     )
     return models
-
-
-def bind_shared_expert_stacks(
-    core: torch.nn.Module, src: dict[str, RefitSource]
-) -> dict[str, float]:
-    """Keep compatible BF16/FP16 expert stacks in learner storage through inference initialization.
-
-    Both projections must already alias their corresponding source parameters and be packed in expert order.
-    Other layouts retain Megatron's ordinary lazy packing and per-refit copies.
-    """
-    # The co-resident engine is the only consumer of optional Megatron inference modules.
-    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-
-    weight_groups = (("linear_fc1", "_fc1_weight"), ("linear_fc2", "_fc2_weight"))
-    layers = shared_bytes = 0
-    for prefix, module in core.named_modules():
-        if not isinstance(module, InferenceGroupedMLP):
-            continue
-        if module._concatenated_weights_built:
-            raise RuntimeError(
-                "shared expert stacks must be bound before the first inference forward"
-            )
-        stacks = {}
-        for linear_name, buffer_name in weight_groups:
-            linear = getattr(module, linear_name)
-            weights = []
-            for index in range(module.num_local_experts):
-                name = f"{prefix + '.' if prefix else ''}{linear_name}.weight{index}"
-                weight = getattr(linear, f"weight{index}")
-                source = src.get(name)
-                if (
-                    not isinstance(source, torch.Tensor)
-                    or not isinstance(weight, torch.nn.Parameter)
-                    or not _aliases(weight, source)
-                ):
-                    break
-                weights.append(source)
-            if len(weights) != module.num_local_experts:
-                break
-            stack = _contiguous_expert_stack(weights)
-            if stack is None:
-                break
-            stacks[buffer_name] = stack
-        if len(stacks) != len(weight_groups):
-            continue
-        for buffer_name, stack in stacks.items():
-            module.register_buffer(buffer_name, stack, persistent=False)
-            shared_bytes += stack.numel() * stack.element_size()
-        module._uses_mxfp8_weights = False
-        module._concatenated_weights_built = True
-        layers += 1
-    return {"shared_expert_layers": layers, "shared_expert_bytes": shared_bytes}
-
-
-def _aliases(d: torch.Tensor, s: torch.Tensor) -> bool:
-    return (
-        d.data_ptr() == s.data_ptr()
-        and d.shape == s.shape
-        and d.stride() == s.stride()
-        and d.dtype == s.dtype
-    )
-
-
-def copy_refit(
-    src: dict[str, RefitSource], named_dst: Iterable[tuple[str, torch.Tensor]]
-) -> dict[str, float]:
-    """Copy private inference tensors and account for shared storage.
-
-    Engine side, per step (engine paused, learner idle): copy every learner tensor into the engine tensor of the
-    same name unless that engine tensor IS the learner's memory. The engine's tensors are enumerated live, so a tensor
-    the engine re-homed after setup is still the one written. Returns the bytes copied and the bytes shared.
-    """
-    dst = dict(named_dst)
-    _check_names(src, dst)
-    copied = shared = 0
-    copy_groups = defaultdict(lambda: ([], []))
-    # The engine's tensors can be inference tensors (allocated lazily under inference mode); write them there too.
-    with torch.inference_mode():
-        for name, d in dst.items():
-            s = src[name]
-            if s.shape != d.shape:
-                raise ValueError(
-                    f"co-resident refit: {name} has shape {tuple(s.shape)} (learner) vs {tuple(d.shape)} (engine)"
-                )
-            if isinstance(s, RefitSlices):
-                for source_view, target_slice in s.parts:
-                    d[target_slice].copy_(source_view)
-                    copied += source_view.numel() * source_view.element_size()
-                continue
-            nbytes = s.numel() * s.element_size()
-            if _aliases(d, s):
-                shared += nbytes
-                continue
-            if (
-                nbytes <= _FOREACH_COPY_MAX_BYTES
-                and s.is_contiguous()
-                and d.is_contiguous()
-            ):
-                # Mixed dtype lists force foreach back to one copy per tensor.
-                key = (s.device, d.device, s.dtype, d.dtype)
-                sources, destinations = copy_groups[key]
-                sources.append(s)
-                destinations.append(d)
-            else:
-                # Enqueue large copies while the host prepares subsequent tensors.
-                d.copy_(s)
-            copied += nbytes
-        for copy_src, copy_dst in copy_groups.values():
-            torch._foreach_copy_(copy_dst, copy_src)
-    torch.cuda.current_stream().synchronize()
-    return {"bytes": float(copied), "bytes_shared": float(shared)}

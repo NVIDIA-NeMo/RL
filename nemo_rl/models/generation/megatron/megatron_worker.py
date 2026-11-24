@@ -299,10 +299,10 @@ def _apply_inference_cuda_graph_scope(
 
 
 if TYPE_CHECKING:
-    from megatron.core.resharding.utils import ParameterMetadata, ReshardPlan
+    from megatron.core.resharding import coresident
+    from megatron.core.resharding.coresident import LocalSourcePlan
 
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
-    from nemo_rl.models.megatron.coresident_reshard import LocalSourcePlan
 
 
 # Streaming calls occupy separate Ray slots so refit and pause RPCs can still run.
@@ -1610,11 +1610,7 @@ class MegatronGenerationRefitMixin:
 
     _coresident_plan: Optional["LocalSourcePlan"]
     _coresident_destination_fingerprint: Optional[str]
-    _coresident_reshard_plan: Optional["ReshardPlan"]
-    _coresident_reshard_service: Optional[NCCLCopyService]
-    _coresident_receive_module: Optional[torch.nn.Module]
-    _coresident_receive_metadata: Optional[dict[str, "ParameterMetadata"]]
-    _coresident_receive_fingerprint: Optional[str]
+    _residual_refit: Optional["coresident.ResidualRefit"]
 
     def _init_generation_refit_state(self) -> None:
         """Reset every refit attribute to its unprepared state.
@@ -1652,11 +1648,7 @@ class MegatronGenerationRefitMixin:
         self.refit_execution_batch_bytes: int | None = None
         self._coresident_plan = None
         self._coresident_destination_fingerprint = None
-        self._coresident_reshard_plan = None
-        self._coresident_reshard_service = None
-        self._coresident_receive_module = None
-        self._coresident_receive_metadata = None
-        self._coresident_receive_fingerprint = None
+        self._residual_refit = None
 
     def init_collective_mcore_generation(
         self,
@@ -2529,15 +2521,8 @@ class MegatronGenerationRefitMixin:
         share: bool,
     ) -> sm_partition.RefitBinding:
         """Bind local shards and identify inference tensors needing remote shards."""
-        from megatron.core.resharding.utils import (
-            ParameterMetadata,
-            named_refit_tensors,
-        )
-
-        from nemo_rl.models.megatron.coresident_reshard import (
-            plan_local_sources,
-            remap_metadata,
-        )
+        from megatron.core.resharding import coresident
+        from megatron.core.resharding.utils import ParameterMetadata
 
         if self._inference_engine_initialized or self._coresident_plan is not None:
             raise RuntimeError(
@@ -2546,32 +2531,16 @@ class MegatronGenerationRefitMixin:
         if local_placement.device_id != self.report_device_id():
             raise ValueError("Co-resident IPC handles must come from the engine's GPU")
         core = sm_partition.refit_core(self._gen_model())
-        plan = plan_local_sources(
-            sm_partition.open_refit_handles(local_handles),
+        plan, stats = coresident.bind_inference_weights(
+            core,
+            local_handles,
             [ParameterMetadata(**item) for item in source_metadata],
-            remap_metadata(
-                sm_partition.refit_metadata(core),
-                engine_to_learner,
-                learner_world_size=learner_world_size,
-            ),
-            learner_rank=local_placement.rank,
+            engine_to_learner,
+            learner_world_size,
+            local_placement.rank,
+            share=share,
         )
         self._coresident_plan = plan
-        local_tensors = [
-            (name, tensor)
-            for name, tensor in named_refit_tensors(core)
-            if name in plan.local_sources
-        ]
-        stats: dict[str, float] = {"tensors_bound": 0, "tensors": len(local_tensors)}
-        if share:
-            stats = sm_partition.bind_shared(
-                plan.local_sources, local_tensors, {id(p) for p in core.parameters()}
-            )
-            stats.update(
-                sm_partition.bind_shared_expert_stacks(core, plan.local_sources)
-            )
-        stats["residual_tensors"] = len(plan.residual)
-        stats["tensors"] += len(plan.residual)
         return sm_partition.RefitBinding(
             [asdict(item) for item in plan.residual], stats
         )
@@ -2598,25 +2567,11 @@ class MegatronGenerationRefitMixin:
         plan = self._coresident_plan
         if plan is None:
             raise RuntimeError("co-resident refit has not been planned")
-        tensors = plan.current_tensors(sm_partition.refit_core(self._gen_model()))
-        targets = {}
-        for metadata in plan.residual:
-            name = metadata.name
-            tensor = tensors[name]
-            if (
-                type(tensor) not in (torch.Tensor, torch.nn.Parameter)
-                or tensor.shape != metadata.shape
-                or tensor.dtype != metadata.dtype
-            ):
-                raise RuntimeError(
-                    f"co-resident receive storage changed layout or dtype: {name}"
-                )
-            targets[name] = tensor
-        fingerprint = sm_partition.storage_fingerprint(targets.items())
-        handles = None
-        if fingerprint != self._coresident_destination_fingerprint:
-            handles = sm_partition.export_refit_handles(targets.items())
-            self._coresident_destination_fingerprint = fingerprint
+        fingerprint, handles = plan.export_destinations(
+            sm_partition.refit_core(self._gen_model()),
+            self._coresident_destination_fingerprint,
+        )
+        self._coresident_destination_fingerprint = fingerprint
         return sm_partition.RefitDestination(
             self.report_device_id(), fingerprint, handles
         )
@@ -2640,27 +2595,16 @@ class MegatronGenerationRefitMixin:
         # A host-side pause can precede completion of already-submitted GPU work.
         torch.cuda.synchronize()
         stats = self._coresident_copy_weights()
-        # Match MCore resume's prefix-cache invalidation without suspending live requests.
-        engine = self.dynamic_inference_engine
-        engine._weight_epoch += 1
-        engine._resalt_unprefilled_requests()
+        self.dynamic_inference_engine.publish_paused_weights()
         return stats
 
     def _coresident_copy_weights(self) -> dict[str, float]:
-        # Load reshard cache hooks only for the IPC refit path.
-        from megatron.core.resharding.execution import refresh_module_caches
-
         t0 = time.perf_counter()
         plan = self._coresident_plan
         if plan is None:
             raise RuntimeError("co-resident refit has not been planned")
         core = sm_partition.refit_core(self._gen_model())
-        tensors = plan.current_tensors(core)
-        stats = sm_partition.copy_refit(
-            plan.local_sources, ((name, tensors[name]) for name in plan.local_sources)
-        )
-        with torch.inference_mode():
-            refresh_module_caches(core)
+        stats = plan.refresh(core)
         # Derived weight storage, as every other refit path (FlashInfer MXFP8 experts; no-op otherwise).
         self._refresh_flashinfer_mxfp8_weights()
         torch.cuda.synchronize()

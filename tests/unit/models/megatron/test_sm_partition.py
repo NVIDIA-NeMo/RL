@@ -21,54 +21,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from megatron.core.resharding import coresident
 
 from nemo_rl.models.megatron import sm_partition as smp
 
 MPS = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps"}
-
-
-@pytest.mark.parametrize("contiguous", [True, False])
-def test_bind_shared_expert_stacks_uses_native_megatron_buffers(contiguous):
-    # Use the installed class so the test cannot invent an unavailable Core API.
-    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-
-    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
-    torch.nn.Module.__init__(experts)
-    experts.num_local_experts = 2
-    experts._concatenated_weights_built = False
-    sources = {}
-    for linear_name, shape in [("linear_fc1", (4, 3)), ("linear_fc2", (3, 4))]:
-        linear = torch.nn.Module()
-        packed = torch.arange(2 * shape[0] * shape[1], dtype=torch.float32).reshape(
-            2, *shape
-        )
-        for index in range(2):
-            source = packed[index] if contiguous else packed[index].clone()
-            linear.register_parameter(f"weight{index}", torch.nn.Parameter(source))
-            sources[f"{linear_name}.weight{index}"] = source
-        experts.add_module(linear_name, linear)
-
-    stats = smp.bind_shared_expert_stacks(experts, sources)
-    assert experts._concatenated_weights_built is contiguous
-    assert stats["shared_expert_layers"] == int(contiguous)
-    if contiguous:
-        assert stats["shared_expert_bytes"] == sum(
-            value.numel() * value.element_size() for value in sources.values()
-        )
-        sources["linear_fc1.weight0"].add_(7)
-        torch.testing.assert_close(
-            experts._fc1_weight[0], sources["linear_fc1.weight0"]
-        )
-        assert (
-            experts._fc1_weight.data_ptr() == sources["linear_fc1.weight0"].data_ptr()
-        )
-        assert (
-            experts._fc2_weight.data_ptr() == sources["linear_fc2.weight0"].data_ptr()
-        )
-    else:
-        assert stats["shared_expert_bytes"] == 0
-        assert "_fc1_weight" not in experts._buffers
-        assert "_fc2_weight" not in experts._buffers
 
 
 def _cfg(**over):
@@ -301,7 +258,7 @@ def _learner(q_to_engine, q_from_engine):
         ("b.bias", buf[512 * 1024 : 512 * 1024 + 1024]),
         ("e.weight0", buf[600000 : 600000 + 64 * 64].view(64, 64)),
     ]
-    q_to_engine.put(smp.export_refit_handles(named))
+    q_to_engine.put(coresident.export_refit_handles(named))
     while True:
         msg = q_from_engine.get(timeout=120)
         if msg == "quit":
@@ -315,7 +272,7 @@ def _learner(q_to_engine, q_from_engine):
 def _engine(q_from_learner, q_to_learner, out):
     try:
         torch.cuda.set_device(0)
-        src = smp.open_refit_handles(q_from_learner.get())
+        src = coresident.open_refit_handles(q_from_learner.get())
         dst = {
             "a.weight": torch.zeros(512, 1024, device="cuda", dtype=torch.bfloat16),
             "b.bias": torch.zeros(1024, device="cuda", dtype=torch.bfloat16),
@@ -324,7 +281,7 @@ def _engine(q_from_learner, q_to_learner, out):
         res = {}
         q_to_learner.put("update")
         expect = q_from_learner.get()
-        res["bytes"] = smp.copy_refit(src, dst.items())["bytes"]
+        res["bytes"] = coresident.copy_refit(src, dst.items())["bytes"]
         res["bitwise"] = all(
             torch.equal(dst[n].float().cpu(), expect[n].to(dst[n].dtype).float())
             for n in dst
@@ -336,11 +293,11 @@ def _engine(q_from_learner, q_to_learner, out):
             for n in dst
         )
         try:
-            smp.copy_refit(src, [("a.weight", dst["a.weight"])])
+            coresident.copy_refit(src, [("a.weight", dst["a.weight"])])
         except ValueError as ex:
             res["name_mismatch"] = "differ by name" in str(ex)
         try:
-            smp.copy_refit(
+            coresident.copy_refit(
                 src,
                 [("a.weight", dst["a.weight"].view(1024, 512))]
                 + [(n, t) for n, t in dst.items() if n != "a.weight"],
@@ -433,7 +390,7 @@ def test_copy_refit_matches_materialized_sources(
     src["float_buffer"] = torch.arange(7, dtype=torch.float32)
     dst["float_buffer"] = torch.empty_like(src["float_buffer"])
     src["shared"] = dst["shared"] = torch.ones(3)
-    stats = smp.copy_refit(src, dst.items())
+    stats = coresident.copy_refit(src, dst.items())
     for name, tensor in dst.items():
         assert torch.equal(tensor, src[name].to(tensor.dtype)), name
     assert stats == {
@@ -449,17 +406,17 @@ def test_copy_refit_rejects_shape_mismatch(monkeypatch: pytest.MonkeyPatch) -> N
     src = {"a": torch.ones(4), "b": torch.ones(4)}
     dst = {"a": torch.zeros(4), "b": torch.zeros(5)}
     with pytest.raises(ValueError, match="has shape"):
-        smp.copy_refit(src, dst.items())
+        coresident.copy_refit(src, dst.items())
 
 
 def test_storage_fingerprint_moves_with_storage():
     a, b = torch.zeros(4), torch.zeros(8)
-    fp = smp.storage_fingerprint([("a", a), ("b", b)])
-    assert fp == smp.storage_fingerprint([("a", a), ("b", b)])
+    fp = coresident.storage_fingerprint([("a", a), ("b", b)])
+    assert fp == coresident.storage_fingerprint([("a", a), ("b", b)])
     a.add_(1.0)  # in-place update: same storage
-    assert fp == smp.storage_fingerprint([("a", a), ("b", b)])
+    assert fp == coresident.storage_fingerprint([("a", a), ("b", b)])
     b.data = torch.zeros(8)  # rebound storage (offload / reload): must change
-    assert fp != smp.storage_fingerprint([("a", a), ("b", b)])
+    assert fp != coresident.storage_fingerprint([("a", a), ("b", b)])
 
 
 def test_partition_backend_swap_point(tmp_path, monkeypatch):
@@ -506,7 +463,7 @@ def test_bind_shared_then_copy_whatever_is_not_aliased(
     grouped = torch.zeros(8)
     e0 = grouped[:4]  # a view of a grouped parameter: never bound
     named = [("w", owner.w), ("e0", e0), ("h", owner.h)]
-    stats = smp.bind_shared(src, named, {id(owner.w), id(owner.h), id(grouped)})
+    stats = coresident.bind_shared(src, named, {id(owner.w), id(owner.h), id(grouped)})
     assert stats == {"tensors_bound": 1, "tensors": 3}
     assert owner.w.data_ptr() == src["w"].data_ptr()
     buffer_before_backward = owner.h.clone()
@@ -516,21 +473,21 @@ def test_bind_shared_then_copy_whatever_is_not_aliased(
         1.0
     )  # the learner's in-place optimizer write is what the engine reads
     assert torch.equal(owner.w.detach(), src["w"])
-    out = smp.copy_refit(src, named)
+    out = coresident.copy_refit(src, named)
     assert out["bytes_shared"] == 16 * 4 and out["bytes"] == 2 * 4 * 4
     assert torch.equal(e0, src["e0"]) and torch.equal(owner.h, src["h"])
     # The engine re-homes a bound tensor (its own copy): the next refit must copy it, not trust the binding.
     owner.w.data = owner.w.detach().clone()
     src["w"].add_(1.0)
-    out = smp.copy_refit(src, named)
+    out = coresident.copy_refit(src, named)
     assert out["bytes_shared"] == 0 and torch.equal(owner.w.detach(), src["w"])
     with pytest.raises(ValueError, match="differ by name"):
-        smp.bind_shared(src, named[:1], set())
+        coresident.bind_shared(src, named[:1], set())
     strided = torch.nn.Parameter(torch.zeros(4, 4))
     assert (
-        smp.bind_shared({"w": torch.randn(4, 4).t()}, [("w", strided)], {id(strided)})[
-            "tensors_bound"
-        ]
+        coresident.bind_shared(
+            {"w": torch.randn(4, 4).t()}, [("w", strided)], {id(strided)}
+        )["tensors_bound"]
         == 0
     )
 
@@ -735,43 +692,6 @@ def test_coresident_copy_failure_keeps_engine_paused(single_rank_workers) -> Non
         "engine.coresident_refit_copy",
     ]
     assert refit._paused_at is not None
-
-
-@pytest.mark.parametrize(
-    "layout", ["packed", "reversed", "padded", "separate", "strided"]
-)
-def test_contiguous_expert_stack_preserves_storage_or_falls_back(layout: str) -> None:
-    backing = torch.arange(3 * 8 * 4, dtype=torch.float32).reshape(3, 8, 4)
-    weights = list(backing.unbind())
-    if layout == "reversed":
-        weights.reverse()
-    elif layout == "padded":
-        weights = [weight[:4] for weight in weights]
-    elif layout == "separate":
-        weights = [weight.clone() for weight in weights]
-    elif layout == "strided":
-        weights = [weight.t() for weight in weights]
-    stack = smp._contiguous_expert_stack(weights)
-    if layout != "packed":
-        assert stack is None
-        return
-    assert stack is not None
-    assert stack.is_contiguous()
-    assert stack.data_ptr() == backing.data_ptr()
-    backing.add_(3)
-    assert torch.equal(stack, backing)
-
-
-def test_contiguous_expert_stack_accepts_offset_subsets_and_rejects_mixed_shapes() -> (
-    None
-):
-    backing = torch.randn(6, 8, 4)
-    weights = list(backing[2:5].unbind())
-    stack = smp._contiguous_expert_stack(weights)
-    assert stack is not None
-    assert torch.equal(stack, backing[2:5])
-    assert stack.data_ptr() == weights[0].data_ptr()
-    assert smp._contiguous_expert_stack([weights[0], weights[1][:4]]) is None
 
 
 def test_expert_parameter_order_preserves_names_objects_and_optimizer_updates() -> None:

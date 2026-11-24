@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from nemo_rl.models.megatron import sm_partition
-from nemo_rl.models.megatron.coresident_reshard import LocalSourcePlan
 
 
 pytestmark = [
@@ -31,8 +30,9 @@ pytestmark = [
 @pytest.mark.parametrize("shared", [False, True])
 def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
     # The standalone CPU suite does not need the optional Megatron inference dependencies.
+    from megatron.core.resharding import coresident
     from megatron.core.resharding.utils import named_refit_tensors
-    from megatron.core.ssm.mamba_mixer import MambaMixer
+    from megatron.core.ssm.mamba_mixer import MambaInferenceParamCache, MambaMixer
     from megatron.core.transformer.module import MegatronModule
 
     from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -43,14 +43,25 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
     mixer = object.__new__(MambaMixer)
     MegatronModule.__init__(mixer, SimpleNamespace())
     mixer.A_log = torch.nn.Parameter(torch.tensor([0.2, 0.7], device="cuda"))
-    mixer._A_neg_exp_cache = torch.empty_like(mixer.A_log)
-    mixer._A_neg_exp_cache_stale = True
+    mixer.conv1d_weight = torch.nn.Parameter(torch.zeros(2, 1, 3, device="cuda"))
+    mixer.conv1d_bias = torch.nn.Parameter(torch.zeros(2, device="cuda"))
+    cache = MambaInferenceParamCache(
+        A_neg_exp=torch.empty_like(mixer.A_log),
+        conv_weight=torch.empty_like(mixer.conv1d_weight[:, 0]),
+        conv_bias=torch.empty_like(mixer.conv1d_bias),
+        dt_bias=None,
+    )
+    mixer._inference_cache = cache
     mixer.headdim, mixer.d_state = 2, 3
-    source = {"A_log": mixer.A_log.detach().clone()}
+    source = {
+        name: tensor.detach().clone() for name, tensor in named_refit_tensors(mixer)
+    }
     if shared:
-        sm_partition.bind_shared(source, named_refit_tensors(mixer), {id(mixer.A_log)})
+        coresident.bind_shared(
+            source, named_refit_tensors(mixer), {id(p) for p in mixer.parameters()}
+        )
     mixer.eval()
-    cache_ptr = mixer._A_neg_exp_cache.data_ptr()
+    cache_ptr = cache.A_neg_exp.data_ptr()
     weight_ptr = mixer.A_log.data_ptr()
     x = torch.ones(2, 2, 3, device="cuda")
     out = torch.empty_like(x)
@@ -62,7 +73,7 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
         out.copy_(x * mixer._get_decode_A_neg_exp())
 
     source["A_log"].copy_(torch.tensor([0.9, 1.1], device="cuda"))
-    sm_partition.copy_refit(source, named_refit_tensors(mixer))
+    coresident.copy_refit(source, named_refit_tensors(mixer))
     graph.replay()
     torch.cuda.synchronize()
     expected = -source["A_log"].exp().view(2, 1, 1).expand_as(x)
@@ -71,7 +82,7 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
     )
 
     worker = SimpleNamespace(
-        _coresident_plan=LocalSourcePlan(source, ()),
+        _coresident_plan=coresident.LocalSourcePlan(source, ()),
         _gen_model=lambda: mixer,
         _refresh_flashinfer_mxfp8_weights=lambda: None,
     )
@@ -82,7 +93,7 @@ def test_coresident_refit_refreshes_captured_mamba_cache(shared: bool) -> None:
         torch.cuda.synchronize()
         expected = -source["A_log"].exp().view(2, 1, 1).expand_as(x)
         assert torch.equal(out, expected)
-        assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
+        assert cache.A_neg_exp.data_ptr() == cache_ptr
         assert mixer.A_log.data_ptr() == weight_ptr
 
 
@@ -91,6 +102,7 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
     packed: bool,
 ) -> None:
     # Actual inference modules are optional in the standalone CPU suite.
+    from megatron.core.resharding import coresident
     from megatron.core.resharding.utils import named_refit_tensors
     from megatron.core.transformer.module import MegatronModule
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
@@ -110,14 +122,10 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
                 f"weight{index}", torch.nn.Parameter(torch.empty_like(tensor))
             )
             source[f"{linear_name}.weight{index}"] = tensor
-    sm_partition.bind_shared(
+    coresident.bind_shared(
         source, named_refit_tensors(experts), {id(p) for p in experts.parameters()}
     )
-    stats = sm_partition.bind_shared_expert_stacks(experts, source)
-    assert stats["shared_expert_layers"] == int(packed)
-    if not packed:
-        assert not experts._concatenated_weights_built
-        experts._build_concatenated_weights()
+    experts._build_concatenated_weights()
     assert not {"_fc1_weight", "_fc2_weight"}.intersection(
         dict(named_refit_tensors(experts))
     )
@@ -134,7 +142,7 @@ def test_shared_expert_stacks_keep_graph_addresses_and_refit_values(
     for value in (0.25, 0.5):
         for tensor in source.values():
             tensor.fill_(value)
-        stats = sm_partition.copy_refit(source, named_refit_tensors(experts))
+        stats = coresident.copy_refit(source, named_refit_tensors(experts))
         graph.replay()
         torch.cuda.synchronize()
         expected_stacks = [
@@ -185,7 +193,9 @@ def test_shared_expert_order_uses_native_optimizer_storage_layout() -> None:
     for linear_name in ("linear_fc1", "linear_fc2"):
         linear = getattr(experts, linear_name)
         weights = [getattr(linear, f"weight{i}") for i in range(3)]
-        stack = sm_partition._contiguous_expert_stack(weights)
+        from megatron.core.transformer.moe.experts import _contiguous_expert_stack
+
+        stack = _contiguous_expert_stack(weights)
         assert stack is not None
         assert torch.equal(
             stack,

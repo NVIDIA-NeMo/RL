@@ -40,7 +40,7 @@ Inference pauses and drains active GPU work before the optimizer writes shared p
 
 Where dense and expert ownership permit it, the planner reorders ranks to keep aligned TP/ETP/EP increases local, including across CP replicas. Otherwise it retains the normal placement. Remote shards use Megatron’s point-to-point transfer schedule with the original TP coordinates and task and batch IDs. Every learner joins the communicator, including learner-only GPUs and ranks with no transfers.
 
-All workers must use the same Megatron-Core build. NeMo RL asks Core’s `build_plan_from_rosters` to plan the private copies. On Bridge’s pinned Core (`e0a4bfed`), NeMo RL falls back to Core’s point-to-point schedule if the planner fails because the first TP shard is already shared. Core `a463e854` handles that case directly. GPU runs with remote shards require the NCCL communicator reuse fix on affected PyTorch versions. [Megatron-LM #9485](https://github.com/NVIDIA/Megatron-LM/pull/9485)
+NeMo RL pauses inference, coordinates workers and publishes each new policy version. Megatron Core’s `megatron.core.resharding.coresident` module plans shard transfers, maps CUDA IPC storage and refreshes inference tensors in place. Both roles require a Core build with that module. At publication the dynamic inference engine advances the prefix-cache epoch for new requests. Requests with live KV retain their existing prefix salt. When stale multimodal embeddings are disabled, the engine invalidates the vision cache and refreshes live vision request data.
 
 ## Validation and limits
 
@@ -52,4 +52,4 @@ All workers must use the same Megatron-Core build. NeMo RL asks Core’s `build_
 
 The full-model run used Core `3e95097b` with fixes for two MTP prefill helpers, per-forward MoE metadata, partial-destination planning and NCCL communicator initialization. It qualified functional execution for that layout. Full-model per-tensor parity, convergence and throughput require separate measurements. Earlier Ultra training CP8 to inference CP1 evidence uses matching TP. Training ETP greater than one, training PP and changed-EP full-model layouts still need GPU qualification.
 
-The implementation supports one model chunk per worker and matching refit dtypes. It rejects virtual pipeline chunks, GTP rematerialization and quantized refit storage.
+The implementation supports one model chunk per worker. A matching dtype permits zero-copy sharing. Floating-point tensors with different learner and inference dtypes are copied into inference storage at its existing precision. It rejects virtual pipeline chunks, GTP rematerialization and quantized refit storage.
