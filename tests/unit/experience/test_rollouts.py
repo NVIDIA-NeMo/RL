@@ -1560,10 +1560,7 @@ def sliding_puzzle_environment(rollout_cluster):
 def initial_sliding_puzzle_batch(rollout_tokenizer):
     print("Creating initial sliding puzzle test batch...")
     batch_size = 1
-    game_config: SlidingPuzzleConfig = {
-        "size": 2,
-        "shuffle_moves": 1,
-    }
+    game_config = SlidingPuzzleConfig(size=2, shuffle_moves=1)
     max_moves = 10  # Set a limit for the test
 
     # Generate initial game state
@@ -1574,7 +1571,7 @@ def initial_sliding_puzzle_batch(rollout_tokenizer):
     prompt_instructions = (
         f"{welcome_message}\n\n"
         f"Current Board State:\n{initial_render}\n\n"
-        f"Reach the goal state where numbers are ordered 1 through {game_config['size'] ** 2 - 1} "
+        f"Reach the goal state where numbers are ordered 1 through {game_config.size**2 - 1} "
         f"with the empty space (0) at the bottom right.\n"
         f"Valid actions: 'up', 'down', 'left', 'right'\n"
         f"After thinking, output your chosen action on a new line starting with '<action></action>' like this:\n<action>your_action</action>"
