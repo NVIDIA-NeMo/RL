@@ -62,10 +62,7 @@ def capture_reward_settings(
 
 
 async def validate_replay_inventory(
-    replay_metadata: TQReplayMetadataState,
-    *,
-    dp_client: Any,
-    partition_id: str,
+    replay_metadata: TQReplayMetadataState, *, dp_client: Any, partition_id: str
 ) -> None:
     """Require the canonical TQ keys to match the SC replay index exactly.
 

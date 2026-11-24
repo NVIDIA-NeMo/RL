@@ -21,9 +21,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.async_utils.replay_buffer import (
-    TQReplayBuffer,
-)
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler, InOrderSampler
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import AdvantageComputer
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig

@@ -6041,14 +6041,13 @@ class TestReplayBufferPersistence:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
-        dp_client = _FakeDPClient(sample_ids=actual_sample_ids)
 
         with pytest.raises(RuntimeError, match=error_fragment):
             _run_actor_run(
                 mc,
                 _make_actor_args(
                     tq_buffer=_FakeTQBuffer(load_return=1),
-                    dp_client=dp_client,
+                    dp_client=_FakeDPClient(sample_ids=actual_sample_ids),
                     last_checkpoint_path=str(ckpt_dir),
                     data_plane_checkpoint_metadata=tq_metadata,
                 ),

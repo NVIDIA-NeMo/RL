@@ -47,9 +47,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (
-    GROUP_ID_TAG,
-)
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
