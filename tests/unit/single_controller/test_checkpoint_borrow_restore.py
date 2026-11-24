@@ -240,6 +240,7 @@ def _controller(
         grpo=controller._algo_cfg,
         checkpointing=CheckpointingConfig.model_construct(load_replay_buffer=True),
         token_capture=SimpleNamespace(enabled=False, forest_training=False),
+        loss_fn=SimpleNamespace(resolved_normalization="global_token_mean"),
     )
     controller._dataloader = loader
     controller._rollout_permitted = asyncio.Event()

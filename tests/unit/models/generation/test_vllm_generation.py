@@ -24,7 +24,7 @@ import time
 import types
 import warnings
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,7 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRITE_LIMITS
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
@@ -1793,9 +1794,13 @@ def _generation_cut_route(
     worker, _, app = _setup_fake_vllm_app(monkeypatch)
     cuts = []
 
-    def checkpoint_cut(inventory, *, deadline):
+    def submit(inventory, *, deadline):
         cuts.append((inventory, deadline))
-        return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+        receipt: Future = Future()
+        receipt.set_result(
+            types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+        )
+        return receipt
 
     if enabled:
         recovery = PrefixRecovery(
@@ -1812,9 +1817,14 @@ def _generation_cut_route(
                 prefix_row_extras=lambda state: None,
                 router_replay=False,
                 sampler_top_k=0,
+                prefix_write_max_rows=256,
+                prefix_write_max_tokens=4_194_304,
+                prefix_read_max_rows=256,
+                write_limits=PREFIX_WRITE_LIMITS,
             )
         )
-        recovery.checkpoint_cut = checkpoint_cut
+        # Every cut goes through the write pipeline; record what it is handed.
+        recovery._pipeline.submit = submit
         worker._prefix_recovery = recovery
     else:
         worker._prefix_recovery = NoPrefixRecovery()

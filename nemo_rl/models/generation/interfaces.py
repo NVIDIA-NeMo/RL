@@ -711,6 +711,9 @@ class GenerationInterface(ABC):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -736,6 +739,11 @@ class GenerationInterface(ABC):
                 coordinator to authorize generation-cut requests.
             generation_cut_control_timeout_s: Bound on one generation-cut
                 request; calls not cut by then are acknowledged as failures.
+            prefix_write_max_rows: Maximum rows per TQ write at a checkpoint cut.
+            prefix_write_max_tokens: Maximum tokens per TQ write at a checkpoint
+                cut; a single larger row is written alone.
+            prefix_read_max_rows: Maximum rows per TQ read at restore; 1 reads
+                each restore on its own.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

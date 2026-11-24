@@ -25,7 +25,7 @@ import os
 import threading
 import time
 import warnings
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
@@ -62,7 +62,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
@@ -128,6 +128,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    collect_dataset_agent_names,
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -154,6 +155,7 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -233,6 +235,44 @@ class SingleControllerActorArgs:
     simulator: Optional[SimulatorConfig] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    # warmup_first_pass's arguments when the controller runs the trainer warm-up;
+    # None when setup already ran it or it does not run.
+    trainer_warmup_kwargs: Optional[dict[str, Any]] = None
+
+
+# Checkpoints written before loss_normalization was recorded could only have
+# been trained under one of these.
+_PRE_METADATA_LOSS_NORMALIZATIONS = ("global_token_mean", "sequence_mean")
+
+
+def _validate_checkpoint_loss_normalization(
+    metadata: DataPlaneCheckpointMetadata, loss_normalization: str
+) -> None:
+    """Reject resuming buffered rollouts under a different loss normalization.
+
+    The restored rows were prepared for the normalization they were written
+    under, so resuming in the same checkpoint_dir keeps it. A new stage that
+    only initializes from a checkpoint's weights does not restore rows and is
+    not affected.
+    """
+    saved = metadata.get("loss_normalization")
+    if saved is None:
+        if loss_normalization in _PRE_METADATA_LOSS_NORMALIZATIONS:
+            return
+        saved_description = (
+            "an unrecorded normalization (one of "
+            f"{', '.join(_PRE_METADATA_LOSS_NORMALIZATIONS)})"
+        )
+    elif saved == loss_normalization:
+        return
+    else:
+        saved_description = repr(saved)
+    raise ValueError(
+        "Native TQ checkpoint was written under loss_fn.normalization="
+        f"{saved_description}, but this run uses {loss_normalization!r}. "
+        "Resume with the original normalization, or start a new run in a new "
+        "checkpoint_dir that initializes from this checkpoint's weights."
+    )
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -242,6 +282,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
+    loss_normalization: str,
     opd_full_teacher_checkpoints: Optional[list[str]] = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
@@ -324,6 +365,7 @@ def _maybe_restore_native_data_plane_checkpoint(
             f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
             f"number them {opd_full_teacher_checkpoints!r}."
         )
+    _validate_checkpoint_loss_normalization(metadata, loss_normalization)
     manifest_digest = metadata.get("replay_manifest_digest")
     if not isinstance(manifest_digest, str) or not manifest_digest:
         raise ValueError(
@@ -377,6 +419,12 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
+    # Reducers declare their columns before any producer can publish values.
+    partition_fields.extend(
+        make_objective_reduction(
+            master_config.loss_fn.resolved_normalization
+        ).extra_fields
+    )
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -723,6 +771,17 @@ def _build_clusters(
     return train_cluster, inference_cluster, value_cluster, teacher_topology
 
 
+def _apply_vllm_generation_config(master_config: MasterConfig) -> None:
+    """Write the generation-config keys vLLM derives from the policy (idempotent)."""
+    generation_config = master_config.policy["generation"]
+    generation_config["model_name"] = master_config.policy["model_name"]
+    vllm_config = cast(VllmConfig, generation_config)
+    vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+        master_config.policy.get("hf_config_overrides", {})
+    )
+    configure_vllm_for_router_replay(master_config.policy)
+
+
 def _build_generation(
     inference_cluster: RayVirtualCluster,
     master_config: MasterConfig,
@@ -754,11 +813,8 @@ def _build_generation(
     backend = generation_config["backend"]
 
     if backend == "vllm":
+        _apply_vllm_generation_config(master_config)
         vllm_config = cast(VllmConfig, generation_config)
-        vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            master_config.policy.get("hf_config_overrides", {})
-        )
-        configure_vllm_for_router_replay(master_config.policy)
         gen = VllmGeneration(
             cluster=inference_cluster,
             config=vllm_config,
@@ -1279,6 +1335,54 @@ def _move_synchronizer_to_refit_actor(
         flush=True,
     )
     return remote
+
+
+def _trainer_warmup_skip_reason(
+    master_config: MasterConfig, *, is_ppo: bool, opd: bool, steps_left: bool
+) -> Optional[str]:
+    """Why the trainer warm-up does not apply to this run, or None if it does."""
+    policy_config = master_config.policy
+    if not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        return "the trainer is not Megatron"
+    if policy_config["generation"]["colocated"]["enabled"]:
+        return "generation shares the trainer's GPUs"
+    if is_ppo:
+        return "PPO steps are not covered"
+    if opd:
+        return "on-policy distillation is not covered"
+    if master_config.loss_fn.score_centering:
+        return "score centering is not covered"
+    if sampler_replay_enabled(policy_config["generation"]):
+        return "sampler replay is not covered"
+    if not steps_left:
+        return "no train step is left"
+    return None
+
+
+def _trainer_warmup_kwargs(
+    master_config: MasterConfig, *, current_step: int
+) -> Optional[dict[str, Any]]:
+    """Arguments for warmup_first_pass, or None when the warm-up does not run."""
+    warmup_cfg = master_config.async_rl.trainer_warmup
+    if not warmup_cfg.enabled:
+        return None
+    stage_cfg = AdvantageStageConfig.from_master_config(master_config)
+    reason = _trainer_warmup_skip_reason(
+        master_config,
+        is_ppo=stage_cfg.is_ppo,
+        opd=stage_cfg.teacher_logprobs_required,
+        steps_left=current_step < stage_cfg.algo.max_num_steps,
+    )
+    if reason is not None:
+        print(f"  ⚠ Trainer warm-up skipped: {reason}.", flush=True)
+        return None
+    return {
+        "train_fields": stage_cfg.train_fields(master_config),
+        "run_logprobs": stage_cfg.policy_logprobs_required,
+        "seqlens": warmup_cfg.seqlens,
+    }
 
 
 def setup_single_controller(
@@ -2170,6 +2274,22 @@ def setup_single_controller(
             "NeMo-Gym. Set env.should_use_nemo_gym=true, or disable the router."
         )
 
+    early_trainer_executor: Optional[ThreadPoolExecutor] = None
+    early_trainer_future = None
+    if (
+        master_config.async_rl.early_trainer_build
+        and overlap_dataset_load
+        and segment_size is not None
+    ):
+        # Built beside the vLLM reserve only once segment_size has the training
+        # placement groups claimed above; otherwise the two could interleave on nodes.
+        # The trainer thread reads this config, so write it before the thread starts.
+        _apply_vllm_generation_config(master_config)
+        early_trainer_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="early-trainer"
+        )
+        early_trainer_future = early_trainer_executor.submit(trainer_factory)
+
     if use_nemo_gym:
         # Before the Gym build task below reads master_config.env.
         set_nemo_gym_log_dir(master_config.env, master_config.logger.log_dir)
@@ -2256,7 +2376,16 @@ def setup_single_controller(
                 tokenizer=tokenizer,
                 processor=processor,
             )
-        build_tasks["trainer"] = trainer_factory
+        if early_trainer_future is None:
+            build_tasks["trainer"] = trainer_factory
+
+    dataset_agent_names = None
+    loss_fn = ClippedPGLossFn(
+        master_config.loss_fn,
+        opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
+    )
+    _restore_adaptive_loss_state(loss_fn, save_state)
 
     # The communicator needs only the trainer and generation: start it when both return, beside Gym's last stretch.
     start_communicator_early = _start_communicator_early(
@@ -2329,6 +2458,8 @@ def setup_single_controller(
                 for k, fn in build_tasks.items()
                 if not (defer_trainer and k == "trainer")
             }
+            if early_trainer_future is not None:
+                submitted["trainer"] = early_trainer_future
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:
@@ -2386,15 +2517,41 @@ def setup_single_controller(
                         stale_value.shutdown()
                     stale_trainer.shutdown()
                     _maybe_inject_megatron_train_iters(master_config)
-                    submitted["trainer"] = executor.submit(build_tasks["trainer"])
+                    # The shared executor has no spare worker for an early trainer.
+                    submitted["trainer"] = (early_trainer_executor or executor).submit(
+                        _build_trainer_and_value
+                    )
+            # After the dataset load, which can clamp max_num_steps.
+            warmup_kwargs = _trainer_warmup_kwargs(
+                master_config, current_step=save_state.current_step
+            )
+            if use_nemo_gym:
+                dataset_agent_names = collect_dataset_agent_names(
+                    {"training": dataset, "validation": _val_dataset}
+                )
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"
                 ].result()
                 gen_load_time = time_metrics["gen_time"]
             else:
-                generation, gen_load_time = submitted["generation"].result()
-                trainer, value, time_metrics = submitted["trainer"].result()
+                gen_f, trainer_f = submitted["generation"], submitted["trainer"]
+                refs = None
+                if warmup_kwargs is not None:
+                    # Only while generation still loads; otherwise the controller
+                    # runs the warm-up beside the first rollouts.
+                    wait([gen_f, trainer_f], return_when=FIRST_COMPLETED)
+                    if trainer_f.done() and not gen_f.done():
+                        refs = trainer_f.result()[0].start_warmup_first_pass(
+                            loss_fn, **warmup_kwargs
+                        )
+                generation, gen_load_time = gen_f.result()
+                trainer, value, time_metrics = trainer_f.result()
+                if refs is not None:
+                    print(
+                        f"  ✓ Trainer warm-up (rank 0): {ray.get(refs)[0]}", flush=True
+                    )
+                    warmup_kwargs = None  # done; the controller must not run it again
             if start_communicator_early:
                 communicator_future = _start_on_daemon_thread(
                     _init_communicator, name="refit-communicator"
@@ -2424,9 +2581,9 @@ def setup_single_controller(
                 setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
             if use_nemo_gym:
                 nemo_gym_shards, gym_time = submitted["nemo_gym"].result()
+                route_datasets = {"training": dataset, "validation": _val_dataset}
                 validate_dataset_agent_coverage(
-                    nemo_gym_shards,
-                    {"training": dataset, "validation": _val_dataset},
+                    nemo_gym_shards, route_datasets, agent_names=dataset_agent_names
                 )
                 env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
@@ -2445,6 +2602,8 @@ def setup_single_controller(
             # The frontend ranks adopted (or will never adopt) the held sockets;
             # drop the holders.
             ray.kill(megatron_port_holder)
+        if early_trainer_executor is not None:
+            early_trainer_executor.shutdown(wait=True)
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
@@ -2466,6 +2625,7 @@ def setup_single_controller(
             save_state=save_state,
             partition_id=partition_id,
             sampler_name=master_config.async_rl.sampler.name,
+            loss_normalization=master_config.loss_fn.resolved_normalization,
             opd_full_teacher_checkpoints=(
                 opd_module.opd_full_teacher_checkpoints_by_index(master_config)
             ),
@@ -2554,6 +2714,11 @@ def setup_single_controller(
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
             generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
+            prefix_write_max_rows=master_config.rollout_recovery.prefix_write_max_rows,
+            prefix_write_max_tokens=(
+                master_config.rollout_recovery.prefix_write_max_tokens
+            ),
+            prefix_read_max_rows=master_config.rollout_recovery.prefix_read_max_rows,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
@@ -2566,12 +2731,6 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn = ClippedPGLossFn(
-        master_config.loss_fn,
-        opd_full=opd_module.get_opd_full_config(master_config),
-        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
-    )
-    _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)
@@ -2641,6 +2800,10 @@ def setup_single_controller(
                     ),
                     thinking_tags=thinking_tags,
                     top_logprobs=master_config.policy["generation"]["top_logprobs"],
+                    stamp_agent_names=(
+                        master_config.grpo is not None
+                        and bool(master_config.grpo.agent_overrides)
+                    ),
                 ),
                 num_workers=token_capture_cfg.num_reassembler_workers,
             )
@@ -2793,6 +2956,7 @@ def setup_single_controller(
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
+        trainer_warmup_kwargs=warmup_kwargs,
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,

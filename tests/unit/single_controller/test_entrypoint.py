@@ -51,6 +51,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     generation_config = {"backend": "vllm"}
     config = MasterConfig.model_construct(
         policy={
+            "model_name": "test-model",
             "tokenizer": {},
             "generation": generation_config,
             "draft": Eagle3DraftConfig(enabled=False),
@@ -88,6 +89,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     shutdown_environments = MagicMock()
     apply_simulator_overrides = MagicMock()
     reject_online_quantization = MagicMock()
+    reject_dummy_weights_only_checkpoint = MagicMock()
     # What the two YAML files hold. The recipe is empty because MasterConfig is
     # replaced below; the simulator YAML is read for real.
     yaml_files = {
@@ -113,7 +115,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ),
     )
     monkeypatch.setattr(entrypoint_utils, "load_config", load_config)
-    monkeypatch.setattr(entrypoint_utils, "MasterConfig", lambda **_: config)
+    monkeypatch.setattr(
+        entrypoint_utils,
+        "MasterConfig",
+        SimpleNamespace(model_validate=lambda _: config),
+    )
     monkeypatch.setattr(entrypoint_utils, "init_ray", lambda: None)
     monkeypatch.setattr(entrypoint_utils, "get_tokenizer", lambda _: "tokenizer")
     monkeypatch.setattr(
@@ -133,6 +139,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(
         entrypoint_utils, "reject_online_quantization", reject_online_quantization
+    )
+    monkeypatch.setattr(
+        entrypoint_utils,
+        "reject_dummy_weights_only_checkpoint",
+        reject_dummy_weights_only_checkpoint,
     )
     actor_remote = MagicMock(return_value=actor)
     monkeypatch.setattr(entrypoint_utils.SingleControllerActor, "remote", actor_remote)
@@ -162,6 +173,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         overrides=overrides,
         ray_get=ray_get,
         ray_wait=ray_wait,
+        reject_dummy_weights_only_checkpoint=reject_dummy_weights_only_checkpoint,
         reject_online_quantization=reject_online_quantization,
         setup_single_controller=setup_single_controller,
         shutdown_environments=shutdown_environments,
@@ -428,6 +440,7 @@ def test_training_main_builds_no_simulator_config(
     assert main_context.setup_single_controller.call_args.kwargs["simulator"] is None
     main_context.apply_simulator_overrides.assert_not_called()
     main_context.reject_online_quantization.assert_not_called()
+    main_context.reject_dummy_weights_only_checkpoint.assert_not_called()
 
 
 def test_simulator_main_passes_the_simulator_config_to_setup(
@@ -457,6 +470,9 @@ def test_simulator_main_configures_generation_as_training_without_refit_weights(
     main_context.reject_online_quantization.assert_called_once_with(
         main_context.generation_config
     )
+    main_context.reject_dummy_weights_only_checkpoint.assert_called_once_with(
+        "test-model"
+    )
     main_context.configure_generation.assert_called_once_with(
         main_context.generation_config,
         "tokenizer",
@@ -467,6 +483,16 @@ def test_simulator_main_configures_generation_as_training_without_refit_weights(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
+
+
+def test_simulator_main_skips_the_vllm_checkpoint_rule_for_sglang(
+    main_context: SimpleNamespace,
+) -> None:
+    main_context.generation_config["backend"] = "sglang"
+
+    run_single_controller_simulator.main()
+
+    main_context.reject_dummy_weights_only_checkpoint.assert_not_called()
 
 
 def test_simulator_main_rejects_an_unknown_simulator_key(

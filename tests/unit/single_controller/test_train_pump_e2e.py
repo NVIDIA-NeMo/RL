@@ -451,7 +451,7 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
-            assert metrics["weight_version_lag"] >= 0
+            assert metrics["weight_version_lag_max"] >= 0
             # Only a simulator run reports the simulated hold.
             assert "simulated_train_time_s" not in metrics
             assert "simulated_train_idle_skipped_s" not in metrics
@@ -592,7 +592,7 @@ def test_train_pump_consumes_batches_with_the_no_op_trainer(tmp_path):
             inference_cluster=None,  # type: ignore[arg-type]
             dp_client=dp_client,
             dataloader=None,  # type: ignore[arg-type]  # _rollout_pump not started
-            weight_synchronizer=NoOpWeightSynchronizer(),
+            weight_synchronizer=NoOpWeightSynchronizer(refit_time_s=0.0),
             advantage_estimator=_FakeAdvEstimator(),
             loss_fn=SimpleLossFn(),
             rollout_manager=rollout_manager,

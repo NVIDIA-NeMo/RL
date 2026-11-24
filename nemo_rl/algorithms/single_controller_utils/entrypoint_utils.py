@@ -36,6 +36,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import setup_single_contro
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     SimulatorConfig,
     apply_simulator_overrides,
+    reject_dummy_weights_only_checkpoint,
     reject_online_quantization,
 )
 from nemo_rl.algorithms.single_controller_utils.watchdog import (
@@ -141,7 +142,7 @@ def _load_config(
     if simulator is not None:
         # After the CLI overrides, so the simulator's node and step counts win over the recipe.
         apply_simulator_overrides(raw_config, simulator)
-    master_config = MasterConfig(**raw_config)
+    master_config = MasterConfig.model_validate(raw_config)
     # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
     # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
     # when a video recipe requests (and caches) 64 frames.
@@ -198,6 +199,9 @@ def _configure_generation(
     else:
         # First: configure_generation_config's nvfp4 check rejects such a recipe without saying why.
         reject_online_quantization(config.policy["generation"])
+        if config.policy["generation"]["backend"] == "vllm":
+            # The dummy-weights rule is the vLLM worker's.
+            reject_dummy_weights_only_checkpoint(config.policy["model_name"])
         # No refit follows, so the engine expects no draft or MTP weights from one.
         has_refit_draft_weights = trains_mtp = draft_full_refit = False
     config.policy["generation"] = configure_generation_config(
