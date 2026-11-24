@@ -308,6 +308,8 @@ data_plane:
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
     num_storage_units: null          # null = 2 per selected node
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+  # Optional TransferQueue controller metrics port (integer 1024-65535); omit to keep it off.
+  # metrics_port: 8200
   # observability:                    # NotRequired
   #   enabled: false
 

@@ -576,3 +576,41 @@ def test_storage_unit_settings_need_the_single_controller_plan(
     )
     with pytest.raises(ValueError, match="only supported by the SingleController"):
         adapter._init_tq(cfg)
+
+
+@pytest.mark.parametrize(
+    ("backend", "block"),
+    [
+        ("simple", {"num_storage_units": 1}),
+        ("mooncake_cpu", {"ssd_offload": {"enabled": False}}),
+        # Explicit node_ids skip the Ray placement lookup.
+        ("nixl", {"node_ids": ["a" * 56]}),
+    ],
+)
+@pytest.mark.parametrize("port", [None, 8200])
+def test_controller_metrics_configuration(
+    monkeypatch: pytest.MonkeyPatch, backend: str, block: dict, port: int | None
+) -> None:
+    """The overlay is applied after the backend branches, so it must hold for each."""
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    # Only Mooncake reads the node IP, transport and chmod; the others ignore them.
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
+    monkeypatch.setattr(
+        adapter,
+        "_mooncake_transport_config",
+        lambda: {"protocol": "rdma", "device_name": "mlx5_test"},
+    )
+    monkeypatch.setattr(adapter.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg(backend, **{backend: block})
+    if port is not None:
+        cfg["metrics_port"] = port
+    adapter._init_tq(cfg)
+    metrics = OmegaConf.to_container(captured["conf"], resolve=True).get("metrics", {})
+    assert bool(metrics.get("enabled", False)) is (port is not None)
+    if port is not None:
+        assert metrics["port"] == port
