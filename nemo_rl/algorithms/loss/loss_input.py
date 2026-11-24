@@ -344,7 +344,10 @@ def prepare_loss_input(
         d2t: Draft to target token mapping.
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
-            full-size float32 logits during training.
+            full-size float32 logits during training. Exception: top-k/top-p
+            filtering that the trainer recomputes (no sampler replay) still
+            takes one full-size float32 copy of the logits, so chunking then
+            bounds only the all-to-all, filter and softmax temporaries.
         cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
             sequence layout; set only when cp_size > 1. ``logits`` are then this
             rank's CP-local shard while ``data`` stays canonical.
@@ -623,7 +626,10 @@ def prepare_packed_loss_input(
         sampling_params: Sampling parameters.
         chunk_size: Sequence-dim chunk size for the logprob computation
             (policy.logprob_chunk_size); avoids materializing full-size
-            float32 logits during training.
+            float32 logits during training. Exception: top-k/top-p filtering
+            that the trainer recomputes (no sampler replay) still takes one
+            full-size float32 copy of the logits, so chunking then bounds
+            only the all-to-all, filter and softmax temporaries.
         reuse_logits_storage: Let the chunked logprob write its grad into the
             logits' storage (policy.megatron_cfg.reuse_logits_storage). Takes
             effect only with chunking; the logits must have no other consumer.
