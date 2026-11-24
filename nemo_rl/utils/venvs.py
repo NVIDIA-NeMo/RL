@@ -262,8 +262,8 @@ def make_actor_runtime_env(
     the same interpreter as the driver. Additional actor-specific environment
     variables can be supplied via ``extra_env_vars``.
 
-    Used by ReplayBuffer, AsyncTrajectoryCollector, and SyncRolloutActor
-    — three actors that need the VLLM tier's venv on every node. Also
+    Used by ReplayBuffer and AsyncTrajectoryCollector
+    — two actors that need the VLLM tier's venv on every node. Also
     used by the SGLang router and SGLang generation engines (SGLANG tier).
     """
     # Local import — venvs.py is dep-light; the registry imports

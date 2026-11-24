@@ -3824,20 +3824,6 @@
       "severity": "error"
     },
     {
-      "column": 51,
-      "path": "nemo_rl/experience/sync_rollout_actor.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, Any]` is not assignable to parameter `cfg` with type `LocalDataPlaneConfig | DataPlaneConfig | None` in function `nemo_rl.data_plane.factory.build_data_plane_client`",
-      "severity": "error"
-    },
-    {
-      "column": 16,
-      "path": "nemo_rl/experience/sync_rollout_actor.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[KVBatchMeta, BatchedDataDict[@_], dict[str, Any], dict[str, Any] | None]` is not assignable to declared return type `tuple[KVBatchMeta, dict[str, Any], dict[str, Any], dict[str, Any] | None]`",
-      "severity": "error"
-    },
-    {
       "column": 9,
       "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
       "name": "bad-override",

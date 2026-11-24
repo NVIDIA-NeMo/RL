@@ -19,7 +19,7 @@ from dataclasses import replace
 from typing import Any, Optional
 
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
-from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
+from nemo_rl.data_plane.column_io import read_columns, round_up
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -137,7 +137,3 @@ class TQDriverMixin:
             select_fields=select_fields,
             pad_value_dict=pad_value_dict,
         )
-
-    def write_to_dataplane(self, meta: KVBatchMeta, fields: dict[str, Any]) -> None:
-        """Write driver-computed columns to the data plane (TQ)."""
-        write_columns(self.dp_client, meta, fields=fields)
