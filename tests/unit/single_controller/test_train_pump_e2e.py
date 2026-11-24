@@ -592,7 +592,7 @@ def test_train_pump_consumes_batches_with_the_no_op_trainer(tmp_path):
             inference_cluster=None,  # type: ignore[arg-type]
             dp_client=dp_client,
             dataloader=None,  # type: ignore[arg-type]  # _rollout_pump not started
-            weight_synchronizer=NoOpWeightSynchronizer(),
+            weight_synchronizer=NoOpWeightSynchronizer(refit_time_s=0.0),
             advantage_estimator=_FakeAdvEstimator(),
             loss_fn=SimpleLossFn(),
             rollout_manager=rollout_manager,

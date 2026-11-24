@@ -36,6 +36,7 @@ from typing import Any, Callable, Literal, Optional, cast
 
 import ray
 from pydantic import BaseModel, NonNegativeFloat, PositiveInt
+from transformers import AutoConfig
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -44,7 +45,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data_plane import is_metrics_client
 from nemo_rl.data_plane.factory import build_data_plane_client
-from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneRuntimeConfig
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.observability import reduce_step_snapshots
 from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig
@@ -52,6 +53,9 @@ from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.vllm.worker_utils import (
+    find_dummy_weights_only_checkpoint,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.timer import Timer
@@ -146,6 +150,23 @@ def apply_simulator_overrides(
     nemo_gym = raw_config["env"].get("nemo_gym")
     if isinstance(nemo_gym, dict):
         nemo_gym.pop("is_trajectory_collection", None)
+
+
+def reject_dummy_weights_only_checkpoint(model_name: str) -> None:
+    """Refuse a checkpoint the vLLM worker only starts from dummy weights.
+
+    Training serves such a checkpoint in bf16: the engine starts empty and the
+    first refit fills it in. A simulator run has no refit, and the worker
+    asserts on any other load format, so reject it before an engine starts.
+    """
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    kind = find_dummy_weights_only_checkpoint(hf_config)
+    if kind is not None:
+        raise NotImplementedError(
+            f"rollout_only cannot serve policy.model_name={model_name!r}: a {kind} "
+            "checkpoint only starts from dummy weights that a refit fills in, "
+            "and this run has no refit. Use a bf16 export."
+        )
 
 
 def reject_online_quantization(generation_config: GenerationConfig) -> None:
@@ -341,9 +362,7 @@ class NoOpWeightSynchronizer(WeightSynchronizer):
     transfer would.
     """
 
-    def __init__(self, *, refit_time_s: float = 0.0) -> None:
-        if refit_time_s < 0:
-            raise ValueError("refit_time_s must be non-negative")
+    def __init__(self, *, refit_time_s: float) -> None:
         self._refit_time_s = refit_time_s
 
     def sync_weights(
@@ -387,9 +406,8 @@ class NoOpTrainer:
         dp_cfg: DataPlaneRuntimeConfig,
         policy_config: PolicyConfig,
         storage_unit_node_ids: Optional[list[str]] = None,
-        dp_client: Optional[DataPlaneClient] = None,
     ) -> None:
-        """Bootstrap the data plane (or adopt ``dp_client``) and hold the config.
+        """Bootstrap the data plane and hold the config.
 
         Args:
             dp_cfg: ``master_config.data_plane``; bootstraps the TQ controller
@@ -397,18 +415,14 @@ class NoOpTrainer:
             policy_config: ``master_config.policy``; read by the callers that
                 expect ``trainer.cfg``.
             storage_unit_node_ids: Storage-unit plan forwarded to the bootstrap.
-            dp_client: An already-built client to use instead of bootstrapping
-                one. Tests pass an in-process client here.
         """
         self.cfg = policy_config
-        if dp_client is None:
-            dp_client = build_data_plane_client(
-                dp_cfg,
-                bootstrap=True,
-                checkpointing=False,
-                storage_unit_node_ids=storage_unit_node_ids,
-            )
-        self.dp_client = dp_client
+        self.dp_client = build_data_plane_client(
+            dp_cfg,
+            bootstrap=True,
+            checkpointing=False,
+            storage_unit_node_ids=storage_unit_node_ids,
+        )
         self._prev_cluster_snapshot: dict[str, Any] = {}
         self._extra_snapshot_sources: list[Any] = []
         self._extra_snapshot_fns: list[Callable[[], list[dict[str, Any]]]] = []

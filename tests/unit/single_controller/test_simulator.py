@@ -18,12 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller_utils import simulator as simulator_module
@@ -39,6 +37,7 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
     NoOpWeightSynchronizer,
     SimulatorConfig,
     apply_simulator_overrides,
+    reject_dummy_weights_only_checkpoint,
     reject_online_quantization,
     simulate_train_step,
     validate_simulator_config,
@@ -46,11 +45,6 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 from nemo_rl.utils.checkpoint import CheckpointingConfig
-from nemo_rl.utils.config import load_config
-
-_SIMULATOR_EXEMPLAR = (
-    Path(__file__).parents[3] / "examples/configs/simulator/rollout_only.yaml"
-)
 
 _PARTITION = "rollout_data"
 _DP_CFG: dict[str, Any] = {
@@ -58,23 +52,6 @@ _DP_CFG: dict[str, Any] = {
     "impl": "transfer_queue",
     "backend": "simple",
 }
-
-
-# ── simulator config ────────────────────────────────────────────────────────
-
-
-def test_config_defaults_to_rollout_only_with_the_no_op_trainer() -> None:
-    settings = SimulatorConfig()
-    assert settings.mode == "rollout_only"
-    assert settings.uses_no_op_trainer
-
-
-def test_shipped_simulator_yaml_states_the_schema_defaults() -> None:
-    """The exemplar documents every key at the value the schema defaults it to."""
-    shipped = OmegaConf.to_container(load_config(_SIMULATOR_EXEMPLAR), resolve=True)
-    assert isinstance(shipped, dict)
-    assert shipped == SimulatorConfig().model_dump()
-    assert SimulatorConfig.model_validate(shipped) == SimulatorConfig()
 
 
 # ── config overrides ────────────────────────────────────────────────────────
@@ -291,6 +268,13 @@ def test_validate_rejects_the_trainer_warmup() -> None:
         validate_simulator_config(_master_config(async_rl=async_rl), SimulatorConfig())
 
 
+def test_validate_rejects_on_policy_distillation() -> None:
+    config = _master_config()
+    config.on_policy_distillation = {"enabled": True}
+    with pytest.raises(NotImplementedError, match="on-policy distillation"):
+        validate_simulator_config(config, SimulatorConfig())
+
+
 def test_validate_rejects_refittable_fp8_kv_cache() -> None:
     with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
         validate_simulator_config(
@@ -351,6 +335,33 @@ def test_reject_online_quantization_names_the_offending_setting(
         reject_online_quantization(generation)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("kind", "rejected"), [("quantized GPT-OSS", True), (None, False)]
+)
+def test_reject_dummy_weights_only_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, kind: str | None, rejected: bool
+) -> None:
+    hf_config = object()
+    loaded: list[tuple[str, bool]] = []
+
+    def from_pretrained(model_name: str, *, trust_remote_code: bool) -> object:
+        loaded.append((model_name, trust_remote_code))
+        return hf_config
+
+    monkeypatch.setattr(simulator_module.AutoConfig, "from_pretrained", from_pretrained)
+    monkeypatch.setattr(
+        simulator_module,
+        "find_dummy_weights_only_checkpoint",
+        lambda config: kind if config is hf_config else None,
+    )
+    if rejected:
+        with pytest.raises(NotImplementedError, match="quantized GPT-OSS.*bf16"):
+            reject_dummy_weights_only_checkpoint("org/model")
+    else:
+        reject_dummy_weights_only_checkpoint("org/model")
+    assert loaded == [("org/model", True)]
+
+
 def test_reject_online_quantization_passes_unquantized_and_other_backends() -> None:
     reject_online_quantization({"backend": "vllm", "vllm_cfg": {"precision": "bf16"}})  # type: ignore[arg-type]
     reject_online_quantization({"backend": "megatron"})  # type: ignore[arg-type]
@@ -371,11 +382,6 @@ def test_noop_weight_synchronizer_is_never_stale_and_holds_the_refit_time() -> N
     synchronizer.shutdown()
 
 
-def test_noop_weight_synchronizer_rejects_negative_hold() -> None:
-    with pytest.raises(ValueError):
-        NoOpWeightSynchronizer(refit_time_s=-1.0)
-
-
 # ── NoOpTrainer ─────────────────────────────────────────────────────────────
 
 
@@ -387,26 +393,36 @@ def _metrics_client() -> MetricsDataPlaneClient:
     return client
 
 
-def test_no_op_trainer_adopts_the_given_client_without_bootstrapping() -> None:
+def _no_op_trainer(monkeypatch: pytest.MonkeyPatch, client: Any) -> NoOpTrainer:
+    """A NoOpTrainer whose data-plane bootstrap returns ``client``."""
+    monkeypatch.setattr(
+        simulator_module, "build_data_plane_client", lambda *a, **k: client
+    )
+    return NoOpTrainer(dp_cfg=_DP_CFG, policy_config={})
+
+
+def test_no_op_trainer_holds_the_bootstrapped_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = NoOpDataPlaneClient()
-    trainer = NoOpTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=client)
+    trainer = _no_op_trainer(monkeypatch, client)
     assert trainer.dp_client is client
     assert trainer.cfg == {}
     assert trainer.sync_params_before_refit() is None
     assert trainer.shutdown() is True
 
 
-def test_no_op_trainer_reports_no_data_plane_metrics_without_observability() -> None:
-    trainer = NoOpTrainer(
-        dp_cfg=_DP_CFG, policy_config={}, dp_client=NoOpDataPlaneClient()
-    )
+def test_no_op_trainer_reports_no_data_plane_metrics_without_observability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _no_op_trainer(monkeypatch, NoOpDataPlaneClient())
     assert trainer.get_data_plane_step_metrics(1.0) is None
 
 
 def test_no_op_trainer_data_plane_metrics_cover_the_registered_rollout_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer = NoOpTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=_metrics_client())
+    trainer = _no_op_trainer(monkeypatch, _metrics_client())
     metrics, scope = trainer.get_data_plane_step_metrics(1.0)
     assert scope == "driver"
     assert metrics

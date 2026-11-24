@@ -36,6 +36,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import setup_single_contro
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     SimulatorConfig,
     apply_simulator_overrides,
+    reject_dummy_weights_only_checkpoint,
     reject_online_quantization,
 )
 from nemo_rl.algorithms.single_controller_utils.watchdog import (
@@ -198,6 +199,7 @@ def _configure_generation(
     else:
         # First: configure_generation_config's nvfp4 check rejects such a recipe without saying why.
         reject_online_quantization(config.policy["generation"])
+        reject_dummy_weights_only_checkpoint(config.policy["model_name"])
         # No refit follows, so the engine expects no draft or MTP weights from one.
         has_refit_draft_weights = trains_mtp = draft_full_refit = False
     config.policy["generation"] = configure_generation_config(

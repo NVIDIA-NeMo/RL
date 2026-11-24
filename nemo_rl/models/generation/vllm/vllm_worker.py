@@ -61,6 +61,7 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.video_utils import register_vllm_video_loader
 from nemo_rl.models.generation.vllm.worker_utils import (
+    find_dummy_weights_only_checkpoint,
     find_tokenizer_required_architectures,
     resolve_distributed_executor_backend,
     resolve_vllm_dp_settings,
@@ -723,11 +724,14 @@ class BaseVllmGenerationWorker:
         )
         if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
             validate_nvfp4_pertoken_model(hf_config)
+        dummy_only_checkpoint = find_dummy_weights_only_checkpoint(hf_config)
+        assert dummy_only_checkpoint is None or load_format == "dummy", (
+            f"Loading a {dummy_only_checkpoint} checkpoint in vLLM is only supported "
+            "with load_format='dummy' (NeMo-RL refits bf16 weights). "
+            f"Got load_format={load_format!r}."
+        )
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
-                assert load_format == "dummy", (
-                    "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
-                )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
         elif detected_arch := find_tokenizer_required_architectures(
@@ -749,11 +753,6 @@ class BaseVllmGenerationWorker:
             # ZMQ (load_format='dummy'). Clear the auto-detected quantization_config
             # so vLLM allocates bf16 buffers instead of building Fp8Config.
             if hasattr(hf_config, "quantization_config"):
-                assert load_format == "dummy", (
-                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
-                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
-                    "ZMQ). Got load_format=%r." % load_format
-                )
                 # NeMo-RL refits bf16 weights, so we intentionally clear any fp8
                 # quantization here -- including the quantization="fp8" that
                 # init_fp8 set above when precision == "fp8". Warn so a

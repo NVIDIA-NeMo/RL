@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
+from typing import Any
 
 TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
     {
@@ -37,6 +38,23 @@ def find_tokenizer_required_architectures(
         for architecture in architectures or ()
         if architecture in TOKENIZER_REQUIRED_ARCHITECTURES
     ]
+
+
+def find_dummy_weights_only_checkpoint(hf_config: Any) -> str | None:
+    """Name the kind of checkpoint vLLM can only start from dummy weights.
+
+    Quantized GPT-OSS and FP8 Mistral3 ship quantized on disk, while NeMo-RL
+    serves them in bf16: the engine starts with ``load_format='dummy'`` and the
+    first refit fills the weights in. Returns None for any other checkpoint.
+    """
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if "GptOssForCausalLM" in architectures and "quantization_config" in hf_config:
+        return "quantized GPT-OSS"
+    if "Mistral3ForConditionalGeneration" in architectures and hasattr(
+        hf_config, "quantization_config"
+    ):
+        return "FP8-quantized Mistral3"
+    return None
 
 
 def resolve_distributed_executor_backend(
