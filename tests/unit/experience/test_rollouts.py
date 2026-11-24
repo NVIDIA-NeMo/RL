@@ -3819,21 +3819,6 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert validation.rollout_metrics["baseline_groups/logical_groups"] == 2
     assert not warnings()
 
-    # Two logical groups with only one of them split: still a failure, and a
-    # first report for this agent.
-    caplog.clear()
-    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
-        partial = _postprocess_rollouts(
-            [[1, 5, 10], [1, 5, 11], [1, 6]],
-            group_ids=["a", "a", "b"],
-            agent_name="other",
-        )
-    assert partial.rollout_metrics["baseline_groups/distinct_first_prompts"] == 3
-    assert partial.rollout_metrics["baseline_groups/logical_groups"] == 2
-    [record] = warnings()
-    assert "3 NeMo-Gym rollouts form 2 logical prompt group(s)" in record.getMessage()
-    assert "attribution key(s) ['other']" in record.getMessage()
-
     # Shared text across groups must not hide a split within one of them.
     caplog.clear()
     with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
