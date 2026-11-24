@@ -85,9 +85,11 @@ loss_fn:
   truncated_importance_sampling_adaptive_k_max: 1.0
   truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
-  token_level_loss: true
+  # global_token_mean (default) or sequence_mean.
+  normalization: null
+  token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
   force_on_policy_ratio: false
-  seq_logprob_error_in_loss: false  # Only supported by Megatron GRPO trainers.
+  seq_logprob_error_in_loss: false  # Supported by Megatron GRPO trainers and SingleController PPO (ppo_epochs=1).
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
@@ -110,6 +112,11 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
+  save_data_plane: false
+  load_replay_buffer: true
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -303,6 +310,7 @@ policy:
       logprobs_mode: processed_logprobs
       http_server_num_replicas: 8
     vllm_cfg:
+      http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
@@ -332,6 +340,9 @@ policy:
 
 # Value Model with Megatron-Core Backend (for GAE in PPO)
 value:
+  dedicated: false
+  resources:
+    num_nodes: null
   model_name: ${policy.model_name}
   tokenizer:
     name: ${value.model_name}
@@ -498,6 +509,7 @@ data:
 env:
   math:
     num_workers: 8
+    verifier_type: "math"
     math_verify_impl: "dapo_math_verify"
 
 logger:

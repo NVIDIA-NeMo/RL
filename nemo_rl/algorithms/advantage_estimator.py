@@ -42,7 +42,8 @@ Reference papers:
 """
 
 import math
-from typing import Annotated, Literal, Optional
+from abc import ABC, abstractmethod
+from typing import Annotated, Callable, ClassVar, Literal, Optional
 
 import torch
 from pydantic import BaseModel, Field
@@ -52,9 +53,8 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
     get_gdpo_reward_component_keys,
-    masked_mean,
-    masked_var,
 )
+from nemo_rl.utils.tensor_ops import masked_mean, masked_var
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -91,7 +91,26 @@ class GAEConfig(BaseModel, extra="allow"):
     length_adaptive_alpha: float = 0.0
 
 
-class GRPOAdvantageEstimator:
+class AdvantageEstimator(ABC):
+    """Advantage computation and the batch it needs to produce consistent results."""
+
+    @property
+    @abstractmethod
+    def requires_global_batch(self) -> bool:
+        """Whether one call must contain the entire training step's batch.
+
+        True forbids streaming chunks and sharding across advantage actors.
+        False allows both, provided each prompt group and response stays intact.
+        Implementations must account for settings that enable batch statistics.
+        """
+
+    # Each estimator takes different inputs; callers know which one they hold.
+    compute_advantage: ClassVar[
+        Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]]
+    ]
+
+
+class GRPOAdvantageEstimator(AdvantageEstimator):
     """GRPO-style advantage estimator with leave-one-out baseline.
 
     Note: GRPO computes advantages over all responses for each prompt.
@@ -103,7 +122,19 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
 
-    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
+    @property
+    def requires_global_batch(self) -> bool:
+        return False
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        valid_mask=None,
+        normalize_rows=None,
+        **kwargs,
+    ):
         """Compute GRPO advantages.
 
         Args:
@@ -117,6 +148,10 @@ class GRPOAdvantageEstimator:
                   placeholder rows carry 0.0 (their sample_mask already excludes them
                   from the loss; excluding them here keeps siblings' baselines unbiased).
                   None keeps the legacy all-valid behavior.
+            normalize_rows: Optional bool tensor of shape [batch_size] that
+                  replaces ``normalize_rewards`` row by row: True divides that
+                  row's advantage by its group's reward std (grpo.agent_overrides).
+                  None applies ``normalize_rewards`` to every row.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -134,10 +169,20 @@ class GRPOAdvantageEstimator:
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 
-        if self.normalize_rewards:
+        if normalize_rows is not None or self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
             normalize_mask = (std > 0) & ~is_trivial_distribution
+            if normalize_rows is not None:
+                normalize_rows = normalize_rows.reshape(-1).to(
+                    device=normalize_mask.device, dtype=torch.bool
+                )
+                if normalize_rows.numel() != normalize_mask.numel():
+                    raise ValueError(
+                        f"normalize_rows has {normalize_rows.numel()} rows; "
+                        f"expected {normalize_mask.numel()}"
+                    )
+                normalize_mask = normalize_mask & normalize_rows
             advantages[normalize_mask] = advantages[normalize_mask] / (
                 std.unsqueeze(-1)[normalize_mask] + epsilon
             )
@@ -145,7 +190,7 @@ class GRPOAdvantageEstimator:
         return advantages.expand(mask.shape)
 
 
-class GDPOAdvantageEstimator:
+class GDPOAdvantageEstimator(AdvantageEstimator):
     """GDPO-style advantage estimator with leave-one-out baseline.
 
     Note: GDPO computes advantages for each reward separately over all responses for each prompt.
@@ -159,6 +204,10 @@ class GDPOAdvantageEstimator:
         # Optional per-reward weights w_n for the aggregation A = sum_n w_n * A_n
         # (paper: https://arxiv.org/abs/2601.05242). None => equal weights (all 1.0).
         self.reward_weights = estimator_config.reward_weights
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return True
 
     def compute_advantage(
         self,
@@ -250,7 +299,7 @@ class GDPOAdvantageEstimator:
         return advantages.expand(mask.shape)
 
 
-class ReinforcePlusPlusAdvantageEstimator:
+class ReinforcePlusPlusAdvantageEstimator(AdvantageEstimator):
     """Reinforce++ advantage estimator with optional baseline subtraction and KL penalty in reward.
 
     Args:
@@ -265,6 +314,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return True
 
     def compute_advantage(
         self,
@@ -346,7 +399,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         return adv
 
 
-class RawRewardAdvantageEstimator:
+class RawRewardAdvantageEstimator(AdvantageEstimator):
     """Advantage estimator that uses the raw reward directly as the advantage.
 
     No value model, no baselines. Optionally normalizes across the batch.
@@ -354,6 +407,10 @@ class RawRewardAdvantageEstimator:
 
     def __init__(self, estimator_config: GAEConfig, loss_config: ClippedPGLossConfig):
         self.normalize_advantages = estimator_config.normalize_advantages
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return self.normalize_advantages
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute advantages as raw rewards expanded to token-level shape.
@@ -378,7 +435,7 @@ class RawRewardAdvantageEstimator:
         return adv, None
 
 
-class GeneralizedAdvantageEstimator:
+class GeneralizedAdvantageEstimator(AdvantageEstimator):
     """Generalized Advantage Estimation (GAE) with temporal bootstrapping.
 
     GAE computes advantages using temporal difference (TD) and exponentially-weighted averages:
@@ -420,6 +477,10 @@ class GeneralizedAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return self.normalize_advantages
 
     def _reward_whiten(
         self,
@@ -663,7 +724,7 @@ class GeneralizedAdvantageEstimator:
         return advantages, returns
 
 
-class OPDAdvantageEstimator:
+class OPDAdvantageEstimator(AdvantageEstimator):
     """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
 
     Computes token-level distillation advantages:
@@ -683,7 +744,8 @@ class OPDAdvantageEstimator:
     ``subtract_global_baseline`` then centers the advantage on the mean over
     every valid token passed to one ``compute_advantage`` call. That call
     covers a whole training step on ``run_grpo.py``; the SingleController
-    calls it once per streaming chunk and so requires one chunk per step.
+    requires one chunk per step and sends that complete batch to one advantage
+    actor when this baseline is enabled.
 
     The loss function should be configured with:
         disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
@@ -703,6 +765,10 @@ class OPDAdvantageEstimator:
         self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
         self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
+
+    @property
+    def requires_global_batch(self) -> bool:
+        return self.subtract_global_baseline
 
     def compute_advantage(
         self,
@@ -780,3 +846,35 @@ class OPDAdvantageEstimator:
             "on_policy_distillation/adv_mean": adv_mean,
             "on_policy_distillation/adv_std": adv_std,
         }
+
+
+def create_advantage_estimator(
+    config: AdvEstimatorConfig | GAEConfig, loss_config: ClippedPGLossConfig
+) -> AdvantageEstimator:
+    """Create the advantage estimator selected by the algorithm configuration.
+
+    Args:
+        config: GRPO-family or PPO advantage estimator configuration.
+        loss_config: Loss settings used by estimators that include KL rewards.
+
+    Returns:
+        The configured advantage estimator.
+    """
+    if isinstance(config, GAEConfig):
+        if config.name == "gae":
+            return GeneralizedAdvantageEstimator(config, loss_config)
+        if config.name == "raw_reward":
+            return RawRewardAdvantageEstimator(config, loss_config)
+        raise ValueError(
+            f"Invalid adv_estimator name for PPO: {config.name!r}. "
+            "PPO only supports 'gae' or 'raw_reward'."
+        )
+    if config.name == "grpo":
+        return GRPOAdvantageEstimator(config, loss_config)
+    if config.name == "gdpo":
+        return GDPOAdvantageEstimator(config, loss_config)
+    if config.name == "reinforce_plus_plus":
+        return ReinforcePlusPlusAdvantageEstimator(config, loss_config)
+    if config.name == "opd":
+        return OPDAdvantageEstimator(config, loss_config)
+    raise ValueError(f"Invalid adv_estimator name: {config.name}")

@@ -25,7 +25,9 @@ loss_fn:
   # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
   use_on_policy_kl_approximation: false
   use_importance_sampling_correction: false
-  token_level_loss: true
+  # global_token_mean (default), sequence_mean, or group_token_mean (SC GRPO/Megatron).
+  normalization: null
+  token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
   ratio_clip_c: null
 
 checkpointing:

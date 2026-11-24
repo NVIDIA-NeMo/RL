@@ -19,37 +19,16 @@ its output tensors for ``generate_async``.
 """
 
 import logging
-from dataclasses import dataclass
 from typing import Any, Optional, cast
 
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationOutputSpec
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.utils import pad_and_align_routed_expert_indices
 
 LOGGER = logging.getLogger(__name__)
-
-
-@dataclass
-class RolloutResult:
-    """One rollout's outcome, independent of where its output is assembled."""
-
-    token_ids: list[int]
-    # The sampled token's log probability at each position; 0.0 where vLLM
-    # reported none.
-    logprobs: list[float]
-    # The engine stopped at max_tokens.
-    truncated: bool
-    # [prompt + generated, num_moe_layers, topk], aligned for router replay.
-    routed_experts: Optional[torch.Tensor]
-    # missing/expected/actual route counts; set when router replay is on.
-    r3_stats: Optional[dict[str, int]]
-
-    @classmethod
-    def nothing_generated(cls) -> "RolloutResult":
-        """The result when no new token fits: the prompt alone, untruncated."""
-        return cls([], [], False, None, None)
 
 
 def _selected_logprobs(completion: Any) -> list[float]:

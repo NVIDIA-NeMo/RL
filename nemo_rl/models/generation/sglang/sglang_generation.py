@@ -974,8 +974,11 @@ class SGLangGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Initialize the GPU-side bulk reshard communicators."""
+        if layout_index != 0:
+            raise ValueError("SGLang generation has a single reshard layout.")
         if membership != self._refit_membership:
             raise ValueError("SGLang reshard membership changed during setup.")
         return self._dispatch_nccl_reshard(
@@ -989,9 +992,11 @@ class SGLangGeneration(GenerationInterface):
             },
         )
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_reshard_refit_info(self, refit_infos: list[dict]) -> None:
         """Validate every destination view before the first weight transfer."""
-        ray.get(self._dispatch_nccl_reshard("prepare", {"refit_info": refit_info}))
+        if len(refit_infos) != 1:
+            raise ValueError("SGLang generation requires exactly one reshard plan.")
+        ray.get(self._dispatch_nccl_reshard("prepare", {"refit_info": refit_infos[0]}))
 
     def nccl_reshard_refit(
         self, refit_timeout_s: Optional[float] = None

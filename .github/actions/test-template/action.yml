@@ -25,10 +25,6 @@ inputs:
     description: "Failure will cancel all other tests if set to true"
     required: false
     default: "false"
-  is_doc_test:
-    description: "Upload coverage as doc test"
-    required: false
-    default: "false"
   is_unit_test:
     description: "Upload coverage as unit test"
     required: false
@@ -94,6 +90,25 @@ runs:
         echo "id=$(uuidgen)" >> "$GITHUB_OUTPUT"
 
     - name: Checkout NeMo
+      id: checkout
+      continue-on-error: true
+      uses: actions/checkout@v6
+      env:
+        DIR: ${{ github.run_id }}
+      with:
+        submodules: "recursive"
+        path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
+        ref: ${{ inputs.test-commit-sha }}
+
+    - name: Wait before retrying checkout
+      if: steps.checkout.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::warning title=Retrying checkout::Checkout failed (e.g. git fetch-pack error); retrying once in 30s."
+        sleep 30
+
+    - name: Retry checkout NeMo
+      if: steps.checkout.outcome == 'failure'
       uses: actions/checkout@v6
       env:
         DIR: ${{ github.run_id }}
@@ -135,7 +150,7 @@ runs:
       id: test
       shell: bash
       run: |
-        COVERAGE_PREFIX=$([[ "${{ inputs.is_doc_test }}" == "true" ]] && echo "doc-test" || ([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e"))
+        COVERAGE_PREFIX=$([[ "${{ inputs.is_unit_test }}" == "true" ]] && echo "unit-test" || echo "e2e")
         echo "coverage-prefix=$COVERAGE_PREFIX" | tee -a "$GITHUB_OUTPUT"
 
         echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
@@ -170,7 +185,7 @@ runs:
         # devices but not their RoCE netdevs (gpuNrdma0), so UCX's default
         # "route" check fails on if_nametoindex and nixl finds no transport
         # (NIXL_ERR_BACKEND). Mooncake reads the netdev name from sysfs only.
-        if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
+        if rdma_device_available; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1
                       --env MC_ENABLE_DEST_DEVICE_AFFINITY=1
@@ -180,6 +195,7 @@ runs:
         echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
+        run_shard() {
         echo "::group::Logs"
         # docker/Dockerfile always installs Alloy, so NEMO_RL_REQUIRE_ALLOY turns
         # the config validation test's skip into a failure: losing that COPY should
@@ -212,16 +228,25 @@ runs:
             # fingerprint once upfront instead of using NRL_FORCE_REBUILD_VENVS=true which
             # rebuilds on every Ray remote call.
             if [[ "${FAST:-0}" == "1" ]]; then
-              if [[ "${{ inputs.is_doc_test }}" == "true" ]]; then
-                UV_LINK_MODE=symlink uv sync --inexact
-              else
-                UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
-              fi
+              UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py
               python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
             fi
-            bash tests/${{ inputs.is_doc_test == 'true' && 'docs' || (inputs.is_unit_test == 'true' && 'unit' || 'functional') }}/${{ inputs.script }}.sh && \
+            bash tests/${{ inputs.is_unit_test == 'true' && 'unit' || 'functional' }}/${{ inputs.script }}.sh && \
             echo "Finished successfully." || echo "Did not finish."' 2>&1 | tee err.log
         echo "::endgroup::"
+        }
+
+        run_shard
+        if ! tail -n 1 err.log | grep -q "Finished successfully."; then
+          patterns_file="${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/.github/scripts/known-flake-patterns.txt"
+          flake_line=$(grep -m 1 -E -f <(grep -vE '^[[:space:]]*(#|$)' "$patterns_file") err.log | cut -c1-300 || true)
+          if [[ -n "$flake_line" ]]; then
+            echo "::warning title=Known flake, re-running ${{ inputs.script }}::${flake_line}"
+            echo "Re-ran \`${{ inputs.script }}\` once after a known flake: \`${flake_line}\`" >> "$GITHUB_STEP_SUMMARY"
+            mv err.log err.attempt1.log
+            run_shard
+          fi
+        fi
 
     - name: Check result
       id: check

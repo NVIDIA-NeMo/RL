@@ -199,6 +199,7 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
         {
             "total_save_seconds": 30,
             "tq_save_seconds": 12,
+            "staging_inventory_seconds": 2,
             "snapshot_sequence": 99,
             "replay_rows": 256,
             "controller_sidecar_bytes": 4096,
@@ -224,6 +225,7 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
     } == {
         ("save", "total"): 30,
         ("save", "tq"): 12,
+        ("save", "staging_inventory"): 2,
         ("restore", "total"): 8,
         ("restore", "tq"): 5,
     }

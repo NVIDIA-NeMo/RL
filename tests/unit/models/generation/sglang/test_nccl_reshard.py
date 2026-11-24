@@ -17,14 +17,17 @@
 import json
 import subprocess
 import sys
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.nccl_reshard import (
+    SGLangNcclReshardReceiver,
     build_sglang_refit_param_map,
 )
 from nemo_rl.models.generation.sglang.utils.train_utils import MultiprocessingSerializer
@@ -104,6 +107,20 @@ def test_wrong_destination_dtype_rejected_before_transfer() -> None:
 def test_wrong_tp_layout_rejected_before_transfer() -> None:
     with pytest.raises(ValueError, match="expected contiguous"):
         build_sglang_refit_param_map(_model(tp_size=1), _metadata(), tp_size=2)
+
+
+def test_receiver_rejects_native_source_when_destination_lacks_nccl_m2n(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("nemo_rl.weight_sync.xferdtensor._reshard", None)
+    model = _model(tp_size=2)
+    model.config = SimpleNamespace(model_type="qwen2")
+    receiver = SGLangNcclReshardReceiver(model, tp_rank=0, tp_size=2)
+    with pytest.raises(RuntimeError, match="this destination cannot"):
+        receiver.prepare(
+            refit_info={**_metadata(), "source_uses_real_reshard_op": True}
+        )
+    assert receiver.refit_info is None
 
 
 def _config() -> dict:
@@ -256,7 +273,16 @@ def test_shared_mover_uses_sglang_mesh_without_a_ray_worker_group() -> None:
     mover._policy.init_nccl_reshard_comm_group.return_value = []
     mover._policy.prepare_nccl_reshard_refit_info.return_value = _metadata()
     generation.rebuild_collective.return_value = []
-    generation.rebuild_nccl_reshard_comm_group.return_value = []
+    generation.set_refit_membership.side_effect = partial(
+        SGLangGeneration.set_refit_membership, generation
+    )
+    generation.rebuild_nccl_reshard_comm_group.side_effect = partial(
+        SGLangGeneration.rebuild_nccl_reshard_comm_group, generation
+    )
+    generation.prepare_nccl_reshard_refit_info.side_effect = partial(
+        SGLangGeneration.prepare_nccl_reshard_refit_info, generation
+    )
+    generation._dispatch_nccl_reshard.return_value = []
     del generation.worker_group
     with patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray.get"):
         mover.init_communicator()
@@ -265,6 +291,13 @@ def test_shared_mover_uses_sglang_mesh_without_a_ray_worker_group() -> None:
         {"tp_size": 2, "ep_size": 1, "etp_size": 2, "pp_size": 1},
         1,
         2,
+        layout_index=0,
+    )
+    assert generation._dispatch_nccl_reshard.call_count == 2
+    operation, payload = generation._dispatch_nccl_reshard.call_args_list[0].args
+    assert operation == "init_bulk" and payload["sub_world_size"] == 3
+    generation._dispatch_nccl_reshard.assert_called_with(
+        "prepare", {"refit_info": _metadata()}
     )
     membership = generation.set_refit_membership.call_args.args[0]
     assert membership.world_size == 3

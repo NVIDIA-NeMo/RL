@@ -154,8 +154,12 @@ class SGLangNcclReshardReceiver:
 
     def prepare(self, *, refit_info: dict[str, Any]) -> None:
         """Validate all live destination views before starting a transfer."""
+        # NCCL bindings are available in the serving workers.
+        from nemo_rl.weight_sync.xferdtensor import follow_source_reshard_path
+
         if self.model.config.model_type != "qwen2":
             raise ValueError("SGLang NCCL reshard currently supports dense Qwen2 only.")
+        follow_source_reshard_path(refit_info["source_uses_real_reshard_op"])
         restored = restore_refit_info_placements(refit_info)
         mapping = build_sglang_refit_param_map(
             self.model, restored, tp_size=self.tp_size

@@ -475,6 +475,35 @@ def test_registry_shell_helpers_add_replace_remove(tmp_path):
     ]
 
 
+def test_registry_list_takes_shared_lock_on_readable_descriptor(tmp_path):
+    # NFS grants a shared lock only on a descriptor opened for reading, while a local disk
+    # accepts it on a write-only one, so this flock stand-in reads from the lock descriptor.
+    nfs_like_flock = textwrap.dedent(
+        """\
+        flock() {
+            if [ "$1" = -s ]; then
+                cat <&"${@: -1}" > /dev/null
+            fi
+        }
+        """
+    )
+    script = REPO_ROOT / "tools/external_gym_vllm/vllm_backend_registry.sh"
+    program = nfs_like_flock + textwrap.dedent(
+        f"""
+        set -euo pipefail
+        export EXTERNAL_VLLM_STATE_DIR={tmp_path}
+        export EXTERNAL_VLLM_GROUP_ID=test
+        source {script}
+        registry_add job-a 10.0.0.1 8000
+        registry_list_ready
+        """
+    )
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["10.0.0.1:8000"]
+
+
 def test_load_balancer_watchdog_forwards_term_to_child(tmp_path):
     watchdog = REPO_ROOT / "tools/external_gym_vllm/lb_watchdog.sh"
     fake_python = tmp_path / "fake-python"
@@ -773,6 +802,15 @@ def test_load_balancers_use_lb_container_and_its_python():
     )
     assert '--container-image="${EXTERNAL_VLLM_LB_CONTAINER}"' in source
     assert "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh" in source
+
+
+def test_pool_cache_is_seeded_before_ray_and_survives_pool_env_vars():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+
+    seed = source.index('"${CACHE_SYNC}" seed "${POOL_CACHE_DIR}"')
+    assert seed < source.index("  ray start")
+    env_vars = source.index('done <<< "$(pool_value ENV_VARS)"')
+    assert source.index("export_cache_env", env_vars) < source.index("vllm_args=()")
 
 
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():

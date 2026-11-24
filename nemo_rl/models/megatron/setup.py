@@ -981,7 +981,9 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
-        hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
+        # Key by the resolved path so that symlinked spellings of one checkpoint
+        # share a conversion.
+        hf_model_subdir = f"model_{os.path.realpath(hf_model_name).replace('/', '_')}"
 
     if hf_config_overrides:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
