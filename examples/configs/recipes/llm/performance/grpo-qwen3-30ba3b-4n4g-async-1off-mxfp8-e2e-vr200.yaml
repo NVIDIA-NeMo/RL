@@ -4,7 +4,7 @@ grpo:
 policy:
   train_micro_batch_size: 8
   logprob_batch_size: 16
-  logprob_chunk_size: 1024
+  logprob_chunk_size: 2048
   sequence_packing:
     # Cap the packed policy microbatch independently of the nominal sequence count.
     train_mb_tokens: 20480
