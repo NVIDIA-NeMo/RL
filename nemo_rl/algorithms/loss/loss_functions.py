@@ -1003,7 +1003,7 @@ class ClippedPGLossFn(LossFunction):
         # whose importance weight falls outside the truncation bounds. Each microbatch
         # contributes its out-of-bounds count divided by the *global* valid token/seq
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
-        if self.truncated_importance_sampling_ratio is not None:
+        if self.truncated_importance_sampling_type is not None:
             if self.truncated_importance_sampling_type == "tis":
                 tis_min = self.truncated_importance_sampling_ratio_min
                 if tis_min is None:

@@ -1779,6 +1779,34 @@ def test_clipped_pg_loss_reports_is_oob_ratio_tis():
     assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
 
 
+def test_clipped_pg_loss_tis_type_null_ignores_inherited_ratio():
+    """type: null turns truncation off even when a parent recipe set the ratio."""
+
+    def run(ratio):
+        data, _, seq_len, _ = _setup_clipped_pg_test_data(device="cpu")
+        cfg = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type=None,
+            truncated_importance_sampling_ratio=ratio,
+        )
+        data["advantages"][0, 1:] = torch.ones(3)
+        data["prev_logprobs"][0, 1:] = torch.log(torch.tensor([1.0, 3.0, 0.5]))
+        data["generation_logprobs"][0, 1:] = torch.zeros(3)
+        return ClippedPGLossFn(cfg)(
+            next_token_logprobs=torch.zeros((1, seq_len - 1)),
+            data=data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+        )
+
+    loss, metrics = run(ratio=2.0)
+    loss_off, _ = run(ratio=None)
+
+    torch.testing.assert_close(loss, loss_off)
+    assert "is_oob_ratio" not in metrics
+
+
 @pytest.mark.parametrize("tis_type", ["tis", "icepop", "seq-mask-tis"])
 def test_clipped_pg_loss_rejects_tis_min_above_max(tis_type):
     cfg = ClippedPGLossConfig(
