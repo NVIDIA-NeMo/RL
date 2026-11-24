@@ -19,11 +19,16 @@ import hashlib
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Protocol
 
+from nemo_rl.models.generation.tito import (
+    QUALIFICATION_HISTORY,
+    QUALIFICATION_OBSERVATIONS,
+)
 from nemo_rl.models.generation.capture_context import (
     CaptureInputDecision,
     decide_capture_input,
@@ -37,6 +42,11 @@ LOGGER = logging.getLogger(__name__)
 # Official Qwen/Qwen3-0.6B tokenizer_config.json chat_template. An exact
 # template contract prevents custom templates from silently changing the suffix.
 QWEN3_TEMPLATE_SHA256 = "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"  # pragma: allowlist secret
+
+# The adapter calls the versioned OnlineRenderer interface.
+SUPPORTED_VLLM_VERSION = "0.33.0"
+
+_OUTCOME_SUMMARY_INTERVAL = 1000
 
 
 class TitoNotApplicable(ValueError):
@@ -111,6 +121,66 @@ INCREMENTAL_TOKENIZERS: dict[str, IncrementalTokenizer] = {
 }
 
 
+def qualify_incremental_tokenizer(
+    model: str, *, tokenizer: Any, chat_template: str | None, vllm_version: str
+) -> None:
+    """Reject a server whose incremental prompts would differ from its chat template.
+
+    Replays fixed conversations and requires each incremental suffix to equal the
+    tail of the full chat-template rendering, token for token.
+
+    Args:
+        model: The configured ``vllm_cfg.tito_model``.
+        tokenizer: The server's Hugging Face tokenizer.
+        chat_template: The server's resolved default chat template.
+        vllm_version: The installed vLLM version.
+
+    Raises:
+        ValueError: The vLLM version, the chat template or the tokenizer cannot
+            serve incremental prompts for ``model``.
+    """
+    if vllm_version != SUPPORTED_VLLM_VERSION:
+        raise ValueError(
+            f"Captured TITO requires vLLM {SUPPORTED_VLLM_VERSION}, found {vllm_version}"
+        )
+    incremental_tokenizer = INCREMENTAL_TOKENIZERS[model]
+    try:
+        incremental_tokenizer.qualify_template(chat_template)
+    except TitoNotApplicable as error:
+        raise ValueError(
+            f"vllm_cfg.tito_model={model} does not support this server's chat "
+            "template; serve the model's official template or unset tito_model"
+        ) from error
+    for observations in QUALIFICATION_OBSERVATIONS:
+        for enable_thinking in (True, False):
+            rendered = tokenizer.apply_chat_template(
+                QUALIFICATION_HISTORY + observations,
+                chat_template=chat_template,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            rendered_ids = tokenizer.encode(rendered, add_special_tokens=False)
+            suffix_ids = incremental_tokenizer.encode_suffix(
+                tokenizer, observations, enable_thinking=enable_thinking
+            )
+            cut = len(rendered_ids) - len(suffix_ids)
+            roles = [message["role"] for message in observations]
+            if cut < 1 or rendered_ids[cut:] != suffix_ids:
+                raise ValueError(
+                    f"vllm_cfg.tito_model={model}: the incremental suffix for "
+                    f"{roles} (enable_thinking={enable_thinking}) differs from "
+                    "the chat template rendering"
+                )
+            try:
+                incremental_tokenizer.validate_prefix(tokenizer, rendered_ids[:cut])
+            except TitoNotApplicable as error:
+                raise ValueError(
+                    f"vllm_cfg.tito_model={model}: the chat template does not end "
+                    f"the assistant turn before {roles} on the expected token"
+                ) from error
+
+
 @dataclass(frozen=True)
 class CapturedContinuation:
     """A verified Gym-selected parent and its request-owned original tokens."""
@@ -174,6 +244,27 @@ class TitoTrace:
     suffix_seconds: float = 0.0
     prepare_seconds: float = 0.0
     total_seconds: float = 0.0
+
+
+@dataclass
+class TitoOutcomes:
+    """Tally of preprocessing outcomes, summarized periodically in the log."""
+
+    counts: Counter[str] = field(default_factory=Counter)
+
+    def record(self, trace: TitoTrace) -> None:
+        self.counts[f"{trace.outcome}/{trace.reason}"] += 1
+        total = self.counts.total()
+        if total % _OUTCOME_SUMMARY_INTERVAL == 0:
+            LOGGER.info(
+                "Captured TITO outcomes over %d requests: %s",
+                total,
+                json.dumps(dict(self.counts), sort_keys=True),
+            )
+
+
+# One HTTP server process owns one tally.
+_OUTCOMES = TitoOutcomes()
 
 
 @dataclass(frozen=True)
@@ -311,7 +402,6 @@ async def preprocess_captured_tito(
 ) -> TitoPreprocessResult:
     """Use native vLLM request adjustment with a request-local token renderer."""
     # These imports are only needed when the optional TITO serving path is used.
-    import vllm
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.renderers.hf import HfRenderer
     from vllm.renderers.online_renderer import OnlineRenderer
@@ -328,12 +418,11 @@ async def preprocess_captured_tito(
         trace.outcome = outcome
         trace.reason = reason
         trace.total_seconds = time.perf_counter() - started
+        _OUTCOMES.record(trace)
         if LOGGER.isEnabledFor(logging.DEBUG):
             LOGGER.debug("Captured TITO %s", json.dumps(asdict(trace), sort_keys=True))
         return TitoPreprocessResult(result, continuation)
 
-    if vllm.__version__ != "0.33.0":
-        raise ValueError("Captured TITO requires vLLM 0.33.0")
     incremental_tokenizer = INCREMENTAL_TOKENIZERS[model]
     if not isinstance(request, ChatCompletionRequest):
         return finish("fallback", "unsupported_request", None, None)

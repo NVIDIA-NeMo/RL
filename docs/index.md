@@ -342,6 +342,7 @@ guides/async-grpo.md
 guides/single-controller.md
 guides/context-compaction.md
 guides/captured-tito.md
+guides/tito-interface.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/automodel-speculative-decoding.md
@@ -412,6 +413,7 @@ design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
+design-docs/tito.md
 design-docs/dflash-draft-body.md
 design-docs/dspark-objectives.md
 design-docs/single-controller-rollout-checkpointing.md

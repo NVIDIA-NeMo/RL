@@ -308,6 +308,41 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def test_finalize_group_counts_root_reasons(tq_client, partitions):
+    group_id = "grp_roots"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipts = []
+    for rollout_id, reason in zip(rollout_ids, ["first_call", "no_prefix_match"]):
+        receipt, expected = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_id
+        )
+        receipt["manifest"][0]["root_reason"] = reason
+        receipts.append(receipt)
+
+    finalized = _finalizer(
+        tq_client, max_seq_len=len(expected.token_ids)
+    ).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[True, True],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        loss_multiplier=1.0,
+    )
+    metrics = finalized.metrics
+    assert metrics["finalize/root_reason_first_call_count"] == 1.0
+    assert metrics["finalize/root_reason_no_prefix_match_count"] == 1.0
+    assert metrics["finalize/root_reason_ambiguous_candidate_count"] == 0.0
+    # Only the root that is not a first call re-rendered a history.
+    assert metrics["finalize/rerooted_tokens"] == float(
+        receipts[1]["manifest"][0]["delta_len"]
+    )
+    # A continuation row carries no reason and lands in no bucket.
+    assert not [key for key in metrics if "root_reason_None" in key]
+
+
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     group_id = "grp_unset"
     receipt, expected = _stage_fixture(

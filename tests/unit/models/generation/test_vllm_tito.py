@@ -25,6 +25,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
+from nemo_rl.models.generation.vllm import tito
 from nemo_rl.models.generation.vllm.tito import (
     QWEN3_TEMPLATE_SHA256,
     CapturedTitoRenderer,
@@ -32,6 +33,7 @@ from nemo_rl.models.generation.vllm.tito import (
     TitoNotApplicable,
     TitoTrace,
     preprocess_captured_tito,
+    qualify_incremental_tokenizer,
     qwen3_suffix_text,
     resolve_captured_continuation,
 )
@@ -289,7 +291,6 @@ def test_qwen3_template_contract(tokenizer):
 def online_stub(monkeypatch, parser_stub):
     """Exercise request-local dispatch without importing optional engine binaries."""
     runtime = ModuleType("vllm")
-    runtime.__version__ = "0.33.0"
     protocol = ModuleType("vllm.entrypoints.openai.chat_completion.protocol")
     protocol.ChatCompletionRequest = type(
         "ChatCompletionRequest", (SimpleNamespace,), {}
@@ -373,11 +374,75 @@ def test_preprocess_requires_qualified_capture(online_stub, case):
     online_stub.native.assert_not_called()
 
 
-def test_preprocess_rejects_unqualified_runtime(online_stub):
-    sys.modules["vllm"].__version__ = "0.29.0"
-    with pytest.raises(ValueError, match="requires vLLM 0.33.0"):
-        run_preprocess(online_stub)
-    online_stub.native.assert_not_called()
+def test_qualification_accepts_official_template(tokenizer):
+    qualify_incremental_tokenizer(
+        "qwen3",
+        tokenizer=tokenizer,
+        chat_template=tokenizer.chat_template,
+        vllm_version="0.33.0",
+    )
+
+
+class _ExtraSuffixToken(Qwen3IncrementalTokenizer):
+    def qualify_template(self, template):
+        pass
+
+    def encode_suffix(self, tokenizer, messages, *, enable_thinking):
+        suffix = super().encode_suffix(
+            tokenizer, messages, enable_thinking=enable_thinking
+        )
+        return suffix + [tokenizer.eos_token_id]
+
+
+class _MissingSeparator(_ExtraSuffixToken):
+    def encode_suffix(self, tokenizer, messages, *, enable_thinking):
+        return Qwen3IncrementalTokenizer.encode_suffix(
+            self, tokenizer, messages, enable_thinking=enable_thinking
+        )[1:]
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("version", "requires vLLM 0.33.0, found 0.29.0"),
+        ("template", "does not support this server's chat template"),
+        ("missing_template", "does not support this server's chat template"),
+        ("suffix", "differs from the chat template rendering"),
+        ("boundary", "does not end the assistant turn"),
+    ],
+)
+def test_qualification_rejects_unqualified_server(tokenizer, monkeypatch, case, match):
+    template = tokenizer.chat_template
+    if case == "template":
+        template += " "
+    elif case == "missing_template":
+        template = None
+    elif case == "suffix":
+        monkeypatch.setitem(tito.INCREMENTAL_TOKENIZERS, "qwen3", _ExtraSuffixToken())
+    elif case == "boundary":
+        monkeypatch.setitem(tito.INCREMENTAL_TOKENIZERS, "qwen3", _MissingSeparator())
+    with pytest.raises(ValueError, match=match):
+        qualify_incremental_tokenizer(
+            "qwen3",
+            tokenizer=tokenizer,
+            chat_template=template,
+            vllm_version="0.29.0" if case == "version" else "0.33.0",
+        )
+
+
+def test_outcomes_are_summarized_at_the_interval(monkeypatch, caplog):
+    monkeypatch.setattr(tito, "_OUTCOME_SUMMARY_INTERVAL", 2)
+    outcomes = tito.TitoOutcomes()
+    with caplog.at_level(logging.INFO, logger="nemo_rl.models.generation.vllm.tito"):
+        outcomes.record(TitoTrace(outcome="incremental", reason="matched"))
+        assert not caplog.records
+        outcomes.record(TitoTrace(outcome="fallback", reason="stream"))
+    summary = caplog.records[-1].getMessage()
+    assert summary.startswith("Captured TITO outcomes over 2 requests: ")
+    assert json.loads(summary.split(": ", 1)[1]) == {
+        "fallback/stream": 1,
+        "incremental/matched": 1,
+    }
 
 
 @pytest.mark.nemo_gym

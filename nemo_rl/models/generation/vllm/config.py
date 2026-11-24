@@ -67,6 +67,9 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     # Opt-in incremental rendering for source-history capture. None keeps native preprocessing.
     tito_model: NotRequired[Literal["qwen3"] | None]
+    # Serve the token-in/token-out route and bridge chat continuations onto
+    # their captured parent's tokens. See docs/design-docs/tito.md.
+    tito_interface: NotRequired[bool]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
@@ -366,6 +369,16 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
         if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
             raise ValueError(
                 "vllm_cfg.tito_model requires async_engine and expose_http_server"
+            )
+    if vllm_cfg.get("tito_interface"):
+        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+            raise ValueError(
+                "vllm_cfg.tito_interface requires async_engine and expose_http_server"
+            )
+        if tito_model is not None:
+            raise ValueError(
+                "vllm_cfg.tito_interface and vllm_cfg.tito_model select different "
+                "prompt construction paths; set only one"
             )
     api_server_count = vllm_cfg.get("http_api_server_count", 1)
     if api_server_count < 1:

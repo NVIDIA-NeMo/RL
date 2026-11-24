@@ -12,7 +12,9 @@ Captured TITO reuses Gym's source-history matching and NeMo RL's exact token cap
 
 The generation backend must be native async vLLM with its HTTP server exposed. The opt-in path requires a candidate from Gym's source-history matcher; it does not trust assistant token metadata as a substitute for that proof. Uncaptured requests and ordinary fingerprint capture retain the existing renderer.
 
-The template is qualified by its SHA-256, not by a model name substring. Custom templates, non-text requests, unfinished assistant generations, tokenization-only requests, prompt truncation, checkpointed generation restores, and unsupported request options use the existing full-history path. Invalid capture evidence and storage failures remain errors. The module checks the vLLM version because it delegates to the versioned OnlineRenderer interface.
+The template is qualified by its SHA-256, not by a model name substring. Custom templates, non-text requests, unfinished assistant generations, tokenization-only requests, prompt truncation, checkpointed generation restores, and unsupported request options use the existing full-history path. Invalid capture evidence and storage failures remain errors.
+
+The HTTP server qualifies the configuration once at startup. It requires vLLM 0.33.0 (the adapter delegates to the versioned OnlineRenderer interface), the Hugging Face renderer, and the server's default chat template to be the qualified one. It then replays fixed conversations and requires each incremental suffix to equal the tail of the full template rendering, token for token. Any failure stops the server with a `ValueError`, so a misconfigured `tito_model` cannot run with every request silently using the full-history path. A request that overrides the chat template is still qualified on its own and falls back when it does not match.
 
 ## Gym and training compatibility
 
@@ -40,6 +42,10 @@ Enable DEBUG logging for `nemo_rl.models.generation.vllm.tito` to collect one `C
 | `incremental` | A verified parent was reused and the suffix was encoded incrementally. |
 | `no_history` | No candidate was available, including ambiguous or rewritten histories. |
 | `fallback` | The request, template, generation boundary or converted messages could not use incremental preprocessing. |
+
+Every 1000 preprocessing attempts, each HTTP server process also logs one INFO line, `Captured TITO outcomes over N requests: {JSON}`, with cumulative counts keyed by `outcome/reason`. Use it to read hit and fallback rates without DEBUG logging.
+
+The finalizer reports why each text root started as `finalize/root_reason_<reason>_count`, one metric per Gym root reason (`first_call`, `no_prefix_match`, `non_user_suffix`, `render_options_changed`, `worker_rooted`, `ambiguous_candidate`). These counts come from the capture manifest, so they are available with `tito_model` unset. Every rollout has one `first_call` root; the other reasons mark calls whose history was rendered from text. See the [TITO design](../design-docs/tito.md) for what each reason means.
 
 `reason` identifies the cause, such as `unqualified_template`, `unfinished_generation`, `unverified_boundary`, `stream`, `prompt_truncation` or Gym's `ambiguous_candidate`. `reused_tokens` and `suffix_tokens` report successful construction. `history_seconds`, `suffix_seconds` and `prepare_seconds` measure the completed history-resolution, suffix-encoding and engine-input-preparation stages; they include executor wait when applicable. `total_seconds` covers this preprocessing attempt, including native message parsing. It excludes later native fallback work, capture finalization, GPU generation and sandbox execution. Invalid evidence and storage failures raise rather than producing a successful fallback event.
 

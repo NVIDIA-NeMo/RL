@@ -1244,7 +1244,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
     )
-    make_module("vllm.renderers.hf", HfRenderer=type("HfRenderer", (), {}))
+    make_module(
+        "vllm.renderers.hf",
+        HfRenderer=type("HfRenderer", (), {}),
+        resolve_chat_template=MagicMock(return_value="chat-template"),
+    )
 
     def with_cancellation(handler):
         handler.cancels_on_disconnect = True
@@ -1336,6 +1340,8 @@ def _setup_fake_vllm_app(
     *,
     with_cancellation: Callable[..., Any] | None = None,
     openai_serving_chat: type | None = None,
+    vllm_cfg: dict[str, Any] | None = None,
+    hf_tokenizer: Any | None = None,
 ):
     """Build the worker's HTTP routes against the fake vLLM modules.
 
@@ -1347,6 +1353,9 @@ def _setup_fake_vllm_app(
             the stub, e.g. the real pinned one with a stub constructor. It must
             record its instances in a class-level ``instances`` list like the
             stub does.
+        vllm_cfg: The worker's ``vllm_cfg``; empty when omitted.
+        hf_tokenizer: When given, the engine serves this tokenizer through
+            vLLM's Hugging Face renderer and returns no routed experts.
 
     Returns:
         The worker, the OpenAIServingChat instance, and the app holding the
@@ -1376,7 +1385,7 @@ def _setup_fake_vllm_app(
         "val_temperature": 0.0,
         "val_top_p": 1.0,
         "val_top_k": None,
-        "vllm_cfg": {},
+        "vllm_cfg": vllm_cfg or {},
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
@@ -1393,6 +1402,11 @@ def _setup_fake_vllm_app(
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
+    if hf_tokenizer is not None:
+        renderer = sys.modules["vllm.renderers.hf"].HfRenderer()
+        renderer.get_tokenizer = lambda: hf_tokenizer
+        worker.llm.renderer = renderer
+        worker.llm_async_engine_args.enable_return_routed_experts = False
 
     app = _FakeFastAPIApp()
     worker._setup_vllm_openai_api_server(app)
@@ -4262,6 +4276,75 @@ def test_vllm_http_server(cluster, tokenizer):
         )
 
 
+def test_vllm_http_server_tito_interface(cluster, tokenizer):
+    """The chat adapter and the token-only route feed the engine the same tokens."""
+    generation_config = configure_http_server_config(tokenizer)
+    generation_config["vllm_cfg"]["tito_interface"] = True
+    # Greedy, so the chat path and the token-only route can be compared.
+    generation_config["temperature"] = 0.0
+    vllm_generation = VllmGeneration(cluster, generation_config)
+    base_url = vllm_generation.dp_openai_server_base_urls[0]
+    _wait_for_vllm_http_server_spinup(base_url)
+    sampling = dict(
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        max_tokens=8,
+    )
+
+    def chat(messages: list[dict], **extra) -> dict:
+        response = requests.post(
+            url=f"{base_url}/chat/completions",
+            json=dict(
+                model=generation_config["model_name"],
+                messages=messages,
+                logprobs=True,
+                **sampling,
+                **extra,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["choices"][0]["message"]
+
+    history = [{"role": "user", "content": "count to 5"}]
+    first = chat(history)
+    parent = first["prompt_token_ids"] + first["generation_token_ids"]
+    # The eight-token reply is cut short, so its text does not re-tokenize into
+    # the sampled tokens and only the bridge keeps them in the next prompt.
+    history += [
+        {"role": "assistant", "content": first["content"]},
+        {"role": "user", "content": "now count to 10"},
+    ]
+    second = chat(history, required_prefix_token_ids=parent)
+
+    prompt = second["prompt_token_ids"]
+    assert prompt[: len(parent)] == parent
+    assert tokenizer.decode(prompt[len(parent) :]) == (
+        "<|im_end|>\n<|im_start|>user\nnow count to 10<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    response = requests.post(
+        url=f"{base_url}/tito/generate", json=dict(token_ids=prompt, **sampling)
+    )
+    assert response.status_code == 200, response.text
+    generated = response.json()
+    assert generated["prompt_token_count"] == len(prompt)
+    assert generated["token_ids"] == second["generation_token_ids"]
+    assert generated["logprobs"] == pytest.approx(
+        second["generation_log_probs"], abs=1e-3
+    )
+    assert generated["call_id"] is None
+
+    response = requests.post(
+        url=f"{base_url}/tito/generate",
+        json=dict(token_ids=[1] * 1024, **sampling),
+    )
+    assert response.status_code == 400
+    assert "maximum context length" in response.json()["error"]["message"]
+
+    vllm_generation.shutdown()
+
+
 def test_vllm_deferred_model_load(cluster, tokenizer):
     """Test deferred model loading for overlapped initialization.
 
@@ -4449,12 +4532,14 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tito_interface", [False, True])
 async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
-    cluster, tokenizer
+    cluster, tokenizer, tito_interface
 ):
     """Test that vLLM http server works."""
 
     generation_config = configure_http_server_config(tokenizer)
+    generation_config["vllm_cfg"]["tito_interface"] = tito_interface
 
     # Ensure we can get same output
     assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
@@ -5696,6 +5781,168 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+_WORKER_MODULE = "nemo_rl.models.generation.vllm.vllm_worker_async"
+
+
+def _setup_tito_interface(monkeypatch):
+    """Build the HTTP server with the token-in/token-out interface enabled.
+
+    Returns:
+        The worker, its online renderer, and the qualification and route
+        registration mocks the server setup called.
+    """
+    qualify = MagicMock()
+    register = MagicMock()
+    monkeypatch.setattr(f"{_WORKER_MODULE}.qualify_bridge", qualify)
+    monkeypatch.setattr(f"{_WORKER_MODULE}.register_tito_route", register)
+    worker, serving_chat, _ = _setup_fake_vllm_app(
+        monkeypatch,
+        vllm_cfg={"tito_interface": True},
+        hf_tokenizer=types.SimpleNamespace(eos_token_id=9),
+    )
+    worker._capture_media = False
+    worker._begin_request_capture = MagicMock()
+    return worker, serving_chat.kwargs["online_renderer"], qualify, register
+
+
+def _tito_preprocess(monkeypatch, online, request, engine_prompt):
+    """Run the chat preprocessing over a stubbed full-history rendering."""
+    monkeypatch.setattr(
+        sys.modules["vllm.renderers.online_renderer"].OnlineRenderer,
+        "preprocess_chat",
+        AsyncMock(return_value=([{"role": "user", "content": "new"}], [engine_prompt])),
+        raising=False,
+    )
+    return asyncio.run(
+        online.preprocess_chat(
+            request, [{"role": "user", "content": "new"}], None, "string", None
+        )
+    )
+
+
+def test_tito_interface_qualifies_the_template_and_serves_the_core_route(monkeypatch):
+    worker, _, qualify, register = _setup_tito_interface(monkeypatch)
+
+    assert qualify.call_args.kwargs["turn_close_token_ids"] == {9}
+    assert qualify.call_args.kwargs["chat_template"] == "chat-template"
+    assert register.call_args.kwargs["worker"] is worker
+
+
+def test_tito_interface_rejects_routed_experts_at_server_setup(monkeypatch):
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_return_routed_experts_enabled",
+        lambda self: True,
+    )
+
+    with pytest.raises(ValueError, match="does not support returning routed experts"):
+        _setup_tito_interface(monkeypatch)
+
+
+def test_tito_interface_rejects_unsupported_renderer_at_server_setup(monkeypatch):
+    with pytest.raises(ValueError, match="requires vLLM's Hugging Face renderer"):
+        _setup_fake_vllm_app(monkeypatch, vllm_cfg={"tito_interface": True})
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"capture_media": True},
+        {"top_logprobs": 4},
+        {"generation_prefix_cuts_enabled": True},
+    ],
+)
+def test_tito_interface_rejects_capture_features_it_does_not_carry(unsupported):
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.is_model_owner = True
+    worker._api_server_pool = None
+    worker.cfg = {"vllm_cfg": {"tito_interface": True}}
+
+    with pytest.raises(ValueError, match="tito_interface does not support"):
+        asyncio.run(worker.setup_token_capture({}, "staging", **unsupported))
+
+
+def test_tito_chat_root_submits_the_full_rendering(monkeypatch):
+    worker, online, _, _ = _setup_tito_interface(monkeypatch)
+    worker._capture_admission = MagicMock(return_value=None)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None, parallel_tool_calls=None
+    )
+    engine_prompt = {"prompt_token_ids": [1, 5, 9, 7, 8]}
+
+    _tito_preprocess(monkeypatch, online, request, engine_prompt)
+
+    assert engine_prompt["prompt_token_ids"] == [1, 5, 9, 7, 8]
+    worker._begin_request_capture.assert_called_once_with(
+        request, [1, 5, 9, 7, 8], admission=None, prefix_token_ids=None
+    )
+
+
+@pytest.mark.parametrize("captured", [True, False])
+def test_tito_chat_continuation_bridges_onto_the_parent_tokens(monkeypatch, captured):
+    """Captured and inline parents both replace the re-rendered history."""
+    worker, online, _, _ = _setup_tito_interface(monkeypatch)
+    admission = types.SimpleNamespace(
+        mode="token_in",
+        request_replay=None,
+        parent_call_id="call-1",
+        prev_len=3,
+        generation_cut=None,
+    )
+    worker._capture_admission = MagicMock(return_value=admission if captured else None)
+    worker._resolve_admission_prefix = MagicMock(return_value=[1, 2, 9])
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None if captured else [1, 2, 9],
+        parallel_tool_calls=None,
+    )
+    engine_prompt = {"prompt_token_ids": [1, 5, 6, 9, 7, 8]}
+
+    _tito_preprocess(monkeypatch, online, request, engine_prompt)
+
+    assert engine_prompt["prompt_token_ids"] == [1, 2, 9, 7, 8]
+    worker._begin_request_capture.assert_called_once_with(
+        request,
+        [1, 2, 9, 7, 8],
+        admission=admission if captured else None,
+        prefix_token_ids=[1, 2, 9],
+    )
+
+
+def test_tito_chat_rejects_a_history_that_does_not_reach_the_parent(monkeypatch):
+    from nemo_rl.models.generation.tito import TitoBridgeError
+
+    worker, online, _, _ = _setup_tito_interface(monkeypatch)
+    worker._capture_admission = MagicMock(return_value=None)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=[1, 9, 2, 9], parallel_tool_calls=None
+    )
+
+    with pytest.raises(TitoBridgeError):
+        _tito_preprocess(monkeypatch, online, request, {"prompt_token_ids": [1, 9, 7]})
+
+    worker._begin_request_capture.assert_not_called()
+
+
+def test_tito_chat_rejects_multimodal_prompts(monkeypatch):
+    worker, online, _, _ = _setup_tito_interface(monkeypatch)
+    worker._capture_admission = MagicMock(return_value=None)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None, parallel_tool_calls=None
+    )
+    engine_prompt = {"prompt_token_ids": [1, 9], "mm_placeholders": {"image": [0]}}
+
+    with pytest.raises(
+        sys.modules["vllm.exceptions"].VLLMValidationError,
+        match="does not support multimodal prompts",
+    ):
+        _tito_preprocess(monkeypatch, online, request, engine_prompt)
+
+
+def test_captured_tito_rejects_unsupported_renderer_at_server_setup(monkeypatch):
+    with pytest.raises(ValueError, match="requires vLLM's Hugging Face renderer"):
+        _setup_fake_vllm_app(monkeypatch, vllm_cfg={"tito_model": "qwen3"})
 
 
 @pytest.mark.asyncio
