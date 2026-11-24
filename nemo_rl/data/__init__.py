@@ -34,6 +34,9 @@ class ResponseDatasetConfig(TypedDict):
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
     processor: NotRequired[str]  # remove once processor is refactored
+    # Task name for the rows; only datasets whose constructor takes `task_name`
+    # (NemoGymDataset) read it.
+    task_name: NotRequired[str]
     download_dir: NotRequired[str]
     # Size of the validation data
     split_validation_size: NotRequired[float]

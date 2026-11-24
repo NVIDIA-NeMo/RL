@@ -216,6 +216,7 @@ _BEHAVIORAL_DATASET_CONFIG_KEYS = (
     "split",
     "split_validation_size",
     "subset",
+    "task_name",  # picks the processor, prompt and environment for the rows
 )
 
 

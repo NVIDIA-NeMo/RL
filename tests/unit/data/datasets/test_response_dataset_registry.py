@@ -270,6 +270,18 @@ def test_no_warning_when_base_class_declares_key():
         )
 
 
+def test_task_name_warns_unless_the_dataset_takes_it():
+    with pytest.warns(UserWarning, match="task_name='math-val'.*ResponseDataset"):
+        warn_on_unsupported_dataset_config_keys(
+            RESPONSE_REGISTRY["ResponseDataset"], {"task_name": "math-val"}
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_on_unsupported_dataset_config_keys(
+            RESPONSE_REGISTRY["NemoGymDataset"], {"task_name": "math-val"}
+        )
+
+
 def test_warns_through_functools_partial():
     """Registry entries like the AIME variants are ``functools.partial``."""
     wrapped = functools.partial(_SplitOnlyDataset, split="train")

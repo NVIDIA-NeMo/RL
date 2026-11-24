@@ -25,12 +25,24 @@ class NemoGymDataset(RawDataset):
     Args:
         data_path: Path to a JSONL file or a pre-converted Arrow/Parquet dataset.
         repeat: Number of times to repeat the dataset, default is 1
+        task_name: Task name for the rows. When None, it is built from the
+            last two parts of ``data_path`` (``.../validation/data.jsonl``
+            becomes ``validation-data``), so datasets with the same layout
+            share a name and therefore one processor and environment.
     """
 
-    def __init__(self, data_path: str, repeat: int = 1, **kwargs) -> None:
-        self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
-        if self.task_name[0] == "-":
-            self.task_name = self.task_name[1:]
+    def __init__(
+        self,
+        data_path: str,
+        repeat: int = 1,
+        task_name: str | None = None,
+        **kwargs,
+    ) -> None:
+        if task_name is None:
+            task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
+            if task_name[0] == "-":
+                task_name = task_name[1:]
+        self.task_name = task_name
 
         # Record a stable source identity for JSONL sources so the setup-time
         # agent coverage check can scan agent names from the file once.

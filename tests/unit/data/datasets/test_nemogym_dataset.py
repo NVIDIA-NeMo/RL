@@ -82,6 +82,23 @@ def test_nemogym_dataset_reads_json_lines_regardless_of_suffix(
     assert [json.loads(row) for row in dataset.dataset["extra_env_info"]] == rows
 
 
+def test_nemogym_dataset_explicit_task_name_separates_same_layout(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for benchmark in ("math", "code"):
+        data_path = tmp_path / benchmark / "validation" / "data.jsonl"
+        data_path.parent.mkdir(parents=True)
+        data_path.write_text(f"{json.dumps({'agent_ref': {'name': benchmark}})}\n")
+        paths.append(str(data_path))
+
+    assert {NemoGymDataset(path).task_name for path in paths} == {"validation-data"}
+
+    dataset = NemoGymDataset(paths[0], task_name="math-val")
+    assert dataset.task_name == "math-val"
+    assert dataset.dataset["task_name"] == ["math-val"]
+
+
 def test_nemogym_dataset_records_source_for_jsonl_symlink(tmp_path: Path) -> None:
     # Mirrors the Hugging Face hub cache layout: snapshots/.../train.jsonl -> blobs/<sha>.
     blob_path = tmp_path / "blobs" / "0123abcd"
