@@ -253,8 +253,7 @@ def pack_jagged_fields(
                     f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
                     "Use torch.Tensor or np.ndarray(dtype=object). PackedTensor "
                     "must be converted to torch.nested at the wire boundary "
-                    "(see sync_rollout_actor.py) so the codec's dispatch stays "
-                    "binary."
+                    "so the codec's dispatch stays binary."
                 )
         out = TensorDict(packed, batch_size=[n])
         return out

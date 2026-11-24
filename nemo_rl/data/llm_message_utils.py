@@ -799,8 +799,7 @@ def remap_dataset_keys(
 # The helpers below split `message_log` into per-field arrays (role/content
 # strings as object arrays, per-turn lengths as one slim tensor) and
 # rebuild the list-of-dicts shape on the consumer from local-arena views.
-# No tensor ever reaches per-row pickle. `SyncRolloutActor` does not write
-# these fields to the data plane; they reach the driver via `driver_carry`.
+# No tensor ever reaches per-row pickle.
 
 # Fields consumed by :func:`reconstruct_message_log` to rebuild the
 # list-of-dicts view, when a batch carries them.

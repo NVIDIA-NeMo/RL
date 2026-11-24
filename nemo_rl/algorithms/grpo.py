@@ -1599,9 +1599,7 @@ def setup(
             "(reference model is not loaded)."
         )
 
-    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
-    # Policy subclass without this shared setup needing to know the data
-    # plane exists. Default is the plain Policy class — legacy behavior.
+    # A caller-supplied factory replaces the plain Policy class.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
     def init_policy(reserved_http_server_ports: Optional[dict[int, int]] = None):
@@ -2939,7 +2937,7 @@ def _apply_async_sample_masks(
     # placeholder row plus a row-aligned marker column, and a reason here that
     # masks marked rows ahead of overlong filtering and reports
     # num_masked_seqs_by_empty_response_output. The producer runs in the shared
-    # Gym actor, so it must be opt-in until the sync, grpo_sync, distillation,
+    # Gym actor, so it must be opt-in until the sync, distillation,
     # and single-controller paths also mask the placeholder rows.
     # (field, metric, timer label, required, enabled)
     mask_reasons = [
@@ -3042,7 +3040,7 @@ def _advantage_valid_mask(
     ``include`` lets every row with a nonzero dataset weight vote
     (``_include_valid_mask``); ``exclude`` lets the rows with a nonzero (final)
     loss weight vote. Both return a binary mask and leave ``sample_mask``
-    unchanged. The legacy and TransferQueue trainers carry no synthetic
+    unchanged. The legacy trainers carry no synthetic
     placeholder rows; the SingleController stage excludes its token-capture
     placeholders itself (see ``advantage_stage.py``).
     """
@@ -4251,13 +4249,13 @@ def _grpo_train_impl(
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
                     )
-                    # Router replay (R3) on the legacy data_plane.enabled=false
-                    # driver path: routed_experts already rides flat_messages
+                    # Router replay (R3) on the legacy driver path:
+                    # routed_experts already rides flat_messages
                     # (attached to message_log during rollout, then batched into
                     # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
                     # but the train_data whitelist above drops it. Copy it back so
                     # the Megatron worker's train-stage router-replay guard finds
-                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
+                    # it.
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )

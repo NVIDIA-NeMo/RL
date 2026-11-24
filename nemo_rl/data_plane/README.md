@@ -6,7 +6,7 @@ Stable boundary between NeMo-RL and the underlying data-plane backend (currently
 
 ## Vocabulary
 
-- **partition** — a named data-flow scope in TQ (e.g. `"train"`, `"val"`). Each partition owns its own field schema, consumer task set, and per-sample production-status matrix. Sync GRPO uses one stable partition (`"train"`) that is cleared and reused across steps — different partitions are for different data flows (training vs validation vs replay buffer), not for different steps.
+- **partition** — a named data-flow scope in TQ (e.g. `"train"`, `"val"`). Each partition owns its own field schema, consumer task set, and per-sample production-status matrix. The training partition is cleared and reused across steps — different partitions are for different data flows (training vs validation vs replay buffer), not for different steps.
 - **sample** — one row in a partition, identified by a per-sample **key** (e.g. `"<uid>_g0"`). Lives in TQ until `kv_clear`.
 - **field** — a named column (e.g. `input_ids`, `advantages`). Producers write fields; consumers select them on read. Each `(sample, field)` pair has an independent "produced?" bit on the TQ controller.
 - **task** — a *consumer* name (e.g. `"prev_lp"`, `"train"`). Each task has its own consumption cursor, used by the task-mediated API only.
@@ -21,7 +21,7 @@ Stable boundary between NeMo-RL and the underlying data-plane backend (currently
 **Three layers, one-way dependency:**
 
 ```
-algorithms/grpo_sync.py            ← orchestration (sync trainer)
+algorithms/single_controller.py    ← orchestration
         │
         ▼
 data_plane/{column_io, preshard}   ← producer/consumer helpers
@@ -32,82 +32,6 @@ data_plane/interfaces.py           ← stable boundary (DataPlaneClient)
         ▼
 data_plane/adapters/               ← TransferQueue / NoOp
 ```
-
----
-
-## Legacy vs TQ-mediated — same algorithm, encapsulated I/O
-
-The TQ-mediated trainer (`grpo_train_sync`) is meant to read like the legacy in-memory trainer (`grpo_train`). The algorithm is identical; only the data-fetch and lifecycle calls move behind `TQPolicy` / `meta` methods. Per-step side-by-side:
-
-| Step | Legacy (`grpo.py: grpo_train`) | TQ-mediated (`grpo_sync.py: grpo_train_sync`) |
-|---|---|---|
-| Step start | (implicit) | `policy.prepare_step(N, group_size)` |
-| Rollout | `run_multi_turn_rollout(...)` driver-side | `ray.get(rollout_actor.rollout_to_tq.remote(...))` — bulk written to TQ inside the actor |
-| Carry per-row data | `repeated_batch[k]` | `driver_carry[k]` (returned alongside `meta`) |
-| Reward scale / shape / baseline / std | unchanged | unchanged |
-| Mirror std for filter | `std` tensor in scope | `meta.stamp_tags({"std": …, "baseline": …})` |
-| Dynamic sampling filter | `repeated_batch.select_indices(keep_idx)` | `meta.subset(keep_idx)` + `driver_carry.select_indices(keep_idx)` (inside `_apply_dynamic_sampling`, which also `kv_clear`s dropped uids) |
-| Overlong filter / mask | unchanged | unchanged |
-| Read columns for masking | `repeated_batch["generation_logprobs"]`, `repeated_batch["token_mask"]` | `policy.read_from_dataplane(meta, select_fields=["generation_logprobs", "token_mask"])` |
-| Compute advantage | unchanged | unchanged |
-| Write back advantage | mutate `repeated_batch["advantages"]` | `policy.write_to_dataplane(meta, {"advantages": …})` |
-| Train | `policy.train(repeated_batch, loss_fn)` | `policy.train_from_meta(meta, loss_fn)` |
-| Step end | (Python GC) | `policy.finish_step(meta)` |
-
-**The shape of the algorithm is unchanged.** Each TQ-mediated step has a one-to-one counterpart in legacy; the only difference is where data lives (Python memory vs TQ) and which method moves it.
-
-Per-stage audit grade after the encapsulation refactor: **A**. The trainer body never references `policy.dp_client` directly — only meta and policy methods. `_apply_dynamic_sampling` still takes a raw `dp_client` argument by design so unit tests can inject `NoOpDataPlaneClient`.
-
----
-
-## E2E flow — one sync GRPO step
-
-```
-┌─ DRIVER · grpo_train_sync ───────────────────────────────────────────┐
-│ ① policy.prepare_step(num_samples, group_size)                       │
-│      → register "train" partition with DP_TRAIN_FIELDS schema        │
-│ ② meta, driver_carry, *_ = ray.get(                                  │
-│       rollout_actor.rollout_to_tq.remote(repeated_batch, uids=…))    │
-│      ← single Ray RPC; actor runs rollout + flatten + mask +         │
-│        kv_first_write of bulk under uid-derived keys.                │
-└────────────┬─────────────────────────────────────────────────────────┘
-             │ bulk now in TQ; driver has meta + driver_carry slice
-             ▼
-┌─ DRIVER (reward + advantage, on driver_carry only) ──────────────────┐
-│ ③ scale_rewards / apply_reward_shaping (legacy parity)               │
-│ ④ baseline, std, _ = calculate_baseline_and_std_per_prompt(...)      │
-│   meta.stamp_tags({"std": …, "baseline": …})                         │
-│      → filter-without-fetch primitive on meta                        │
-│ ⑤ [optional] _apply_dynamic_sampling(meta, driver_carry, …)          │
-│      → meta.subset(keep) + driver_carry.select_indices(keep)         │
-│      → dp_client.kv_clear(dropped_keys)                              │
-│ ⑥ overlong filter (loss_multiplier = 0 on truncated rows)            │
-└────────────┬─────────────────────────────────────────────────────────┘
-             ▼
-┌─ DRIVER → WORKERS (logprob phase) ───────────────────────────────────┐
-│ ⑦ prev_lp = policy.get_logprobs_from_meta(meta)                      │
-│   ref_lp  = policy.get_reference_policy_logprobs_from_meta(meta)     │
-│      ↓ inside the policy method:                                     │
-│         shard_meta_for_dp(meta) — length-balanced split, pure meta   │
-│         fan-out: worker.get_logprobs_presharded.remote(shard) × N    │
-│           → _fetch(shard) → kv_batch_get → materialize               │
-│           → forward → logprobs                                       │
-│           → leader writes back as new TQ column on meta.keys         │
-│ ⑧ extras  = policy.read_from_dataplane(meta, select_fields=[…])      │
-│   advantages = compute_advantages(...)                               │
-│ ⑨ policy.write_to_dataplane(meta, {"advantages": …, "sample_mask":…})│
-└────────────┬─────────────────────────────────────────────────────────┘
-             ▼
-┌─ DRIVER → WORKERS (train + cleanup) ─────────────────────────────────┐
-│ ⑩ policy.train_from_meta(meta, loss_fn=…)                            │
-│      ↓ same shard_meta_for_dp + fan-out shape; no write-back         │
-│        (training is terminal).                                       │
-│ ⑪ policy.finish_step(meta) → drop step's bulk from TQ                │
-└──────────────────────────────────────────────────────────────────────┘
-                                                  → next step → ①
-```
-
-Bulk tensors live in TQ; the driver only holds `meta` + the small `driver_carry` slice. On-wire layout is jagged (`codec.pack_jagged_fields` ↔ `codec.materialize` at every put / get).
 
 ---
 
@@ -151,7 +75,7 @@ The receipt for a put. `meta.fields` is only what was written by *this* put, not
 
 | Helper | What it does |
 |---|---|
-| `column_io.kv_first_write` | Rollout actor's flat first put. Caller mints `keys`. |
+| `column_io.kv_first_write` | Flat first put. Caller mints `keys`. |
 | `column_io.read_columns` / `write_columns` | `kv_batch_get` / `kv_batch_put` + jagged ↔ padded materialize. |
 | `preshard.shard_meta_for_dp` | Pure metadata split, length-balanced when packing args are passed. |
 | `KVBatchMeta.subset` / `.slice` / `.concat` | Pure meta transforms used by dynamic sampling; thread `tags` 1:1 with `keys`. |
@@ -169,145 +93,12 @@ Worker write-backs append new columns under the same keys.
 
 ## Concrete examples
 
-### Call shapes
-
-A real step at production scale — `num_prompts_per_step=128, num_generations_per_prompt=4`, DP world = 8, prompt ≈ 512 tok, response ≤ 1024 tok. Final batch is `128 × 4 = 512` rows.
-
-**1. Step prepare + rollout** (driver — `grpo_train_sync` body):
-
-```python
-# Open the per-step TQ partition. Cleared and reused across steps.
-policy.prepare_step(num_samples=512, group_size=4)
-
-# One Ray RPC bundles: clear gen metrics → rollout → flatten + mask →
-# kv_first_write of bulk to TQ → finish_generation → metrics snapshot.
-# The actor handles 6 stages internally; the driver gets back the
-# meta handle + a small per-row tensor slice.
-n_prompts = repeated_batch.size                # 512 (= 128 prompts × 4 gens)
-uids = [str(uuid.uuid4()) for _ in range(n_prompts // 4)]   # 128 uids
-meta, driver_carry, rollout_metrics, gen_metrics = ray.get(
-    rollout_actor.rollout_to_tq.remote(
-        repeated_batch,
-        uids=uids,
-        partition_id=policy.tq_partition_id,         # "train"
-        first_iter=(dynamic_sampling_num_gen_batches == 1),
-    )
-)
-# meta.keys             ≈ ["a3f9_g0", "a3f9_g1", "a3f9_g2", "a3f9_g3",
-#                          "b7c1_g0", …]                       (512 keys)
-# meta.sequence_lengths ≈ [847, 612, 1503, 989, 711, …]        (actual lens)
-# meta.fields           = ["input_ids", "input_lengths",
-#                          "generation_logprobs", "token_mask",
-#                          "sample_mask", …multimodal extras…]
-# driver_carry          : BatchedDataDict of per-row tensors
-#                         (total_reward, loss_multiplier, truncated,
-#                          length, input_lengths, prompt_ids_for_adv,
-#                          response_token_lengths, GDPO components)
-```
-
-**2. Reward + dynamic sampling** (driver, on `driver_carry` only):
-
-```python
-driver_carry = scale_rewards(driver_carry, cfg["grpo"]["reward_scaling"])
-if cfg["grpo"]["reward_shaping"]["enabled"]:
-    driver_carry = apply_reward_shaping(driver_carry, cfg["grpo"]["reward_shaping"])
-driver_carry["baseline"], driver_carry["std"], _ = (
-    calculate_baseline_and_std_per_prompt(
-        driver_carry["prompt_ids_for_adv"],
-        driver_carry["total_reward"],
-        torch.ones_like(driver_carry["total_reward"]),
-        leave_one_out_baseline=cfg["grpo"]["use_leave_one_out_baseline"],
-    )
-)
-# Mirror std/baseline onto meta so dynamic sampling can filter on
-# meta alone (no tensor fetch).
-meta.stamp_tags(
-    {
-        "std": driver_carry["std"].tolist(),
-        "baseline": driver_carry["baseline"].tolist(),
-    }
-)
-
-# DAPO non-zero-std filter — drops rows where the prompt's reward
-# variance is zero, kv_clears their bulk, accumulates survivors
-# across iterations until train_prompts_size (512) is reached.
-if cfg["grpo"]["use_dynamic_sampling"]:
-    pending_meta, pending_carry, *_ = _apply_dynamic_sampling(
-        meta=meta, driver_carry=driver_carry,
-        pending_meta=pending_meta, pending_carry=pending_carry,
-        train_prompts_size=512,
-        num_gen_batches=dynamic_sampling_num_gen_batches,
-        max_gen_batches=cfg["grpo"]["dynamic_sampling_max_gen_batches"],
-        dp_client=policy.dp_client,
-    )
-```
-
-**3. Logprob + advantage + write-back**:
-
-```python
-# Worker fan-out happens inside these. Per-DP-rank shard via
-# shard_meta_for_dp(meta, dp_world=8, …); each worker fetches its
-# ~64 keys via kv_batch_get and writes back the result column under
-# the same keys on the leader.
-prev_lp = policy.get_logprobs_from_meta(meta, timer=timer)["logprobs"]
-ref_lp  = policy.get_reference_policy_logprobs_from_meta(meta, timer=timer)
-ref_lp  = ref_lp["reference_logprobs"]
-
-# Driver-side per-token columns for masking. Tiny delta — just two
-# fields × 512 rows.
-extras = policy.read_from_dataplane(
-    meta,
-    select_fields=["generation_logprobs", "token_mask"],
-    pad_value_dict=_pad_dict,
-)
-advantages = adv_estimator.compute_advantage(
-    prompt_ids=driver_carry["prompt_ids_for_adv"],
-    rewards=rewards, mask=mask,
-    repeated_batch=adv_inputs,
-    logprobs_policy=prev_lp,
-    logprobs_reference=ref_lp,
-)
-
-# Write the per-token advantage + post-masking sample_mask back to TQ
-# under meta.keys so workers fetch the unified view in train.
-policy.write_to_dataplane(
-    meta,
-    fields={"advantages": advantages, "sample_mask": sample_mask},
-)
-```
-
-**4. Train + cleanup**:
-
-```python
-train_results = policy.train_from_meta(meta, loss_fn=loss_fn, timer=timer)
-policy.finish_step(meta)                              # drop step's bulk from TQ
-```
-
-**5. Validation path** — slim `driver_carry` to skip ~1 MB/batch:
-
-```python
-# inside validate_sync; val_batch_size ≈ 64
-policy.prepare_val_partition(n_prompts, partition_id="val")
-meta, driver_carry, rollout_metrics, _ = ray.get(
-    rollout_actor.rollout_to_tq.remote(
-        val_batch, uids=uids, partition_id="val",
-        finish_generation=False,                       # keep inference state warm
-        task_to_env_override=val_task_to_env,
-        # turn_* are not written to TQ; validation gets them via driver_carry
-        carry_keys=["total_reward", "turn_roles", "turn_contents"],
-    )
-)
-total_rewards.extend(driver_carry["total_reward"].tolist())
-roles, contents = driver_carry["turn_roles"], driver_carry["turn_contents"]
-policy.finish_step(meta)
-```
-
 ### Sequence-length flow (seqpack / dynbatch)
 
 How `meta.sequence_lengths` routes samples to DP ranks. Worked example sized to one production microbatch — 4 prompts × 2 generations = 8 samples, DP world = 4, lengths typical of math/code rollouts.
 
 ```
-# Rollout actor flattens prompt + response per sample.
+# The producer flattens prompt + response per sample.
 # input_lengths[i] = prompt_len_i + response_len_i (actual content,
 # unpadded).
 sample 0 (a3f9_g0):  prompt=312, response=  892 → input_lengths=1204
@@ -319,7 +110,7 @@ sample 5 (c0d8_g1):  prompt=148, response=  339 → input_lengths= 487
 sample 6 (d2e1_g0):  prompt=276, response=  651 → input_lengths= 927
 sample 7 (d2e1_g1):  prompt=276, response=  402 → input_lengths= 678
 
-# kv_first_write returns meta row-aligned with keys:
+# The first put returns meta row-aligned with keys:
 meta.keys             = ["a3f9_g0", "a3f9_g1", "b7c1_g0", "b7c1_g1",
                          "c0d8_g0", "c0d8_g1", "d2e1_g0", "d2e1_g1"]
 meta.sequence_lengths = [    1204,       499,      1445,       876,
@@ -374,7 +165,7 @@ All eight keys below are **required** when `enabled=true`. Recipes under `exampl
 
 ```yaml
 data_plane:
-  enabled: false                       # flip to true to engage grpo_train_sync
+  enabled: false                       # the SingleController path requires true
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
   storage_capacity: 1000000            # max samples retained per partition
@@ -412,8 +203,7 @@ data_plane:
 
 `enabled: true` wraps the adapter in `MetricsDataPlaneClient`, which records per-op wall time, latency percentiles (fixed-bucket histogram, so per-rank counts sum into one cluster-wide distribution) and byte volume. `snapshot()` returns the cumulative view; `get_step_metrics(step_time_s)` returns the per-step delta already flattened for the logger.
 
-**Scope: one process, not the cluster.** Every process builds its own client with its own counters — the driver, each policy worker, the rollout actor. `grpo_train_sync` logs the *driver's*, under `data_plane/driver/`.
-The driver issues about one op of each kind per step, so `calls` is small by construction; the bulk traffic is the rollout actor's `kv_first_write` and the workers' per-DP-rank `get_samples`, and neither appears in these series. Do not read `comm_volume_mb` as cluster-wide volume.
+**Scope: one process, not the cluster.** Every process builds its own client with its own counters. A `data_plane/driver/` series covers the driver's client only, so do not read its `comm_volume_mb` as cluster-wide volume.
 
 `OpStats` is additive on purpose, and `merge_snapshots()` uses it: the histogram buckets and the byte and wall-time totals from every rank *sum* into one cluster-wide view. Everything derived — percentiles, the throughput — is recomputed from the merged totals, never averaged across ranks (averaging per-rank percentiles does not give a cluster percentile).
 
@@ -445,16 +235,13 @@ step/percent_of_dataplane/by_op/put                 42.1   within it, put is the
 
 **`frac_of_step` and `wall_s` report the slowest process's data-plane time, which the collective makes everyone wait for.** The denominator is one step's wall clock, so the numerator has to be wall time too. The DP ranks fetch in parallel and then meet at the gradient all-reduce, so no rank passes the barrier until the straggler has its shard: the phase costs what the *slowest* rank paid. Summing the ranks gives process-time, which exceeded the step itself (measured 1.054 across ten processes); averaging them reports a cost no rank ever paid. `by_op` percentages still sum, because "where did the time go" is a process-time question, not an elapsed one.
 
-Two things it still understates, both independent of the reduction:
+One thing it still understates, independent of the reduction:
 
 - The driver's ops and the workers' fetches are *serial* with each other, so the exposed total is `driver + max(workers)` and a max over all processes keeps only the larger. The driver issues about one op of each kind per step against the workers' bulk fetches, so the dropped term is small.
-- The rollout actor's `kv_first_write` -- the largest write in the step -- is in the fan-out (see below) but is also serial with the workers' fetches, so the max keeps only the larger of the two. On the sync path that write is on the critical path.
 
 The barrier is also at the all-reduce rather than at the end of the fetch: a fast rank can start forward while a slow one is still fetching, so what leaks through is the straggler's *excess*. `max` is therefore a slight over-statement of the fetch phase and an under-statement overall.
 
 `volume_mb` counts *transfers*, not data size, and two things follow from that. A byte written and later read is counted on both sides. And every reporting process is summed, so four ranks each fetching their own shard count four times. Both are correct for "what crossed the wire" -- every DP rank fetches its shard once for the logprob pass and again for the train pass, so get counts the batch twice. Neither is correct for "how big was the batch", which these series cannot answer.
-
-The rollout actor is in the fan-out (`grpo_train_sync` registers it via `TQPolicy.add_data_plane_snapshot_source`), so `kv_first_write` -- the write of the entire rollout batch -- counts in `volume_mb/by_op/put` and `comm_volume_mb`.
 
 On the cluster path the per-op `wall_ms` is summed over processes that ran concurrently, so the **`by_op` percentages** are shares of aggregate process-time, not of elapsed time. That is the right denominator for "what should I optimise" and the wrong one for "what blocked the step" -- which is what `frac_of_step` answers, and why it takes a max instead.
 
@@ -487,7 +274,7 @@ Two more read differently in the cluster view and are named to say so:
 - **`step/frac_of_step` is the slowest process.** `wall_ms` sums processes that ran concurrently, so dividing it by one step's wall clock exceeded 1 whenever they overlapped (measured 1.054 across ten processes) and read as "105% of the step". Reduced with a max instead, it is the share of the step the slowest process spent in the data plane — the cost the step actually waited on, which is what the name claims.
 - **`step/by_op/{op}/max_ms` is scoped to the step by being reset**, not by being differenced. A maximum cannot be recovered from two cumulative readings the way `calls` and `wall_ms` can, so the reader that consumes it zeroes it — `snapshot(reset_step_window=True)`, which the once-per-step collector passes and an inspection snapshot does not. Without that the cluster path reported the lifetime max: after one 50 ms call every later step still read 50 ms.
 
-`grpo_train_sync` fans out to the driver, every policy worker, and the rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`, since it builds its own client off the worker group), and logs the combined result under `data_plane/cluster/` instead of the driver's own, so `kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one process. The single controller logs the same `data_plane/cluster/` series and adds the processes that do its I/O: the trainer's workers and own client, the finalizer and advantage actors, the vLLM token-capture clients, and the PPO critic and OPD/MOPD teacher workers. Without these, a run with token capture and advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10 processes, against a 6x wider view of the traffic. The fan-out is best-effort — a rank that cannot answer is dropped rather than failing the step.
+The single controller fans out to the processes that do its I/O — the trainer's workers and own client, the finalizer and advantage actors, the vLLM token-capture clients, and the PPO critic and OPD/MOPD teacher workers — and logs the combined result under `data_plane/cluster/` instead of the driver's own. It falls back to `data_plane/driver/` when the fan-out finds only one process. Without these, a run with token capture and advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10 processes, against a 6x wider view of the traffic. The fan-out is best-effort — a rank that cannot answer is dropped rather than failing the step.
 
 **`step/self/frac` is a share of process-time, not of `wall_s`.** Both its terms are summed across processes, so it answers "what fraction of the data plane's process-time was the wrapper". It deliberately does **not** divide by `step/wall_s`, which is a max: a sum over a max is a ratio of nothing. So `self/frac` will not equal `self/overhead_ms / (step/wall_s * 1000)`, and the difference is the DP degree, not an error.
 
@@ -510,7 +297,7 @@ The tail quantile is **p90, not p99**, because a step holds tens of calls, not t
 
 Measured against a no-op inner client on the payload the wire actually carries — 256 ragged rows, 12 MB, jagged per-token fields as `pack_jagged_fields` leaves them: **~37 µs per put, ~15 µs per get**, under 0.1% of a 59 ms operation. What is left is dominated by the per-key attribution `clear_samples` needs to undo.
 
-This is **on in the exemplar config**, which is where a v1 `TypedDict` default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a config with no `observability:` block still falls back to `False` at the factory. It only engages when `data_plane.enabled` is true either way, so it costs nothing for runs that don't use the data plane. There is no default per-op sink: `get_step_metrics()` is the surface, and `grpo_train_sync` logs it once a step under the `data_plane/` prefix — so the series reach whatever backends the run has enabled (wandb, TensorBoard, MLflow). Roughly 5-8 series per distinct op tag. Set `observability.callback` if you additionally want a hook on every transfer; `log_event` is exported for that.
+This is **on in the exemplar config**, which is where a v1 `TypedDict` default lives — so recipes inheriting `grpo_math_1B.yaml` get it, and a config with no `observability:` block still falls back to `False` at the factory. It only engages when `data_plane.enabled` is true either way, so it costs nothing for runs that don't use the data plane. There is no default per-op sink: `get_step_metrics()` is the surface, and the single controller logs it once a step under the `data_plane/` prefix — so the series reach whatever backends the run has enabled (wandb, TensorBoard, MLflow). Roughly 5-8 series per distinct op tag. Set `observability.callback` if you additionally want a hook on every transfer; `log_event` is exported for that.
 
 `verify_tensor_hash: true` additionally records a fingerprint of every row on every put and re-checks it on every get, so a tensor that changes between wire-in and wire-out is reported (`hash/mismatches`) instead of being trained on silently.
 
@@ -719,7 +506,7 @@ The `2 ×` headroom covers dynamic sampling overflow and one step of pipelining 
 ## When `data_plane.enabled=False`
 
 `build_data_plane_client` raises — there is no NoOp prod fallback.
-For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; the sync trainer `grpo_train_sync` requires `enabled=True` and a `TQPolicy`.
+The legacy `nemo_rl.algorithms.grpo` trainers run without the data plane and reject `enabled=true`; the SingleController path requires it.
 
 `NoOpDataPlaneClient` (`adapters/noop.py`) exists only as a unit-test fixture for the ABC contract tests.
 
@@ -737,9 +524,8 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 | DP-rank meta sharding | `nemo_rl/data_plane/preshard.py` |
 | Worker fetch + leader write-back | `nemo_rl/data_plane/worker_mixin.py` |
 | Schema constants | `nemo_rl/data_plane/schema.py` |
-| Rollout actor (first put) | `nemo_rl/experience/sync_rollout_actor.py` |
 | TQ-mediated Policy subclass | `nemo_rl/models/policy/tq_policy.py` |
-| End-to-end orchestration | `nemo_rl/algorithms/grpo_sync.py` |
+| End-to-end orchestration | `nemo_rl/algorithms/single_controller.py` (see `docs/guides/single-controller.md`) |
 | Unit tests | `tests/data_plane/unit/` |
 | Functional tests (real backends) | `tests/data_plane/functional/` |
 
@@ -829,9 +615,3 @@ Set `data_plane.simple.async_checkpoint: true` (needs `ssd_offload.enabled: fals
 - If a captured view cannot be released, checkpointing stops and keeps the unpublished directory; do not delete it while the run is alive.
 
 To measure the gain, compare `exclusive_hold_seconds` and `gym_parked_seconds` with the setting on and off. The phase names are mapped in `_CHECKPOINT_DURATION_PHASES` in `nemo_rl/telemetry/metrics.py`; see `docs/observability/metrics.md`. Inside the barrier, the inventory checks, the recovery-state build and the TQ capture run concurrently, so `exclusive_hold_seconds` tracks the longest of those phases, not their sum. Each cut lists the staging partition once; `staging_inventory_seconds` covers that listing and both the environment's and RL's checks against it.
-
-## Async path (proposed)
-
-The data-plane interface covers both sync and async, but the **sync trainer uses only half of it**. The task-mediated half (`claim_meta` / `get_data` / `check_consumption_status`) is reserved for the async trainer, which is not yet wired into production.
-
-Design proposal, filtering / staleness strategies, and open questions: see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).

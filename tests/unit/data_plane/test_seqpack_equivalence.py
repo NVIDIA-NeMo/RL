@@ -51,7 +51,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
 # is provided by ``tests/unit/data_plane/conftest.py``.
 
 
-# Mirror of the seed-field set in nemo_rl/algorithms/grpo_sync.py.
+# Seed fields a producer writes at first put.
 _DP_SEED_FIELDS = (
     "input_ids",
     "input_lengths",
@@ -105,7 +105,7 @@ def _round_trip_shards_through_tq(
     """Put each shard's seed fields to TQ, fetch back, attach packing metadata.
 
     This is the same dance the production driver+worker does:
-    ``grpo_sync.py`` builds per-rank metas and seeds TQ; ``train_presharded``
+    the driver builds per-rank metas and seeds TQ; ``train_presharded``
     fetches its slice and attaches ``extra_info`` packing metadata.
     """
     n_total = sum(int(s["sample_mask"].shape[0]) for s in pre_shards)

@@ -53,8 +53,7 @@ def shard_meta_for_dp(
 
     Seq-len-aware on top of ``shard_by_batch_size``. No I/O, no key
     minting. Used for every dispatch after rollout (logprob, ref-logprob,
-    train); the rollout actor's first write goes through
-    :func:`nemo_rl.experience.sync_rollout_actor.kv_first_write` directly.
+    train).
 
     Per-rank packing metadata (``micro_batch_indices`` /
     ``micro_batch_lengths`` / ``elem_counts_per_gb``) is set in each

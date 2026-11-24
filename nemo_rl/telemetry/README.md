@@ -41,7 +41,6 @@ Not yet wired:
 | Gap | Effect |
 |---|---|
 | SGLang, TRT-LLM and Megatron generation workers | no `init_telemetry_worker`, no generation spans — only vLLM is instrumented |
-| `grpo_sync.py` | no spans at all |
 | `rl.startup` in other launchers | `init_ray()` opens `rl.setup.ray_init` for every launcher; `run_grpo.py`, `run_grpo_single_controller.py`, and `run_sft_v2.py` open the umbrella around it, while other launchers leave startup phases as root spans |
 | Startup sub-phases inside `setup()` | `rl.setup.workers` is one block on the driver: its phases run concurrently in worker threads, which OTel context does not reach. Each worker's own load is a span (`rl.policy.load_model` / `rl.value.load_model` / `rl.vllm.load_model`) in a separate trace; the driver-side per-phase breakdown is in the `rl.setup.duration` metric |
 | Driver-side startup phases as metrics | `rl_init_timer`'s outer phases (`config`, `ray_connect`, `tokenizer`, `data`, `setup`) are printed by the launcher but never logged, so `rl.setup.duration` carries only the phases from inside `setup()`. Summing the metric does not reconstruct `rl.startup` |
@@ -49,7 +48,6 @@ Not yet wired:
 | SingleController's generation workers | the actor's phases, the transfer queue and the `TQPolicy` / `TQValue` presharded entrypoints are instrumented and parented, but no trace context reaches the generation workers, so their spans form separate traces correlated by `nemo.run.id` |
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | no `init_telemetry_driver`, so a `telemetry:` block in those configs parses and the run succeeds while emitting nothing, driver *and* worker |
 | `VllmGeneration.generate_async` | no `rl.vllm.generate` span, so async rollouts and async validation show `rl.grpo.generation` / `rl.grpo.evaluate` with no generate breakdown inside |
-| `SyncRolloutActor` | the sync data-plane counterpart of the collector; no `init_telemetry_worker`, no rollout spans |
 | Worker `shutdown()` on non-async trainers | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`; elsewhere Ray reaps the actors, so the worker's final flush never runs and its telemetry depends on the periodic export |
 | Trace context into the non-presharded worker paths | the presharded entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces |
 

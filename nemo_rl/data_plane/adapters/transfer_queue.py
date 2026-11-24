@@ -1257,7 +1257,7 @@ class TQDataPlaneClient(DataPlaneClient):
         # — once tq.init/connect runs, Mooncake's engine.so reads the
         # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
         # needed in EVERY process that builds a TQ client (driver,
-        # SyncRolloutActor, every MegatronPolicyWorker rank): Mooncake
+        # every MegatronPolicyWorker rank): Mooncake
         # engine.so writes it into desc.ip_or_host_name, the address peers
         # receive from the metadata service. Without it, getifaddrs()[0]
         # picks usb0 (169.254.x APIPA) and peers fail to connect.

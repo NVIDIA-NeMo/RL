@@ -398,8 +398,7 @@ def test_write_columns_accepts_batched_data_dict_input() -> None:
 
 def test_kv_first_write_rejects_key_count_mismatch() -> None:
     """If ``len(keys) != n_samples``, keys would silently mis-align.
-    Must fail loud. (Caller-side ``n % len(uids) == 0`` is now enforced
-    at the rollout actor — see ``SyncRolloutActor.rollout_and_first_put``.)"""
+    Must fail loud."""
     client = NoOpDataPlaneClient()
     register_train_partition(client, num_samples=5)
     fb = _final_batch(5)

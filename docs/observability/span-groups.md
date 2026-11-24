@@ -142,7 +142,7 @@ In the SingleController the rollout pump advances the epoch on its own clock, so
 
 ### `rl.iteration` is set once per step
 
-Most algorithms open their step inside `nemo_rl.telemetry.instrumentation.iteration_scope`, which stamps `rl.iteration` on every span started within it **in the driver process**. So the step umbrella, the leaves under it and the checkpoint span all carry the same value, and `rl.iteration = 412` selects the driver's whole step rather than the step span alone. `grpo_train_sync`, `async_ppo_train`, `xtoken_off_policy_distillation_train` and `mpo_train` do not open the scope yet, so their spans carry no `rl.iteration`.
+Most algorithms open their step inside `nemo_rl.telemetry.instrumentation.iteration_scope`, which stamps `rl.iteration` on every span started within it **in the driver process**. So the step umbrella, the leaves under it and the checkpoint span all carry the same value, and `rl.iteration = 412` selects the driver's whole step rather than the step span alone. `async_ppo_train`, `xtoken_off_policy_distillation_train` and `mpo_train` do not open the scope yet, so their spans carry no `rl.iteration`.
 
 A span that passes `rl.iteration` itself keeps its own value — lens sets the caller's attributes after the span starts, so they overwrite the scope's value.
 `rl.<algo>.evaluate` does exactly that, because validation also runs once before training starts, where it reports `rl.iteration = 0`: a sentinel for "no step has run yet".
@@ -435,9 +435,7 @@ A group being enabled does not guarantee spans: something has to emit them. Know
 |---|---|
 | SGLang / TRT-LLM / Megatron generation workers | uninstrumented — no `init_telemetry_worker` and no generation spans; only vLLM emits `rl.vllm.*`. (Policy and value workers do initialise telemetry, so their metrics and any future spans are wired.) |
 | `VllmGeneration.generate_async` | no span, so async rollouts and async validation have no generate breakdown under `rl.grpo.generation` / `rl.grpo.evaluate` |
-| `SyncRolloutActor` | the sync data-plane counterpart of the async collector — uninstrumented, so its rollouts produce no spans |
 | Worker flush outside async GRPO | only `async_grpo_train` calls `policy.shutdown()` / `policy_generation.shutdown()`, so on other trainers a worker's last spans depend on the periodic export rather than a flush |
-| `grpo_sync.py` | no spans |
 | Startup phases inside `setup()` | `rl.setup.workers` is one block; its sub-phases run concurrently in worker threads, which OTel context does not reach, so they would detach into their own traces. Read the `rl.setup.duration` metric for the breakdown |
 | `rl.startup` in other launchers | `run_grpo.py`, `run_grpo_single_controller.py`, and `run_sft_v2.py` open the umbrella; other launchers leave `rl.setup.ray_init` as a root span rather than part of a startup waterfall |
 | `rl.init.total` on async PPO | the timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so the span is not emitted there |
