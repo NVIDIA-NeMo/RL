@@ -1331,6 +1331,54 @@ def test_qwen_vl_vision_key_mapping_workaround_still_needed():
         )
 
 
+def _wrap_fake_key_mapping(monkeypatch, fake):
+    """Install the Qwen-VL wrapper around ``fake`` and return the wrapped function."""
+    import nemo_automodel.components.checkpoint.checkpointing as am_ckpt
+
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    monkeypatch.delenv("NRL_DISABLE_QWENVL_VISION_PATCH", raising=False)
+    monkeypatch.setattr(am_ckpt, "get_combined_key_mapping", fake)
+    ckpt_mod._patch_qwen_vl_vision_key_mapping()
+    wrapped = am_ckpt.get_combined_key_mapping
+    assert wrapped is not fake and wrapped._nrl_orig is fake
+    return wrapped
+
+
+@pytest.mark.automodel
+def test_qwen_vl_key_mapping_wrapper_forwards_model_and_passes_callables(monkeypatch):
+    """Automodel may return a callable mapping and passes ``model=``; both go through."""
+    model = object()
+    calls = []
+
+    def renamer(key):
+        return key
+
+    def fake(model_type, model_key_mapping=None, *, model=None):
+        calls.append((model_type, model_key_mapping, model))
+        return renamer
+
+    wrapped = _wrap_fake_key_mapping(monkeypatch, fake)
+
+    assert wrapped("qwen2_5_vl", {"a": "b"}, model=model) is renamer
+    assert calls == [("qwen2_5_vl", {"a": "b"}, model)]
+
+
+@pytest.mark.automodel
+def test_qwen_vl_key_mapping_wrapper_adds_vision_rules_to_dict_results(monkeypatch):
+    """A dict result for Qwen-VL gains the vision and language-model renames."""
+
+    def fake(model_type, model_key_mapping=None, *, model=None):
+        return {}
+
+    wrapped = _wrap_fake_key_mapping(monkeypatch, fake)
+
+    mapping = wrapped("qwen2_vl")
+    assert mapping[r"^visual\."] == "model.visual."
+    assert mapping[r"^model(?!\.(language_model|visual))"] == "model.language_model"
+    assert wrapped("llama") is None
+
+
 def _manager_with_stub_config(monkeypatch):
     """A manager whose Automodel config build is stubbed out (no process groups)."""
     from nemo_rl.models.automodel import checkpoint as ckpt_mod
