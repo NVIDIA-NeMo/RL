@@ -9,6 +9,7 @@ The interface is off by default. The existing chat path is unchanged when it is 
 | Key | Values | Behavior |
 | --- | --- | --- |
 | `policy.generation.vllm_cfg.tito_interface` | `false` (default), `true` | Serve `/v1/tito/generate` and bridge chat continuations onto their parent's tokens. |
+| `policy.generation.vllm_cfg.tito_reject_root_reasons` | `[]` (default), list of Gym root reasons | Answer a call with HTTP 400 instead of re-rendering its history from text when it would start a root for one of these reasons. Requires `tito_interface`. `first_call` is not allowed. |
 
 Requirements, checked when the run starts:
 
@@ -68,6 +69,12 @@ The route answers with HTTP 400 and generates nothing when:
 The parent's turn close is found by counting turn-close tokens, so reasoning that the template drops from earlier turns does not move it. If the rendered history has fewer turn closes than the parent, the request fails instead of falling back to the rendered text.
 
 Requests with media fail on this path.
+
+### Refusing roots
+
+By default a call whose parent cannot be identified starts a root and is counted. With `tito_reject_root_reasons` set, such a call is answered with HTTP 400 and the error code `tito_root_rejected` on both routes, and nothing is generated or recorded. The reasons are Gym's: `no_prefix_match`, `non_user_suffix`, `render_options_changed`, `ambiguous_candidate`, and `worker_rooted`. Use it to check that a harness never rewrites history, or in an experiment that must not contain re-rendered history; a rollout that hits it fails.
+
+Context-measuring requests to `/tokenize` are never refused.
 
 ## Qualification
 

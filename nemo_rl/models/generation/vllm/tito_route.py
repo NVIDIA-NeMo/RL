@@ -25,6 +25,7 @@ from nemo_rl.models.generation.tito import (
     TITO_GENERATE_ROUTE,
     TitoGenerateRequest,
     TitoGenerateResponse,
+    TitoRootRejected,
 )
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
@@ -77,6 +78,7 @@ def register_tito_route(
     worker: Any,
     engine_client: Any,
     abort_request_capture: Callable[[Any, str], Awaitable[None]],
+    reject_root_reasons: frozenset[str],
 ) -> None:
     """Serve token-in/token-out model calls from the worker's engine.
 
@@ -85,6 +87,7 @@ def register_tito_route(
         worker: The generation worker that hosts token capture.
         engine_client: The worker's HTTP engine client.
         abort_request_capture: Fails a request's in-flight capture.
+        reject_root_reasons: Gym root reasons that refuse a call.
     """
     # vLLM is optional outside the serving worker.
     from vllm.entrypoints.serve.utils.api_utils import with_cancellation
@@ -119,6 +122,8 @@ def register_tito_route(
             admission = worker._capture_admission(request)
             if admission is None:
                 return refusal("ng_capture requires token capture on this worker")
+            if admission.root_reason in reject_root_reasons:
+                return refusal(str(TitoRootRejected(admission.root_reason)))
             try:
                 admission, parent = await resolve_tito_parent(worker, admission)
             except ValueError as error:

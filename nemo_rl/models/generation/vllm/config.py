@@ -70,6 +70,9 @@ class VllmSpecificArgs(TypedDict):
     # Serve the token-in/token-out route and bridge chat continuations onto
     # their captured parent's tokens. See docs/design-docs/tito.md.
     tito_interface: NotRequired[bool]
+    # Gym root reasons that fail a call instead of re-rendering its history from
+    # text. Requires tito_interface; first_call cannot be rejected.
+    tito_reject_root_reasons: NotRequired[list[str]]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
@@ -379,6 +382,17 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             raise ValueError(
                 "vllm_cfg.tito_interface and vllm_cfg.tito_model select different "
                 "prompt construction paths; set only one"
+            )
+    reject_root_reasons = vllm_cfg.get("tito_reject_root_reasons")
+    if reject_root_reasons:
+        if not vllm_cfg.get("tito_interface"):
+            raise ValueError(
+                "vllm_cfg.tito_reject_root_reasons requires vllm_cfg.tito_interface"
+            )
+        if "first_call" in reject_root_reasons:
+            raise ValueError(
+                "vllm_cfg.tito_reject_root_reasons cannot contain first_call: every "
+                "rollout starts with one"
             )
     api_server_count = vllm_cfg.get("http_api_server_count", 1)
     if api_server_count < 1:

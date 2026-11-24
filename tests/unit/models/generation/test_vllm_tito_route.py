@@ -30,9 +30,10 @@ from nemo_rl.models.generation.vllm.tito_route import (
 MAX_MODEL_LEN = 16
 
 
-def _admission(mode="token_in", *, prev_len=3, generation_cut=None):
+def _admission(mode="token_in", *, prev_len=3, generation_cut=None, root_reason=None):
     admission = types.SimpleNamespace(
         mode=mode,
+        root_reason=root_reason,
         model_call_id="call-2",
         parent_call_id="call-1",
         prev_len=prev_len,
@@ -160,7 +161,11 @@ def route(monkeypatch):
     abort = AsyncMock()
     app = _App()
     register_tito_route(
-        app, worker=worker, engine_client=engine_client, abort_request_capture=abort
+        app,
+        worker=worker,
+        engine_client=engine_client,
+        abort_request_capture=abort,
+        reject_root_reasons=frozenset({"no_prefix_match"}),
     )
     return types.SimpleNamespace(
         handler=app.routes[TITO_GENERATE_ROUTE],
@@ -230,6 +235,12 @@ def test_captured_call_continues_its_parent(route):
     [
         (None, [4, 5], "requires token capture", False),
         (_admission("candidate"), [4, 5], "decided capture admission", False),
+        (
+            _admission("text", prev_len=0, root_reason="no_prefix_match"),
+            [4, 5],
+            "re-render its history from text (no_prefix_match)",
+            False,
+        ),
         (_admission(), [4] * MAX_MODEL_LEN, "maximum context length", True),
     ],
 )
@@ -301,6 +312,7 @@ def test_token_only_calls_stage_a_training_row(route):
         worker=worker,
         engine_client=route.engine_client,
         abort_request_capture=route.abort,
+        reject_root_reasons=frozenset(),
     )
     handler = app.routes[TITO_GENERATE_ROUTE]
 

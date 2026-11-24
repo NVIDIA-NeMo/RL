@@ -126,7 +126,11 @@ from nemo_rl.models.generation.vllm.generation_cut_route import (
 )
 from nemo_rl.models.generation.vllm.progress_reader import VllmProgressReader
 from nemo_rl.models.generation.capture_context import decide_capture_input
-from nemo_rl.models.generation.tito import bridge_suffix, qualify_bridge
+from nemo_rl.models.generation.tito import (
+    TitoRootRejected,
+    bridge_suffix,
+    qualify_bridge,
+)
 from nemo_rl.models.generation.vllm.tito_route import (
     register_tito_route,
     resolve_tito_parent,
@@ -1652,6 +1656,21 @@ class VllmAsyncGenerationWorkerImpl(
             generation_eos_token_ids = [generation_eos_token_ids]
         model_stop_token_ids |= set(generation_eos_token_ids or ())
         tito_interface = bool(self.cfg["vllm_cfg"].get("tito_interface"))
+        tito_reject_root_reasons = frozenset(
+            self.cfg["vllm_cfg"].get("tito_reject_root_reasons") or ()
+        )
+        if tito_reject_root_reasons:
+            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+            from typing import get_args
+
+            from nemo_gym.token_id_capture.staging.records import RootReason
+
+            unknown = tito_reject_root_reasons - set(get_args(RootReason))
+            if unknown:
+                raise ValueError(
+                    "vllm_cfg.tito_reject_root_reasons names unknown Gym root "
+                    f"reasons: {sorted(unknown)}"
+                )
         if tito_interface:
             if type(engine_client.renderer) is not HfRenderer:
                 raise ValueError(
@@ -1859,6 +1878,7 @@ class VllmAsyncGenerationWorkerImpl(
                 admission = worker_self._capture_admission(request)
                 serving_admission = admission
                 verify_retained_media = False
+                requested_admission = admission
                 if admission is not None and (
                     admission.mode == "candidate"
                     or admission.request_replay is not None
@@ -1883,6 +1903,19 @@ class VllmAsyncGenerationWorkerImpl(
                     serving_admission = decision.serving
                     verify_retained_media = decision.verify_retained_media
                 if tito_interface:
+                    root_reason = None
+                    if requested_admission is not None:
+                        root_reason = requested_admission.root_reason
+                        if (
+                            requested_admission.mode == "candidate"
+                            and admission.mode == "text"
+                        ):
+                            root_reason = "worker_rooted"
+                    # A measuring request generates nothing, so it is not refused.
+                    if root_reason in tito_reject_root_reasons and not getattr(
+                        request, "ng_measure_only", False
+                    ):
+                        raise TitoRootRejected(root_reason)
                     engine_prompt = res[1][0]
                     if engine_prompt.get("mm_placeholders"):
                         raise VLLMValidationError(
@@ -2493,6 +2526,7 @@ class VllmAsyncGenerationWorkerImpl(
                 worker=worker_self,
                 engine_client=engine_client,
                 abort_request_capture=abort_request_capture,
+                reject_root_reasons=tito_reject_root_reasons,
             )
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
@@ -2569,6 +2603,20 @@ class VllmAsyncGenerationWorkerImpl(
                 LOGGER.warning(
                     "Rejected captured call before inference (%s): %s", e.code, e
                 )
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": e.code,
+                        }
+                    },
+                    status_code=400,
+                )
+            except TitoRootRejected as e:
+                # Raised before begin_call, like MediaCaptureRejected above.
+                await abort_request_capture(request, e.code)
                 return JSONResponse(
                     content={
                         "error": {

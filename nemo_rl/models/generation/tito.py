@@ -65,6 +65,18 @@ class TitoBridgeError(ValueError):
     """The rendered history has no turn close where the captured parent ends."""
 
 
+class TitoRootRejected(ValueError):
+    """A call would start a root for a reason the server is configured to reject."""
+
+    code = "tito_root_rejected"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"The call would re-render its history from text ({reason}), which "
+            "vllm_cfg.tito_reject_root_reasons rejects"
+        )
+
+
 class TitoGenerateRequest(BaseModel, extra="forbid"):
     """One token-in/token-out model call.
 

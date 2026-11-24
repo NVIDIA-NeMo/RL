@@ -238,7 +238,7 @@ A fourth property, that rendering a message and parsing it back returns the orig
 | --- | --- |
 | No parent because this is the first call | Root. |
 | Tools or template arguments changed | Root, counted. The context really changed. |
-| History rewritten or compacted by the harness | Root, counted. Configurable to reject instead. |
+| History rewritten or compacted by the harness | Root, counted. Rejected instead when `vllm_cfg.tito_reject_root_reasons` lists the reason; the same switch covers every root reason except `first_call`. |
 | Several candidate parents with identical token sequences | Use any of them. |
 | Several candidate parents with different token sequences | Root, counted. |
 | Appended items include harness-authored non-user messages | Bridge them; the parent's tokens are still valid. |
@@ -322,7 +322,7 @@ The value of the design is therefore: a contract where there was a side effect, 
 | 0 | Root-reason counts and re-rooted token counts on the existing path | Distribution measured on the SWE recipe. This sizes the benefit of every later phase. | Metrics implemented. Measured on a two-step SWE smoke only; see [SWE smoke](#swe-smoke). |
 | 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation and by training rows built from the route in a unit test. |
 | 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations. The SWE smoke ran two steps with identical root statistics in the first step; prompts were not compared token by token there. |
-| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Not started. The matching rules live in Gym, and the smoke shows no root reason that a rule change would recover. |
+| 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Rejection mode implemented (`vllm_cfg.tito_reject_root_reasons`). Matching-rule changes not started: the rules live in Gym, and the smoke shows no root reason that a rule change would recover. |
 | 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Not started. The Megatron chat endpoint lives in Megatron-LM. |
 
 ## Implementation status

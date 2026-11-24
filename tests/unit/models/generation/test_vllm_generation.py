@@ -5786,8 +5786,12 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
 _WORKER_MODULE = "nemo_rl.models.generation.vllm.vllm_worker_async"
 
 
-def _setup_tito_interface(monkeypatch):
+def _setup_tito_interface(monkeypatch, *, reject_root_reasons=()):
     """Build the HTTP server with the token-in/token-out interface enabled.
+
+    Args:
+        monkeypatch: The pytest fixture used to install the fake module tree.
+        reject_root_reasons: The worker's ``tito_reject_root_reasons``.
 
     Returns:
         The worker, its online renderer, and the qualification and route
@@ -5799,7 +5803,10 @@ def _setup_tito_interface(monkeypatch):
     monkeypatch.setattr(f"{_WORKER_MODULE}.register_tito_route", register)
     worker, serving_chat, _ = _setup_fake_vllm_app(
         monkeypatch,
-        vllm_cfg={"tito_interface": True},
+        vllm_cfg={
+            "tito_interface": True,
+            "tito_reject_root_reasons": list(reject_root_reasons),
+        },
         hf_tokenizer=types.SimpleNamespace(eos_token_id=9),
     )
     worker._capture_media = False
@@ -5887,6 +5894,7 @@ def test_tito_chat_continuation_bridges_onto_the_parent_tokens(monkeypatch, capt
     admission = types.SimpleNamespace(
         mode="token_in",
         request_replay=None,
+        root_reason=None,
         parent_call_id="call-1",
         prev_len=3,
         generation_cut=None,
@@ -5923,6 +5931,58 @@ def test_tito_chat_rejects_a_history_that_does_not_reach_the_parent(monkeypatch)
         _tito_preprocess(monkeypatch, online, request, {"prompt_token_ids": [1, 9, 7]})
 
     worker._begin_request_capture.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("measure_only", [False, True])
+def test_tito_chat_refuses_a_configured_root_reason(monkeypatch, measure_only):
+    from nemo_rl.models.generation.tito import TitoRootRejected
+
+    worker, online, _, _ = _setup_tito_interface(
+        monkeypatch, reject_root_reasons=["no_prefix_match"]
+    )
+    worker._capture_admission = MagicMock(
+        return_value=types.SimpleNamespace(
+            mode="text",
+            request_replay=None,
+            root_reason="no_prefix_match",
+            generation_cut=None,
+        )
+    )
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None,
+        parallel_tool_calls=None,
+        ng_measure_only=measure_only,
+    )
+    engine_prompt = {"prompt_token_ids": [1, 9]}
+
+    if measure_only:
+        _tito_preprocess(monkeypatch, online, request, engine_prompt)
+        assert engine_prompt["prompt_token_ids"] == [1, 9]
+    else:
+        with pytest.raises(TitoRootRejected, match="no_prefix_match"):
+            _tito_preprocess(monkeypatch, online, request, engine_prompt)
+        worker._begin_request_capture.assert_not_called()
+
+
+@pytest.mark.nemo_gym
+def test_tito_interface_rejects_unknown_root_reasons_at_server_setup(monkeypatch):
+    with pytest.raises(ValueError, match="unknown Gym root reasons"):
+        _setup_tito_interface(monkeypatch, reject_root_reasons=["compacted"])
+
+
+def test_chat_route_answers_a_refused_root_with_a_stable_code(monkeypatch):
+    from nemo_rl.models.generation.tito import TitoRootRejected
+
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    serving_chat.create_chat_completion = AsyncMock(
+        side_effect=TitoRootRejected("no_prefix_match")
+    )
+
+    response = asyncio.run(chat_handler(_fake_chat_request(), MagicMock()))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "tito_root_rejected"
 
 
 def test_tito_chat_rejects_multimodal_prompts(monkeypatch):
