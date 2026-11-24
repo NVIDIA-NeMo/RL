@@ -14,7 +14,6 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -334,7 +333,7 @@ def _run_gym_rollouts(
 ):
     """Drive the real _run_rollouts against a fake NeMo-Gym stream."""
     impl = AsyncNemoGymRolloutImpl(
-        tokenizer=SimpleNamespace(pad_token_id=0),
+        tokenizer=None,
         task_to_env={},
         num_generations_per_prompt=len(results),
         max_seq_len=100_000,

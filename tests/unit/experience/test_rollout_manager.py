@@ -1098,6 +1098,7 @@ def test_nemo_gym_metric_namespace_supports_task_source_only_rows(
         ([[1, 5, 7], [1, 5, 7]], 1),
         ([[1, 5, 7], [1, 5, 9]], 2),
         ([[1, 5], [1, 5, 7]], 2),
+        ([[1, 5], [1, 5, 0]], 2),
         (None, None),
     ],
 )
@@ -1107,7 +1108,6 @@ def test_nemo_gym_rollout_first_prompt_metrics(
     from nemo_rl.utils.timer import Timer
 
     impl = _nemo_gym_impl(True)
-    impl._tokenizer = SimpleNamespace(pad_token_id=0)
     impl._num_generations_per_prompt = 2
     impl._task_to_env = {"nemo_gym": object()}
     if first_prompts is None:
@@ -3153,7 +3153,6 @@ def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capt
             return stream()
 
     impl = _nemo_gym_impl(True)
-    impl._tokenizer = SimpleNamespace(pad_token_id=0)
     impl._length_penalty_config = LengthPenaltyConfig(
         default=LengthPenaltyParams(
             length_type="chars", group_total_length_penalty_coeff=0.2

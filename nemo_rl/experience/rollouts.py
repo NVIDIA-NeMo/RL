@@ -3528,18 +3528,8 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
-    # Within one logical prompt group every rollout should start from the same
-    # first prompt. An agent harness that renders a per-rollout identifier (an
-    # id, a URL, a timestamp) into its prompt gives each rollout a distinct
-    # first prompt instead: the group's prefix is never shared across the
-    # engine's prefix cache, and any consumer that keys on the first-prompt
-    # tokens (a per-prompt baseline, a cache, a dedup) sees one group per
-    # rollout. GRPO's baselines key on the explicit group id, so they are not
-    # affected. Check prompt identity within each logical group: separate
-    # groups can share prompt text, and validation and distillation batches
-    # legitimately hold one rollout per prompt. _prepare_nemo_gym_rows stamps
-    # one group id per logical prompt group; rows handed in by a direct caller
-    # without the key form one group.
+    # Count the distinct first prompts, and warn when the rollouts of one logical
+    # prompt group (one _ng_group_id; rows without the key form one group) differ.
     unique_first_prompts, first_prompt_ids = torch.unique(
         input_ids, dim=0, return_inverse=True
     )

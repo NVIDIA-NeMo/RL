@@ -2852,7 +2852,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
-    manager._tokenizer = SimpleNamespace(pad_token_id=0)
+    manager._tokenizer = None
     manager._effort_config = None
     manager._length_penalty_config = None
     manager._results_to_completions = lambda results: (
@@ -3263,7 +3263,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             route_to_shard={"agent": "tools"},
         )
     }
-    manager._tokenizer = SimpleNamespace(pad_token_id=0)
+    manager._tokenizer = None
     manager._effort_config = None
     manager._length_penalty_config = None
     manager._stats = None
@@ -3668,7 +3668,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
             handles={"tools": [first, second]}, route_to_shard={"agent": "tools"}
         )
     }
-    impl._tokenizer = SimpleNamespace(pad_token_id=0)
+    impl._tokenizer = None
     impl._effort_config = None
     impl._length_penalty_config = None
 
