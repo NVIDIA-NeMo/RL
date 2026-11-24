@@ -331,6 +331,21 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
             "set per engine by the Dynamo engine fleet",
             id="engine_role",
         ),
+        pytest.param(
+            _set("disaggregation", "num_prefill_engines", value=0),
+            "at least one prefill and one decode",
+            id="zero_prefill",
+        ),
+        pytest.param(
+            _set("disaggregation", "frontend_tokenize", value=True),
+            "frontend_tokenize false",
+            id="frontend_tokenize",
+        ),
+        pytest.param(
+            _set("real_quant", value=True),
+            "real_quant is not supported",
+            id="real_quant",
+        ),
     ],
 )
 def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
@@ -376,6 +391,18 @@ def test_megatron_generation_refuses_disaggregation_without_dynamo() -> None:
         MegatronGeneration.validate_settings(_master_config(generation))
 
 
+@pytest.mark.parametrize("role_key", ["prefill_engine", "decode_engine"])
+def test_megatron_generation_refuses_role_layouts_without_dynamo(role_key) -> None:
+    """Only engines behind Dynamo read the per-role layouts; without it they
+    would be dropped and the run would use the shared layout."""
+    generation = _megatron_config(
+        dynamo=False, **{role_key: {"tensor_model_parallel_size": 8}}
+    )
+    generation["disaggregation"]["enabled"] = False
+    with pytest.raises(ValueError, match="ignored without it"):
+        MegatronGeneration.validate_settings(_master_config(generation))
+
+
 def test_dynamo_cfg_is_the_shared_dynamo_schema() -> None:
     """Megatron reads the same ``dynamo_cfg`` block as vLLM, Gym fields included."""
     validate_megatron_dynamo_generation(
@@ -404,3 +431,11 @@ def test_nvlink_domain_span_is_the_widest_engine() -> None:
     )
     assert replica_width(policy) == 6
     assert MegatronGeneration.nvlink_domain_span(policy) == 4  # type: ignore[arg-type]
+    # Decode wider than prefill: the span must follow the wider role.
+    wide_decode = _policy(
+        _megatron_config(
+            prefill_engine={"tensor_model_parallel_size": 1},
+            decode_engine={"tensor_model_parallel_size": 4},
+        )
+    )
+    assert MegatronGeneration.nvlink_domain_span(wide_decode) == 4  # type: ignore[arg-type]

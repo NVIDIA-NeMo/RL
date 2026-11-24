@@ -895,7 +895,7 @@ def setup(
     configure_lora_refit(policy_config)
     if dynamo_enabled(generation_config) and generation_config["backend"] == "megatron":
         # Megatron engines behind Dynamo are built by the SingleController
-        # setup only; refuse before any side effect on the config or cluster.
+        # setup only; refuse before any cluster, logger or data side effect.
         raise NotImplementedError(
             "policy.generation.dynamo=true with backend=megatron runs only under "
             "the SingleController (examples/run_grpo_single_controller.py); use "
