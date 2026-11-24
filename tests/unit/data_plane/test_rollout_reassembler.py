@@ -360,20 +360,22 @@ def test_finalize_group_does_not_stamp_agent_names_by_default(tq_client, partiti
 
 
 @pytest.mark.parametrize(
-    ("stopped_call", "finish_reason", "truncated"),
+    ("stopped_call", "finish_reason", "attribution_reason", "truncated"),
     [
         # The scored terminal stopped at its output-token cap: truncated even
         # though the row is far shorter than max_seq_len.
-        ("terminal", "length", True),
-        ("terminal", "max_output_tokens", True),
+        ("terminal", "length", None, True),
+        # Token-identical retries of the terminal recorded different finish
+        # reasons: Gym gives no verdict, so the row is not truncated.
+        ("terminal", "length", "finish_reason_disagreement", False),
         # A normal stop, or a cap hit on an earlier call that the terminal
         # continued from, is not truncation.
-        ("terminal", "stop", False),
-        ("parent", "length", False),
+        ("terminal", "stop", None, False),
+        ("parent", "length", None, False),
     ],
 )
 def test_finalize_group_counts_output_cap_stops_as_truncated(
-    tq_client, partitions, stopped_call, finish_reason, truncated
+    tq_client, partitions, stopped_call, finish_reason, attribution_reason, truncated
 ):
     group_id = "grpcap"
     rollout_id = f"{group_id}_g0"
@@ -381,6 +383,8 @@ def test_finalize_group_counts_output_cap_stops_as_truncated(
         tq_client, "worked_example", rollout_id=rollout_id
     )
     receipt["capture_key"] = rollout_id
+    if attribution_reason is not None:
+        receipt["terminal_attribution_reason"] = attribution_reason
     terminal = receipt["terminal_model_call_id"]
     target = next(
         record

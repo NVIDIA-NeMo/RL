@@ -103,10 +103,6 @@ from nemo_rl.utils.length_penalty import (
     apply_group_length_penalties_from_inputs,
 )
 
-# Finish reasons of a generation stopped by its output-token cap (vLLM / OpenAI
-# chat, completions, Responses), as the receipt path checks them for Forest rows.
-_OUTPUT_CAP_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
-
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -146,9 +142,9 @@ class FinalizedRollout:
     # (model call ID, weight version stamped when it began, tokens it generated)
     # for the same owned calls.
     call_versions: tuple[tuple[str, int, int], ...] = ()
-    # The scored terminal call stopped at its output-token cap (finish reason
-    # length / max_tokens / max_output_tokens), whether or not the row fills
-    # max_seq_len.
+    # The scored terminal call stopped at its output-token cap (Gym's
+    # ``incomplete_reason`` is ``max_output_tokens``), whether or not the row
+    # fills max_seq_len.
     stopped_at_output_cap: bool = False
 
 
@@ -489,6 +485,9 @@ class RolloutReassembler:
         substitutes a placeholder.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.records import (
+            MAX_OUTPUT_TOKENS_INCOMPLETE_REASON,
+        )
         from nemo_gym.token_id_capture.staging.rebuild import (
             RebuildError,
             ReceiptVerificationError,
@@ -740,10 +739,10 @@ class RolloutReassembler:
                     flags.malformed_thinking and call_id not in loss_excluded_call_ids
                 ] * generation_len
                 position = end
-        terminal_record = records_by_call.get(parsed.terminal_model_call_id)
+        # Gym's verdict on the rebuilt row: no verdict (None) when token-identical
+        # retries of the terminal call recorded different finish reasons.
         stopped_at_output_cap = (
-            getattr(terminal_record, "finish_reason", None)
-            in _OUTPUT_CAP_FINISH_REASONS
+            row.incomplete_reason == MAX_OUTPUT_TOKENS_INCOMPLETE_REASON
         )
         return FinalizedRollout(
             rollout_id=rollout_id,
@@ -904,7 +903,8 @@ class RolloutReassembler:
         row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
-        instead, from each row's rebuilt length against ``max_seq_len``.
+        instead, by ``_truncated_flags``: the row fills ``max_seq_len``, or its
+        scored terminal call stopped at its output-token cap.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
