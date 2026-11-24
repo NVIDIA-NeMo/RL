@@ -66,7 +66,7 @@ from nemo_rl.algorithms.metric_utils import (
     RolloutCheckpointAttemptReason,
     rollout_checkpoint_reason_key,
 )
-from nemo_rl.algorithms.swe_privileged_critic import PRIVILEGE_PREFIXES_FILENAME
+from nemo_rl.algorithms.ppo_utils.privileged_value import PRIVILEGE_PREFIXES_FILENAME
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
     list_staging_keys,

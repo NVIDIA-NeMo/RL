@@ -49,6 +49,7 @@ from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
+    has_logical_owners,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
@@ -1197,9 +1198,9 @@ class TQReplayBuffer:
         self._rollout_ids_list: list[Optional[list[str]]] = []
         self._staging_keys_list: list[Optional[list[str]]] = []
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
-        self._post_write_enricher: Optional[
+        self._post_write_enrichers: list[
             Callable[[KVBatchMeta, Optional[dict[str, Any]]], Awaitable[KVBatchMeta]]
-        ] = None
+        ] = []
         # Sampler selection removes ready slots from the live replay index but
         # deliberately leaves their rows in TQ until optimizer completion.
         # Retain their metadata here so a periodic checkpoint can make an open
@@ -1226,14 +1227,14 @@ class TQReplayBuffer:
             raise RuntimeError("data-plane checkpoint barrier is not configured")
         return self._data_plane_checkpoint_barrier
 
-    def set_post_write_enricher(
+    def add_post_write_enricher(
         self,
         enricher: Callable[
             [KVBatchMeta, Optional[dict[str, Any]]], Awaitable[KVBatchMeta]
         ],
     ) -> None:
-        """Install the required enrichment stage run before slots become ready."""
-        self._post_write_enricher = enricher
+        """Append a required enrichment stage run, in order, before slots become ready."""
+        self._post_write_enrichers.append(enricher)
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -1357,15 +1358,13 @@ class TQReplayBuffer:
                     tags=[dict(t) for t in tags],
                 )
 
-                if self._post_write_enricher is not None:
-                    try:
-                        meta = await self._post_write_enricher(
-                            meta, record.extra_env_info
-                        )
-                    except Exception as error:
-                        raise PostWriteEnrichmentError(
-                            f"post-write enrichment failed for group_id={group_id!r}"
-                        ) from error
+                try:
+                    for enricher in self._post_write_enrichers:
+                        meta = await enricher(meta, record.extra_env_info)
+                except Exception as error:
+                    raise PostWriteEnrichmentError(
+                        f"post-write enrichment failed for group_id={group_id!r}"
+                    ) from error
 
                 try:
                     idx = self._group_ids.index(group_id)
@@ -1515,9 +1514,10 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
-        if self._post_write_enricher is not None:
+        if self._post_write_enrichers:
             try:
-                meta = await self._post_write_enricher(meta, extra_env_info)
+                for enricher in self._post_write_enrichers:
+                    meta = await enricher(meta, extra_env_info)
             except Exception as error:
                 raise PostWriteEnrichmentError(
                     f"post-write enrichment failed for group_id={group_id!r}"
@@ -1890,7 +1890,6 @@ class TQReplayBuffer:
         """
         # Defer to avoid the SC setup -> replay buffer import cycle.
         from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-            has_logical_owners,
             validate_logical_owner_metadata,
         )
 

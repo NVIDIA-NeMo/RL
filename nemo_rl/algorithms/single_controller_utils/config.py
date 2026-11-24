@@ -57,10 +57,7 @@ from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
-from nemo_rl.algorithms.swe_privileged_critic import privilege_budget_tokens
-from nemo_rl.algorithms.swe_privileged_critic import (
-    resolve_config as resolve_swe_privileged_critic_config,
-)
+from nemo_rl.algorithms.ppo_utils.privileged_value import privilege_budget_tokens
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
@@ -1399,17 +1396,19 @@ def _validate_failure_settings(
         )
 
 
-def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
+def _validate_privileged_value(master_config: MasterConfig) -> None:
     """Check the critic can hold the privileged sequences."""
     value_cfg = master_config.value
-    privilege_cfg = resolve_swe_privileged_critic_config(value_cfg)
-    if value_cfg is None or privilege_cfg is None:
+    if value_cfg is None:
+        return
+    privilege_cfg = value_cfg.get("privileged_value")
+    if privilege_cfg is None or not privilege_cfg.enabled:
         return
     ppo_config = master_config.ppo
     assert ppo_config is not None  # a value block implies the PPO path
     if ppo_config.value_training_mode != "whole_batch":
         raise ValueError(
-            "value.swe_privileged_critic requires ppo.value_training_mode="
+            "value.privileged_value requires ppo.value_training_mode="
             "whole_batch: the split value-training path does not splice the "
             "reference block, so the critic would train blind."
         )
@@ -1420,14 +1419,14 @@ def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
         "value.max_total_sequence_length": value_cfg["max_total_sequence_length"]
     }
     for batching in ("sequence_packing", "dynamic_batching"):
-        batching_cfg = value_cfg.get(batching)
+        batching_cfg = cast(Optional[Mapping[str, Any]], value_cfg.get(batching))
         if batching_cfg is not None and batching_cfg["enabled"]:
             for key in ("train_mb_tokens", "logprob_mb_tokens"):
                 budgets[f"value.{batching}.{key}"] = batching_cfg[key]
     too_small = {name: size for name, size in budgets.items() if size < needed}
     if too_small:
         raise ValueError(
-            "value.swe_privileged_critic prefixes every critic row with up to "
+            "value.privileged_value prefixes every critic row with up to "
             f"{privilege_budget_tokens(privilege_cfg)} tokens, so the critic needs "
             f"policy.max_total_sequence_length + that = {needed} tokens, but "
             f"{too_small} is smaller."
@@ -1875,7 +1874,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
         )
 
-    _validate_swe_privileged_critic(master_config)
+    _validate_privileged_value(master_config)
 
     sampler_name = async_config.sampler.name
     if sampler_name not in ("in_order", "ready_first"):

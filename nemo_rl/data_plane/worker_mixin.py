@@ -37,11 +37,6 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 import numpy as np
 import torch
 
-from nemo_rl.algorithms.swe_privileged_critic import (
-    policy_view_meta,
-    prepend_privilege_prefix,
-    values_to_policy_layout,
-)
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -49,6 +44,11 @@ from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.column_io import fetch_columns
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, gdr_enabled
 from nemo_rl.data_plane.observability import is_metrics_client
+from nemo_rl.data_plane.privilege_prefix import (
+    policy_view_meta,
+    prepend_privilege_prefix,
+    values_to_policy_layout,
+)
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -1068,7 +1068,7 @@ class TQWorkerMixin:
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate.
 
-        ``privilege_prefixes`` (SWE privileged critic only) switches the fetched
+        ``privilege_prefixes`` (privileged value only) switches the fetched
         rows to the critic layout: ``meta`` carries critic lengths, and the
         per-token targets are shifted past each row's reference-block prefix.
         """
@@ -1281,13 +1281,14 @@ class TQWorkerMixin:
         Same contract as get_logprobs_presharded, and only the value workers
         mix it in: only the PPO critic implements get_values.
 
-        With ``privilege_prefixes`` (SWE privileged critic), ``meta`` carries
+        With ``privilege_prefixes`` (privileged value), ``meta`` carries
         critic lengths: each row is prefixed with its reference block before the
         forward, and the values are sliced back onto the policy's token positions
         so ``values`` stays in the policy layout for GAE.
         """
         data = self._fetch(meta)
         write_meta = meta
+        policy_lengths: Optional[torch.Tensor] = None
         if privilege_prefixes is not None:
             policy_lengths = data["input_lengths"].clone()
             data = prepend_privilege_prefix(data, meta, privilege_prefixes)
@@ -1297,7 +1298,7 @@ class TQWorkerMixin:
             data=data,
             micro_batch_size=micro_batch_size,
         )
-        if privilege_prefixes is not None:
+        if policy_lengths is not None:
             result["values"] = values_to_policy_layout(
                 result["values"], meta, policy_lengths
             )

@@ -19,9 +19,6 @@ import pprint
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.ppo import MasterConfig, async_ppo_train, ppo_train, setup
-from nemo_rl.algorithms.swe_privileged_critic import (
-    resolve_config as resolve_swe_privileged_critic_config,
-)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -127,9 +124,10 @@ def main() -> None:
             "SingleController PPO entrypoint (run_grpo_single_controller.py); "
             "the legacy PPO entrypoint requires whole_batch."
         )
-    if resolve_swe_privileged_critic_config(config.value) is not None:
+    privilege_cfg = config.value.get("privileged_value")
+    if privilege_cfg is not None and privilege_cfg.enabled:
         raise ValueError(
-            "value.swe_privileged_critic is only supported by "
+            "value.privileged_value is only supported by "
             "run_grpo_single_controller.py; the legacy PPO entrypoint would train "
             "a blind critic."
         )

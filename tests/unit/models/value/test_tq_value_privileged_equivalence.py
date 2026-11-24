@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU equivalence test for the SWE privileged critic's value path.
+"""GPU equivalence test for the privileged value's critic path.
 
 On a real Megatron critic behind the TQ data plane, the feature path (policy-layout
 rows plus ``privilege_prefixes``) must match the plain path run on explicitly
@@ -29,13 +29,14 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.algorithms import swe_privileged_critic as spc
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
+from nemo_rl.algorithms.ppo_utils.swe_privilege_prefix import build_privilege_prefix
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.experience.payload import pack_payload
-from nemo_rl.models.value.config import SwePrivilegedCriticConfig
+from nemo_rl.models.value.config import PrivilegedValueConfig
 from nemo_rl.models.value.tq_value import TQValue
 from tests.unit.models.value.test_megatron_value_worker import (
     _apply_config_updates,
@@ -144,8 +145,8 @@ def _put(
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
     "tp,batching",
-    [(1, "dynamic_batching"), (2, "sequence_packing")],
-    ids=["dp2_dynamic_batching", "tp2_sequence_packing"],
+    [(1, "dynamic_batching"), (2, "sequence_packing"), (2, "sequence_parallel")],
+    ids=["dp2_dynamic_batching", "tp2_sequence_packing", "tp2_sequence_parallel"],
 )
 def test_privileged_values_and_loss_match_explicit_prefix_concatenation(
     tiny_qwen2_model_path: str, tp: int, batching: str
@@ -181,8 +182,24 @@ def test_privileged_values_and_loss_match_explicit_prefix_concatenation(
             num_samples=32,
             consumer_tasks=["value_fwd", "value_train"],
         )
-        store = spc.SwePrivilegePrefixStore(
-            tokenizer, SwePrivilegedCriticConfig(enabled=True, max_total_tokens=64)
+        store = PrivilegePrefixStore(
+            tokenizer,
+            PrivilegedValueConfig(
+                enabled=True,
+                max_total_tokens=64,
+                prefix_builder_fqn=(
+                    f"{build_privilege_prefix.__module__}.build_privilege_prefix"
+                ),
+                prefix_builder_kwargs={
+                    "caps": {
+                        "golden_patch": 64,
+                        "test_patch": 64,
+                        "pass_to_pass": 64,
+                        "fail_to_pass": 64,
+                    }
+                },
+            ),
+            build_privilege_prefix,
         )
 
         # Two groups (two instances), each written in the policy layout and stamped

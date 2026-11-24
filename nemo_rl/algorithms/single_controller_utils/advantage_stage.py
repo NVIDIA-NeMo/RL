@@ -71,7 +71,6 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
-    has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -90,6 +89,7 @@ from nemo_rl.data_plane.schema import (
     INPUT_IDS,
     INPUT_LENGTHS,
     SAMPLER_TOPK_FIELDS,
+    has_logical_owners,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled

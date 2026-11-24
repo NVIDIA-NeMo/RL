@@ -16,11 +16,7 @@
 import torch
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
-
-# Forest rows, execution padding included, name their group here instead
-# (``LogicalRowTag.dispatch_group_id``).
-_FOREST_GROUP_TAG = "dispatch_group_id"
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, has_logical_owners
 
 
 def row_group_ids(meta: KVBatchMeta) -> list[str]:
@@ -48,14 +44,14 @@ def row_group_ids(meta: KVBatchMeta) -> list[str]:
 def prompt_group_ids(meta: KVBatchMeta) -> list[str]:
     """Return the distinct prompt-group ids of ``meta``'s rows, in row order.
 
-    Reads the row tags rather than parsing the ``_g{i}`` suffix back off the
-    sample ids, so every consumer agrees with the advantage stage about what
-    a group is. Forest rows carry ``dispatch_group_id``; others carry
-    ``GROUP_ID_TAG``.
+    Reads the same tag the advantage stage keys its baseline on rather than
+    parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
+    disagree about what a group is. Forest rows carry ``dispatch_group_id``;
+    others carry ``GROUP_ID_TAG``.
     """
-    if any(_FOREST_GROUP_TAG in tag for tag in meta.tags or []):
+    if has_logical_owners(meta):
         assert meta.tags is not None
-        return list(dict.fromkeys(tag[_FOREST_GROUP_TAG] for tag in meta.tags))
+        return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
     return list(dict.fromkeys(row_group_ids(meta)))
 
 

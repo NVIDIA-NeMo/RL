@@ -48,8 +48,8 @@ from nemo_rl.experience.reward_penalties import (
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
     from nemo_rl.algorithms.async_utils.staleness_sampler import PromptGroupSampler
+    from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
     from nemo_rl.algorithms.rollout_checkpointing.trace import RolloutTrace
-    from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
     from nemo_rl.experience.rollout_manager import RolloutManager
 
 
@@ -107,7 +107,7 @@ class CapturedRolloutState:
     next_nemo_gym_task_index: int
     replacement_reserve: dict[str, list[DatumSpec]]
     replay_metadata: Optional[TQReplayMetadataState]
-    # Privileged critic prefixes the replay groups reference; None without one.
+    # Privileged value prefixes the replay groups reference; None without one.
     privilege_state: Optional[dict[str, Any]]
     rollout_recovery_payload: Optional[bytes]
     rollout_recovery_group_count: Optional[int]
@@ -161,8 +161,8 @@ class RolloutParts:
     data_plane_barrier: DataPlaneCheckpointBarrier
     environment_checkpoint: EnvironmentCheckpoint
     runtime_state: RolloutRuntimeState
-    # The privileged critic's prefix cache; None when the critic is blind.
-    privilege_store: Optional[SwePrivilegePrefixStore]
+    # The privileged value's prefix cache; None when the critic is blind.
+    privilege_store: Optional[PrivilegePrefixStore]
     # Returns the controller's current training counters.
     read_progress: Callable[[], TrainingProgress]
     # The controller's telemetry logger.

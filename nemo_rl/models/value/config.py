@@ -34,40 +34,25 @@ from nemo_rl.models.policy import (
 )
 
 
-class SwePrivilegedCriticCaps(BaseModel, extra="forbid"):
-    """Per-field token ceilings within the reference block's total budget.
+class PrivilegedValueConfig(BaseModel, extra="forbid"):
+    """``value.privileged_value``: prefix the critic input with a reference block.
 
-    They stop one pathological field from consuming the budget (one corpus
-    instance carries a 323k-token golden patch, and pass_to_pass reaches 125k)
-    and deliberately sum to more than the default total, so the total stays the
-    binding constraint.
-    """
-
-    golden_patch: PositiveInt = 24576
-    test_patch: PositiveInt = 16384
-    pass_to_pass: PositiveInt = 4096
-    fail_to_pass: PositiveInt = 4096
-
-
-class SwePrivilegedCriticConfig(BaseModel, extra="forbid"):
-    """``value.swe_privileged_critic``: prefix the critic input with a reference block.
-
-    The block carries the accepted fix and the grading tests of the rollout's SWE
-    instance (see ``nemo_rl.algorithms.swe_privileged_critic``). Keep
-    ``max_total_tokens`` and ``caps`` identical to the critic-pretrain run a critic
-    is warm-started from: they change which content is truncated, a distribution
-    shift the warm start was not trained on.
+    The block is built per prompt from its ``extra_env_info`` by the function at
+    ``prefix_builder_fqn`` and is never shown to the policy. Keep
+    ``max_total_tokens`` and ``prefix_builder_kwargs`` identical to the
+    critic-pretrain run a critic is warm-started from: they change which content
+    is truncated, a distribution shift the warm start was not trained on.
     """
 
     # Build privileged critic inputs. False leaves the critic blind.
-    enabled: bool = False
-    # Token budget for the whole block, spent in priority order fail_to_pass >
-    # golden_patch > test_patch > pass_to_pass. Measured over 400 instances (real
-    # tokenizer) the untruncated block is median 5467 / p90 17683 / p99 77911
-    # tokens, so 32768 truncates ~4.8% of them; privilege/frac_truncated reports
-    # the share a run actually cuts.
-    max_total_tokens: PositiveInt = 32768
-    caps: SwePrivilegedCriticCaps = Field(default_factory=SwePrivilegedCriticCaps)
+    enabled: bool
+    # Token budget for the whole block.
+    max_total_tokens: PositiveInt
+    # Dotted path to build_privilege_prefix(extra_env_info, tokenizer, cfg) ->
+    # (block, stats); see nemo_rl.algorithms.ppo_utils.privileged_value.
+    prefix_builder_fqn: str
+    # Options the builder reads from cfg, e.g. the SWE builder's per-field caps.
+    prefix_builder_kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 class ValueResourcesConfig(BaseModel, extra="forbid"):
@@ -115,10 +100,10 @@ class ValueConfig(TypedDict):
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
 
-    # SWE privileged critic: prefix the critic's input with a reference block
-    # (accepted fix + grading tests). max_total_sequence_length and the packing
-    # token budgets must then cover policy length + the block budget.
-    swe_privileged_critic: NotRequired[SwePrivilegedCriticConfig]
+    # Privileged value: prefix the critic's input with a reference block the
+    # policy never sees. max_total_sequence_length and the packing token budgets
+    # must then cover policy length + the block budget.
+    privileged_value: NotRequired[PrivilegedValueConfig]
 
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]

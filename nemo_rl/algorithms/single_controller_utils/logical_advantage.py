@@ -13,19 +13,12 @@
 # limitations under the License.
 """Validate logical owners for replay restore and the existing GRPO estimator."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import LogicalRowTag, forest_segment_id
-
-_OWNER_TAGS = frozenset(field.name for field in fields(LogicalRowTag))
-
-
-def has_logical_owners(meta: KVBatchMeta) -> bool:
-    """Detect even partially tagged Forest batches so they cannot take ordinary GRPO."""
-    return any(_OWNER_TAGS.intersection(tag) for tag in meta.tags or [])
+from nemo_rl.data_plane.schema import LOGICAL_OWNER_TAGS, forest_segment_id
 
 
 @dataclass(frozen=True)
@@ -64,7 +57,7 @@ def validate_logical_owner_metadata(
     tags = meta.tags
     groups: dict[str, dict[int, list[int]]] = {}
     for row, tag in enumerate(tags):
-        if not _OWNER_TAGS.issubset(tag):
+        if not LOGICAL_OWNER_TAGS.issubset(tag):
             raise ValueError("Forest batches require complete owner tags on every row")
         group = tag["dispatch_group_id"]
         size = tag["logical_group_size"]

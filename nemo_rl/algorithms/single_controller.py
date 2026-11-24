@@ -97,6 +97,7 @@ from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.ppo_utils.privileged_value import privilege_kwargs
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BootstrapCompatibilityIdentity,
 )
@@ -139,9 +140,6 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
     make_debug_writer,
 )
-from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-    has_logical_owners,
-)
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     _maybe_restore_native_data_plane_checkpoint,
@@ -169,6 +167,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.checkpoint import checkpoint_io
+from nemo_rl.data_plane.grouping import prompt_group_ids
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     backend_health_metrics,
@@ -179,6 +178,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    has_logical_owners,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -243,7 +243,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
-    from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
+    from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -358,9 +358,9 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
-    # SWE privileged critic prefix cache, declared on the class for the same
+    # Privileged value prefix cache, declared on the class for the same
     # reason: an instance built without __init__ runs with a blind critic.
-    _privilege_store: Optional[SwePrivilegePrefixStore] = None
+    _privilege_store: Optional[PrivilegePrefixStore] = None
 
     def __init__(
         self,
@@ -583,20 +583,14 @@ class SingleControllerActor:
                 ),
                 on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
             )
-            self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
+            self._buffer.add_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
-        # SWE privileged critic: stamp each group with its reference-block prefix
-        # before it becomes selectable. The buffer takes a single enricher.
+        # Privileged value: stamp each group with its reference-block prefix
+        # before it becomes selectable.
         self._privilege_store = getattr(actor_args, "privilege_store", None)
         if self._privilege_store is not None:
-            if self._teacher_coordinator is not None:
-                raise ValueError(
-                    "value.swe_privileged_critic cannot be combined with "
-                    "on-policy distillation teachers: both need the replay "
-                    "buffer's single post-write enricher."
-                )
-            self._buffer.set_post_write_enricher(self._privilege_store.enrich)
+            self._buffer.add_post_write_enricher(self._privilege_store.enrich)
         if self._value is not None:
             self._trainer.add_data_plane_snapshot_fn(
                 _worker_group_snapshots(self._value.worker_group)
@@ -1448,9 +1442,9 @@ class SingleControllerActor:
     ) -> Optional[dict[str, Any]]:
         """The ``extra_env_info`` the replay buffer's enricher sees for a finalized group.
 
-        Routing metadata comes from the finalized request. The SWE privileged critic
-        needs the prompt's own env info (its golden patch), which the
-        metadata-only request does not carry, so the prompt is looked up.
+        Routing metadata comes from the finalized request. A privileged critic
+        also needs the prompt's own env info, which the metadata-only request
+        does not carry, so the prompt is looked up.
         """
         env_info: dict[str, Any] = {}
         if request.attribution_key is not None:
@@ -1463,9 +1457,9 @@ class SingleControllerActor:
             group_id=request.group_id, sample_id=str(request.prompt_idx)
         )
         if prompt.get("idx") != request.prompt_idx:
-            # The block would describe another instance: fail, not mislabel.
+            # The prefix would describe another prompt: fail, not mislabel.
             raise ValueError(
-                "SWE privileged critic: dataset position "
+                "privileged critic: dataset position "
                 f"{request.prompt_idx} holds prompt idx={prompt.get('idx')!r} "
                 f"(group={request.group_id!r})"
             )
@@ -1820,21 +1814,6 @@ class SingleControllerActor:
             return  # observability disabled -> plain adapter
         metrics, scope = result
         log_step_metrics(self._logger, metrics, self._train_steps, scope)
-
-    @staticmethod
-    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
-        """Return stable prompt-group IDs in canonical sample order.
-
-        Reads the same tag the advantage stage keys its baseline on rather than
-        parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
-        disagree about what a group is. The stage would raise on a batch whose
-        tag is missing anyway; doing it here fails one stage earlier in the
-        same iteration.
-        """
-        if has_logical_owners(meta):
-            assert meta.tags is not None
-            return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
-        return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
     async def _rollout_pump(self) -> None:
@@ -3008,7 +2987,7 @@ class SingleControllerActor:
                             training_claim_ids_after - training_claim_ids_before
                         )
                         if train_meta is not None:
-                            selected_group_ids = self._group_ids_from_meta(train_meta)
+                            selected_group_ids = prompt_group_ids(train_meta)
                             if new_training_claim_ids:
                                 if set(selected_group_ids) != new_training_claim_ids:
                                     raise RuntimeError(
@@ -3638,9 +3617,8 @@ class SingleControllerActor:
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
-                    # In the same cut as the training claims: a rollout snapshot
-                    # re-persists claimed groups, so it must still find their
-                    # prefixes.
+                    # Same cut as the claim release: a snapshot between them would
+                    # re-persist groups whose prefixes are gone.
                     if self._privilege_store is not None:
                         self._privilege_store.release(consumed_metas)
                     for group_id in step_finalizer_group_ids:
@@ -5400,20 +5378,10 @@ class SingleControllerActor:
         await asyncio.to_thread(
             self._value.get_values_from_meta,
             meta,
-            **self._privilege_kwargs(meta),
+            **privilege_kwargs(self._privilege_store, meta),
         )
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
-
-    def _privilege_kwargs(self, meta: KVBatchMeta) -> dict[str, Any]:
-        """Critic-call kwargs carrying the batch's reference-block prefixes.
-
-        Empty unless the critic is privileged, so a blind critic's calls are
-        unchanged.
-        """
-        if self._privilege_store is None:
-            return {}
-        return {"privilege_prefixes": self._privilege_store.prefixes_for(meta)}
 
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int
@@ -5426,13 +5394,13 @@ class SingleControllerActor:
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
-            privilege_kwargs = self._privilege_kwargs(full_meta)
+            critic_kwargs = privilege_kwargs(self._privilege_store, full_meta)
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
                     self._value.train_from_meta,
                     full_meta,
                     value_loss_fn,
-                    **privilege_kwargs,
+                    **critic_kwargs,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects

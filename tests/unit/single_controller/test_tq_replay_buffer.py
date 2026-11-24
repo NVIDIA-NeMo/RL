@@ -551,7 +551,7 @@ class TestTQReplayBufferReserveCommit:
             observations.append((dp.depth(), list(buf.ready_list)))
             return meta.with_fields(["teacher_reference_logprobs"])
 
-        buf.set_post_write_enricher(enrich)
+        buf.add_post_write_enricher(enrich)
         record = _make_record()
         record.extra_env_info = {"agent_ref": {"name": "image_agent"}}
         group_id = buf.reserve(weight_version=3)
@@ -569,7 +569,7 @@ class TestTQReplayBufferReserveCommit:
             del meta, record
             raise RuntimeError("teacher unavailable")
 
-        buf.set_post_write_enricher(fail_enrichment)
+        buf.add_post_write_enricher(fail_enrichment)
         group_id = buf.reserve(weight_version=3)
 
         with pytest.raises(PostWriteEnrichmentError, match="post-write enrichment"):
@@ -1986,7 +1986,7 @@ class TestTQReplayBufferTokenCaptureMode:
                 await release.wait()
                 return meta.with_fields(["teacher_reference_logprobs"])
 
-            buf.set_post_write_enricher(enrich)
+            buf.add_post_write_enricher(enrich)
             task = asyncio.create_task(_commit_finalized(buf, target, meta, 2, 3))
             await asyncio.wait_for(started.wait(), timeout=1)
             assert buf.ready_list == [False, False]

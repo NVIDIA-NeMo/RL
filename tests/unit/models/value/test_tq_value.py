@@ -28,14 +28,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_rl.algorithms.swe_privileged_critic import (
-    PRIVILEGE_KEY_TAG,
-    PRIVILEGE_PREFIX_LEN_TAG,
-)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_VALUE_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
+    PRIVILEGE_KEY_TAG,
+    PRIVILEGE_PREFIX_LEN_TAG,
     VALUE_SEED_FIELDS,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -387,7 +385,7 @@ class TestTQValueSplitFanout:
 
 
 class TestPrivilegedCritic:
-    """SWE privileged critic: the critic runs on ``prefix + policy row`` while
+    """Privileged value: the critic runs on ``prefix + policy row`` while
     ``values`` reaches TQ in the policy layout GAE reads."""
 
     _PREFIX = torch.tensor([9, 9, 9, 9], dtype=torch.int32)

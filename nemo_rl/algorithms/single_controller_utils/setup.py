@@ -69,6 +69,10 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo_utils.privileged_value import (
+    PrivilegePrefixStore,
+    resolve_prefix_builder,
+)
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
@@ -90,10 +94,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     rollout_snapshots_enabled,
     validate_grpo_chunk_cap_alignment,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
-from nemo_rl.algorithms.swe_privileged_critic import (
-    resolve_config as resolve_swe_privileged_critic_config,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.captured_media import media_capture_family
@@ -229,8 +229,8 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
-    # SWE privileged critic (value.swe_privileged_critic.enabled); None otherwise.
-    privilege_store: Optional[SwePrivilegePrefixStore] = None
+    # Privileged value (value.privileged_value.enabled); None otherwise.
+    privilege_store: Optional[PrivilegePrefixStore] = None
     # warmup_first_pass's arguments when the controller runs the trainer warm-up;
     # None when setup already ran it or it does not run.
     trainer_warmup_kwargs: Optional[dict[str, Any]] = None
@@ -2785,13 +2785,19 @@ def setup_single_controller(
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
     print_setup_timing_summary(setup_timing_metrics)
 
-    # SWE privileged critic: the controller caches one reference-block prefix
-    # per instance and stamps it onto rows at commit.
-    # None on a GRPO run, which validation already kept free of a value block.
-    privilege_cfg = resolve_swe_privileged_critic_config(master_config.value)
+    # None on a GRPO run: validation already rejected a value block without ppo.
+    privilege_cfg = (
+        master_config.value.get("privileged_value")
+        if master_config.value is not None
+        else None
+    )
     privilege_store = (
-        SwePrivilegePrefixStore(tokenizer, privilege_cfg)
-        if privilege_cfg is not None
+        PrivilegePrefixStore(
+            tokenizer,
+            privilege_cfg,
+            resolve_prefix_builder(privilege_cfg.prefix_builder_fqn),
+        )
+        if privilege_cfg is not None and privilege_cfg.enabled
         else None
     )
 

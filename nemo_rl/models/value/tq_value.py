@@ -27,6 +27,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.privilege_prefix import critic_view_meta
 from nemo_rl.data_plane.schema import (
     DP_VALUE_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -100,7 +101,7 @@ class TQValue(TQDriverMixin, Value):
             warnings.warn(f"Error closing data-plane client: {e}")
         return super().shutdown()
 
-    # ── SWE privileged critic ──────────────────────────────────────────
+    # ── privileged value ───────────────────────────────────────────────
 
     def _privileged_dispatch(
         self,
@@ -116,10 +117,6 @@ class TQValue(TQDriverMixin, Value):
         """
         if privilege_prefixes is None:
             return meta, {}
-        # Deferred to break an import cycle: swe_privileged_critic imports
-        # nemo_rl.models.value.config, whose package __init__ imports this module.
-        from nemo_rl.algorithms.swe_privileged_critic import critic_view_meta
-
         extra_info = dict(meta.extra_info)
         extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)
         critic_meta = replace(critic_view_meta(meta), extra_info=extra_info)
@@ -145,7 +142,7 @@ class TQValue(TQDriverMixin, Value):
             meta: Full-step batch metadata consumed by all DP ranks.
             micro_batch_size: Inference micro batch size; None uses the config default.
             timer: Optional timer for nested get_values measurements.
-            privilege_prefixes: SWE privileged critic only: reference-block token
+            privilege_prefixes: Privileged value only: reference-block token
                 ids keyed by the rows' privilege tags. Values still land in the
                 policy layout.
         """
@@ -204,7 +201,7 @@ class TQValue(TQDriverMixin, Value):
             gbs: Global batch size; defaults to the config's train_global_batch_size.
             mbs: Micro batch size; defaults to the config's train_micro_batch_size.
             timer: Optional timer for nested value_training measurements.
-            privilege_prefixes: SWE privileged critic only; see get_values_from_meta.
+            privilege_prefixes: Privileged value only; see get_values_from_meta.
 
         Returns:
             Aggregated training-step output dict.

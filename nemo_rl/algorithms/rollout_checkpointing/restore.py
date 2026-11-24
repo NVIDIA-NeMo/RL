@@ -61,6 +61,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     _UsesRolloutParts,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data_plane.schema import PROMPT_IDX_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.checkpointing.interfaces import (
     RestoredEnvironmentRollouts,
@@ -276,7 +277,7 @@ class RolloutRestorer(_UsesRolloutParts):
             )
 
     async def _restore_privilege_prefixes(self, restored_groups: int) -> None:
-        """Re-cache the privileged critic prefixes the restored replay groups reference."""
+        """Re-cache the privileged value prefixes the restored replay groups reference."""
         if self._privilege_store is None or not restored_groups:
             return
         # Replay groups are only ever restored from a checkpoint.
@@ -520,7 +521,7 @@ class RolloutRestorer(_UsesRolloutParts):
 
         for group in groups:
             tags = group["meta"].tags or []
-            prompt_indices = {tag.get("prompt_idx") for tag in tags}
+            prompt_indices = {tag.get(PROMPT_IDX_TAG) for tag in tags}
             if len(prompt_indices) != 1:
                 raise ValueError(
                     "replay-free resume requires one stable prompt_idx per group: "
