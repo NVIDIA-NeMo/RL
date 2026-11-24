@@ -751,7 +751,10 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
 # toolkit than the one uv.lock pins:
 #   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
-# Comma-separated exact pins, so the value survives build systems that pass it unquoted.
+# Comma-separated requirements, so the value survives build systems that pass it unquoted.
+# VLLM_VENV_PACKAGE_OVERRIDES_INDEX is a comma-separated list of extra indexes. Nightly
+# wheels work too: a requirement that names a pre-release (torch==2.16.0.dev20261116+cu135,
+# vllm==0.34.0rc1.dev1193) lets uv pick one.
 # uv.lock cannot express this per extra: the base project also requires torch, so a second
 # torch index for the vllm extra conflicts with it in the same resolution fork. The venvs
 # then no longer match uv.lock: anything that rebuilds them from the lock (a `uv sync`,
@@ -801,6 +804,15 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
     # unsafe-best-match: the override index mirrors only some NVIDIA wheels, so each
     # package must be free to come from whichever index has the requested version.
     IFS=, read -ra vllm_venv_overrides <<< "${VLLM_VENV_PACKAGE_OVERRIDES}"
+    IFS=, read -ra vllm_venv_override_indexes <<< "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}"
+    vllm_venv_index_args=()
+    for index_url in "${vllm_venv_override_indexes[@]}"; do
+        vllm_venv_index_args+=(--index "${index_url}")
+    done
+    # Also pass the list as uv overrides: an overridden vllm wheel pins its own torch,
+    # and the torch requested here must win over that pin.
+    vllm_venv_overrides_file="$(mktemp)"
+    printf '%s\n' "${vllm_venv_overrides[@]}" > "${vllm_venv_overrides_file}"
     while IFS=$'\t' read -r venv_name stage extras; do
         if [[ " $extras " != *" vllm "* ]]; then
             continue
@@ -808,8 +820,9 @@ if [[ -n "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ]]; then
         UV_LINK_MODE=hardlink uv pip install --no-config \
             --python "${NEMO_RL_VENV_DIR}/${venv_name}/bin/python" \
             --default-index https://pypi.org/simple \
-            --index "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}" \
+            "${vllm_venv_index_args[@]}" \
             --index-strategy unsafe-best-match \
+            --overrides "${vllm_venv_overrides_file}" \
             "${vllm_venv_overrides[@]}"
         # flashinfer points Triton at the ptxas on PATH (the base image's CUDA toolkit)
         # unless TRITON_PTXAS_BLACKWELL_PATH is already set. That ptxas can be older than

@@ -87,7 +87,14 @@ docker buildx build -f docker/Dockerfile \
     .
 ```
 
-The value is a comma-separated list of exact pins. Override torch together with its companion packages (torchvision, torchaudio): torchaudio refuses to import next to a torch built for a different CUDA version. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX` (default: the PyTorch cu134 index).
+The value is a comma-separated list of requirements, normally exact pins. Override torch together with its companion packages (torchvision, torchaudio): torchaudio refuses to import next to a torch built for a different CUDA version. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX`, a comma-separated list of extra indexes (default: the PyTorch cu134 index).
+
+The list may include `vllm` itself and nightly wheels. The listed requirements also override what the installed packages ask for, so a vLLM wheel that pins an older torch still installs next to the torch you list. A requirement that names a pre-release allows one for that package:
+
+```sh
+--build-arg VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/nightly/cu135,https://download.pytorch.org/whl/nightly/cu134,https://wheels.vllm.ai/4f0ecfff6be6f4d28ba91ad4d44b43b4100d4f2d \
+--build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0rc1.dev1193,torch==2.16.0.dev20261116+cu135,torchvision==0.30.0.dev20261116+cu134,torchaudio==2.11.0.dev20261116+cu134
+```
 
 When the overridden venv has a Triton wheel with its own `ptxas-blackwell`, the build also sets `TRITON_PTXAS_BLACKWELL_PATH` to it for that venv (through a `.pth` file, unless the variable is already set). Otherwise flashinfer points Triton at the base image's `ptxas`, which can be too old for the GPU the overridden torch targets.
 
