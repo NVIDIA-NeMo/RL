@@ -545,6 +545,24 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
         )
 
 
+def test_setup_rejects_a_different_policy_worker_before_allocation() -> None:
+    from nemo_rl.algorithms import sft_v2
+
+    config = _valid_setup_config()
+    config.policy["worker_extension_cls_fqn"] = (
+        "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+    )
+
+    with (
+        patch.object(sft_v2, "RayVirtualCluster") as cluster_cls,
+        pytest.raises(
+            ValueError, match=r"SFTv2 requires policy\.worker_extension_cls_fqn="
+        ),
+    ):
+        sft_v2.setup_sft_v2(config, MagicMock())
+    cluster_cls.assert_not_called()
+
+
 @pytest.mark.parametrize(
     (
         "sequence_overrides",
@@ -897,3 +915,46 @@ def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
         "policy_init must cover the policy build alone, not the placement wait"
     )
     assert timing.total_setup_time_s == 10.0
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_setup_selects_the_sft_worker_through_config(explicit: bool) -> None:
+    from nemo_rl.algorithms import sft_v2
+
+    sft_worker = "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"
+    config = _valid_setup_config()
+    if explicit:
+        config.policy["worker_extension_cls_fqn"] = sft_worker
+    probe = MagicMock()
+    probe.get_latest_checkpoint_path.return_value = None
+    probe.load_training_info.return_value = None
+    probe.get_resume_paths.return_value = (None, None)
+    worker_at_build: list[Any] = []
+
+    def build_policy(*args: Any, **kwargs: Any) -> MagicMock:
+        # Policy reads the field while it is built, so it must be set by then.
+        worker_at_build.append(kwargs["config"].get("worker_extension_cls_fqn"))
+        return MagicMock()
+
+    with (
+        patch.object(sft_v2, "set_seed"),
+        patch.object(sft_v2, "CheckpointManager", return_value=probe),
+        patch.object(
+            sft_v2, "prepare_segment_topology", return_value=(None, None, None)
+        ),
+        patch.object(sft_v2, "RayVirtualCluster"),
+        patch.object(sft_v2, "TQPolicy", side_effect=build_policy) as tq_policy,
+        patch.object(sft_v2, "resolve_topology_mapper") as resolve_mapper,
+        patch.object(sft_v2, "NLLLossFn"),
+        patch.object(sft_v2, "_restore_save_state"),
+        patch.object(sft_v2, "_max_train_steps", return_value=10),
+    ):
+        resolve_mapper.return_value.map.return_value = SimpleNamespace(
+            logical_world_size=4, placement_hash="hash"
+        )
+        sft_v2.setup_sft_v2(config, MagicMock())
+
+    assert worker_at_build == [sft_worker]
+    assert config.policy["worker_extension_cls_fqn"] == sft_worker
+    assert tq_policy.call_args.kwargs["config"] is config.policy
+    assert "worker_extension_cls_fqn" not in tq_policy.call_args.kwargs

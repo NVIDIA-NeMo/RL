@@ -627,6 +627,29 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
     cluster._init_placement_groups.assert_not_called()
 
 
+def test_policy_rejects_unregistered_resolved_worker_without_worker_extension() -> None:
+    """The resolved worker is checked even when the config names no extension."""
+    config = create_automodel_config("test-model", tp=1)
+    cluster = create_mock_cluster(world_size=1)
+
+    with (
+        patch(
+            "nemo_rl.models.policy.lm_policy.resolve_policy_worker_cls",
+            return_value="tests.extensions.UnregisteredPolicyWorker",
+        ),
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        Policy(cluster=cluster, config=config, tokenizer=create_mock_tokenizer())
+
+    assert config.get("worker_extension_cls_fqn") is None
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [

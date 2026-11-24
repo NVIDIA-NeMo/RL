@@ -385,9 +385,8 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        if self.cfg.get("worker_extension_cls_fqn") is not None:
-            # Validate registration before allocating workers or placement groups.
-            get_actor_python_env(worker_cls)
+        # Validate registration before allocating workers or placement groups.
+        get_actor_python_env(worker_cls)
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(

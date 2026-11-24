@@ -87,6 +87,9 @@ VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
 ENERGON_WORKERS_PER_RANK_ATTR = "rl.energon.workers_per_rank"
 ENERGON_IN_FLIGHT_ATTR = "rl.energon.batches_in_flight_per_rank"
 
+# SFTv2 drives the Energon loader this worker hosts on each DP owner.
+SFT_V2_WORKER = "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"
+
 SFT_V2_TEED_METRICS = (
     TeedMetric(
         LOADER_LATENCY_MAX_KEY,
@@ -569,6 +572,13 @@ def setup_sft_v2(
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
+    configured_worker = master_config.policy.get("worker_extension_cls_fqn")
+    if configured_worker not in (None, SFT_V2_WORKER):
+        raise ValueError(
+            f"SFTv2 requires policy.worker_extension_cls_fqn={SFT_V2_WORKER!r}, "
+            f"got {configured_worker!r}."
+        )
+    master_config.policy["worker_extension_cls_fqn"] = SFT_V2_WORKER
     if master_config.sft.defer_async_checkpoint_finalize:
         megatron_checkpoint_cfg = master_config.policy["megatron_cfg"].get("checkpoint")
         if not (
@@ -706,9 +716,6 @@ def setup_sft_v2(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
-        worker_extension_cls_fqn=(
-            "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"
-        ),
         dp_cfg=master_config.data_plane,
     )
     policy_seconds = time.monotonic() - policy_started

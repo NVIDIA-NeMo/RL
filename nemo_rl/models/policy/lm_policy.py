@@ -341,8 +341,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
 
         # Validate the resolved worker before allocating workers or placement groups.
-        if config.get("worker_extension_cls_fqn") is not None:
-            get_actor_python_env(worker_builder_cls_fqn)
+        get_actor_python_env(worker_builder_cls_fqn)
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size

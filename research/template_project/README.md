@@ -54,12 +54,7 @@ policy:
   worker_extension_cls_fqn: template_project.worker_extension.AutomodelPolicyWorkerExtension
 ```
 
-The `Policy(worker_extension_cls_fqn=...)` constructor argument is deprecated.
-It is copied into the config and follows the same validation rules. If both
-are set, they must match. With `quant_cfg`, the extension must name the exact
-ModelOpt worker for the selected backend; custom subclasses are not accepted
-through either channel. Existing quantization recipes that omit the field
-continue to work: initialization fills it in and warns with the selected FQN.
+The `Policy(worker_extension_cls_fqn=...)` constructor argument is deprecated. It is copied into the config and follows the same validation rules. If both are set, they must match. With `quant_cfg`, the extension must name the exact ModelOpt worker for the selected backend; custom subclasses are not accepted through either channel. Existing quantization recipes that omit the field continue to work: initialization fills it in and warns with the selected FQN.
 
 ## Testing
 
