@@ -616,6 +616,7 @@ data:
 env:
   math:
     num_workers: 8
+    verifier_type: "math"
     math_verify_impl: "hf_math_verify"
 
 logger:
