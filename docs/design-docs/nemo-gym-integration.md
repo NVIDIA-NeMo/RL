@@ -392,6 +392,27 @@ The async GRPO collector uses the same prompt-group contract for Gym and native 
 - Native rollouts still execute as one batch. Their per-sample metrics are aggregated separately for each prompt group before buffering, so batch-level metrics are not duplicated across groups.
 - Gym rows are validated for range, uniqueness, completeness, and single-agent grouping. Results are restored to input order within a prompt group before post-processing.
 
+### First-Prompt Diagnostic
+
+The rollouts of one prompt group should start from the same first prompt. An agent harness that renders a per-rollout string into its prompt, such as an identifier or a timestamp, gives them different first prompts. NeMo RL reports this with three rollout metrics. Two first prompts are the same when their token IDs are equal.
+
+| Metric | Counts |
+|--------|--------|
+| `baseline_groups/distinct_first_prompts` | Distinct first prompts among the rollouts |
+| `baseline_groups/logical_groups` | Prompt groups among the rollouts, by `_ng_group_id` |
+| `baseline_groups/samples` | Rollouts |
+
+The rollouts that the metrics count depend on the rollout path:
+
+- **Synchronous GRPO, PPO, and distillation**, and their validation, process a whole batch in one call, so the metrics count over the batch. When every group shares its first prompt, `distinct_first_prompts` is at most `logical_groups`.
+- **Async GRPO and SingleController** compute the metrics for each prompt group, and a training step logs the mean of each metric over its groups. `logical_groups` is 1 there, and `distinct_first_prompts` is 1 when every group shares its first prompt.
+
+The synchronous paths and async GRPO also log a warning when the rollouts of at least one prompt group do not share the same first prompt. The warning names the attribution keys of those groups (the Agent name of a flat row, `task_id.taskset` of a materialized task) and is logged once per key in a process. A group of one rollout cannot differ, so a batch with one generation per prompt logs no warning. SingleController logs no warning.
+
+With token capture, the results of a SingleController group are receipts that carry no prompt tokens, and the group reports none of the three metrics.
+
+The diagnostic only reports. GRPO forms its baseline groups from prompt-group IDs, not from first-prompt tokens, so the grouping does not change.
+
 ## Data Format Translation
 
 ```mermaid
