@@ -997,6 +997,20 @@ class TestApplyMoeConfig:
 
         assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
 
+    def test_moe_router_enable_expert_bias_is_applied_only_when_configured(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        # A quantile-balancing checkpoint keeps its bias with this flag off.
+        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=False)
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
+
+        _apply_moe_config(model_cfg, config)
+        assert model_cfg.moe_router_enable_expert_bias is False
+
+        config["megatron_cfg"]["moe_router_enable_expert_bias"] = True
+        _apply_moe_config(model_cfg, config)
+        assert model_cfg.moe_router_enable_expert_bias is True
+
     def test_moe_grouped_gemm_absent_keeps_default(self):
         """Absent key leaves the attr unset on the model cfg."""
         from nemo_rl.models.megatron.setup import _apply_moe_config

@@ -477,6 +477,8 @@ class MegatronConfig(TypedDict):
     moe_router_dtype: str | None
     moe_router_load_balancing_type: str | list[str]
     moe_router_bias_update_rate: float
+    # Omit to retain the checkpoint/provider default.
+    moe_router_enable_expert_bias: NotRequired[bool]
     moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
