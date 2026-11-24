@@ -334,10 +334,11 @@ class SingleControllerActor:
     All other actors are passive — they expose methods and wait to be called.
     """
 
-    # async_rl.defer_async_checkpoint_finalize, and the (tmp_step_N path, step) of a
-    # policy save whose async write has not been finalized and published yet.
+    # async_rl.defer_async_checkpoint_finalize, and the (tmp_step_N path, step,
+    # is_final_checkpoint) of a policy save whose async write has not been
+    # finalized and published yet.
     _defer_checkpoint_finalize: bool = False
-    _pending_checkpoint: Optional[tuple[PathLike, int]] = None
+    _pending_checkpoint: Optional[tuple[PathLike, int, bool]] = None
     # rollout_checkpointing.trace's event log. Disabled by default; a disabled
     # trace holds no state, so one instance serves every controller.
     _rollout_trace: RolloutTrace = RolloutTrace(None)
@@ -4949,11 +4950,17 @@ class SingleControllerActor:
         # weight write, so anything written into checkpoint_path after it races
         # the rename.
         await self._publish_when_policy_write_done(
-            checkpoint_path, publish_now=publish_now
+            checkpoint_path,
+            is_final_checkpoint=is_final_checkpoint,
+            publish_now=publish_now,
         )
 
     async def _publish_when_policy_write_done(
-        self, checkpoint_path: PathLike, *, publish_now: bool = False
+        self,
+        checkpoint_path: PathLike,
+        *,
+        is_final_checkpoint: bool = False,
+        publish_now: bool = False,
     ) -> None:
         """Arrange for tmp_step_N to become step_N once the policy write lands.
 
@@ -4962,13 +4969,18 @@ class SingleControllerActor:
         """
         if self._defer_checkpoint_finalize and not publish_now:
             # Published by _finish_pending_save at a later step boundary.
-            self._pending_checkpoint = (checkpoint_path, self._train_steps)
+            self._pending_checkpoint = (
+                checkpoint_path,
+                self._train_steps,
+                is_final_checkpoint,
+            )
             return
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,
+            is_final_checkpoint=is_final_checkpoint,
         )
         await asyncio.to_thread(
             _write_latest_checkpoint_status,
@@ -4995,9 +5007,11 @@ class SingleControllerActor:
             await asyncio.to_thread(self._trainer.finalize_async_save)
         elif not await asyncio.to_thread(self._trainer.poll_async_save):
             return
-        checkpoint_path, step = self._pending_checkpoint
+        checkpoint_path, step, is_final_checkpoint = self._pending_checkpoint
         async with self._rollout_snapshots.trainer_checkpoint():
-            self._checkpointer.begin_finalization(checkpoint_path)
+            self._checkpointer.begin_finalization(
+                checkpoint_path, is_final_checkpoint=is_final_checkpoint
+            )
             # No await between the rename starting and the clear.
             self._pending_checkpoint = None
             await asyncio.to_thread(

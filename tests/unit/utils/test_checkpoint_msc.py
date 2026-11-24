@@ -22,6 +22,7 @@ import pytest
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
+    PublishedCheckpoint,
     _load_checkpoint_history,
     validate_warm_start_checkpoint,
 )
@@ -98,13 +99,13 @@ def test_failed_async_writer_never_publishes(manager):
 
 def test_publish_hooks_receive_the_msc_uri(manager):
     published = []
-    manager._publish_hooks = [lambda **kwargs: published.append(kwargs)]
+    manager._publish_hooks = [published.append]
     checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
 
-    manager.finalize_checkpoint(checkpoint)
+    manager.finalize_checkpoint(checkpoint, is_final_checkpoint=True)
 
     assert checkpoint.startswith("msc://")
-    assert published == [{"step": 1, "path": checkpoint}]
+    assert published == [PublishedCheckpoint(1, checkpoint, True)]
 
 
 def test_existing_checkpoint_cannot_be_overwritten(manager):

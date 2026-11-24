@@ -4751,6 +4751,9 @@ def _grpo_train_impl(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
+                            ),
                         )
 
                         # Record last-successful-checkpoint time/step for external
@@ -6718,6 +6721,9 @@ def async_grpo_train(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
+                            ),
                         )
 
                         # Record last-successful-checkpoint time/step for external

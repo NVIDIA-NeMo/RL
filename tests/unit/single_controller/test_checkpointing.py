@@ -149,6 +149,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
     PretrainedCheckpointConfig,
+    PublishedCheckpoint,
 )
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
@@ -936,6 +937,13 @@ class _FakeDataloader(list):
 
 
 # ── builders ─────────────────────────────────────────────────────────────────
+
+
+published_by_hook: list[PublishedCheckpoint] = []
+
+
+def _record_publish(checkpoint: PublishedCheckpoint) -> None:
+    published_by_hook.append(checkpoint)
 
 
 def _actor_master_config(
@@ -1887,11 +1895,19 @@ class TestSaveTrigger:
         mc = _actor_master_config(
             tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
         )
+        mc.checkpointing.publish_hooks = [f"{__name__}._record_publish"]
+        published_by_hook.clear()
         ckpt_dir = tmp_path / "checkpoints"
         # Step 3's poll finds the step-2 writes unfinished; step 4's finds them done.
         trainer = _PollingTrainer([False, True], ckpt_dir)
 
         _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        # Step 4 was the last step, published from the teardown flush.
+        assert [(c.step, c.is_final_checkpoint) for c in published_by_hook] == [
+            (2, False),
+            (4, True),
+        ]
 
         assert trainer.poll_calls == 2
         assert not trainer.polled_inside_a_train_step
@@ -1929,7 +1945,7 @@ class TestSaveTrigger:
             )
             # A step-1 save is still pending when the train pump fails.
             path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
-            actor._pending_checkpoint = (path, 1)
+            actor._pending_checkpoint = (path, 1, False)
 
             async def _failing_train_pump():
                 raise RuntimeError("injected train failure")
@@ -1968,7 +1984,7 @@ class TestSaveTrigger:
                 mc, _make_actor_args(trainer=trainer), SetupTimingMetrics()
             )
             path = actor._checkpointer.init_tmp_checkpoint(1, {}, mc)
-            actor._pending_checkpoint = (path, 1)
+            actor._pending_checkpoint = (path, 1, False)
             # Another publication (e.g. a rollout snapshot) holds the lock.
             await actor._rollout_snapshots._save_lock.acquire()
             finish = asyncio.create_task(actor._finish_pending_save(blocking=True))
@@ -1980,7 +1996,7 @@ class TestSaveTrigger:
                 await finish
             actor._rollout_snapshots._save_lock.release()
             # Still pending, so the teardown publish finds it.
-            assert actor._pending_checkpoint == (path, 1)
+            assert actor._pending_checkpoint == (path, 1, False)
             await actor._finish_pending_save(blocking=True)
             assert actor._pending_checkpoint is None
             actor._checkpointer.shutdown()

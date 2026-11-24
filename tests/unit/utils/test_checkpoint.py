@@ -24,7 +24,11 @@ import torch
 import yaml
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PublishedCheckpoint,
+)
 
 
 @pytest.fixture
@@ -1450,14 +1454,14 @@ def test_a_non_numeric_staging_name_costs_only_the_span_label(
     assert not staged.exists()
 
 
-published_by_hook: list[dict] = []
+published_by_hook: list[PublishedCheckpoint] = []
 
 
-def _record_publish(**kwargs):
-    published_by_hook.append(kwargs)
+def _record_publish(checkpoint: PublishedCheckpoint) -> None:
+    published_by_hook.append(checkpoint)
 
 
-def _failing_publish(**kwargs):
+def _failing_publish(checkpoint: PublishedCheckpoint) -> None:
     raise RuntimeError("event API down")
 
 
@@ -1479,12 +1483,14 @@ def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
     with pytest.warns(UserWarning, match="failed for step 1: .*event API down"):
         manager.finalize_checkpoint(manager.init_tmp_checkpoint(1, {}))
     with pytest.warns(UserWarning, match="failed for step 2: .*event API down"):
-        manager.begin_finalization(manager.init_tmp_checkpoint(2, {}))
+        manager.begin_finalization(
+            manager.init_tmp_checkpoint(2, {}), is_final_checkpoint=True
+        )
         manager.shutdown()
 
     assert published_by_hook == [
-        {"step": 1, "path": str(checkpoint_dir / "step_1")},
-        {"step": 2, "path": str(checkpoint_dir / "step_2")},
+        PublishedCheckpoint(1, str(checkpoint_dir / "step_1"), False),
+        PublishedCheckpoint(2, str(checkpoint_dir / "step_2"), True),
     ]
 
 
@@ -1505,7 +1511,7 @@ def test_publish_hooks_wait_for_async_write(hooked_manager):
 
     written.set()
     hooked_manager.finalize_pending()
-    assert [hook["step"] for hook in published_by_hook] == [1]
+    assert [checkpoint.step for checkpoint in published_by_hook] == [1]
 
 
 @pytest.mark.parametrize("failing", ["write", "publish"])

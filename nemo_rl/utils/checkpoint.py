@@ -24,6 +24,7 @@ import threading
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
@@ -271,6 +272,23 @@ _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class PublishedCheckpoint:
+    """A checkpoint that has just been published, as passed to publish hooks.
+
+    Attributes:
+        step (int): Training step the checkpoint was saved at.
+        path (str): Published ``step_N`` directory; may be a URI such as
+            ``msc://profile/run/step_N``.
+        is_final_checkpoint (bool): Whether the run saved it after its last
+            step, as passed to the policy's ``save_checkpoint``.
+    """
+
+    step: int
+    path: str
+    is_final_checkpoint: bool
+
+
 class CheckpointManager:
     """Manages model checkpoints during training.
 
@@ -290,11 +308,9 @@ class CheckpointManager:
     ```
 
     Publish hooks (``checkpointing.publish_hooks``) are called as
-    ``hook(*, step: int, path: str)`` once a checkpoint is published, in config
-    order on the thread that publishes it (the background finalization thread
-    for ``begin_finalization``). ``path``
-    is the published ``step_N`` directory and may be a URI such as
-    ``msc://profile/run/step_N``. Hooks are not called when the write or the
+    ``hook(checkpoint: PublishedCheckpoint)`` once a checkpoint is published, in
+    config order on the thread that publishes it (the background finalization
+    thread for ``begin_finalization``). Hooks are not called when the write or the
     publication fails. A hook that raises is reported as a warning and not
     retried; the checkpoint stays published. Hooks delay the next
     finalization and ``shutdown()``, so they should be bounded. A published
@@ -337,7 +353,7 @@ class CheckpointManager:
         self.save_period: int = config.save_period
         self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
         self.save_optimizer = config.save_optimizer
-        self._publish_hooks: list[Callable[..., None]] = [
+        self._publish_hooks: list[Callable[[PublishedCheckpoint], None]] = [
             get_method(name) for name in config.publish_hooks
         ]
 
@@ -451,7 +467,9 @@ class CheckpointManager:
 
         return save_dir
 
-    def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
+    def finalize_checkpoint(
+        self, checkpoint_path: PathLike, *, is_final_checkpoint: bool = False
+    ) -> None:
         """Complete a checkpoint synchronously (rename + delete old).
 
         This is the original synchronous API, preserved for backward
@@ -460,17 +478,21 @@ class CheckpointManager:
 
         Args:
             checkpoint_path (PathLike): Path to the temporary checkpoint directory.
+            is_final_checkpoint (bool): Whether the run saved it after its last step.
         """
-        self._run_publish_hooks(self._storage.publish(checkpoint_path))
+        self._run_publish_hooks(
+            self._storage.publish(checkpoint_path), is_final_checkpoint
+        )
         self.remove_old_checkpoints()
 
-    def _run_publish_hooks(self, published: str) -> None:
+    def _run_publish_hooks(self, published: str, is_final_checkpoint: bool) -> None:
         step = _parse_step(Path(published).name)
         if step is None:
             return
+        checkpoint = PublishedCheckpoint(step, published, is_final_checkpoint)
         for hook in self._publish_hooks:
             try:
-                hook(step=step, path=published)
+                hook(checkpoint)
             except Exception as e:
                 warnings.warn(
                     f"Checkpoint publish hook {hook!r} failed for step {step}: {e!r}",
@@ -481,6 +503,8 @@ class CheckpointManager:
         self,
         checkpoint_path: PathLike,
         wait_fn: Optional[Callable[[], None]] = None,
+        *,
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Start background finalization of a checkpoint.
 
@@ -495,6 +519,7 @@ class CheckpointManager:
             wait_fn: Callable that blocks until all async writes are complete.
                 For Megatron async save: policy.finalize_async_save.
                 For sync saves: None (rename immediately).
+            is_final_checkpoint: Whether the run saved it after its last step.
         """
         self.finalize_pending()
         self._pending_checkpoint_path = as_path(checkpoint_path)
@@ -519,7 +544,7 @@ class CheckpointManager:
                     if wait_fn is not None:
                         wait_fn()
                     published = self._storage.publish(checkpoint_path)
-                    self._run_publish_hooks(published)
+                    self._run_publish_hooks(published, is_final_checkpoint)
                     # Prune old checkpoints off the critical path. Surface any
                     # failure via a done-callback so a broken delete is not
                     # silently swallowed (the discarded Future would otherwise

@@ -2136,6 +2136,7 @@ def ppo_train(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
+                            is_final_checkpoint=is_last_step,
                         )
 
             # Logging
@@ -3118,6 +3119,7 @@ def async_ppo_train(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
+                            is_final_checkpoint=is_last_step,
                         )
 
             # ---- Logging ----
