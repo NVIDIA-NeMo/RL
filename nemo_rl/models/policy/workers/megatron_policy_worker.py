@@ -1162,7 +1162,6 @@ class MegatronPolicyWorkerImpl(
             and self.megatron_cfg.ddp.use_distributed_optimizer
             and not (
                 self.megatron_cfg.dist.use_torch_fsdp2
-                or self.megatron_cfg.dist.use_megatron_fsdp
                 or self.megatron_cfg.ddp.use_megatron_fsdp
                 or self.megatron_cfg.ddp.use_custom_fsdp
                 or self.megatron_cfg.optimizer.use_layer_wise_distributed_optimizer
