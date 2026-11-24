@@ -304,6 +304,7 @@ if TYPE_CHECKING:
     )
 
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.policy import PolicyConfig
 
 
 class MegatronGenerationMixin:
@@ -354,6 +355,13 @@ class MegatronGenerationMixin:
         self._token_capture_enabled = False
         self._request_payload_stager = None
         self._request_prompt_preparer = None
+
+    def _check_generation_requirements(self, config: "PolicyConfig") -> None:
+        """Fail before the model loads if this worker cannot build its engine.
+
+        Called first in the worker's constructor, with the constructor's
+        config (``self.cfg`` is not set yet). The plain engine needs nothing.
+        """
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         """Extra ``InferenceConfig`` kwargs; the plain engine needs none."""

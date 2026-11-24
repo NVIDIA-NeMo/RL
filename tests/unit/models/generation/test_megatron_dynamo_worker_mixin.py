@@ -29,7 +29,7 @@ pytestmark = pytest.mark.mcore
 
 
 class _Worker(MegatronDynamoGenerationMixin, MegatronGenerationMixin):
-    """MegatronDynamoPolicyWorker's generation bases, in the order it composes them."""
+    """MegatronPolicyWorkerImpl's generation bases, in the order it composes them."""
 
 
 def _bare_worker(role, cls=_Worker):
@@ -77,11 +77,112 @@ def test_plain_worker_builds_the_plain_engine(engine_modules):
     handoff.assert_not_called()
 
 
-def test_dynamo_worker_needs_its_role():
-    worker = _bare_worker(role=None)
+# Every override of a MegatronGenerationMixin method on the Dynamo mixin. Each
+# must fall back to the plain behaviour when the worker has no role, since every
+# Megatron worker (training included) carries the mixin. An override added
+# without that fallback fails test_every_override_of_the_plain_mixin_is_role_guarded
+# until it is listed here and covered by test_no_role_hooks_behave_like_the_plain_worker.
+_ROLE_GUARDED = {
+    "_check_generation_requirements",
+    "_inference_config_overrides",
+    "_build_dynamic_inference_engine",
+    "_coordinator_kwargs",
+}
 
-    with pytest.raises(RuntimeError, match="_dynamo_role"):
+
+def test_every_override_of_the_plain_mixin_is_role_guarded():
+    overrides = {
+        name
+        for name, value in vars(MegatronDynamoGenerationMixin).items()
+        if callable(value) and hasattr(MegatronGenerationMixin, name)
+    }
+    assert overrides == _ROLE_GUARDED
+
+
+def test_no_role_hooks_behave_like_the_plain_worker(engine_modules, monkeypatch):
+    """A worker without a role (training, plain inference) gets the plain hooks."""
+    plain, handoff = engine_modules
+    checks = []
+    monkeypatch.setattr(
+        dynamo_worker_mixin,
+        "require_megatron_dynamo_integration",
+        lambda: checks.append("checked"),
+    )
+    worker = _bare_worker(role=None)
+    controller, context = MagicMock(), MagicMock()
+
+    assert worker._dynamo_role is None
+    worker._check_generation_requirements(worker.cfg)
+    assert checks == []
+    assert worker._inference_config_overrides() == {}
+    assert worker._coordinator_kwargs() == {}
+    assert worker._build_dynamic_inference_engine(controller, context) is (
+        plain.return_value
+    )
+    handoff.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_an_engine_role_runs_the_early_megatron_lm_check(monkeypatch, role):
+    checks = []
+    monkeypatch.setattr(
+        dynamo_worker_mixin,
+        "require_megatron_dynamo_integration",
+        lambda: checks.append("checked"),
+    )
+    # The hook reads the constructor's config: self.cfg is not set yet.
+    worker = object.__new__(_Worker)
+    worker._check_generation_requirements({"generation": {"_dynamo_role": role}})
+    assert checks == ["checked"]
+
+
+def test_an_unknown_engine_role_is_refused():
+    worker = _bare_worker(role="aggregated")
+    with pytest.raises(ValueError, match="must be 'prefill' or 'decode'"):
         worker._dynamo_role
+    with pytest.raises(ValueError, match="must be 'prefill' or 'decode'"):
+        worker._check_generation_requirements(worker.cfg)
+
+
+def _policy_worker_module():
+    """``megatron_policy_worker``, which needs Megatron-Bridge (CI, not macOS)."""
+    pytest.importorskip("megatron.bridge")
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    return megatron_policy_worker
+
+
+def test_the_policy_worker_carries_the_dynamo_hooks_ahead_of_the_plain_ones():
+    module = _policy_worker_module()
+    mro = module.MegatronPolicyWorkerImpl.__mro__
+    assert mro.index(MegatronDynamoGenerationMixin) < mro.index(
+        MegatronGenerationMixin
+    )
+    assert not hasattr(module, "MegatronDynamoPolicyWorker")
+
+
+def test_the_early_check_runs_before_the_worker_loads_anything(monkeypatch):
+    """The first thing the constructor does, with the constructor's config."""
+    module = _policy_worker_module()
+
+    class Stop(Exception):
+        pass
+
+    seen = []
+
+    class ExtensionWorker(module.MegatronPolicyWorkerImpl):
+        def _check_generation_requirements(self, config):
+            seen.append(config)
+            raise Stop
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("the worker started loading before the check")
+
+    monkeypatch.setattr(module, "maybe_enable_msc", must_not_run)
+    config = {"generation": {"_dynamo_role": "decode"}}
+    with pytest.raises(Stop):
+        ExtensionWorker(config, None, worker_sharding_annotations=None)
+    assert seen == [config]
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])

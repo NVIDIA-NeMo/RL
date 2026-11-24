@@ -86,7 +86,6 @@ from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
     MegatronDynamoGenerationMixin,
-    require_megatron_dynamo_integration,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
@@ -787,6 +786,9 @@ def _reserved_http_server_port_for_rank(
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
     ManualGCMixin,
+    # Ahead of MegatronGenerationMixin: its engine hooks serve a prefill or
+    # decode engine behind Dynamo and fall back to the plain ones otherwise.
+    MegatronDynamoGenerationMixin,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
@@ -966,6 +968,9 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Before anything loads: a worker that cannot build its inference
+        # engine would otherwise fail only at its first refit.
+        self._check_generation_requirements(config)
         # Resume loads from weights_path/optimizer_path during setup, before any
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
@@ -5812,22 +5817,3 @@ class MegatronPolicyWorkerImpl(
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
-
-
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
-class MegatronDynamoPolicyWorker(
-    MegatronDynamoGenerationMixin, MegatronPolicyWorkerImpl
-):
-    """A prefill or decode engine served through Dynamo.
-
-    ``Policy`` picks this class over ``MegatronPolicyWorker`` when the engine's
-    config carries ``generation._dynamo_role``; the mixin's engine-build hooks
-    then override the plain ones unconditionally.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # Before the model loads, not at the first refit that builds the engine.
-        require_megatron_dynamo_integration()
-        super().__init__(*args, **kwargs)

@@ -14,9 +14,12 @@
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
 import dataclasses
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+from nemo_rl.models.generation.disagg_layout import ROLES, Role
+from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts.dynamic_context import (
@@ -26,6 +29,25 @@ if TYPE_CHECKING:
     from megatron.core.inference.text_generation_controllers.text_generation_controller import (
         TextGenerationController,
     )
+
+    from nemo_rl.models.policy import PolicyConfig
+
+
+def _role_from_generation_config(generation: Mapping[str, Any]) -> Role | None:
+    """The engine role ``MegatronDynamoGeneration`` wrote into ``generation``, if any.
+
+    Raises:
+        ValueError: For a role that is neither ``prefill`` nor ``decode``.
+    """
+    role = generation.get("_dynamo_role")
+    if role is None:
+        return None
+    if role not in ROLES:
+        raise ValueError(
+            "policy.generation._dynamo_role must be 'prefill' or 'decode' when "
+            f"set, got {role!r}; MegatronDynamoGeneration sets it per engine"
+        )
+    return role
 
 
 def require_megatron_dynamo_integration() -> None:
@@ -62,49 +84,52 @@ def require_megatron_dynamo_integration() -> None:
         )
 
 
-class MegatronDynamoGenerationMixin:
+class MegatronDynamoGenerationMixin(MegatronGenerationMixin):
     """Prefill/decode engine hooks for a Megatron worker served through Dynamo.
 
-    Hosted by ``MegatronDynamoPolicyWorker``, the worker class the policy picks
-    when ``generation._dynamo_role`` is set, so every override here applies
-    unconditionally; a worker without a role is a plain ``MegatronPolicyWorker``
-    and never sees this class. Compose it before ``MegatronGenerationMixin`` so
-    the overrides win. ``MegatronDynamoGeneration`` sets the role per engine;
-    it picks the state-handoff engine variant and its KV transfer agents.
+    Composed into ``MegatronPolicyWorkerImpl`` ahead of
+    ``MegatronGenerationMixin``, so every Megatron worker carries it. A worker
+    whose config has no ``generation._dynamo_role`` (training, plain
+    inference) gets the plain behaviour: every override here falls back to
+    ``super()`` when the role is unset. ``MegatronDynamoGeneration`` sets the
+    role per engine; it picks the state-handoff engine variant and its KV
+    transfer agents.
 
-    Borrowed from ``MegatronGenerationMixin``:
-
-     - cfg: policy config (TypedDict).
+    Any further override of a ``MegatronGenerationMixin`` method must fall back
+    the same way; ``test_megatron_dynamo_worker_mixin`` lists the guarded ones.
     """
 
     cfg: dict[str, Any]
 
     @property
-    def _dynamo_role(self) -> str:
-        """``"prefill"`` or ``"decode"``: which half of the handoff this engine is."""
-        role = self.cfg["generation"].get("_dynamo_role")
-        if role is None:
-            raise RuntimeError(
-                "MegatronDynamoPolicyWorker needs policy.generation._dynamo_role; "
-                "MegatronDynamoGeneration sets it per engine"
-            )
-        return role
+    def _dynamo_role(self) -> Role | None:
+        """``"prefill"`` or ``"decode"`` for an engine behind Dynamo; ``None`` otherwise."""
+        return _role_from_generation_config(self.cfg["generation"])
+
+    def _check_generation_requirements(self, config: "PolicyConfig") -> None:
+        # Before the model loads, not at the first refit that builds the engine.
+        if _role_from_generation_config(config["generation"]) is not None:
+            require_megatron_dynamo_integration()
+        super()._check_generation_requirements(config)
 
     def _inference_config_overrides(self) -> dict[str, Any]:
+        role = self._dynamo_role
+        if role is None:
+            return super()._inference_config_overrides()
         # Prefill and decode engines are separate process groups, so the
         # handoff must cross them; NIXL is the only transport that does. The
         # role sizes role-specific buffers: a decode context drops the Mamba
         # prefix cache that prefix_caching_mamba_gb gives prefill.
-        return {
-            "kv_transport_backend": "nixl",
-            "disaggregation_role": self._dynamo_role,
-        }
+        return {"kv_transport_backend": "nixl", "disaggregation_role": role}
 
     def _build_dynamic_inference_engine(
         self,
         controller: "TextGenerationController",
         context: "DynamicInferenceContext",
     ) -> "DynamicInferenceEngine":
+        role = self._dynamo_role
+        if role is None:
+            return super()._build_dynamic_inference_engine(controller, context)
         # Prefill/decode behind Dynamo: the state-handoff engine pins prefill
         # blocks until decode releases them and imports them on decode.
         # Deferred: the Dynamo integration is optional (absent from older
@@ -117,10 +142,12 @@ class MegatronDynamoGenerationMixin:
         # Collective over the engine's model-parallel ranks. The Dynamo adapter
         # claims every handoff before decode reads it, so unclaimed prefill
         # offers may expire instead of staying pinned forever.
-        engine.setup_kv_transfer(role=self._dynamo_role, require_handoff_claim=True)
+        engine.setup_kv_transfer(role=role, require_handoff_claim=True)
         return engine
 
     def _coordinator_kwargs(self) -> dict[str, Any]:
+        if self._dynamo_role is None:
+            return super()._coordinator_kwargs()
         # The peer role's engines connect to this coordinator from other
         # processes and nodes.
         return {"hostname": _get_node_ip_local()}

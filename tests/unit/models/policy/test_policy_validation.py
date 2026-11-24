@@ -543,18 +543,15 @@ def _construct_megatron_policy(config: PolicyConfig) -> tuple[MagicMock, MagicMo
     return worker_builder, worker_group
 
 
-@pytest.mark.parametrize(
-    ("role", "worker_cls"),
-    [
-        (None, "MegatronPolicyWorker"),
-        ("prefill", "MegatronDynamoPolicyWorker"),
-        ("decode", "MegatronDynamoPolicyWorker"),
-    ],
-)
-def test_policy_picks_the_dynamo_worker_from_the_engine_role(
-    role: str | None, worker_cls: str
+@pytest.mark.parametrize("role", [None, "prefill", "decode"])
+def test_every_megatron_engine_role_uses_the_one_policy_worker(
+    role: str | None,
 ) -> None:
-    """An engine config carrying ``generation._dynamo_role`` gets the Dynamo worker."""
+    """A prefill or decode engine behind Dynamo is a plain MegatronPolicyWorker.
+
+    Its Dynamo hooks act on ``generation._dynamo_role`` inside the worker, so
+    there is no second actor class (or venv) to pick.
+    """
     config = create_megatron_config("test-model", tp=1)
     config["generation"]["backend"] = "megatron"
     if role is not None:
@@ -562,7 +559,35 @@ def test_policy_picks_the_dynamo_worker_from_the_engine_role(
 
     worker_builder, _ = _construct_megatron_policy(config)
 
-    assert worker_builder.call_args.args[0] == _MEGATRON_WORKERS + worker_cls
+    assert worker_builder.call_args.args[0] == _MEGATRON_WORKERS + "MegatronPolicyWorker"
+
+
+def test_a_worker_extension_is_kept_for_a_dynamo_engine() -> None:
+    """An extension built on MegatronPolicyWorkerImpl keeps the Dynamo hooks."""
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    config["generation"]["_dynamo_role"] = "decode"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
 
 
 def test_policy_rejects_quantization_on_a_dynamo_engine() -> None:
