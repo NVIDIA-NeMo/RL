@@ -939,6 +939,37 @@ class TestEnvHealthCheck:
 
         assert asyncio.run(_main()) == ["tools/0", "tools/1"]
 
+    def test_silent_actors_of_a_shard_set_cost_one_timeout_together(self):
+        """However many actors stay silent, the check takes one timeout, not one each.
+
+        Asking every actor first and then waiting for each answer in turn passes the
+        test above, but adds a full timeout to the tick for every silent actor.
+        """
+        replicas = [
+            _gym_actor(lambda: asyncio.get_event_loop().create_future())
+            for _ in range(3)
+        ]
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            gym_subprocess_check=True,
+            env_handles={"nemo_gym": NemoGymShardSet(handles={"tools": replicas})},
+        )
+        timeout_s = 0.5
+
+        async def _timed_check():
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            problems = await ctrl._check_env_health(timeout_s=timeout_s)
+            return problems, loop.time() - start
+
+        problems, elapsed = asyncio.run(_timed_check())
+        assert len(problems) == 3, problems
+        # One timeout for the three of them, with room for a slow machine. One
+        # timeout per actor would take three.
+        assert elapsed < 2 * timeout_s, f"three silent actors took {elapsed:.2f}s"
+
 
 def _gym_actor(remote):
     """Stand in for a NemoGym actor handle whose health check call is ``remote``."""
