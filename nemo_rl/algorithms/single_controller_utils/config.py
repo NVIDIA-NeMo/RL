@@ -833,9 +833,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
     gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
     # With target_level='turn' or 'prefix', a Gym server whose checkpoint mode
-    # is restart_only (the default for agents and resources servers) starts
-    # every in-flight rollout over after a crash. False fails setup and names such
-    # servers; true accepts them with a warning.
+    # is restart_only (the default for agents, resources servers and environment
+    # servers) starts every in-flight rollout over after a crash. False fails
+    # setup and names such servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
     # Per-generation-owner TQ I/O limits for saved partial responses
     # (target_level: prefix). Rows per TQ write at a checkpoint cut.
