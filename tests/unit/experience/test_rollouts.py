@@ -3611,6 +3611,8 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/reward/median": 0.0,
             "example_multi_step_simple_agent/reward/min": 0.0,
             "example_multi_step_simple_agent/reward/stddev": 0.0,
+            # Two prompts of one generation each, so two groups ran on this agent.
+            "example_multi_step_simple_agent/num_groups": 2,
             "example_multi_step_simple_agent/truncation_rate": 0.0,
             "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
             "example_multi_step_simple_agent/total_tokens_per_sample/max": None,
