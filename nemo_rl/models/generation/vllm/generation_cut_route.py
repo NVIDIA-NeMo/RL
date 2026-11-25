@@ -20,7 +20,7 @@ import asyncio
 import logging
 import secrets
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 import aiohttp
@@ -37,6 +37,8 @@ FRONTEND_CUT_ROUTE = f"{GENERATION_CUT_ROUTE}/frontend"
 # What a cut's participant leaves of the coordinator's deadline for its answer
 # to reach the coordinator.
 CUT_REPLY_MARGIN_S = 1.0
+# How many uncut model call IDs a merged cut's warning names.
+_LOGGED_UNCUT_CALLS = 5
 
 
 class GenerationCutBackend(Protocol):
@@ -60,28 +62,54 @@ class LocalCutBackend(GenerationCutBackend, Protocol):
         """How long a cut may take from its arrival; None waits indefinitely."""
         ...
 
-    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
-        """Cut the calls Gym's inventory names, by a ``time.monotonic()`` deadline."""
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
+        """Cut the calls Gym's inventory names, by a ``time.monotonic()`` deadline.
+
+        With ``held_only``, the receipt names only the calls this process holds.
+        """
         ...
 
 
 def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]]) -> Any:
-    """Build Gym's receipt for ``inventory`` from what each engine cut.
+    """Build Gym's receipt for ``inventory`` from each engine's acks.
 
-    An engine (a Dynamo engine, or one of a worker's HTTP frontends)
-    acknowledges only the calls it cut. A call no engine acknowledged gets
-    Gym's failure ack, so it regenerates after a restore.
+    An engine (a Dynamo engine, or one of a worker's HTTP frontends) acks only
+    the calls it holds: the ones it cut, and failures it has already logged. A
+    cut ack wins over a failure for the same call. A call no engine holds, say
+    one whose request had not arrived, gets Gym's failure ack and one warning
+    per cut; it regenerates after a restore.
     """
     from nemo_gym._checkpoint.generation_cut import (
         GenerationCutPrefixAck,
         GenerationCutReceipt,
     )
 
-    cut: dict[str, Any] = {}
+    held: dict[str, Any] = {}
     for prefixes in engine_prefixes:
         for prefix in prefixes:
             ack = GenerationCutPrefixAck.model_validate(prefix)
-            cut.setdefault(ack.ticket_id, ack)
+            previous = held.get(ack.ticket_id)
+            if previous is None or (
+                previous.disposition != "durable_prefix"
+                and ack.disposition == "durable_prefix"
+            ):
+                held[ack.ticket_id] = ack
+    unheld = [
+        prefix.model_call_id
+        for prefix in inventory.active_prefixes
+        if prefix.ticket_id not in held
+    ]
+    if unheld:
+        LOGGER.warning(
+            "generation cut %s: no engine holds %d of %d model calls; they "
+            "regenerate after a restore: %s",
+            inventory.checkpoint_id,
+            len(unheld),
+            len(inventory.active_prefixes),
+            unheld[:_LOGGED_UNCUT_CALLS],
+        )
     return GenerationCutReceipt(
         checkpoint_id=inventory.checkpoint_id,
         cut_id=f"frontend-{inventory.inventory_digest}",
@@ -89,19 +117,50 @@ def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]])
         inventory=inventory,
         backend_snapshot_id=f"tq-{inventory.inventory_digest}",
         prefixes=tuple(
-            cut.get(prefix.ticket_id) or GenerationCutPrefixAck.failure(prefix)
+            held.get(prefix.ticket_id) or GenerationCutPrefixAck.failure(prefix)
             for prefix in inventory.active_prefixes
         ),
     )
 
 
-def durable_prefixes(receipt: Any) -> list[dict[str, Any]]:
-    """The acks of the calls a receipt cut, as one engine answers a fan-out."""
-    return [
-        ack.model_dump(mode="json")
-        for ack in receipt.prefixes
-        if ack.disposition == "durable_prefix"
-    ]
+async def fan_out_cut(
+    inventory: Any,
+    cuts: Mapping[str, Awaitable[Sequence[Any]]],
+    *,
+    deadline: float | None,
+) -> Any:
+    """Wait for every target's cut until ``deadline`` and merge their acks.
+
+    Each awaitable in ``cuts`` (keyed by a name for the logs) returns the
+    acks of one target: a Dynamo engine, or one of a worker's HTTP frontends. A target that misses the wall-clock ``deadline`` is cancelled
+    and its calls regenerate after a restore. A target that should cost only
+    its own calls when it fails must catch its errors and return ``()``.
+    """
+    tasks = {asyncio.ensure_future(cut): name for name, cut in cuts.items()}
+    done: set[asyncio.Task[Sequence[Any]]] = set()
+    if tasks:
+        done, late = await asyncio.wait(
+            tasks,
+            timeout=None if deadline is None else max(0.0, deadline - time.time()),
+        )
+        for task in late:
+            task.cancel()
+        if late:
+            LOGGER.warning(
+                "generation cut %s: %s did not answer in time; calls they hold "
+                "regenerate after a restore",
+                inventory.checkpoint_id,
+                sorted(tasks[task] for task in late),
+            )
+    # In target order, so which ack wins for a call acked twice does not vary.
+    return merge_cut_receipts(
+        inventory, [task.result() for task in tasks if task in done]
+    )
+
+
+def held_acks(receipt: Any) -> list[dict[str, Any]]:
+    """A ``held_only`` receipt's acks, as one engine answers a fan-out."""
+    return [ack.model_dump(mode="json") for ack in receipt.prefixes]
 
 
 def local_deadline(wall_deadline: float | None) -> float | None:
@@ -178,40 +237,34 @@ class FrontendCutFanOut:
         # One deadline, from the cut's arrival, for this wait and every frontend.
         timeout_s = self._recovery.control_timeout_s
         deadline = None if timeout_s is None else time.time() + timeout_s
-        cuts = [
-            asyncio.ensure_future(self._cut_here(inventory, deadline)),
-            *(
-                asyncio.ensure_future(self._cut_on_peer(url, inventory, deadline))
-                for url in self._peer_urls
-            ),
-        ]
-        done, late = await asyncio.wait(
-            cuts,
-            timeout=None if deadline is None else max(0.0, deadline - time.time()),
+        # This frontend's own cut is not wrapped: if it fails (say its prefix
+        # writer died), the whole cut fails, as it does with one frontend.
+        return await fan_out_cut(
+            inventory,
+            {
+                "this frontend": self._cut_here(inventory, deadline),
+                **{
+                    url: self._cut_on_peer(url, inventory, deadline)
+                    for url in self._peer_urls
+                },
+            },
+            deadline=deadline,
         )
-        for cut in late:
-            cut.cancel()
-        if late:
-            LOGGER.warning(
-                "generation cut %s: %d of %d HTTP frontends did not answer in "
-                "time; calls they hold regenerate after a restore",
-                inventory.checkpoint_id,
-                len(late),
-                len(cuts),
-            )
-        return merge_cut_receipts(inventory, [cut.result() for cut in done])
 
     async def _cut_here(self, inventory: Any, deadline: float | None) -> list[Any]:
         receipt = await self._recovery.run_cut(
-            inventory, deadline=local_deadline(deadline)
+            inventory, deadline=local_deadline(deadline), held_only=True
         )
-        return durable_prefixes(receipt)
+        return held_acks(receipt)
 
     async def _cut_on_peer(
         self, url: str, inventory: Any, deadline: float | None
     ) -> Sequence[Any]:
         try:
-            async with aiohttp.ClientSession() as session:
+            # fan_out_cut enforces the deadline; aiohttp's own 300 s default
+            # would end a longer cut with an error instead.
+            timeout = aiohttp.ClientTimeout(total=None)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{url}{FRONTEND_CUT_ROUTE}",
                     json={
@@ -221,9 +274,22 @@ class FrontendCutFanOut:
                     headers={"authorization": f"Bearer {self.control_token}"},
                 ) as response:
                     response.raise_for_status()
-                    return (await response.json())["prefixes"]
-        # One frontend's failure must cost only the calls it holds.
-        except (aiohttp.ClientError, KeyError, TypeError, ValueError):
+                    prefixes = (await response.json())["prefixes"]
+            cut = sorted(
+                prefix["model_call_id"]
+                for prefix in prefixes
+                if prefix["disposition"] == "durable_prefix"
+            )
+            LOGGER.info(
+                "generation cut %s: HTTP frontend %s cut %d model calls: %s",
+                inventory.checkpoint_id,
+                url,
+                len(cut),
+                cut,
+            )
+            return prefixes
+        # One frontend's failure must cost only the calls it holds, whatever it is.
+        except Exception:  # noqa: BLE001
             LOGGER.warning(
                 "generation cut failed on HTTP frontend %s; calls it holds "
                 "regenerate after a restore",
@@ -269,7 +335,7 @@ def register_generation_cut_route(
         request: dict,
         authorization: str | None = Header(default=None),
     ):
-        """Cut this frontend's share of a fan-out; answer with its durable acks."""
+        """Cut this frontend's share of a fan-out; answer for the calls it holds."""
         from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
 
         current = recovery()
@@ -279,5 +345,6 @@ def register_generation_cut_route(
         receipt = await current.run_cut(
             GenerationCutInventory.model_validate(request["inventory"]),
             deadline=local_deadline(request["deadline"]),
+            held_only=True,
         )
-        return {"prefixes": durable_prefixes(receipt)}
+        return {"prefixes": held_acks(receipt)}

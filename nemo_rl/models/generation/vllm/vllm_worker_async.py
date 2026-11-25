@@ -1071,6 +1071,7 @@ class VllmAsyncGenerationWorkerImpl(
                 staging_partition,
                 {
                     "capture_media": capture_media,
+                    "media_family": media_family,
                     "top_logprobs": top_logprobs,
                     "generation_prefix_cuts_enabled": generation_prefix_cuts_enabled,
                     "generation_cut_control_token": generation_cut_control_token,

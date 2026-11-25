@@ -19,7 +19,7 @@ At a checkpoint NeMo-Gym posts the calls it has in flight to
 Dynamo that URL is the frontend, and the calls run in the engines. So the
 frontend serves the route itself, as a Dynamo route extension (``routes``), and
 sends the cut to every engine over Dynamo's request plane. Each engine answers
-for the calls it cut, and the answers are merged into the one receipt Gym
+for the calls it holds, and the answers are merged into the one receipt Gym
 expects.
 """
 
@@ -44,7 +44,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.vllm.generation_cut_route import (
     GENERATION_CUT_ROUTE,
     answer_generation_cut,
-    merge_cut_receipts,
+    fan_out_cut,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -106,29 +106,16 @@ class EngineCutFanOut:
                 DEADLINE_KEY: deadline,
             },
         }
-        cuts = {
-            asyncio.ensure_future(
-                self._cut_on_engine(client, request, instance_id)
-            ): instance_id
-            for instance_id in client.instance_ids()
-        }
-        engine_prefixes = []
-        if cuts:
-            done, late = await asyncio.wait(
-                cuts,
-                timeout=None if deadline is None else max(0.0, deadline - time.time()),
-            )
-            for cut in late:
-                cut.cancel()
-            if late:
-                LOGGER.warning(
-                    "generation cut %s: engines %s did not answer in time; calls "
-                    "they hold regenerate after a restore",
-                    inventory.checkpoint_id,
-                    sorted(cuts[cut] for cut in late),
+        return await fan_out_cut(
+            inventory,
+            {
+                f"engine {instance_id}": self._cut_on_engine(
+                    client, request, instance_id
                 )
-            engine_prefixes = [cut.result() for cut in done]
-        return merge_cut_receipts(inventory, engine_prefixes)
+                for instance_id in client.instance_ids()
+            },
+            deadline=deadline,
+        )
 
     @staticmethod
     async def _cut_on_engine(

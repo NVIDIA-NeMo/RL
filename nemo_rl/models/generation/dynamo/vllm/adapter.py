@@ -80,7 +80,7 @@ from nemo_rl.models.generation.score_centering import (
     extract_score_centering_samples,
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import (
-    durable_prefixes,
+    held_acks,
     local_deadline,
 )
 from nemo_rl.models.generation.vllm.prompt_and_capture import (
@@ -227,7 +227,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
 
         The frontend sends every engine the whole inventory
         (:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`), so the
-        answer names only the calls cut here.
+        answer names only the calls held here, cut or not.
         """
         del annotation, context
         # Deferred: Gym is optional outside framework-owned capture.
@@ -236,13 +236,15 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         extra_args = request.get("extra_args") or {}
         inventory = GenerationCutInventory.model_validate(extra_args[INVENTORY_KEY])
         receipt = await self._host._prefix_recovery.run_cut(
-            inventory, deadline=local_deadline(extra_args.get(DEADLINE_KEY))
+            inventory,
+            deadline=local_deadline(extra_args.get(DEADLINE_KEY)),
+            held_only=True,
         )
         yield {
             "token_ids": [],
             "index": 0,
             "finish_reason": "stop",
-            "engine_data": {CUT_PREFIXES_KEY: durable_prefixes(receipt)},
+            "engine_data": {CUT_PREFIXES_KEY: held_acks(receipt)},
         }
 
     async def serve_rollout(

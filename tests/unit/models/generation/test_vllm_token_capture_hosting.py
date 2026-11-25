@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -36,7 +37,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -111,7 +112,7 @@ from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
-    durable_prefixes,
+    held_acks,
     merge_cut_receipts,
 )
 from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402
@@ -397,6 +398,57 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     assert coords.weight_version == 4
     assert sink.records[0].weight_version == 4
+
+
+def test_owner_sends_child_frontends_every_capture_setting(monkeypatch):
+    """Each child frontend runs ``setup_token_capture`` with what the owner got."""
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: _MemorySink(),
+    )
+    worker = _fake_worker()
+    worker._api_server_pool = MagicMock(command=AsyncMock())
+    # Text-only capture without cuts, so no engine or prefix writer is needed.
+    owner_kwargs = {
+        "top_logprobs": 3,
+        "generation_cut_control_token": "control-token",
+        "generation_cut_control_timeout_s": 7.0,
+        "prefix_write_max_rows": 11,
+        "prefix_write_max_tokens": 13,
+        "prefix_read_max_rows": 17,
+    }
+
+    asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker, {"impl": "local"}, "stage", **owner_kwargs
+        )
+    )
+
+    ((_, dp_cfg, partition, sent),) = [
+        call.args
+        for call in worker._api_server_pool.command.await_args_list
+        if call.args[0] == "capture"
+    ]
+    assert (dp_cfg, partition) == ({"impl": "local"}, "stage")
+    # A setting left out would make each child run with its default.
+    keyword_only = {
+        name
+        for name, param in inspect.signature(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture
+        ).parameters.items()
+        # Skip what Ray's tracing adds to an actor method (_ray_trace_ctx).
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not name.startswith("_")
+    }
+    assert set(sent) == keyword_only
+    assert {name: sent[name] for name in owner_kwargs} == owner_kwargs
 
 
 def _generation_with_mock_group(*, async_engine: bool = True) -> VllmGeneration:
@@ -1742,12 +1794,13 @@ def _active_call_inventory(
     return inventory, states
 
 
-def test_frontends_cut_their_own_calls_into_one_receipt():
+def test_frontends_cut_their_own_calls_into_one_receipt(caplog):
     # Each HTTP frontend holds the calls whose requests it accepted.
     sinks = [_MemorySink(), _MemorySink()]
     owner, child = (_worker_with_capture(sink) for sink in sinks)
     _active_call_inventory(owner, ("c1", [11, 12]))
-    _active_call_inventory(child, ("c2", [13, 14]))
+    # The child also holds a call still prefilling, which it cannot cut yet.
+    _active_call_inventory(child, ("c2", [13, 14]), ("prefilling", []))
     inventory = GenerationCutInventory.build(
         checkpoint_id="checkpoint-1",
         server_name="policy_model",
@@ -1759,26 +1812,80 @@ def test_frontends_cut_their_own_calls_into_one_receipt():
                 model_call_id=model_call_id,
                 admitted_at=1.0,
             )
-            for model_call_id in ("c1", "c2", "not-arrived")
+            for model_call_id in ("c1", "c2", "prefilling", "not-arrived")
         ],
     )
 
-    receipt = merge_cut_receipts(
-        inventory,
-        [
-            durable_prefixes(_cuts(frontend).checkpoint_cut(inventory))
+    with caplog.at_level(logging.INFO):
+        answers = [
+            held_acks(_cuts(frontend).checkpoint_cut(inventory, held_only=True))
             for frontend in (owner, child)
-        ],
-    )
+        ]
+        receipt = merge_cut_receipts(inventory, answers)
 
     receipt.validate_for(inventory)
-    assert {ack.ticket_id: ack.disposition for ack in receipt.prefixes} == {
+    dispositions = {ack.ticket_id: ack.disposition for ack in receipt.prefixes}
+    assert dispositions == {
         "ticket-c1": "durable_prefix",
         "ticket-c2": "durable_prefix",
+        "ticket-prefilling": "durable_failure",
         "ticket-not-arrived": "durable_failure",
     }
     # Each frontend staged only its own call's row.
     assert [len(sink.generation_prefix_records) for sink in sinks] == [1, 1]
+    # Frontends stay quiet about each other's calls. The child logs its own
+    # uncut call; the merge warns once, only about the call no frontend holds.
+    assert "cannot cut completed model call" not in caplog.text
+    assert "generation cut checkpoint-1 left 1 of 2 model calls uncut" in caplog.text
+    assert caplog.text.count("no engine holds") == 1
+    assert (
+        "generation cut checkpoint-1: no engine holds 1 of 4 model calls; they "
+        "regenerate after a restore: ['not-arrived']"
+    ) in caplog.text
+    # A frontend's cut wins over another's failure for the same call.
+    failure = GenerationCutPrefixAck.failure(inventory.active_prefixes[0])
+    again = merge_cut_receipts(inventory, [[failure.model_dump(mode="json")], *answers])
+    assert {ack.ticket_id: ack.disposition for ack in again.prefixes} == dispositions
+
+
+def test_held_only_cut_answers_for_the_calls_this_frontend_finished(caplog):
+    worker = _worker_with_capture(_MemorySink())
+    _cuts(worker).remember_completed(
+        "finished",
+        SimpleNamespace(
+            capture_key="r0",
+            disposition="staged",
+            staging_key="terminal-key",
+            digest="a" * 64,
+        ),
+        3,
+        effective_output_limit=128,
+        terminal_finish_reason="stop",
+    )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{model_call_id}",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+            for model_call_id in ("elsewhere", "finished")
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        receipt = _cuts(worker).checkpoint_cut(inventory, held_only=True)
+
+    # Another frontend holds "elsewhere"; this one answers only for its own.
+    ((model_call_id, cut_kind),) = [
+        (ack.model_call_id, ack.cut_kind) for ack in receipt.prefixes
+    ]
+    assert (model_call_id, cut_kind) == ("finished", "terminal_completion")
+    assert "elsewhere" not in caplog.text
 
 
 def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):

@@ -390,7 +390,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             peers.append(child)
         try:
             for name, args in [
-                ("capture", ({"impl": "transfer_queue"}, "stage", False, 4)),
+                ("capture", ({"impl": "transfer_queue"}, "stage", {"top_logprobs": 4})),
                 ("version", (10,)),
             ]:
                 task = asyncio.create_task(pool.command(name, *args))
@@ -445,14 +445,14 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "initialization failed"
             ) as failure:
-                await pool.command("capture", {}, "stage", False, 4)
+                await pool.command("capture", {}, "stage", {"top_logprobs": 4})
             engine.shutdown.assert_called_once()
             process.terminate.assert_called_once()
             self.assertEqual(pool.children, [])
             self.assertIs(pool._failure, failure.exception)
             for name, args in [
                 ("version", (10,)),
-                ("capture", ({}, "stage", False, 4)),
+                ("capture", ({}, "stage", {"top_logprobs": 4})),
             ]:
                 with self.assertRaisesRegex(
                     RuntimeError, "initialization failed"

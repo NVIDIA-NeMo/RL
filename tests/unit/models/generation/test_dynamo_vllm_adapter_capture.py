@@ -468,9 +468,11 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
     run_cut = host._prefix_recovery.run_cut
     deadlines = []
 
-    async def record_deadline(inventory, *, deadline):
+    async def record_deadline(inventory, *, deadline, held_only):
+        # The frontend merges every engine's answer, so each names only its own.
+        assert held_only
         deadlines.append(deadline - time.monotonic())
-        return await run_cut(inventory, deadline=deadline)
+        return await run_cut(inventory, deadline=deadline, held_only=held_only)
 
     host._prefix_recovery.run_cut = record_deadline
 
