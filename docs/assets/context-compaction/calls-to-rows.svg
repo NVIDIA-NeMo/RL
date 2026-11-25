@@ -92,7 +92,7 @@ svg a text{text-decoration:underline;fill:var(--accent);font:10.5px ui-monospace
   <rect class="row" x="732" y="318" width="210" height="58" rx="7"/>
   <text class="lbl-b" x="742" y="338">group_g0_s1 · 6 tok</text>
   <text class="mono" x="742" y="358">[10,11,1003,50,51,1005]</text>
-  <text class="note" x="510" y="400">One reward and advantage per rollout, copied to both rows.</text>
+  <text class="note" x="510" y="400">One reward per rollout. GRPO copies one advantage; PPO runs GAE per row.</text>
   <text class="note" x="510" y="418">Each selected generated span contributes loss once.</text>
 
 
