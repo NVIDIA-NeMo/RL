@@ -16,10 +16,11 @@
 
 import logging
 import os
+from collections.abc import Sequence
 from contextlib import nullcontext
 
 import torch
-from torch.distributed._tensor import Shard
+from torch.distributed._tensor import Placement, Shard
 
 try:
     from nccl.m2n import (  # pyrefly: ignore[missing-import]
@@ -34,6 +35,9 @@ except ImportError:
 
 # Log the selected reshard path once per process (real op / python / golden).
 _XFERDTENSOR_PATH_LOGGED = False
+
+# nccl-extensions 0.1.0's hierarchical planner has fixed-size source arrays.
+_NATIVE_MAX_SOURCES = 16
 
 
 class DTensorRef:
@@ -118,6 +122,39 @@ def follow_source_reshard_path(source_uses_real_op: bool) -> None:
         )
 
 
+def _max_reshard_sources(
+    *,
+    src_mesh_shape: Sequence[int],
+    src_placement: Sequence[Placement],
+    dst_mesh_shape: Sequence[int],
+    dst_placement: Sequence[Placement],
+) -> int:
+    """Count maximum source overlaps for native's uniform single-axis layouts."""
+    src_shards = [
+        (p.dim, src_mesh_shape[axis])
+        for axis, p in enumerate(src_placement)
+        if isinstance(p, Shard)
+    ]
+    dst_shards = [
+        (p.dim, dst_mesh_shape[axis])
+        for axis, p in enumerate(dst_placement)
+        if isinstance(p, Shard)
+    ]
+    if not src_shards:
+        return 1
+    src_dim, num_src_shards = src_shards[0]
+    if not dst_shards or src_dim != dst_shards[0][0]:
+        return num_src_shards
+    num_dst_shards = dst_shards[0][1]
+    # Count source intervals intersecting each destination interval; a
+    # non-aligned boundary can add a source beyond ceil(src_count / dst_count).
+    return max(
+        ((dst + 1) * num_src_shards + num_dst_shards - 1) // num_dst_shards
+        - (dst * num_src_shards) // num_dst_shards
+        for dst in range(num_dst_shards)
+    )
+
+
 def xferdtensor(
     src_tensor,
     src_mesh,
@@ -132,7 +169,7 @@ def xferdtensor(
     global _XFERDTENSOR_PATH_LOGGED
     use_golden = _use_golden_api()
     force_python = _use_python_api()
-    # nccl-extensions 0.1.0 supports at most two mesh axes and one shard axis.
+    # nccl-extensions 0.1.0 limits mesh axes, shard axes, and source fan-in.
     # Both endpoints select from the same global layout before transfer starts.
     use_python = (
         force_python
@@ -141,6 +178,13 @@ def xferdtensor(
         or dst_mesh.mesh.ndim > 2
         or sum(isinstance(p, Shard) for p in src_placement) > 1
         or sum(isinstance(p, Shard) for p in dst_placement) > 1
+        or _max_reshard_sources(
+            src_mesh_shape=src_mesh.mesh.shape,
+            src_placement=src_placement,
+            dst_mesh_shape=dst_mesh.mesh.shape,
+            dst_placement=dst_placement,
+        )
+        > _NATIVE_MAX_SOURCES
     )
     if not _XFERDTENSOR_PATH_LOGGED:
         if use_golden:

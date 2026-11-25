@@ -63,6 +63,18 @@ class _Stream:
         ((8,), (8,), (), (), True, None, "native"),
         ((2, 4), (4, 2), (), (), True, None, "native"),
         ((2, 4), (4, 2), (0,), (1,), True, None, "native"),
+        ((16,), (8,), (0,), (1,), True, None, "native"),
+        ((17,), (8,), (0,), (1,), True, None, "python"),
+        ((32,), (8,), (0,), (1,), True, None, "python"),
+        ((32,), (1,), (0,), (), True, None, "python"),
+        ((32,), (2,), (0,), (0,), True, None, "native"),
+        ((33,), (2,), (0,), (0,), True, None, "python"),
+        ((32,), (32,), (0,), (0,), True, None, "native"),
+        ((46,), (3,), (0,), (0,), True, None, "native"),
+        ((47,), (3,), (0,), (0,), True, None, "python"),
+        ((32, 8), (8,), (None, 0), (1,), True, None, "native"),
+        ((32,), (8,), (), (0,), True, None, "native"),
+        ((2, 32), (24, 8), (None, 0), (None, 1), True, None, "python"),
         ((2, 4), (4, 2), (0, 1), (), True, None, "python"),
         ((2, 4), (4, 2), (), (0, 1), True, None, "python"),
         ((2, 4), (4, 2), (0, 1), (0, 1), True, None, "python"),
@@ -75,6 +87,7 @@ class _Stream:
         ((2, 2, 2), (2, 4), (), (), True, "golden", "golden"),
         ((2, 4), (4, 2), (0, 1), (0, 1), True, "golden", "golden"),
         ((2, 4), (4, 2), (), (), True, "both", "golden"),
+        ((2, 32), (24, 8), (None, 0), (None, 1), True, "golden", "golden"),
     ],
 )
 def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
@@ -82,14 +95,18 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     source_rank: bool,
     src_shape: tuple[int, ...],
     dst_shape: tuple[int, ...],
-    src_shards: tuple[int, ...],
-    dst_shards: tuple[int, ...],
+    src_shards: tuple[int | None, ...],
+    dst_shards: tuple[int | None, ...],
     native_available: bool,
     override: str | None,
     expected: str,
 ) -> None:
     dispatcher = import_module("nemo_rl.weight_sync.xferdtensor")
     backends = {name: Mock() for name in ("native", "python", "golden")}
+    if expected == "python":
+        backends["native"].side_effect = AssertionError(
+            "Native Reshard must not run when Python is required"
+        )
     monkeypatch.setattr(
         dispatcher, "_reshard", backends["native"] if native_available else None
     )
@@ -103,18 +120,21 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     monkeypatch.setenv(
         "NRL_XFERDTENSOR_GOLDEN", "1" if override in ("golden", "both") else "0"
     )
-    tensor = _TensorRef(torch.ones(1), (8, 4))
+    global_size = math.lcm(math.prod(src_shape), math.prod(dst_shape))
+    tensor = _TensorRef(torch.ones(1), (global_size, global_size))
+    process_group = _ProcessGroup()
+    stream = _Stream()
     dispatcher.xferdtensor(
         tensor if source_rank else None,
         _Mesh(list(range(math.prod(src_shape))), src_shape),
-        tuple(Shard(dim) for dim in src_shards)
+        tuple(Replicate() if dim is None else Shard(dim) for dim in src_shards)
         + (Replicate(),) * (len(src_shape) - len(src_shards)),
         None if source_rank else tensor,
         _Mesh(list(range(math.prod(dst_shape))), dst_shape),
-        tuple(Shard(dim) for dim in dst_shards)
+        tuple(Replicate() if dim is None else Shard(dim) for dim in dst_shards)
         + (Replicate(),) * (len(dst_shape) - len(dst_shards)),
-        _ProcessGroup(),
-        _Stream(),
+        process_group,
+        stream,
     )
 
     for name, backend in backends.items():
@@ -122,6 +142,9 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
             backend.assert_called_once()
         else:
             backend.assert_not_called()
+    if expected == "python":
+        assert backends["python"].call_args.args[-2] is process_group
+        assert backends["python"].call_args.args[-1] is stream
 
 
 @pytest.fixture(autouse=True)
@@ -309,6 +332,59 @@ def test_plan_geometry_deduplicates_dp_replicas():
         (0, 2, ((0, 4), (0, 4))),
         (1, 3, ((4, 8), (0, 4))),
     )
+
+
+def test_plan_geometry_reconstructs_32_source_cross_axis_shards() -> None:
+    # Source DP2/EP32 and destination DP24/TP8 match the large async recipe.
+    full_tensor = torch.arange(64 * 64).reshape(64, 64)
+    _src_regions, _dst_regions, destination_groups, transfers = impl._plan_geometry(
+        _Mesh(list(range(64)), (2, 32)),
+        (Replicate(), Shard(0)),
+        _Mesh(list(range(64, 256)), (24, 8)),
+        (Replicate(), Shard(1)),
+        full_tensor.shape,
+    )
+    source_shards = {
+        rank: full_tensor[2 * (rank % 32) : 2 * (rank % 32 + 1), :]
+        for rank in range(64)
+    }
+    reconstructed = {
+        representative: torch.zeros((64, 8), dtype=full_tensor.dtype)
+        for _region, _members, representative in destination_groups
+    }
+    writes = {rank: torch.zeros_like(shard) for rank, shard in reconstructed.items()}
+
+    assert len(destination_groups) == 8
+    assert len(transfers) == 32 * 8
+    for source, destination, overlap in transfers:
+        (row_start, row_stop), (column_start, column_stop) = overlap
+        source_row = 2 * (source % 32)
+        destination_column = 8 * ((destination - 64) % 8)
+        destination_slice = (
+            slice(row_start, row_stop),
+            slice(column_start - destination_column, column_stop - destination_column),
+        )
+        reconstructed[destination][destination_slice].copy_(
+            source_shards[source][
+                row_start - source_row : row_stop - source_row,
+                column_start:column_stop,
+            ]
+        )
+        writes[destination][destination_slice] += 1
+
+    assert {
+        member
+        for _region, members, _representative in destination_groups
+        for member in members
+    } == set(range(64, 256))
+    for _region, members, representative in destination_groups:
+        assert len(members) == 24
+        assert torch.all(writes[representative] == 1)
+        for member in members:
+            column = 8 * ((member - 64) % 8)
+            torch.testing.assert_close(
+                reconstructed[representative], full_tensor[:, column : column + 8]
+            )
 
 
 def test_striped_geometry_distributes_replica_receives():
