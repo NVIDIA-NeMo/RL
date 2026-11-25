@@ -34,6 +34,8 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.58.0",                                                                                # CVE mitigation
+  # Fixed cancellation handling for driver and worker HTTP event loops.
+  "uvloop>=0.23.0",
   "wandb>=0.30.0",                                                                                       # Address dependency vulnerabilities in bundled wandb-core
   "numpy",
   "datasets>=4.0.0",

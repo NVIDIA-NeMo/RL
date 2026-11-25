@@ -129,6 +129,7 @@ from nemo_rl.experience.failures import (
     GymTerminalEpisodeFailure,
     GymTransportError,
     RolloutDataFailure,
+    RolloutTimeout,
     http_status_is_infra,
 )
 from nemo_rl.experience.interfaces import (
@@ -1662,28 +1663,32 @@ Depending on your data shape, you may want to change these values."""
 
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
+
+        async def request_and_read() -> dict:
+            response = await self._control_client().request(
+                server_name=_POLICY_SERVER_NAME,
+                url_path=path,
+                method=method,
+                _control=True,
+                headers=headers,
+                **kwargs,
+            )
+            if response.status != 200:
+                raise RuntimeError(
+                    f"ledger control call {method} {path} failed: "
+                    f"HTTP {response.status} {await response.text()}"
+                )
+            return await response.json()
+
         try:
-            response = await asyncio.wait_for(
-                self._control_client().request(
-                    server_name=_POLICY_SERVER_NAME,
-                    url_path=path,
-                    method=method,
-                    headers=headers,
-                    **kwargs,
-                ),
-                timeout=self._control_timeout_s,
+            return await asyncio.wait_for(
+                request_and_read(), timeout=self._control_timeout_s
             )
         except asyncio.TimeoutError:
-            raise RuntimeError(
+            raise RolloutTimeout(
                 f"ledger control call {method} {path} exceeded "
                 f"{self._control_timeout_s}s (control plane unreachable or stalled)"
             ) from None
-        if response.status != 200:
-            raise RuntimeError(
-                f"ledger control call {method} {path} failed: "
-                f"HTTP {response.status} {await response.text()}"
-            )
-        return await response.json()
 
     def list_entries(self) -> Dict[str, List[str]]:
         """Report which config entries this actor actually spawned.
