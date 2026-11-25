@@ -16,7 +16,8 @@
 # Nemotron Nano MPS: single-node, eight-GPU GRPO with shared Megatron weights.
 # Requires an exclusive node with eight high-memory GPUs (GB200-class capacity),
 # NVLink within each four-GPU expert group, CUDA MPS, and the NeMo RL Megatron
-# environment installed as described in docs/about/installation.md. The public
+# environment from docs/about/installation.md and the paired revisions in
+# docs/design-docs/mps-parallelism-sharing.md. The public
 # model and DAPOMath17K dataset must be accessible through Hugging Face.
 #
 # Run from any directory:

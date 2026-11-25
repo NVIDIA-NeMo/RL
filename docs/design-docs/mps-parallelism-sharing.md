@@ -2,6 +2,19 @@
 
 Megatron training and inference run in separate processes under CUDA MPS. Each inference GPU also hosts a learner. Training and inference can use different model-parallel layouts and share compatible weights through CUDA IPC.
 
+The shared-weight path depends on [Megatron-LM #9785](https://github.com/NVIDIA/Megatron-LM/pull/9785). To test this pair before the dependency lands in the default submodules, select the following revisions in a source checkout before installing the Megatron worker environment. For an existing container, the workers must import these same sources.
+
+```bash
+bridge=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+git submodule update --init "$bridge"
+git -C "$bridge" fetch origin c77206abff695c2af2be9416df857258c0ac1942
+git -C "$bridge" checkout --detach c77206abff695c2af2be9416df857258c0ac1942
+git -C "$bridge" submodule update --init 3rdparty/Megatron-LM
+core="$bridge/3rdparty/Megatron-LM"
+git -C "$core" fetch origin refs/pull/9785/head
+git -C "$core" checkout --detach FETCH_HEAD
+```
+
 ## GPU placement and scheduling
 
 The eight-GPU Nano recipe uses TP1/EP4 for both roles. By default, all eight GPUs run both processes. To train on all eight and run one four-GPU inference group, use
