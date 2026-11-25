@@ -24,6 +24,9 @@ from typing import Any
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
 
 TITO_GENERATE_ROUTE = "/v1/tito/generate"
+# Megatron inference: set in a completions request's ``offload_params`` when the
+# token prompt holds only the tokens after the captured parent.
+TITO_APPEND_FIELD = "ng_tito_append"
 
 QUALIFICATION_HISTORY: list[dict[str, Any]] = [
     {"role": "system", "content": "Fix the repository."},

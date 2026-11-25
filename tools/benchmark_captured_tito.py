@@ -28,6 +28,7 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
+from nemo_rl.models.generation.tito import bridge_suffix
 from nemo_rl.models.generation.vllm.tito import Qwen3IncrementalTokenizer
 
 
@@ -100,10 +101,26 @@ def benchmark(
             tokenizer, suffix, enable_thinking=enable_thinking
         )
 
+    def bridge() -> list[int]:
+        complete = tokenizer.encode(
+            render(history + suffix, generation=True), add_special_tokens=False
+        )
+        return prefix + bridge_suffix(
+            parent_token_ids=prefix,
+            rendered_token_ids=complete,
+            turn_close_token_ids={tokenizer.eos_token_id},
+        )
+
     expected = full_splice()
     if incremental() != expected:
         raise ValueError("Incremental tokens differ from the existing capture splice")
-    operations = {"full_splice": full_splice, "incremental": incremental}
+    if bridge() != expected:
+        raise ValueError("Bridged tokens differ from the existing capture splice")
+    operations = {
+        "full_splice": full_splice,
+        "bridge": bridge,
+        "incremental": incremental,
+    }
     for _ in range(3):
         for operation in operations.values():
             operation()
@@ -133,6 +150,8 @@ def benchmark(
         "measurements": measurements,
         "component_speedup": statistics.median(elapsed["full_splice"])
         / statistics.median(elapsed["incremental"]),
+        "bridge_speedup": statistics.median(elapsed["full_splice"])
+        / statistics.median(elapsed["bridge"]),
     }
 
 
@@ -168,7 +187,8 @@ def main() -> None:
     for case in cases:
         print(
             f"prefix={case['prefix_tokens']} suffix={case['suffix_tokens']} "
-            f"component_speedup={case['component_speedup']:.2f}x token_equal=True"
+            f"component_speedup={case['component_speedup']:.2f}x "
+            f"bridge_speedup={case['bridge_speedup']:.2f}x token_equal=True"
         )
 
 

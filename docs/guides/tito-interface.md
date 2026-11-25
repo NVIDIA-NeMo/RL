@@ -96,6 +96,18 @@ policy.generation.vllm_cfg.tito_model=null policy.generation.vllm_cfg.tito_inter
 
 Compare `finalize/token_in_rate` and the root-reason counts with a run that leaves both keys at their defaults.
 
+## Megatron backend
+
+The Megatron inference server's `POST /v1/completions` accepts `prompt` as a list of token IDs and returns `prompt_token_ids`, `generation_token_ids`, and `generation_log_probs`. To continue a captured parent, send only the tokens after it and mark the request:
+
+| Field | Value |
+| --- | --- |
+| `prompt` | Tokens to append after the parent. |
+| `offload_params.ng_capture` | The `token_in` capture admission. |
+| `offload_params.ng_tito_append` | `true`. |
+
+The worker prepends the parent's tokens. A request with `ng_tito_append` that also carries chat splice metadata is rejected. This path is covered by unit tests and has not been run against a Megatron inference server.
+
 ## Measuring roots
 
 These finalize metrics are reported whenever token capture is on, with or without the interface:
@@ -107,6 +119,6 @@ These finalize metrics are reported whenever token capture is on, with or withou
 
 ## Limits
 
-- vLLM backend only. The Megatron inference endpoint does not serve the route.
+- The route, the chat adapter, and `tito_reject_root_reasons` are on the vLLM backend. On the Megatron backend, see below.
 - Text prompts only.
 - Parent matching, root reasons, and training rows are unchanged; see the [token capture ledger](../design-docs/token-capture-ledger.md).

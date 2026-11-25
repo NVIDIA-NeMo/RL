@@ -1,6 +1,6 @@
 # Token-In/Token-Out (TITO) Inference Interface
 
-Status: the vLLM backend implements the core route, the chat adapter, and startup qualification behind `vllm_cfg.tito_interface` (off by default); see the [guide](../guides/tito-interface.md) and [Implementation status](#implementation-status). The root policy changes in Gym and the Megatron backend are not implemented.
+Status: the vLLM backend implements the core route, the chat adapter, and startup qualification behind `vllm_cfg.tito_interface` (off by default), and the Megatron backend takes token-in/token-out calls through its completions route; see the [guide](../guides/tito-interface.md) and [Implementation status](#implementation-status). No matching rule in Gym was changed.
 
 ## Summary
 
@@ -323,7 +323,7 @@ The value of the design is therefore: a contract where there was a side effect, 
 | 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation and by training rows built from the route in a unit test. |
 | 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations. The SWE smoke ran two steps with identical root statistics in the first step; prompts were not compared token by token there. |
 | 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Rejection mode implemented (`vllm_cfg.tito_reject_root_reasons`). No matching-rule change made: in 299 measured calls no root had a reason that a rule change would recover. The rules live in Gym. |
-| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Not started. The token-only route has to be added to the Megatron-LM server; see [Megatron backend](#megatron-backend). |
+| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Core contract implemented in the prompt preparer on top of the existing `/v1/completions` route; unit-tested, not run against a Megatron inference server. See [Megatron backend](#megatron-backend). |
 
 ## Implementation status
 
@@ -345,6 +345,7 @@ What has been verified:
 | Same server: the second prompt submitted to the core route returns the same tokens and log probabilities as the chat route | Passed |
 | Same server: the existing merged-prefix test with the interface on and off | Same expected tokens on both paths |
 | Core route with Gym's capture: a root call and its continuation linearize into one training row | Tokens, loss mask, and log probabilities as expected |
+| Prompt construction on CPU, Qwen3-0.6B tokenizer, prefixes of 677, 5157, and 20517 tokens, 30 alternating measurements each | The bridge is 1.9 times as fast as the splice at every length, with identical tokens. Rollout throughput is not measured. |
 
 ### SWE smoke
 
@@ -369,14 +370,21 @@ The only root reason other than `first_call` was `no_prefix_match`, which no des
 
 ### Megatron backend
 
-Not implemented. What it needs, and where:
+The Megatron-LM text generation server already takes token prompts: `POST /v1/completions` accepts `prompt` as a list of token IDs, forwards `offload_params` to NeMo RL's prompt preparer, and returns `prompt_token_ids`, `generation_token_ids`, and `generation_log_probs`. That route is the core on this backend, so nothing has to change in Megatron-LM.
 
-| Piece | Where | State |
-| --- | --- | --- |
-| Token-only route | The Megatron-LM text generation server, which NeMo RL starts through `start_text_gen_server` and does not own | Missing. It must accept a token prompt and pass the request's `ng_capture` through `offload_params`, as the chat route does. |
-| Parent resolution | `TQMegatronPromptPreparer.prepare_prompt` in `nemo_rl/models/generation/megatron/token_capture.py` | Exists for the chat route: it resolves the admission's staged prefix and splices it over the rendered history. For a token prompt it would prepend the prefix instead. |
-| Chat adapter | The same `prepare_prompt` | The splice there can be replaced by the shared `bridge_suffix`. Not done, because it cannot be validated without a Megatron inference run. |
-| Recording | `TQMegatronTokenStager` | Unchanged. |
+| Call | Request |
+| --- | --- |
+| Not recorded | `prompt` is the full prompt. |
+| Root | `prompt` is the full prompt; `offload_params.ng_capture` is a `text` admission. |
+| Continuation | `prompt` is the tokens after the parent; `offload_params.ng_capture` is a `token_in` admission; `offload_params.ng_tito_append` is `true`. |
+
+For a continuation, `TQMegatronPromptPreparer.prepare_prompt` resolves the parent's tokens and prepends them. Recording through `TQMegatronTokenStager` is unchanged.
+
+Limits on this backend:
+
+- Covered by unit tests of the prompt preparer only. It has not been run against a Megatron inference server.
+- The Megatron chat route still uses the splice. Replacing it with the shared bridge is not done.
+- The sampling-profile check and `tito_reject_root_reasons` are not applied to this route.
 
 What the first implementation leaves out:
 

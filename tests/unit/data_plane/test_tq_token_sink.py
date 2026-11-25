@@ -1674,6 +1674,49 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
         )
 
 
+def _tito_append_admission():
+    return nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=2,
+        mode="token_in",
+        required_prefix_token_ids=[10, 2],
+        parent_chain_hash=_digest("chain:c1"),
+    )
+
+
+def test_megatron_prompt_preparer_prepends_the_parent_to_appended_tokens():
+    """A token-in/token-out request submits only the tokens after its parent."""
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+
+    result = preparer.prepare_prompt(
+        [20, 21],
+        offload_params={
+            "ng_capture": _tito_append_admission().model_dump(mode="json"),
+            "ng_tito_append": True,
+        },
+    )
+
+    assert result.prompt == [10, 2, 20, 21]
+    assert result.offload_params["ng_capture"]["required_prefix_token_ids"] == [10, 2]
+
+
+def test_megatron_prompt_preparer_rejects_appended_tokens_with_splice_metadata():
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+
+    with pytest.raises(ValueError, match="not a rendered history to splice"):
+        preparer.prepare_prompt(
+            [20, 21],
+            offload_params={
+                "ng_capture": _tito_append_admission().model_dump(mode="json"),
+                "ng_tito_append": True,
+                PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [9, 2],
+                PREFIX_EOS_TOKEN_ID_FIELD: [2],
+            },
+        )
+
+
 @pytest.mark.parametrize(
     "endpoint_reports_count", [True, False], ids=["with-count", "without-count"]
 )
