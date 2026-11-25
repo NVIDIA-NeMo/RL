@@ -14,8 +14,8 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
@@ -93,6 +93,44 @@ def _add_message_violation_masks(
             message[MALFORMED_THINKING_MASK] = torch.full_like(
                 token_ids, is_malformed, dtype=torch.bool
             )
+
+
+def reward_component_columns(
+    reward_components: Sequence[Optional[dict[str, float]]],
+) -> dict[str, torch.Tensor]:
+    """Return one ``[N]`` column per reward component of a multi-reward prompt group.
+
+    Args:
+        reward_components: ``Completion.reward_components`` of each of the
+            prompt group's completions, in row order.
+
+    Returns:
+        A float32 column per component name, or an empty dict for a
+        single-reward group.
+
+    Raises:
+        ValueError: If the completions disagree on their component names, or a
+            name lacks the ``reward/`` prefix that keeps it apart from the
+            other payload fields.
+    """
+    if all(c is None for c in reward_components):
+        return {}
+    components = [c or {} for c in reward_components]
+    names = sorted(components[0])
+    if any(sorted(c) != names for c in components):
+        raise ValueError(
+            "Completions of one prompt group must share the same reward "
+            f"components, got {[sorted(c) for c in components]}."
+        )
+    unprefixed = [name for name in names if not name.startswith("reward/")]
+    if unprefixed:
+        raise ValueError(
+            f"Reward component names must start with 'reward/', got {unprefixed}."
+        )
+    return {
+        name: torch.tensor([c[name] for c in components], dtype=torch.float32)
+        for name in names
+    }
 
 
 def record_to_train_batch(
@@ -182,6 +220,7 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
+        **reward_component_columns([c.reward_components for c in completions]),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]

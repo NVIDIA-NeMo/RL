@@ -74,10 +74,12 @@ from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     is_nemo_gym_task,
 )
+from nemo_rl.experience.reward_penalties import effort_shaping_enabled
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
 )
+from nemo_rl.experience.rollouts import get_effort_config
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -1611,18 +1613,39 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.length_penalty."
         )
 
-    # Rejected here rather than at the first advantage call, which is a whole
-    # round of rollouts and logprobs later: gdpo needs one reward column per
-    # component and SC's payload writes a single total_reward, with
-    # AdvantageConfig.repeated_batch_fields never populated.
-    if algo_cfg.adv_estimator.name == "gdpo":
+    if algo_cfg.adv_estimator.name == "gdpo" and algo_cfg.reward_shaping.enabled:
         raise NotImplementedError(
-            "adv_estimator 'gdpo' is not supported on the SingleController "
-            "path. It needs per-component reward columns (reward/<name>), and "
-            "the SC payload writes only total_reward, so the first advantage "
-            "call would raise 'GDPO requires multiple reward components' after "
-            "the run had already paid for a full step of rollouts. Set "
-            "adv_estimator.name to 'grpo'."
+            "grpo.reward_shaping adjusts only the scalar reward, which GDPO does "
+            "not read -- the run would silently skip the shaping. Set "
+            "grpo.reward_shaping.enabled=false to use GDPO."
+        )
+
+    if (
+        algo_cfg.adv_estimator.name == "gdpo"
+        and getattr(algo_cfg, "length_penalty", None) is not None
+    ):
+        raise NotImplementedError(
+            "grpo.length_penalty adjusts only the scalar reward, which GDPO does "
+            "not read -- the run would silently skip the penalty. Remove "
+            "grpo.length_penalty to use GDPO."
+        )
+
+    if algo_cfg.adv_estimator.name == "gdpo" and any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        raise NotImplementedError(
+            "reward_penalties zero only the scalar reward, which GDPO does not "
+            "read -- the run would silently skip the penalties. Disable every "
+            "reward_penalties.penalize_* flag to use GDPO."
+        )
+
+    if algo_cfg.adv_estimator.name == "gdpo" and effort_shaping_enabled(
+        get_effort_config(master_config.env)
+    ):
+        raise NotImplementedError(
+            "env.nemo_gym.effort_levels adjusts only the scalar reward, which "
+            "GDPO does not read -- the run would silently skip the shaping. "
+            "Remove env.nemo_gym.effort_levels to use GDPO."
         )
 
     async_config = master_config.async_rl
@@ -1729,7 +1752,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             f"{algo_prefix}.adv_estimator.name={algo_cfg.adv_estimator.name!r} "
             "requires the whole step's batch with its current settings "
-            "(reinforce_plus_plus always; gae and raw_reward with "
+            "(gdpo and reinforce_plus_plus always; gae and raw_reward with "
             "normalize_advantages=true; opd with subtract_global_baseline=true). "
             "Set async_rl.min_groups_for_streaming_train "
             f"({async_config.min_groups_for_streaming_train}) == "

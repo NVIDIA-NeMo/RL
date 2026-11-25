@@ -541,7 +541,7 @@ def test_ledger_restore_rejects_an_attempt_missing_a_gym_field(field: str) -> No
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-def _sealed_attempt_state() -> dict[str, Any]:
+def _sealed_attempt_state(**seal_kwargs: Any) -> dict[str, Any]:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -568,9 +568,37 @@ def _sealed_attempt_state() -> dict[str, Any]:
             },
             reward=1.0,
             mask_sample=True,
+            **seal_kwargs,
         )
     )
     return ledger.state_dict()
+
+
+def _sealed_attempt(ledger: RolloutRecoveryLedger) -> RolloutAttemptRecord:
+    return ledger.get_group("g7").siblings[0].current_attempt
+
+
+def test_sealed_reward_components_survive_a_round_trip() -> None:
+    components = {"reward/correctness": 0.5, "reward/format": 0.5}
+    state = _sealed_attempt_state(reward_components=components)
+    attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
+    assert attempt_state["reward_components"] == components
+
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert _sealed_attempt(restored).reward_components == components
+
+
+def test_schema_8_recovery_loads_without_reward_components() -> None:
+    state = _labelled_schema(_sealed_attempt_state(), 8)
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert _sealed_attempt(restored).reward_components is None
+
+
+def test_restore_rejects_an_attempt_missing_reward_components() -> None:
+    state = _sealed_attempt_state()
+    del state["groups"][0]["siblings"][0]["attempts"][0]["reward_components"]
+    with pytest.raises(ValueError, match="missing reward_components"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 @pytest.mark.parametrize("schema", [2, 3])
@@ -1595,6 +1623,19 @@ def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, A
         for sibling in group["siblings"]:
             for attempt in sibling["attempts"]:
                 del attempt["gym_instance_id"], attempt["gym_attempt"]
+                del attempt["reward_components"]
+    return old
+
+
+def _labelled_schema(state: dict[str, Any], version: int) -> dict[str, Any]:
+    """Return ``state`` labelled ``version``, without attempt fields newer than it."""
+    old = copy.deepcopy(state)
+    old["schema_version"] = version
+    if version < 9:
+        for group in old["groups"]:
+            for sibling in group["siblings"]:
+                for attempt in sibling["attempts"]:
+                    del attempt["reward_components"]
     return old
 
 
@@ -1695,7 +1736,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt(version: int) -> 
     )
 
     state = ledger.state_dict()
-    state["schema_version"] = version
+    state = _labelled_schema(state, version)
     if version == 6:
         state["groups"][0].pop("attribution_key")
     attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
@@ -2105,7 +2146,7 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     if version < 6:
         state = _pre_turn_recovery_state(state, version)
     else:
-        state["schema_version"] = version
+        state = _labelled_schema(state, version)
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
         group.pop("attribution_key", None)
@@ -2138,7 +2179,7 @@ def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
     if version < 6:
         state = _written_by_schema(state, version)
     else:
-        state["schema_version"] = version
+        state = _labelled_schema(state, version)
     group_state = state["groups"][0]
     group_state["resolved_agent_name"] = "flat-agent"
     group_state.pop("attribution_key", None)

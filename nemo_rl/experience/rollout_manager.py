@@ -43,7 +43,12 @@ from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    build_reward_component_columns,
+    extract_reward_components,
+    validate_reward_components_match_scalar,
+)
 from nemo_rl.environments.nemo_gym_multi_harness import (
     HARNESS_RESULT_KEY,
     MultiHarnessRoutes,
@@ -720,6 +725,7 @@ class AsyncRolloutImpl:
         task_name = input_sample["task_name"]
 
         total_reward = 0.0
+        reward_components: dict[str, float] = {}
         turn_count = 0
         # token statistics
         total_token_count = 0
@@ -813,10 +819,13 @@ class AsyncRolloutImpl:
                 )
 
             # Update reward and termination statistics
-            # Multi-reward isn't supported in RolloutManager now, see
-            # https://github.com/NVIDIA-NeMo/RL/issues/2625 for more details.
-            assert isinstance(env_output.rewards, torch.Tensor)
-            total_reward += float(env_output.rewards[0].item())
+            if isinstance(env_output.rewards, dict):
+                for name, reward in env_output.rewards.items():
+                    value = float(reward[0].item())
+                    reward_components[name] = reward_components.get(name, 0.0) + value
+                    total_reward += value
+            else:
+                total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
             env_obs_content = env_output.observations[0]["content"]
             tokenized_obs = self._tokenizer(
@@ -868,6 +877,7 @@ class AsyncRolloutImpl:
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            reward_components=reward_components or None,
         )
         sample_metrics = {
             "turn_count": turn_count,
@@ -1967,8 +1977,27 @@ class AsyncNemoGymRolloutImpl:
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
         )
+        # Check the verifier's own reward: effort shaping and the penalties
+        # above rewrite full_result["reward"] but not its components.
+        validate_reward_components_match_scalar(
+            [
+                {
+                    **result["full_result"],
+                    "reward": result.get(
+                        "reward_original",
+                        result["full_result"].get("reward") or 0.0,
+                    ),
+                }
+                for result in results
+            ]
+        )
+        # A sample without components gets zeros, as on the legacy path, so a
+        # verify result that omits them does not fail the group's payload.
+        component_columns = build_reward_component_columns(
+            [extract_reward_components(result["full_result"]) for result in results]
+        )
         completions = []
-        for result in results:
+        for index, result in enumerate(results):
             env_extras = dict(completion_extras(result["full_result"]))
             attribution_key = get_nemo_gym_attribution_key(result)
             if attribution_key is not None:
@@ -1997,6 +2026,11 @@ class AsyncNemoGymRolloutImpl:
                         # (nemo_gym._postprocess_receipt_mode): a gym result with
                         # no reward finalizes as 0.0 rather than a KeyError.
                         reward=float(result["full_result"].get("reward") or 0.0),
+                        reward_components={
+                            name: float(column[index])
+                            for name, column in component_columns.items()
+                        }
+                        or None,
                     )
                 )
                 continue
@@ -2012,6 +2046,11 @@ class AsyncNemoGymRolloutImpl:
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                     reward_original=result.get("reward_original"),
+                    reward_components={
+                        name: float(column[index])
+                        for name, column in component_columns.items()
+                    }
+                    or None,
                 )
             )
         return completions, penalty_counts
@@ -3294,6 +3333,7 @@ class RolloutManager:
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
+                    reward_components=completion.reward_components,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -3328,6 +3368,7 @@ class RolloutManager:
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
+                    reward_components=completion.reward_components,
                 )
 
         try:
@@ -3401,6 +3442,10 @@ class RolloutManager:
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
+                reward_components=tuple(
+                    sibling.current_attempt.reward_components
+                    for sibling in self._recovery_ledger.get_group(group_id).siblings
+                ),
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,
