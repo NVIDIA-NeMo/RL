@@ -33,7 +33,10 @@ from nemo_rl.telemetry.instrumentation import (
     safe_set_span_attributes,
     setup_span,
 )
-from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+from nemo_rl.utils.venvs import (
+    add_hf_modules_cache_to_pythonpath,
+    driver_env_for_workers,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -444,7 +447,7 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     Any process env var that must reach every worker (e.g. a backend engine
     knob such as data_plane's) has to be set before this call, in the caller
-    — this function snapshots ``dict(os.environ)`` below into
+    — this function snapshots the driver's environment below into
     ``runtime_env["env_vars"]``, which is the only point such a setting
     becomes cluster-wide. See
     :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, which
@@ -460,7 +463,7 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
     # Put Hugging Face's generated ``transformers_modules`` package on the
     # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
     # that boundary. This covers both V1 worker groups and direct V2/SC actors.
-    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
+    env_vars = add_hf_modules_cache_to_pythonpath(driver_env_for_workers())
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
     runtime_env = {
