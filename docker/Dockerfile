@@ -30,7 +30,7 @@
 # Optional: install packages over the locked ones in the worker venvs that carry the vllm extra:
 #   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
 # can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
 # safe to reuse for a multi-node build, so this must be part of the cache identity,
@@ -615,7 +615,7 @@ TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
-TRTLLM_SYNC_STATUS=$?
+TRTLLM_SYNC_STATUS=${PIPESTATUS[0]}
 set -e
 if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
     echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
@@ -747,7 +747,7 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-# Opt-in, off by default: packages to install over the locked ones in every worker venv
+# Packages to install over the locked ones in every worker venv
 # that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
 # toolkit than the one uv.lock pins:
 #   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
@@ -763,7 +763,7 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # vLLM engines (see nemo_rl/distributed/actor_environments.py).
 # Override every torch companion package together: torchaudio refuses to import next to
 # a torch built for a different CUDA version, and the workers import it through transformers.
-ARG VLLM_VENV_PACKAGE_OVERRIDES=
+ARG VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
 ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu

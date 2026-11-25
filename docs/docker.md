@@ -78,7 +78,7 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 ## Overriding Packages in the vLLM Worker Venvs
 
-`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to try the vLLM wheel on a torch built for a newer CUDA toolkit than the one `uv.lock` pins, which the lock cannot express for a single extra:
+`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. By default it installs torch 2.15.0 built for CUDA 13.4 (with torchvision, torchaudio, Triton and cuBLAS to match), so the vLLM workers also run on Rubin (sm_107). `uv.lock` cannot express a torch for a single extra. The default is equivalent to:
 
 ```sh
 docker buildx build -f docker/Dockerfile \
