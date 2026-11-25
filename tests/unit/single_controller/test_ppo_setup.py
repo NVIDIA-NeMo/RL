@@ -1477,7 +1477,7 @@ def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
     mc.ppo.seq_logprob_error_threshold = 2.0
     mc.loss_fn.seq_logprob_error_in_loss = True
     mc.loss_fn.force_on_policy_ratio = True
-    mc.loss_fn.token_level_loss = True
+    mc.loss_fn.normalization = "global_token_mean"
     mc.ppo.adv_estimator.normalize_advantages = False
     return mc
 

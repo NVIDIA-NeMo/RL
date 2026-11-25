@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     create_advantage_estimator,
 )
@@ -98,6 +99,18 @@ if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
     # back through the controller.
     from nemo_rl.algorithms.ppo import PPOConfig
+
+
+def validate_forest_estimator(estimator: Any, *, is_ppo: bool) -> None:
+    """Forest owners support the standard GRPO estimator and PPO's GAE."""
+    if is_ppo:
+        supported = isinstance(estimator, GeneralizedAdvantageEstimator)
+    else:
+        supported = isinstance(estimator, GRPOAdvantageEstimator)
+    if not supported:
+        raise ValueError(
+            "Forest logical owners require the standard GRPO estimator or PPO's GAE"
+        )
 
 
 def _train_fields_for_step(
@@ -437,15 +450,8 @@ class AdvantageComputer:
             )
         adv_cfg = cfg.advantage
         logical = has_logical_owners(meta)
-        if logical and (
-            cfg.is_ppo
-            or not isinstance(cfg.algo, GRPOConfig)
-            or cfg.algo.adv_estimator.name != "grpo"
-            or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-        ):
-            raise ValueError(
-                "Forest logical owners require the standard GRPO estimator"
-            )
+        if logical:
+            validate_forest_estimator(self._advantage_estimator, is_ppo=cfg.is_ppo)
         input_fields = cfg.input_fields()
         if logical and adv_cfg.prompt_ids_field not in input_fields:
             input_fields.append(adv_cfg.prompt_ids_field)
@@ -704,7 +710,9 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens and owner_batch is not None:
+        # PPO runs GAE per physical row with its own values (below); GRPO
+        # computes one advantage per logical owner and fans it out.
+        if has_valid_training_tokens and owner_batch is not None and not cfg.is_ppo:
             rows = owner_batch.representative_rows
             owner_participation = torch.zeros_like(
                 owner_batch.valid_mask

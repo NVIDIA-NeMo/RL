@@ -1380,6 +1380,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"
     ]
+    megatron_cfg = config["megatron_cfg"]
+    if "moe_router_enable_expert_bias" in megatron_cfg and provider_override_allowed(
+        megatron_cfg, "moe_router_enable_expert_bias"
+    ):
+        model_cfg.moe_router_enable_expert_bias = megatron_cfg[
+            "moe_router_enable_expert_bias"
+        ]
 
     model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
