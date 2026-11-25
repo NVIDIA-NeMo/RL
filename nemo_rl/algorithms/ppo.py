@@ -16,7 +16,7 @@ import os
 import time
 import traceback
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -28,8 +28,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
-    GeneralizedAdvantageEstimator,
-    RawRewardAdvantageEstimator,
+    create_advantage_estimator,
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
@@ -48,7 +47,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
@@ -69,7 +68,11 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     TOPO_RANK_UNKNOWN,
@@ -87,6 +90,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -100,6 +104,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -131,6 +136,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import path_exists
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.factory import (
@@ -212,6 +218,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
+    # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
+    value_training_mode: Literal["split", "whole_batch"] = "whole_batch"
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
@@ -360,9 +368,24 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     value_config = master_config.value
+    if value_config.get("dedicated"):
+        raise ValueError(
+            "value.dedicated=true requires the SingleController PPO entrypoint"
+        )
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
+        raise ValueError(
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
+        )
+    megatron_cfg = policy_config.get("megatron_cfg")
+    make_objective_reduction(loss_config.resolved_normalization).validate_setup(
+        trainer="ppo",
+        algorithm="ppo",
+        megatron_enabled=megatron_cfg is not None and megatron_cfg["enabled"],
+        on_policy_distillation=False,
+    )
     ppo_config = master_config.ppo
     data_config = master_config.data
     logger_config = master_config.logger
@@ -370,13 +393,14 @@ def setup(
 
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use the non-streaming GRPO trainer."
+            "loss_fn.seq_logprob_error_in_loss is not supported by the legacy PPO "
+            "trainer. Use the SingleController trainer with ppo.ppo_epochs=1."
         )
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
@@ -403,8 +427,8 @@ def setup(
         # checkpoint layout cannot represent both the warmup and training states.
         assert not (
             ppo_config.policy_training_start_step > 0
-            and master_config.checkpointing["enabled"]
-            and master_config.checkpointing["save_optimizer"]
+            and master_config.checkpointing.enabled
+            and master_config.checkpointing.save_optimizer
             and "checkpoint" in policy_megatron_config
             and policy_megatron_config["checkpoint"].get(
                 "ckpt_assume_constant_structure"
@@ -425,23 +449,16 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # Automodel PPO value model currently doesn't support sequence packing and CP.
         assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
-        assert value_config["sequence_packing"]["enabled"] is False, (
-            "Sequence packing is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
-        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
-        assert value_config["dynamic_batching"]["enabled"] is False, (
-            "Dynamic batching currently has some issue for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
-        )
+        if value_config["automodel_cfg"]["context_parallel_size"] > 1:
+            assert not value_config["sequence_packing"]["enabled"], (
+                "Automodel context parallelism is incompatible with value sequence "
+                "packing. Set value.sequence_packing.enabled=false when "
+                "value.automodel_cfg.context_parallel_size>1."
+            )
 
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
@@ -527,6 +544,10 @@ def setup(
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        # Later epochs on the same batch would train without any trust region.
+        assert ppo_config.ppo_epochs == 1, (
+            f"force_on_policy_ratio requires ppo.ppo_epochs=1, got {ppo_config.ppo_epochs}"
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
@@ -850,6 +871,7 @@ def setup(
             cluster=train_cluster,
             config=value_config,
             tokenizer=tokenizer,
+            seed=ppo_config.seed,
             name_prefix="lm_value",
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
@@ -1252,20 +1274,13 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = ppo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
+    adv_estimator = create_advantage_estimator(adv_estimator_config, loss_config)
     if adv_estimator_name == "gae":
-        adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.gae_lambda
         gae_gamma = adv_estimator_config.gae_gamma
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
-        adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
-    else:
-        raise ValueError(
-            f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
-            f"PPO only supports 'gae' or 'raw_reward'."
-        )
-
     return adv_estimator
 
 
@@ -1347,7 +1362,7 @@ def ppo_train(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -1428,7 +1443,7 @@ def ppo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -2014,8 +2029,7 @@ def ppo_train(
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -2024,7 +2038,7 @@ def ppo_train(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ppo_save_state["current_step"] = current_step + 1
@@ -2037,7 +2051,7 @@ def ppo_train(
                         del ppo_save_state["val_reward"]
                     ppo_save_state["consumed_samples"] = consumed_samples
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -2115,10 +2129,7 @@ def ppo_train(
                         )
                         value_model.finish_training()
 
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
                         # The value worker finalizes its own write synchronously
                         # (blocking=True) inside save_checkpoint, so only the
                         # policy's async write needs to be awaited before rename.
@@ -2310,7 +2321,7 @@ def async_ppo_train(
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -2340,7 +2351,7 @@ def async_ppo_train(
     val_at_start = master_config.ppo.val_at_start
     val_at_end = master_config.ppo.val_at_end
     num_prompts_per_step = master_config.ppo.num_prompts_per_step
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
     max_training_steps = max_num_steps
 
     replay_buffer: Any = None
@@ -2439,7 +2450,7 @@ def async_ppo_train(
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
+        if path_exists(replay_buffer_path):
             print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
             restore_max_age = _async_ppo_buffer_max_age(
                 step=step,
@@ -3008,11 +3019,11 @@ def async_ppo_train(
                 timeout.mark_iteration()
                 should_save_by_step = (
                     is_last_step
-                    or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (step + 1) % master_config.checkpointing.save_period == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
                 should_save_by_timeout = timeout.check_save()
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ppo_save_state["current_step"] = step + 1
@@ -3027,7 +3038,7 @@ def async_ppo_train(
                     # Record the top-k ranking metric into the save state so
                     # get_best_checkpoint_path / top-k pruning work (parity with
                     # sync ppo_train and async_grpo_train).
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -3093,10 +3104,7 @@ def async_ppo_train(
                         dataloader_state = ray.get(
                             trajectory_collector.get_dataloader_state.remote()
                         )
-                        torch.save(
-                            dataloader_state,
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader_state, checkpoint_path)
                         print("📦 Saving replay buffer state...")
                         num_buffered_trajectories = ray.get(
                             replay_buffer.save_to_path.remote(

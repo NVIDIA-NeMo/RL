@@ -81,6 +81,8 @@ def test_mamba_memory_ratio_default_and_override():
         {"mamba_memory_ratio": None}, True, 1
     ) == pytest.approx(0.2)
     assert _resolve_mamba_memory_ratio({"mamba_memory_ratio": "0.25"}, True, 0) == 0.25
+    with pytest.raises(ValueError, match="mamba_memory_ratio"):
+        _resolve_mamba_memory_ratio({}, True, 9)
     for bad in (0, 1, 1.5, -0.1):
         with pytest.raises(ValueError, match="mamba_memory_ratio"):
             _resolve_mamba_memory_ratio({"mamba_memory_ratio": bad}, True, 0)

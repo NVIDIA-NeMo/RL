@@ -212,8 +212,14 @@ def _stub_converter(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ):
-    del record, pad_value_dict, include_message_violation_fields
+    del (
+        record,
+        pad_value_dict,
+        include_message_violation_fields,
+        per_token_multimodal_fields,
+    )
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((ROLLOUTS_PER_GROUP, 3), dtype=torch.long),
@@ -379,7 +385,7 @@ async def _round_trip(
                     generation_index=generation_index,
                     gate_rollout_id=gate_rollout_id,
                     receipt={
-                        "rollout_id": gate_rollout_id,
+                        "capture_key": gate_rollout_id,
                         "manifest": [{"staging_key": staging_key}],
                     },
                     reward=float(generation_index),
@@ -400,7 +406,7 @@ async def _round_trip(
     buf_b = _new_buffer(dp_b)
     sampler_b = create_sampler(buf_b, sampler_config(sampler_name, scenario.lag))
 
-    # Mirrors SingleControllerActor._maybe_restore_replay_buffer.
+    # Mirrors RolloutRestorer._restore_replay_buffer.
     if sidecar is not None and sampler_b.supports_buffer_checkpoint:
         await buf_b.load_state_dict(
             sidecar,

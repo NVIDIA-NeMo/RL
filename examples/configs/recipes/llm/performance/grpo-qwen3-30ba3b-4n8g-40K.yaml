@@ -49,7 +49,7 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 2
     vllm_kwargs:
-      moe_backend: flashinfer_trtllm
+      moe_backend: triton
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n8g
   wandb_enabled: true

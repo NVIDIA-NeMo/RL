@@ -12,8 +12,8 @@
 #   (TP=4 DP=4 = 16 GPUs) alongside the NL2Bash and Safety judges.
 #
 # Training parallelism: TP=8, EP=64, CP=8, PP=1, SP=true.
-# vLLM parallelism: TP=8, EP=8 (EP=TP keeps vllm_dp_size=1; EP>TP is blocked
-# by https://github.com/NVIDIA-NeMo/RL/issues/1101).
+# vLLM parallelism: TP=8, EP=8 (EP=TP keeps vllm_dp_size=1;
+# EP>TP is supported but not needed for this recipe).
 # =============================================================================
 
 # =============================================================================
@@ -123,7 +123,7 @@ loss_fn:
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
-  token_level_loss: true
+  normalization: global_token_mean
   force_on_policy_ratio: true
   use_kl_in_reward: false
 
@@ -313,7 +313,7 @@ policy:
     stop_strings: null
     # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
     # Same memory as EP=1 but uses all-to-all for expert routing.
-    # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    # EP=TP keeps vLLM DP disabled for this recipe.
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
@@ -391,6 +391,7 @@ env:
   nemo_gym:
     abstention_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -412,6 +413,7 @@ env:
             name: genrm_simple_agent_reasoning_off
     instruction_following_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -419,6 +421,7 @@ env:
             name: instruction_following_simple_agent
     inverse_if_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -426,13 +429,13 @@ env:
             name: inverse_if_simple_agent
     multichallenge_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
             type: responses_api_agents
             name: multichallenge_simple_agent
 
-    nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
     num_gpu_nodes: 20
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.

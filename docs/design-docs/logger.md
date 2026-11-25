@@ -112,13 +112,9 @@ mlflow:
 
 > [!WARNING]
 > Using MLflow's default file-based backend (for example, the `mlruns/` directory store) is not recommended for NeMo RL.
-> NeMo RL logs hierarchical metric names such as `timing/train/policy_training` and
-> `timing/train/policy_training/sharding_data`. With MLflow's file-based backend, `/` is treated
-> as a path separator, which can lead to file-versus-directory conflicts and raise
-> `IsADirectoryError`.
+> NeMo RL logs hierarchical metric names such as `timing/train/policy_training` and `timing/train/policy_training/sharding_data`. With MLflow's file-based backend, `/` is treated as a path separator, which can lead to file-versus-directory conflicts and raise `IsADirectoryError`.
 >
-> If you want to use a local filesystem-backed MLflow store, prefer a SQLite backend instead of
-> the default file store. For example:
+> If you want to use a local filesystem-backed MLflow store, prefer a SQLite backend instead of the default file store. For example:
 >
 > ```python
 > mlflow:
@@ -127,8 +123,7 @@ mlflow:
 >   tracking_uri: "sqlite:////path/to/mlflow.db"
 > ```
 >
-> This keeps the tracking data on the local filesystem while avoiding the metric name path
-> collisions that can happen with the file-based backend.
+> This keeps the tracking data on the local filesystem while avoiding the metric name path collisions that can happen with the file-based backend.
 
 
 #### MLflow UI
@@ -151,6 +146,16 @@ Then access the UI at `http://127.0.0.1:5000/` to view:
 - Metrics (loss, validation metrics, etc.)
 - Hyperparameters
 - Model artifacts and checkpoints
+
+### Custom Backends
+
+Other backends can be added without changing NeMo RL. List {py:class}`LoggerInterface <nemo_rl.utils.logger.LoggerInterface>` subclasses by fully qualified class name; each is imported and constructed without arguments, then receives the same calls as the built-in backends:
+
+```yaml
+logger:
+  extra_backends:
+    - my_package.logging.MyLogger
+```
 
 ## Validation Pretty Logging
 

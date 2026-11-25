@@ -1,20 +1,112 @@
-# Managed Dynamo generation on Slurm
+# Dynamo serving for vLLM generation
 
-NeMo RL can launch and own Dynamo's control plane, frontend, and a fixed vLLM
-worker fleet inside a Slurm-backed Ray allocation. This mode supports direct
-GRPO and NeMo-Gym rollouts, NCCL weight refits, cache invalidation, and
-`generation_metrics/*` telemetry sent to enabled loggers such as W&B.
-See the [Dynamo integration design](../design-docs/dynamo-integration.md) for
-the service ownership, startup, and weight-refit architecture.
+SingleController runs (`examples/run_grpo_single_controller.py`) with non-colocated vLLM generation can serve their rollouts through [Dynamo](https://github.com/ai-dynamo/dynamo)'s OpenAI frontend and KV-aware router. Add one line:
 
-This integration is managed and vLLM-only. It does not connect to an external
-Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
-speculative decoding, quantized generation, or model-parallel engine groups
-that span nodes.
+```yaml
+policy:
+  generation:
+    backend: vllm
+    dynamo: true
+```
+
+The same NeMo RL vLLM workers run the same engines, with the same refit transports, pause and resume, quantization, speculative decoding and metrics.
+Each engine also registers with a managed `dynamo.frontend`, and NeMo RL's own rollouts (`generate_async`) go through that frontend, so each request lands on the engine that already holds most of its prompt's KV cache. The few settings Dynamo cannot serve fail at startup; see [Not supported](#not-supported).
+
+See the [Dynamo integration design](../design-docs/dynamo-integration.md) for how the engines are hosted and why Dynamo upgrades and vLLM bumps stay independent.
+
+## What happens at startup
+
+With `dynamo: true`:
+
+- `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's `AsyncLLM`. Settings Dynamo does not serve are rejected at startup; see [Not supported](#not-supported).
+- The driver starts etcd and NATS. Each `dynamo.frontend` runs on a generation node, from a small Ray actor, in the vLLM workers' own venv, so it is the same ai-dynamo release.
+- Each engine turns on vLLM's KV-cache events for `router_mode: kv` and registers with the frontends from inside its own worker process. Setup waits until every frontend routes to every engine.
+- With NeMo-Gym (`vllm_cfg.expose_http_server: true`), each frontend starts its render workers at launch and builds them while the engines load, from the settings one engine sends before it loads. Gym's first calls then do not wait for them. Other runs start none.
+- vLLM publishes KV-cache events only for blocks its prefix cache stores. With `vllm_cfg.enable_prefix_caching: false`, the engines publish none, and the KV router routes on load alone.
+- Shutdown stops the services after the engines.
+
+## Configure
+
+`dynamo: true` is a complete configuration. `policy.generation.dynamo_cfg` only tunes the frontend and registration. Its fields and defaults live in `nemo_rl/models/generation/dynamo/config.py`, and [`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml) shows them all:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
+| `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
+| `frontend_args.router_mode` | `kv` | Frontend routing policy |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
+| `frontend_args.session_affinity_max_entries` | 16,777,216 | Most sessions the frontends hold at once, across all of them; a new one past it gets HTTP 529. Entries are allocated as sessions start, so a high cap costs nothing until it is used |
+| `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`: with `router_mode: kv`, each router then sees the requests the others have in flight; the other router modes balance only the requests of their own frontend. NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random. With more than one, NeMo RL sets NeMo-Gym's `route_around_failing_endpoints` and `endpoint_connection_retry_timeout_s: 60` on the policy model, unless the recipe sets them: a frontend that stops answering loses its sessions to the others instead of holding their calls forever |
+| `frontend_args.render_workers` | 8 | Processes in each frontend that render NeMo-Gym's chat calls and build their replies; every Gym call that frontend serves shares them. Each holds its own tokenizer and processor, about 1.7–2.3 GB. On one Grace core of a GB200, one serves about 640 single-turn calls/s, 45 for a 21K-token agentic history (22 with its prefix splice), or 200 with 1–4 images |
+| `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags. `--dyn-chat-processor`, `--dyn-chat-processor-config` and `--custom-jinja-template` are rejected: NeMo RL renders chat itself. A flag the managed runtime already sets is rejected too |
+| `frontend_args.extra_env` | `{}` | Extra frontend environment, for settings Dynamo reads only from the environment, such as `DYN_TCP_LISTEN_BACKLOG` and `DYN_FRONTEND_FD_LIMIT_TARGET`. A frontend holds two sockets per call in flight, so it serves at most half its open-file limit at once. NeMo RL sets `DYN_FRONTEND_FD_LIMIT_TARGET` to 65,536 (about 32,000 calls); a higher value here raises the limit further, up to the hard limit. Variables the runtime manages are rejected |
+
+With `vllm_cfg.enable_vllm_metrics_logger` on, the SingleController's telemetry also logs `rollout/throughput/dynamo_frontend_requests_queued` and `rollout/throughput/dynamo_frontend_requests_inflight`: the calls waiting in the frontends for their first response and the calls in flight, summed over the frontends. Each frontend's own counts are logged as `rollout/throughput/dynamo_frontend_<i>_requests_queued` and `..._inflight`, where `<i>` is the frontend's place in the `[Dynamo] frontends, by index` line of the driver log. A call that waits in a frontend is in no engine's vLLM metrics.
+
+With `telemetry.vllm_native_tracing` on, NeMo RL also turns on Dynamo's trace export (`OTEL_EXPORT_ENABLED`) in the frontends and the vLLM workers. vLLM's request span then joins the trace of the frontend's request span, and Dynamo exports its own frontend and engine spans to the same collector, which it reads from the same `OTEL_EXPORTER_OTLP_*` variables. The frontend continues the caller's trace only when it accepts the call's `traceparent`: Dynamo 1.8.0.dev20261117 ignores one whose trace flags are `03`, which NeMo-Gym sends, and starts a new trace ([ai-dynamo/dynamo#19106](https://github.com/ai-dynamo/dynamo/issues/19106)).
+
+The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it is set (the image sets it to `/opt/dynamo/bin`), and on `PATH` otherwise.
+
+## Which requests go through the frontend
+
+| Request | Path |
+|---|---|
+| `generate_async` on text token prompts, router replay (R3) included | Frontend (KV-aware); the engine samples and assembles it exactly as native `generate_async` does |
+| NeMo RL's own multimodal rollouts | Native shard dispatch. Those rollouts send media to the engine directly rather than as OpenAI content |
+| `generate_text_async`, which evaluation uses | Native shard dispatch |
+| NeMo-Gym's chat calls | Frontend, rendered by NeMo RL's chat engine with the native server's code. See [NeMo-Gym](#nemo-gym) |
+
+A rollout through the frontend has the same `GenerationOutputSpec` as the native path: token IDs, log probabilities, truncation, routed experts with their `r3_routed_experts_*` counts, and `gen_leader_worker_idx`. Both paths build it with `nemo_rl/models/generation/vllm/request_pipeline.py`.
+
+## NeMo-Gym
+
+NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect (`dynamo_frontend` in Gym's [`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model) config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native request's extra fields (`ng_capture`, `required_prefix_token_ids`), and `ng_measure` for the measure call it makes in place of `/tokenize`, in one `nemo_rl:gym:` annotation, and reads the call's token fields (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`, `routed_experts`, `ng_commit_coords`) from `nvext.nemo_rl`.
+
+The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own renderer and parsers (it is the frontend's custom chat processor). Each call takes the native server's steps, with the native server's code:
+
+1. In the frontend, a render-pool process renders the call with the engine's own tokenizer, template, processor and `vllm_cfg` chat settings (parser plugins included), which each engine publishes when it registers. It also decides how a token-capture call's prefix is served.
+2. The chat engine checks on-policy sampling, reads a captured prefix from TQ, splices the prefix into the render, clamps the output budget to the context, and routes the final token IDs through the KV router.
+3. On the engine, the adapter snapshots the call's media, begins its capture, generates with the `SamplingParams` the native server builds, and stages the call in one TQ write. Only the commit coordinates travel back.
+4. A render-pool process builds the reply with vLLM's reasoning and tool parsers.
+
+`tests/unit/models/generation/test_gym_chat_path.py` sends the same calls down both paths and checks they run the same prompt and `SamplingParams`, stage the same record and return the same reply.
+
+Where the behavior differs from the native endpoint:
+
+- The frontend refuses more than 32 `stop` strings or 32 `stop_token_ids`, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
+- gpt-oss (Harmony) chat calls are refused with HTTP 400.
+- A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
+- A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.
+- A call's processed media travels to the engine inside the request.
+- A call NeMo-Gym marks as untrained, such as an LLM judge's on the policy model, keeps its own sampling on the native endpoint, which reads the mark from the `x-ng-sampling: null` header. Dynamo's frontend does not forward that header, so NeMo RL's chat engine reads the mark from the `nemo_rl:gym:` annotation (`ng_sampling`). The pinned NeMo-Gym does not send it there yet: until it does, such a call is refused with HTTP 400 unless it matches the training or validation sampling. Give a judge that samples differently a model server of its own.
+
+### Rollout recovery
+
+`rollout_recovery.target_level: turn` and `prefix` work through Dynamo with no extra setting. With `prefix`, NeMo-Gym asks the generation backend to cut its running calls at each checkpoint, and re-sends each cut call after a restore.
+Two things differ from the native endpoint:
+
+- **Where the cut goes.** Gym sends the cut beside the URL its calls go to, which is a frontend, but the calls run in the engines. Each frontend takes the cut on its own port, as a Dynamo route extension, and sends it to every engine over Dynamo's request plane; each engine cuts the calls it holds, up to that frontend's deadline (`token_capture.control_timeout_s` from the cut's arrival there). A frontend runs at most 64 cuts at once, Dynamo's limit for one route, and refuses a further one with HTTP 529. Every worker process of a Gym policy-model server (its `num_workers`, in every shard and replica) sends its own cut to each frontend that holds its calls, so a frontend gets that many cuts at one checkpoint, whatever `num_frontends` is; past 64, the calls of the refused workers regenerate after a restore.
+- **What the router sees for a resumed call.** The engine replaces the prompt the frontend sent with the call's saved tokens and generates the rest, and the frontend puts the saved text back in front of the reply. So the KV router scores that one call on a prompt without the saved tokens. A cut the engine cannot use is dropped and the call regenerates, as natively.
+
+## Not supported
+
+Startup rejects these with `dynamo: true`:
+
+- `colocated.enabled: true`: a colocated engine sleeps while the policy trains, and the frontend would keep routing to it.
+- `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself, and a restarted shard does not register with it yet.
+- `async_rl.generation_router`: each frontend already routes to the whole fleet.
+- `bad_words` in `extra_body` or `sampling_overrides` on the policy model (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend answers every request carrying it with HTTP 400. Startup checks only this overlay, not Gym's own YAMLs.
+- `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
+- `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
+- `vllm_cfg.http_server_api_key_required`: the frontend serves the same engines on 0.0.0.0 and checks no bearer token.
+- `vllm_cfg.http_api_server_count` above 1: NeMo-Gym's calls go through the Dynamo frontend, so the extra vLLM HTTP frontends would serve none of them. `frontend_args.render_workers` sets how many processes render chat calls behind Dynamo.
+- `frontend_args.router_mode: direct`: it needs a worker ID on every request, and NeMo RL's rollouts name none.
+- `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without `dynamo: true`.
 
 ## Build the image
 
-The normal image is unchanged unless `BUILD_DYNAMO` is set:
+ai-dynamo is part of the `vllm` extra, so every vLLM worker venv carries it.
+`BUILD_DYNAMO=1` adds only the etcd and nats-server binaries, under `/opt/dynamo/bin`:
 
 ```bash
 docker buildx build \
@@ -26,175 +118,25 @@ docker buildx build \
   .
 ```
 
-The opt-in layer installs `ai-dynamo[vllm]==1.3.0.post1` in isolated Python
-3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
-It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
-NeMo RL vLLM environment currently uses vLLM 0.29.0, while this isolated
-Dynamo environment uses Dynamo's vLLM 0.23.0 pin. Both environments pin
-`nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
-For a local source checkout, the same environment can be installed under
-`venvs/dynamo`:
+For a local checkout, install the binaries and keep the variable set for the runs that follow. The runtime looks for etcd and nats-server there, or else on `PATH`:
 
 ```bash
+export NEMO_RL_DYNAMO_BIN_DIR="$PWD/venvs/dynamo-bin"
 bash docker/dynamo/install.sh
 ```
 
-Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
-that Dynamo resolved vLLM 0.23.0 and NCCL 2.30.7, applies the vLLM PR #44814
-backport only after `git apply --check`, and writes the upstream marker to
-`VLLM_BACKPORTS`.
+## Run
 
-Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
-must update and reverify these coupled locations:
-
-- `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`: the Dynamo pin
-  and resolved dependency set
-- root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
-  lockfile: the `nvidia-nccl-cu13` pins must remain identical
-- `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
-  version, backport marker, and runtime assertions
-- `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
-  the version-specific #44814 backport
-- `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
-  `broadcast_from/0/0` weight-transfer wire key
-- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
-  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
-  reverify them against real Dynamo output because unit tests validate only the
-  expected local response shape
-- `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
-  `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
-  jail removes `nvext.engine_data`; remove this setting only after an upgraded
-  Dynamo preserves the token metadata for `tool_choice=auto`
-- this guide and the Dynamo design document: the stated versions and backport
-  behavior
-
-If the new Dynamo vLLM pin contains PR #44814, delete the patch file,
-patch-application block, marker assertion, and explanatory backport text. Do
-not rebase the patch onto the newer vLLM release.
-
-## Configure Dynamo
-
-Start with [`examples/configs/grpo_math_1B_dynamo.yaml`](../../examples/configs/grpo_math_1B_dynamo.yaml).
-The important boundary is:
-
-```yaml
-policy:
-  generation:
-    backend: dynamo
-    dynamo_cfg:
-      engine: vllm
-      frontend_args:
-        router_mode: kv
-    vllm_cfg:
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-    colocated:
-      enabled: false
-      resources:
-        gpus_per_node: 1
-        num_nodes: 1
-```
-
-NeMo RL derives each engine's world size from TP times PP. EP must be one or
-equal to TP. Parser settings belong under `dynamo_cfg.worker_args`; inherited
-vLLM HTTP-parser settings are rejected with the corresponding Dynamo field.
-Service ports and the namespace are runtime-owned rather than public config.
-
-`vllm_cfg` settings are handled in five explicit classes:
-
-| Class | Behavior | Examples |
-| --- | --- | --- |
-| Translated | Forwarded to `dynamo.vllm` | TP, PP, EP, dtype, model length |
-| Moved | Startup error naming the Dynamo replacement | tool and reasoning parsers, HTTP serving chat kwargs |
-| Unsupported | Warning when active, or an error when it requests unsupported low precision | tokenizer skipping, MX and mixed BF16/FP8 helpers |
-| Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
-| Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
-
-The shared GRPO base config also supplies `mcore_generation_config` and
-`refit_cfg`. Dynamo accepts these inherited sections but does not use them;
-worker arguments come from `vllm_cfg`, and refit uses the collective weight
-synchronizer.
-
-Enable and filter worker telemetry with both managed configuration sections:
-
-```yaml
-policy:
-  generation:
-    vllm_cfg:
-      enable_vllm_metrics_logger: true
-      vllm_metrics_logger_interval: 1.0
-    dynamo_cfg:
-      metrics_include_prefixes: null  # null selects the curated defaults
-      metrics_exclude_prefixes: null  # null excludes python_ and process_
-```
-
-The NCCL sender also selects vLLM's peer protocol: the policy publishes both
-the raw NeMo RL unique ID and vLLM's pickled `ncclUniqueId`, then uses the
-all-reduce warmup expected by `PyNcclCommunicator`. This protocol choice and
-the packed 1-GiB/two-buffer geometry come from the generation backend rather
-than GRPO-specific branches.
-
-The fixed port layout is:
-
-- `1313-1399`: driver-local etcd and NATS control plane
-- `3000-3999`: frontend and token-wrapper HTTP endpoints
-- `4000-4099`: node-local `DYN_SYSTEM_PORT`
-- `7000 + slot * 100`: node-local vLLM rendezvous ports
-
-## Run the two-GPU smoke
-
-Convert the image to the format required by the Slurm site, then submit from
-the repository root:
+Use any non-colocated SingleController vLLM recipe and add the switch:
 
 ```bash
-export CONTAINER=/shared/images/nemo-rl-dynamo.sqsh
-export MOUNTS="$PWD:$PWD"
-export GPUS_PER_NODE=2
-export BASE_LOG_DIR="$PWD/results/dynamo-smoke/logs"
-printf -v COMMAND '%q ' \
-  /opt/nemo_rl_venv/bin/python -u "$PWD/examples/run_grpo.py" \
-  --config "$PWD/examples/configs/grpo_math_1B_dynamo.yaml"
-export COMMAND
-
-sbatch \
-  --nodes=1 \
-  --gres=gpu:2 \
-  --exclusive \
-  --account=<account> \
-  --partition=<partition> \
-  ray.sub
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/grpo_math_1B_megatron_single_controller.yaml \
+  ++policy.generation.dynamo=true
 ```
 
-The recipe assigns one GPU to training and one to a TP1 Dynamo worker. Its two
-steps exercise generation, refit, post-refit cache invalidation, telemetry,
-and cleanup. For a matched control, run the same seed/model/batch settings with
-the standard non-colocated vLLM backend and compare post-refit output validity.
+[`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml) is the same run with every `dynamo_cfg` default spelled out.
 
-## Run SWE1 with W&B
+## Migrating from `backend: dynamo`
 
-The three-node nightly recipe targets
-`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`. It uses two 8-GPU training
-nodes and one 8-GPU inference node. The inference node runs two TP4/EP4 Dynamo
-engines. Download the standard SWE1 split under
-`${HF_HOME}/superv3_data/swe1`, then run the registered test-suite driver:
-
-```bash
-HF_HOME=/shared/huggingface \
-WANDB_API_KEY=<key> \
-bash tests/test_suites/llm/grpo-nanov3-30ba3b-3n8g-megatron-dynamo-swe1.sh
-```
-
-A successful acceptance run completes four training steps, produces valid
-generations after refit, and records worker timelines under
-`generation_metrics/*` in TensorBoard and W&B.
-
-## Operational notes
-
-- The driver owns all services. Do not start a separate etcd, NATS, frontend,
-  or worker fleet for this mode.
-- Startup validates fixed worker membership; a dead or replaced worker fails
-  refit instead of serving mixed model versions.
-- Shutdown is idempotent and terminates whole subprocess groups, including
-  partial-startup failures.
-- Fault tolerance and a multi-controller architecture remain follow-up work.
+`backend: dynamo` launched Dynamo's own vLLM engine and was removed. Set `backend: vllm` and `dynamo: true`; `vllm_cfg` and `vllm_kwargs` keep their meaning. Startup rejects the old backend and each removed `dynamo_cfg` key (`engine`, `control_timeout_s`, `metrics_*_prefixes`, `worker_args`, `frontend_args.tokenizer*`) with what replaces it.

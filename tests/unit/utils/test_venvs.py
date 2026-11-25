@@ -13,9 +13,14 @@
 # limitations under the License.
 import os
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from typing import Any, Iterator
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+import nemo_rl.utils.venvs as venv_module
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv,
@@ -100,3 +105,89 @@ def test_make_actor_runtime_env_builds_local_venv_for_uv_python_executable():
     assert runtime_env["py_executable"] == "/fake/venv/bin/python"
     assert runtime_env["env_vars"]["VIRTUAL_ENV"] == "/fake/venv"
     assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == "/fake/venv"
+
+
+@pytest.fixture
+def node_venv_builder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[tuple[MagicMock, MagicMock, MagicMock, MagicMock, MagicMock, str]]:
+    monkeypatch.setenv("NEMO_RL_VENV_DIR", str(tmp_path))
+    monkeypatch.setenv("NRL_FORCE_REBUILD_VENVS", "true")
+    monkeypatch.setattr(venv_module, "G_BUILT_VENVS", {})
+    monkeypatch.setattr(venv_module, "G_VENV_BUILD_LOCKS", {})
+    nodes = [{"NodeID": "node-a", "Alive": True, "Resources": {"CPU": 4}}]
+    pg = MagicMock()
+    builder = MagicMock()
+    python_path = str(tmp_path / "gym/bin/python")
+
+    def ray_get(ref: Any) -> list[str] | None:
+        return None if ref is pg.ready.return_value else [python_path]
+
+    with (
+        patch.object(venv_module.ray, "nodes", return_value=nodes) as get_nodes,
+        patch.object(venv_module, "placement_group", return_value=pg) as make_pg,
+        patch.object(venv_module, "_env_builder", builder),
+        patch.object(venv_module.ray, "get", side_effect=ray_get) as get,
+        patch.object(venv_module.ray.util, "remove_placement_group") as remove_pg,
+    ):
+        yield (
+            get_nodes,
+            make_pg,
+            builder.options.return_value.remote,
+            get,
+            remove_pg,
+            python_path,
+        )
+
+
+def test_repeated_force_rebuild_does_not_touch_prepared_venv(node_venv_builder) -> None:
+    _, make_pg, build, _, remove_pg, python_path = node_venv_builder
+    first_path = venv_module.create_local_venv_on_each_node(
+        "uv run --extra nemo_gym", "gym"
+    )
+    second_path = venv_module.create_local_venv_on_each_node(
+        "uv run --extra nemo_gym", "gym"
+    )
+    assert first_path == second_path == python_path
+    make_pg.assert_called_once_with(bundles=[{"CPU": 1}], strategy="STRICT_SPREAD")
+    build.assert_called_once_with("uv run --extra nemo_gym", "gym", 0, True)
+    remove_pg.assert_called_once()
+
+
+@pytest.mark.parametrize("changed_input", ["command", "directory", "nodes"])
+def test_venv_cache_distinguishes_build_inputs(
+    node_venv_builder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed_input: str,
+) -> None:
+    get_nodes, make_pg, build, _, _, _ = node_venv_builder
+    venv_module.create_local_venv_on_each_node("uv run --extra nemo_gym", "gym")
+    command = "uv run --extra nemo_gym"
+    if changed_input == "command":
+        command = "uv run --extra vllm"
+    elif changed_input == "directory":
+        monkeypatch.setenv("NEMO_RL_VENV_DIR", str(tmp_path / "other"))
+    else:
+        get_nodes.return_value = [
+            {"NodeID": "node-b", "Alive": True, "Resources": {"CPU": 4}}
+        ]
+    venv_module.create_local_venv_on_each_node(command, "gym")
+    assert make_pg.call_count == 2
+    assert build.call_count == 2
+
+
+def test_failed_venv_build_is_retried_and_releases_placement_group(
+    node_venv_builder,
+) -> None:
+    _, make_pg, build, get, remove_pg, python_path = node_venv_builder
+    get.side_effect = [None, RuntimeError("uv failed"), None, [python_path]]
+    with pytest.raises(RuntimeError, match="uv failed"):
+        venv_module.create_local_venv_on_each_node("uv run --extra nemo_gym", "gym")
+    assert venv_module.G_BUILT_VENVS == {}
+    assert remove_pg.call_count == 1
+    assert (
+        venv_module.create_local_venv_on_each_node("uv run --extra nemo_gym", "gym")
+        == python_path
+    )
+    assert make_pg.call_count == build.call_count == remove_pg.call_count == 2

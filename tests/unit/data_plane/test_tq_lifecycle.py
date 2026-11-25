@@ -212,6 +212,8 @@ def test_each_public_data_operation_marks_the_client_dirty(
         MagicMock(return_value={"p": {"sample-0": {}}}),
     )
     monkeypatch.setattr(tq_adapter.tq, "kv_clear", MagicMock())
+    monkeypatch.setattr(tq_adapter.ray, "get_actor", MagicMock())
+    monkeypatch.setattr(tq_adapter.ray, "get", MagicMock(return_value=["sample-0"]))
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._data_operations_started = False
@@ -277,6 +279,7 @@ def test_deserialization_rebuilds_mooncake_client_before_attach(monkeypatch) -> 
         "claim_meta_poll_interval_s": 0.5,
         "mooncake_cpu": {
             "reuse_registered_buffers": False,
+            "ssd_offload": {"enabled": False},  # TQ is stubbed here: no store to swap
         },
     }
     events: list[str] = []
@@ -357,21 +360,30 @@ def test_checkpoint_rejects_incomplete_storage(
     load.assert_not_called()
 
 
-def test_list_sample_ids_uses_tq_partition_listing(monkeypatch) -> None:
+def test_list_sample_ids_uses_keys_only_controller_listing(monkeypatch) -> None:
     from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
-    list_call = MagicMock(
-        return_value={"rollout_data": {"sample-b": {}, "sample-a": {}}}
+    controller = MagicMock()
+    get_actor = MagicMock(return_value=controller)
+    monkeypatch.setattr(tq_adapter.ray, "get_actor", get_actor)
+    monkeypatch.setattr(
+        tq_adapter.ray, "get", MagicMock(return_value=["sample-b", "sample-a"])
     )
-    monkeypatch.setattr(tq_adapter.tq, "kv_list", list_call)
+    kv_list = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "kv_list", kv_list)
     client = object.__new__(tq_adapter.TQDataPlaneClient)
     client._data_operations_started = False
 
     sample_ids = client.list_sample_ids("rollout_data")
 
-    assert sample_ids == ["sample-a", "sample-b"]
+    # Callers compare key sets, so the listing is returned unsorted.
+    assert sample_ids == ["sample-b", "sample-a"]
     assert client._data_operations_started
-    list_call.assert_called_once_with(partition_id="rollout_data")
+    get_actor.assert_called_once_with(
+        "TransferQueueController", namespace="transfer_queue"
+    )
+    controller.nrl_list_keys.remote.assert_called_once_with("rollout_data")
+    kv_list.assert_not_called()
 
 
 def test_checkpoint_load_rejects_client_after_data_operation(

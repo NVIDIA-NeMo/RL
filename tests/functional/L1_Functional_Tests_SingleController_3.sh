@@ -34,21 +34,37 @@ run_test() {
     fi
 }
 
+# Two-phase SimpleStorage capture on real Ray/ZMQ actors (CPU only).
+run_test fast uv run --no-sync bash ./tests/functional/data_plane_simple_checkpoint_cpu.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
-# Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
+# Same recovery flow with Mooncake CPU storage, forced onto its SSD offload;
+# skips without an RDMA device.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Same flows with storage units: SimpleStorageUnits pinned by placement, and
-# Mooncake CPU storage units as the only memory owners (skips without RDMA).
+# Mooncake CPU storage units as the only memory owners, with the default SSD
+# offload settings and no spill expected (skips without RDMA).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh simple_placed
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh mooncake_units
+# Same recovery flow on the nixl data plane: default SSD tier with no spill,
+# and forced onto the SSD tier (skip without an RDMA device).
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh nixl_ssd
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
 
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Same SC+Gym smoke with the refit run in a separate RefitActor.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++async_rl.refit_actor.enabled=true
+# Score centering through capture, canonical TQ columns, trainer gather and loss.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
+# BrowseComp compaction smoke (valid rows must prove a context boundary), then
+# resumed from step 10 to 12.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction_resume.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
@@ -59,6 +75,20 @@ run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sy
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Two-process Gym turn-level recovery against a stateful Workplace Assistant
+# server: a restored episode resumes on its Gym instance as its next attempt.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
+# Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
+# the process, restore that exact prefix, and generate only its remaining tail.
+# Three launches on 2 GPUs: an uninterrupted reference, the interrupted run and
+# the recovery (7-9 minutes locally).
+# Score centering with sampler replay: each cut also stages the sampler top-k,
+# and a resumed row trains with it. Score centering needs token-level IS on full
+# logits, so this turns off the config's GSPO and the fused linear logprobs.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4 ++loss_fn.force_on_policy_ratio=false loss_fn.sequence_level_importance_ratios=false loss_fn.normalization=global_token_mean loss_fn.reference_policy_kl_penalty=0 grpo.skip_reference_policy_logprobs_calculation=true policy.sequence_packing.enabled=false ++policy.megatron_cfg.use_fused_linear_logprobs=false policy.logprob_chunk_size=128
+# The same active-decode recovery with MoE router replay, on a tiny random MoE:
+# each restored call must stage the routes it restored for training.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -48,6 +48,7 @@ policy:
     # MTP — disabled
     mtp_num_layers: 0
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:
@@ -58,7 +59,7 @@ policy:
       gpu_memory_utilization: 0.7
       async_engine: true
     vllm_kwargs:
-      moe_backend: flashinfer_trtllm
+      moe_backend: triton
 logger:
   wandb_enabled: true
   tensorboard_enabled: true

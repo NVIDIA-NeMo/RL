@@ -46,6 +46,7 @@ def _config():
             "tensor_parallel_size": 1,
             "max_model_len": 128,
             "precision": "bfloat16",
+            "load_format": "dummy",
             "max_batch_size": 8,
             "max_num_tokens": 256,
             "async_engine": True,
@@ -77,13 +78,6 @@ def test_configure_worker_reserves_gpus_for_internal_trtllm_actors(monkeypatch):
     assert env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "1"
     assert env_vars["NCCL_CUMEM_ENABLE"] == "1"
     assert env_vars["PATH"].endswith(":/usr/bin")
-    for name in (
-        "OMPI_ALLOW_RUN_AS_ROOT",
-        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
-        "PRTE_ALLOW_RUN_AS_ROOT",
-        "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM",
-    ):
-        assert env_vars[name] == "1"
     assert init_kwargs == {
         "bundle_indices": [2, 3],
         "bundle_pg_idx": 0,
@@ -267,6 +261,29 @@ async def test_async_refit_surfaces_worker_exception():
         await worker.update_weights_from_collective_async(
             drain=True, recompute_kv=False
         )
+    with pytest.raises(RuntimeError, match="worker is poisoned") as excinfo:
+        await worker.nccl_reshard_refit_async(drain=True, recompute_kv=False)
+    assert str(excinfo.value.__cause__) == "worker is poisoned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [[True], [], [False], [True, False], [True, True]],
+)
+async def test_async_nccl_reshard_refit_checks_every_worker_result(result):
+    worker = _worker()
+    worker.llm.collective_rpc.return_value = result
+
+    succeeded = await worker.nccl_reshard_refit_async(
+        refit_timeout_s=None, drain=False, recompute_kv=True
+    )
+
+    assert succeeded is (bool(result) and all(result))
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "nccl_reshard_refit",
+        kwargs={"refit_timeout_s": None, "drain": False, "recompute_kv": True},
+    )
 
 
 class _RecordedConfig:

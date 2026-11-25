@@ -77,6 +77,20 @@ def reject_outdated_automodel_block(config: dict[str, Any]) -> None:
             )
 
 
+def reject_outdated_teacher_projection_matrix_path(config: dict[str, Any]) -> None:
+    """Fail when an x-token teacher's projection path is outside its aligner block.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    for path, teacher_config in _train_backend_configs(config):
+        if path.startswith("teachers.") and "projection_matrix_path" in teacher_config:
+            raise ValueError(
+                f"{path}.projection_matrix_path is no longer supported; "
+                f"move it to {path}.aligner.projection_matrix_path."
+            )
+
+
 def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
     """Fail when data still uses the flat pre-train/validation layout.
 
@@ -120,8 +134,15 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     )
 
 
-def reject_outdated_mcore_refit_offload_key(config: dict[str, Any]) -> None:
-    """Fail when the removed Megatron-generation refit offload key is present."""
+def reject_outdated_mcore_generation_keys(config: dict[str, Any]) -> None:
+    """Fail when a removed `policy.generation.mcore_generation_config` key is present.
+
+    A config copied from an old exemplar usually carries several of these at once;
+    they are reported in the order below, one per run.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
     policy = config.get("policy")
     if not isinstance(policy, dict):
         return
@@ -129,13 +150,194 @@ def reject_outdated_mcore_refit_offload_key(config: dict[str, Any]) -> None:
     if not isinstance(generation, dict):
         return
     mcore_generation = generation.get("mcore_generation_config")
-    if (
-        isinstance(mcore_generation, dict)
-        and "offload_policy_before_refit" in mcore_generation
-    ):
+    if not isinstance(mcore_generation, dict):
+        return
+    removed = (
+        (
+            "offload_policy_before_refit",
+            "was removed. Set policy.offload_policy_before_refit instead.",
+        ),
+        (
+            "buffer_guaranteed_fraction",
+            "was removed: Megatron-Core replaced it with paused_buffer_size_gb and "
+            "NeMo-RL stopped forwarding it in PR #1902. Delete the key; buffer_size_gb "
+            "alone sizes the KV pool.",
+        ),
+        (
+            "unified_memory_level",
+            "was removed: NeMo-RL stopped forwarding it to Megatron-Core in PR #2355, "
+            "so it had no effect. Delete the key; kv_cache_management_mode controls KV "
+            "cache placement across suspend/resume.",
+        ),
+    )
+    for key, message in removed:
+        if key in mcore_generation:
+            raise ValueError(
+                f"policy.generation.mcore_generation_config.{key} {message}"
+            )
+
+
+def _dynamo_frontend_args(config: dict[str, Any]) -> dict[str, Any]:
+    """``policy.generation.dynamo_cfg.frontend_args``, or ``{}`` when absent."""
+    node: Any = config
+    for key in ("policy", "generation", "dynamo_cfg", "frontend_args"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return node if isinstance(node, dict) else {}
+
+
+def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
+    """Fail when the Dynamo frontend's removed router-reset-states key is present.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    if "router_reset_states" in _dynamo_frontend_args(config):
         raise ValueError(
-            "policy.generation.mcore_generation_config.offload_policy_before_refit "
-            "was removed. Set policy.offload_policy_before_refit instead."
+            "policy.generation.dynamo_cfg.frontend_args.router_reset_states was "
+            "removed: Dynamo 1.4 dropped the frontend's --router-reset-states flag. "
+            "Delete the key."
+        )
+
+
+def reject_outdated_dynamo_router_mode(config: dict[str, Any]) -> None:
+    """Fail on the Dynamo router mode that Dynamo 1.7 removed.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    if _dynamo_frontend_args(config).get("router_mode") == "power-of-two":
+        raise ValueError(
+            "policy.generation.dynamo_cfg.frontend_args.router_mode='power-of-two' "
+            "was removed: Dynamo 1.7 dropped the power-of-two router. Use "
+            "'least-loaded', or 'kv' to route on cached prefixes."
+        )
+
+
+# Keys of the managed dynamo.vllm backend's dynamo_cfg with no counterpart now that
+# Dynamo serves NeMo RL's own vLLM workers, and what replaces each.
+_REMOVED_DYNAMO_CFG_KEYS = {
+    "engine": "Dynamo always serves the vLLM backend's workers",
+    "control_timeout_s": "refit and pause use the vLLM backend's own controls",
+    "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "worker_args": (
+        "NeMo RL's chat engine in the frontend renders and parses NeMo-Gym's calls "
+        "with the native server's vllm_cfg.http_server_serving_chat_kwargs and "
+        "parser plugins, and engines are configured through vllm_cfg and "
+        "vllm_kwargs"
+    ),
+}
+_REMOVED_DYNAMO_FRONTEND_KEYS = (
+    "tokenizer",
+    "tokenizer_cache",
+    "tokenizer_cache_bytes",
+)
+
+
+def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
+    """Fail on the removed ``backend: dynamo`` and its dynamo_cfg keys.
+
+    Dynamo now serves NeMo RL's own vLLM workers: ``backend: vllm`` plus
+    ``dynamo: true``. One migration, so the backend is reported first and the
+    dynamo_cfg keys that no longer exist with it.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    problems = []
+    if generation.get("backend") == "dynamo":
+        problems.append(
+            "policy.generation.backend='dynamo' was removed: Dynamo now serves NeMo "
+            "RL's own vLLM workers. Set policy.generation.backend=vllm and "
+            "policy.generation.dynamo=true; vllm_cfg and vllm_kwargs keep their "
+            "meaning."
+        )
+    dynamo_cfg = generation.get("dynamo_cfg")
+    if isinstance(dynamo_cfg, dict):
+        for key, replacement in _REMOVED_DYNAMO_CFG_KEYS.items():
+            if key in dynamo_cfg:
+                problems.append(
+                    f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
+                )
+        frontend_args = dynamo_cfg.get("frontend_args")
+        if isinstance(frontend_args, dict):
+            for key in _REMOVED_DYNAMO_FRONTEND_KEYS:
+                if key in frontend_args:
+                    problems.append(
+                        f"policy.generation.dynamo_cfg.frontend_args.{key} was "
+                        "removed: NeMo RL never uses the frontend's tokenizer: "
+                        "rollouts send token IDs, and NeMo-Gym's chat calls are "
+                        "rendered by NeMo RL's own chat engine."
+                    )
+    if problems:
+        raise ValueError(" ".join(problems))
+
+
+def reject_outdated_context_compaction(config: dict[str, Any]) -> None:
+    """Reject the old forest-training switch before schema validation."""
+    capture = config.get("token_capture")
+    if isinstance(capture, dict) and "context_compaction" in capture:
+        raise ValueError(
+            "token_capture.context_compaction was renamed to "
+            "token_capture.forest_training. Rename the key, keeping its value; "
+            "selection_policy=returned_history preserves the existing behavior."
+        )
+
+
+# Removed rollout_recovery key -> the key that replaced it.
+_RENAMED_ROLLOUT_RECOVERY_KEYS = {
+    "default_granularity": "target_level",
+    "task_granularity_overrides": "task_source_target_level_overrides",
+    "task_source_granularity_overrides": "task_source_target_level_overrides",
+    "agent_granularity_overrides": "agent_target_level_overrides",
+}
+
+
+def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None:
+    """Fail when rollout_recovery still uses the *_granularity keys.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    rollout_recovery = config.get("rollout_recovery")
+    if not isinstance(rollout_recovery, dict):
+        return
+
+    removed = sorted(_RENAMED_ROLLOUT_RECOVERY_KEYS.keys() & rollout_recovery.keys())
+    if not removed:
+        return
+
+    renames = ", ".join(
+        f"rollout_recovery.{key} -> rollout_recovery.{_RENAMED_ROLLOUT_RECOVERY_KEYS[key]}"
+        for key in removed
+    )
+    message = (
+        f"rollout_recovery no longer accepts {removed!r}. Rename them ({renames}); "
+        f"the values ('sibling', 'prompt_group') are unchanged."
+    )
+    if "task_granularity_overrides" in removed:
+        message += (
+            " task_granularity_overrides was keyed by task name; its replacement is "
+            "keyed by extra_env_info.task_source."
+        )
+    raise ValueError(message)
+
+
+def reject_outdated_token_level_loss(loss_config: dict[str, Any]) -> None:
+    """Reject the removed loss selector and explain how to preserve its reduction."""
+    if "token_level_loss" in loss_config:
+        raise ValueError(
+            "loss_fn.token_level_loss was removed. Set loss_fn.normalization="
+            "global_token_mean for true or sequence_mean for false, and remove "
+            "token_level_loss. If its value is null, just remove the key."
         )
 
 
@@ -145,12 +347,22 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     Call this from every entrypoint on the resolved config, before the MasterConfig is
     built. Validation rejects a missing required key on its own terms, so a check that
     runs after it can never explain a removal that changed such a key's shape. Add a
-    check here whenever a key is removed or the shape it accepts changes.
+    check here when a previously supported key is removed or its accepted shape changes.
+    Spellings or shapes introduced and replaced within the same unmerged PR need no check.
 
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
     """
     reject_outdated_automodel_block(config)
+    reject_outdated_teacher_projection_matrix_path(config)
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
-    reject_outdated_mcore_refit_offload_key(config)
+    reject_outdated_mcore_generation_keys(config)
+    reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_dynamo_router_mode(config)
+    reject_outdated_dynamo_backend(config)
+    reject_outdated_context_compaction(config)
+    reject_outdated_rollout_recovery_granularity(config)
+    loss_config = config.get("loss_fn")
+    if isinstance(loss_config, dict):
+        reject_outdated_token_level_loss(loss_config)

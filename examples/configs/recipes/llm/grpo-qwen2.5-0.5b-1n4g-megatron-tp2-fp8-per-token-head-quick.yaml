@@ -1,0 +1,39 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 20
+  val_period: 0
+loss_fn:
+  use_importance_sampling_correction: true
+policy:
+  model_name: Qwen/Qwen2.5-0.5B
+  train_global_batch_size: 32
+  train_micro_batch_size: 2
+  logprob_batch_size: 4
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 1.0e-07
+  generation:
+    max_new_tokens: 128
+    ignore_eos: true
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_per_token_head
+      gpu_memory_utilization: 0.4
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
+data:
+  max_input_seq_length: 256
+  train:
+    dataset_name: GSM8K
+env:
+  math:
+    num_workers: 4
+cluster:
+  gpus_per_node: 4

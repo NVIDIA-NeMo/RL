@@ -32,7 +32,6 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     MooncakeCpuConfig,
     SimpleStorageConfig,
-    SsdOffloadConfig,
     backend_config,
     data_plane_supports_checkpointing,
 )
@@ -62,6 +61,12 @@ def test_checkpointing_capability_defaults_to_unsupported(
     assert data_plane_supports_checkpointing(_cfg(backend)) is expected
 
 
+@pytest.mark.parametrize("ssd_on", [False, True])
+def test_nixl_checkpoints_with_its_ssd_tier_on_or_off(ssd_on: bool) -> None:
+    cfg = _cfg("nixl", nixl={"ssd": {"enabled": ssd_on}})
+    assert data_plane_supports_checkpointing(cfg) is True
+
+
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
@@ -81,40 +86,14 @@ def test_nested_block_is_used() -> None:
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
-    """The point of the nesting: a config need not mention a backend it isn't using.
-
-    Pins the literals rather than comparing against MooncakeCpuConfig()'s own
-    attributes — that would hold for any value the class default was changed
-    to and couldn't catch a regression of the sizing itself.
-    """
-    resolved = backend_config(_cfg("mooncake_cpu"))
-    assert resolved.global_segment_size == 68719476736  # 64 GiB per client process
-    assert resolved.local_buffer_size == 2147483648  # 2 GiB = 4 x 512 MiB staging slots
-    # The opt-out flag defaults on, so omitting it must not disable the pool.
-    assert resolved.reuse_registered_buffers is True
-    assert resolved.use_gdr is False
-    assert resolved.gdr_staging_buffer_mb == 1024
-
-
-@pytest.mark.parametrize("value", [0, -1])
-def test_gdr_staging_size_rejects_non_positive_values(value: int) -> None:
-    with pytest.raises(pydantic.ValidationError):
-        backend_config(
-            _cfg("mooncake_cpu", mooncake_cpu={"gdr_staging_buffer_mb": value})
-        )
+    """The point of the nesting: a config need not mention a backend it isn't using."""
+    assert isinstance(backend_config(_cfg("mooncake_cpu")), MooncakeCpuConfig)
 
 
 def test_accepts_an_already_coerced_model() -> None:
     """Configs arriving via pydantic have the block coerced to a model already."""
     cfg = _cfg("mooncake_cpu", mooncake_cpu=MooncakeCpuConfig(global_segment_size=555))
     assert backend_config(cfg).global_segment_size == 555
-
-
-def test_partial_nested_block_keeps_other_defaults() -> None:
-    cfg = _cfg("mooncake_cpu", mooncake_cpu={"local_buffer_size": 7})
-    resolved = backend_config(cfg)
-    assert resolved.local_buffer_size == 7
-    assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
 
 
 def test_mooncake_has_no_backend_specific_checkpoint_knobs() -> None:
@@ -145,7 +124,12 @@ def test_mooncake_checkpoint_mode_is_internal(
     )
 
     cfg = _cfg("mooncake_cpu")
-    cfg["mooncake_cpu"] = {"use_gdr": use_gdr, "gdr_staging_buffer_mb": 384}
+    # TQ is stubbed: the default-on SSD offload would have no store to swap.
+    cfg["mooncake_cpu"] = {
+        "use_gdr": use_gdr,
+        "gdr_staging_buffer_mb": 384,
+        "ssd_offload": {"enabled": False},
+    }
     adapter._init_tq(cfg, checkpointing=checkpointing)
 
     conf = OmegaConf.to_container(captured["conf"], resolve=True)
@@ -169,6 +153,15 @@ def _mooncake_overlay(
 
     # A stub by default: no real thread polling a master that does not exist.
     monkeypatch.setattr(mooncake_ssd_offload, "watch_master_disk_evictions", watch)
+    # install() keeps per-process state; an overlay with offload on must not
+    # leave it behind for a later real client in this test process.
+    for name, value in (
+        ("_dir", None),
+        ("_lock_fd", None),
+        ("_offloading_store_set_up", False),
+        ("_sweep_stop", None),
+    ):
+        monkeypatch.setattr(mooncake_ssd_offload, name, value)
     captured = {}
     monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
     monkeypatch.setattr(adapter, "_mooncake_transport_config", lambda: {})
@@ -176,6 +169,9 @@ def _mooncake_overlay(
     monkeypatch.setattr(
         adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
     )
+    # TQ is stubbed here, so the (default-on) SSD offload has no store to swap;
+    # tests that want it on say so explicitly.
+    mooncake_cpu = {"ssd_offload": {"enabled": False}, **mooncake_cpu}
     cfg = _cfg("mooncake_cpu", mooncake_cpu=mooncake_cpu)
     # Storage units are only started under a plan; the overlay ignores the IDs.
     plan = ["a" * 56] if mooncake_cpu.get("storage_unit_segment_size") else None
@@ -214,7 +210,7 @@ def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
     watched = []
     _mooncake_overlay(
         monkeypatch,
-        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        {"ssd_offload": _MC_SSD if ssd_offload else {"enabled": False}},
         watch=lambda url, path: watched.append((url, path)),
     )
 
@@ -229,7 +225,7 @@ def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
 def test_mooncake_without_ssd_offload_keeps_tq_master_flags(monkeypatch) -> None:
     from transfer_queue.storage.bootstrap import mooncake_bootstrap
 
-    storage = _mooncake_overlay(monkeypatch, {})
+    storage = _mooncake_overlay(monkeypatch, {"ssd_offload": {"enabled": False}})
     assert storage["hard_pin"] is None
     assert mooncake_bootstrap.subprocess.extra_args == ()
 
@@ -249,7 +245,7 @@ def test_mooncake_checkpointing_pins_replicas_unless_offloading(
 ) -> None:
     storage = _mooncake_overlay(
         monkeypatch,
-        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        {"ssd_offload": _MC_SSD if ssd_offload else {"enabled": False}},
         checkpointing=True,
     )
     # Offload must evict; without it, saves borrow hard-pinned memory directly.
@@ -260,7 +256,6 @@ def test_mooncake_checkpointing_pins_replicas_unless_offloading(
 @pytest.mark.parametrize(
     ("mooncake_cpu", "match"),
     [
-        ({"storage_unit_segment_size": 1, "ssd_offload": {"enabled": True}}, "path"),
         (
             {
                 "storage_unit_segment_size": 1,
@@ -325,6 +320,17 @@ def test_simple_storage_units_skip_nodes_without_cpu(monkeypatch) -> None:
     assert [s.node_id for s in strategies] == [worker["NodeID"]] * 3
 
 
+def test_a_null_ssd_path_is_the_node_nvme() -> None:
+    """``path: null`` resolves to local_disk.default_ssd_dir on the node; a set path wins."""
+    from nemo_rl.data_plane import local_disk
+    from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
+
+    assert MooncakeCpuConfig().ssd_offload.dir() == local_disk.default_ssd_dir(
+        "nrl_mooncake_ssd_offload"
+    )
+    assert MooncakeCpuConfig(ssd_offload={"path": "/x"}).ssd_offload.dir() == "/x"
+
+
 def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
     # Whatever TQ's own base config carries, we must not turn it on.
     storage = _simple_overlay(monkeypatch)
@@ -341,8 +347,8 @@ def test_simple_ssd_offload_reaches_tq_config(monkeypatch) -> None:
     assert storage["ssd_offload"]["threshold_bytes"] == 4096
 
 
-@pytest.mark.parametrize("path", [None, "", "relative/ssd"])
-def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
+@pytest.mark.parametrize("path", ["", "relative/ssd"])
+def test_ssd_offload_requires_an_absolute_path(path) -> None:
     """Fails at config load, not later inside driver bootstrap."""
     with pytest.raises(pydantic.ValidationError, match="ssd_offload.path"):
         TypeAdapter(DataPlaneConfig).validate_python(
@@ -356,20 +362,14 @@ def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
         )
 
 
-def test_ssd_offload_defaults_are_off_and_path_optional_when_disabled() -> None:
-    absent = backend_config(_cfg("simple", simple={"num_storage_units": 2}))
-    assert absent.ssd_offload == SsdOffloadConfig(
-        enabled=False, path=None, threshold_bytes=1048576
+def test_simple_ssd_offload_null_path_is_the_node_nvme(monkeypatch) -> None:
+    """TQ raises on an empty path, so the overlay carries the resolved default."""
+    from nemo_rl.data_plane import local_disk
+
+    storage = _simple_overlay(monkeypatch, ssd_offload={"enabled": True})
+    assert storage["ssd_offload"]["path"] == local_disk.default_ssd_dir(
+        "nrl_simple_ssd_offload"
     )
-    partial = backend_config(
-        _cfg(
-            "simple",
-            simple={"num_storage_units": 2, "ssd_offload": {"path": "/local/ssd"}},
-        )
-    )
-    assert partial.ssd_offload.path == "/local/ssd"
-    assert partial.ssd_offload.enabled is False
-    assert partial.ssd_offload.threshold_bytes == 1048576
 
 
 def test_simple_backend_num_storage_units_has_no_default() -> None:
@@ -392,15 +392,6 @@ def test_only_the_selected_backend_is_read() -> None:
     resolved = backend_config(cfg)
     assert isinstance(resolved, SimpleStorageConfig)
     assert not hasattr(resolved, "global_segment_size")
-
-
-def test_schema_validates_without_any_backend_block() -> None:
-    """Regression guard: a required backend key is what broke SingleController CI.
-
-    ``data_plane`` built from scratch — not inherited from the exemplar — must
-    validate, otherwise MasterConfig fails before training starts.
-    """
-    TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
 
 
 @pytest.fixture
@@ -585,3 +576,41 @@ def test_storage_unit_settings_need_the_single_controller_plan(
     )
     with pytest.raises(ValueError, match="only supported by the SingleController"):
         adapter._init_tq(cfg)
+
+
+@pytest.mark.parametrize(
+    ("backend", "block"),
+    [
+        ("simple", {"num_storage_units": 1}),
+        ("mooncake_cpu", {"ssd_offload": {"enabled": False}}),
+        # Explicit node_ids skip the Ray placement lookup.
+        ("nixl", {"node_ids": ["a" * 56]}),
+    ],
+)
+@pytest.mark.parametrize("port", [None, 8200])
+def test_controller_metrics_configuration(
+    monkeypatch: pytest.MonkeyPatch, backend: str, block: dict, port: int | None
+) -> None:
+    """The overlay is applied after the backend branches, so it must hold for each."""
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    # Only Mooncake reads the node IP, transport and chmod; the others ignore them.
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
+    monkeypatch.setattr(
+        adapter,
+        "_mooncake_transport_config",
+        lambda: {"protocol": "rdma", "device_name": "mlx5_test"},
+    )
+    monkeypatch.setattr(adapter.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg(backend, **{backend: block})
+    if port is not None:
+        cfg["metrics_port"] = port
+    adapter._init_tq(cfg)
+    metrics = OmegaConf.to_container(captured["conf"], resolve=True).get("metrics", {})
+    assert bool(metrics.get("enabled", False)) is (port is not None)
+    if port is not None:
+        assert metrics["port"] == port

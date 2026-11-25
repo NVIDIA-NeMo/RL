@@ -103,9 +103,6 @@ from nemo_rl.models.megatron.memory_saver import (
     pause_inference_weights,
     resume_inference_weights,
 )
-from nemo_rl.models.megatron.zero_train_gen_mismatch import (
-    allow_installed_flash_attn_4,
-)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -262,20 +259,11 @@ def _resolve_mamba_memory_ratio(
     is_hybrid_model: bool,
     num_speculative_tokens: int,
 ) -> Optional[float]:
-    """Fraction of ``buffer_size_gb`` reserved for Mamba states (hybrid models only).
-
-    Unless ``max_requests`` is set, this fraction caps the concurrent requests per engine
-    rank: e.g. an fp32 SSM state of a Nemotron-3 Nano model is ~49 MB per request, so the
-    default 0.1 of a 20 GB buffer admits 40 requests while the KV blocks in the other
-    90% would hold millions of tokens. The default reserves more when speculative
-    decoding needs intermediate states.
-    """
+    """Reserve a fraction of the hybrid cache budget for recurrent states."""
     if not is_hybrid_model:
         return None
     ratio = mcore_generation_config.get("mamba_memory_ratio")
-    if ratio is None:
-        return 0.1 + 0.1 * num_speculative_tokens
-    ratio = float(ratio)
+    ratio = 0.1 + 0.1 * num_speculative_tokens if ratio is None else float(ratio)
     if not 0.0 < ratio < 1.0:
         raise ValueError(f"mamba_memory_ratio must be in (0, 1), got {ratio}.")
     return ratio
@@ -338,6 +326,8 @@ class MegatronGenerationMixin:
      - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
      - _reserved_http_server_port: driver-reserved server port, or None.
+     - _router_replay_enabled: whether MInf must emit routing indices with
+       every captured payload (read by setup_token_capture).
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here
@@ -602,6 +592,17 @@ class MegatronGenerationMixin:
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
+        if self._router_replay_enabled:
+            # Must precede engine construction: the engine captures CUDA graphs
+            # and sizes its route buffer from the registry length. A colocated
+            # worker that built a reference model has already had the registry
+            # cleared (or double-filled) by setup_reference_model_state.
+            from nemo_rl.models.megatron.router_replay import (
+                reset_global_router_replay_instances_for_model,
+            )
+
+            reset_global_router_replay_instances_for_model(self._gen_model())
+
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
         block_size_tokens = mcore_generation_config["block_size_tokens"]
@@ -650,7 +651,6 @@ class MegatronGenerationMixin:
         # an explicit True there.
         if getattr(model_config, "batch_invariant_mode", False):
             use_flashinfer_fused_rope = False
-            allow_installed_flash_attn_4()
 
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
@@ -727,6 +727,25 @@ class MegatronGenerationMixin:
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
         )
+        token_capacity = model_config.inference_flashinfer_mxfp8_token_capacity
+        if token_capacity is not None:
+            decode_rows = (
+                self.inference_context.max_requests
+                * (num_speculative_tokens + 1)
+                * model_config.expert_model_parallel_size
+            )
+            if decode_rows > token_capacity:
+                raise ValueError(
+                    "policy.generation.mcore_generation_config."
+                    f"inference_flashinfer_mxfp8_token_capacity={token_capacity} can never "
+                    "engage: MCore applies it only when max_requests * "
+                    "(num_speculative_tokens + 1) * expert_model_parallel_size <= capacity, "
+                    f"and this engine derived max_requests="
+                    f"{self.inference_context.max_requests} with EP="
+                    f"{model_config.expert_model_parallel_size}, i.e. {decode_rows} decode "
+                    "rows. Raise the capacity (it may go up to the full dispatcher buffer) "
+                    "or lower buffer_size_gb / max_requests."
+                )
         if media_model is None:
             self.inference_wrapped_model = GPTInferenceWrapper(
                 engine_model, self.inference_context
@@ -972,6 +991,14 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
                 self._sleep()
+            if self._router_replay_enabled:
+                # MInf leaves RECORD and its route buffer on these routers; a
+                # non-replaying forward (the reference pass) would record into
+                # that buffer. MInf sets both again before its next step.
+                from megatron.core.transformer.moe.router_replay import RouterReplay
+
+                RouterReplay.clear_global_router_replay_action()
+                RouterReplay.clear_global_static_buffers()
             cuda_graph_impl = self.cfg["generation"]["mcore_generation_config"][
                 "cuda_graph_impl"
             ]
@@ -1145,13 +1172,22 @@ class MegatronGenerationMixin:
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
+        expected_route_dims = None
+        if self._router_replay_enabled:
+            from nemo_rl.models.megatron.router_replay import (
+                router_replay_dimensions_for_model,
+            )
+
+            expected_route_dims = router_replay_dimensions_for_model(self._gen_model())
         stager = TQMegatronTokenStager(
             TQTokenSink(
                 dp_client,
                 staging_partition=staging_partition,
                 capture_media=capture_media,
                 media_pixel_dtype=pixel_dtype,
-            )
+            ),
+            require_routed_experts=self._router_replay_enabled,
+            expected_route_dims=expected_route_dims,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager

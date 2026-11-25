@@ -20,14 +20,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from nemo_rl.algorithms.single_controller_utils import rollout_checkpoint
-from nemo_rl.algorithms.single_controller_utils.config import (
-    AsyncRLConfig,
-    MasterConfig,
-    RolloutCheckpointConfig,
-    TokenCaptureConfig,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+from nemo_rl.algorithms.rollout_checkpointing import manifest as snapshot_manifest
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
     BOOTSTRAP_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -35,7 +29,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
-    bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
@@ -43,10 +36,23 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
+    RolloutCheckpointConfig,
+    RolloutRecoveryConfig,
+    TokenCaptureConfig,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
+
+
+def bootstrap_fingerprint(master_config: MasterConfig) -> str:
+    """The digest that decides whether a bootstrap snapshot can be reused."""
+    return bootstrap_compatibility_identity(master_config).fingerprint()
 
 
 class _DumpedConfig:
@@ -211,8 +217,17 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             "sampler": {"name": "windowed", "max_staleness_versions": 1},
             "stall_watchdog": {"interval_s": 30},
         },
-        "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
+        "checkpointing": CheckpointingConfig.model_construct(
+            checkpoint_dir="/run/one/checkpoints"
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
+        "rollout_recovery": {
+            "target_level": "prefix",
+            "gym_prepare_timeout_s": 300.0,
+            "prefix_write_max_rows": 256,
+            "prefix_write_max_tokens": 4_194_304,
+            "prefix_read_max_rows": 256,
+        },
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -240,8 +255,17 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             **base["async_rl"],
             "stall_watchdog": {"interval_s": 5},
         },
-        "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
+        "checkpointing": CheckpointingConfig.model_construct(
+            checkpoint_dir="/run/two/checkpoints"
+        ),
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
+        "rollout_recovery": {
+            **base["rollout_recovery"],
+            "gym_prepare_timeout_s": 900.0,
+            "prefix_write_max_rows": 64,
+            "prefix_write_max_tokens": 1_048_576,
+            "prefix_read_max_rows": 1,
+        },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
     }
@@ -353,9 +377,10 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
         ("policy", "generation"): _fields(VllmConfig),
         ("policy", "generation", "vllm_cfg"): _fields(VllmSpecificArgs),
         ("rollout_checkpointing",): _fields(RolloutCheckpointConfig),
+        ("rollout_recovery",): _fields(RolloutRecoveryConfig),
         ("token_capture",): _fields(TokenCaptureConfig),
     }
-    for excluded_path in rollout_checkpoint._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
+    for excluded_path in snapshot_manifest._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
         segments = tuple(excluded_path.split("."))
         for prefix, fields in schemas_by_prefix.items():
             if segments[: len(prefix)] != prefix or len(segments) == len(prefix):
@@ -381,7 +406,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
             "async_rl",
             {"sampler": {"name": "windowed", "max_staleness_versions": 2}},
         ),
-        ("rollout_recovery", {"default_granularity": "prompt_group"}),
+        ("rollout_recovery", {"target_level": "prompt_group"}),
     ],
 )
 def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
@@ -403,7 +428,7 @@ def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
             "mixed_weight_version_policy": "allow",
         },
         "async_rl": {"sampler": {"name": "windowed", "max_staleness_versions": 1}},
-        "rollout_recovery": {"default_granularity": "sibling"},
+        "rollout_recovery": {"target_level": "sibling"},
     }
     modified = {**base, section: {**base[section], **changed}}
 
@@ -820,8 +845,8 @@ def test_commit_snapshot_flushes_payload_before_publication(tmp_path, monkeypatc
     (tmp_snapshot / "payload").write_text("payload")
     fsync_tree = Mock()
     fsync_directory = Mock()
-    monkeypatch.setattr(rollout_checkpoint, "_fsync_tree", fsync_tree)
-    monkeypatch.setattr(rollout_checkpoint, "_fsync_directory", fsync_directory)
+    monkeypatch.setattr(snapshot_manifest, "_fsync_tree", fsync_tree)
+    monkeypatch.setattr(snapshot_manifest, "_fsync_directory", fsync_directory)
 
     commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=1)
 
@@ -878,7 +903,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
     (third_tmp / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
         json.dumps(manifest.to_dict())
     )
-    real_rmtree = rollout_checkpoint.shutil.rmtree
+    real_rmtree = snapshot_manifest.shutil.rmtree
 
     def fail_trash_delete(path: Path) -> None:
         path = Path(path)
@@ -886,7 +911,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
             raise OSError("simulated delete failure")
         real_rmtree(path)
 
-    monkeypatch.setattr(rollout_checkpoint.shutil, "rmtree", fail_trash_delete)
+    monkeypatch.setattr(snapshot_manifest.shutil, "rmtree", fail_trash_delete)
 
     with pytest.raises(OSError, match="simulated delete failure"):
         commit_snapshot(third_tmp, third, keep_latest_k=2)
@@ -906,7 +931,7 @@ def test_commit_snapshot_removes_stale_snapshot_from_live_namespace_before_delet
 
 def test_prepare_snapshot_paths_sweeps_interrupted_snapshot_garbage(tmp_path):
     anchor = _ensure_test_bootstrap_anchor(tmp_path)
-    root = anchor / rollout_checkpoint.ROLLOUT_SNAPSHOTS_DIRNAME
+    root = anchor / snapshot_manifest.ROLLOUT_SNAPSHOTS_DIRNAME
     stale_tmp = root / "tmp_snapshot_000001"
     stale_trash = root / "trash_snapshot_000002"
     stale_tmp.mkdir(parents=True)
@@ -963,6 +988,12 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
             "penalize_unwanted_tokens": True,
             "token_ids": {"unwanted": [42, 7, 42]},
         },
+        "grpo": {
+            "length_penalty": {
+                "verbose": False,
+                "default": {"group_total_length_penalty_coeff": 0.2},
+            }
+        },
         "env": {
             "nemo_gym": {"effort_levels": {"low_weight": 1, "low_string": "budget"}}
         },
@@ -980,6 +1011,8 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
     equivalent["env"]["nemo_gym"]["effort_levels"].update(
         low_ub=64000, low_penalty=1, note="unused"
     )
+    # A verbose-only length-penalty change is a logging switch, not a reward rule.
+    equivalent["grpo"]["length_penalty"]["verbose"] = True
     validate_bootstrap_anchor(
         anchor,
         identity=bootstrap_compatibility_identity(cast(Any, _DumpedConfig(equivalent))),
@@ -991,6 +1024,18 @@ def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None
             anchor,
             identity=bootstrap_compatibility_identity(
                 cast(Any, _DumpedConfig(changed))
+            ),
+        )
+    # A real length-penalty rule change must still reject the restart.
+    changed_length = deepcopy(base)
+    changed_length["grpo"]["length_penalty"]["default"][
+        "group_total_length_penalty_coeff"
+    ] = 0.3
+    with pytest.raises(ValueError):
+        validate_bootstrap_anchor(
+            anchor,
+            identity=bootstrap_compatibility_identity(
+                cast(Any, _DumpedConfig(changed_length))
             ),
         )
 
@@ -1006,3 +1051,41 @@ def test_capture_bootstrap_normalizes_disabled_effort() -> None:
     assert bootstrap_fingerprint(
         cast(Any, _DumpedConfig(base))
     ) == bootstrap_fingerprint(cast(Any, _DumpedConfig(changed)))
+
+
+@pytest.mark.parametrize("counter", [None, 0, 123])
+def test_manifest_round_trips_optional_gym_counter(counter: int | None) -> None:
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=0,
+        trainer_version=0,
+        current_epoch=0,
+        sampler_dispatch_index=-1,
+        mutation_version=0,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint="fingerprint-v1",
+        next_nemo_gym_task_index=counter,
+    )
+    raw = manifest.to_dict()
+    assert RolloutSnapshotManifest.from_mapping(raw) == manifest
+    raw.pop("next_nemo_gym_task_index")
+    assert RolloutSnapshotManifest.from_mapping(raw).next_nemo_gym_task_index is None
+
+
+@pytest.mark.parametrize("counter", [-1, True, 1.5, "1"])
+def test_manifest_rejects_invalid_gym_counter(counter: object) -> None:
+    raw = {
+        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        "base_train_step": 0,
+        "trainer_version": 0,
+        "current_epoch": 0,
+        "sampler_dispatch_index": -1,
+        "mutation_version": 0,
+        "rolled_back_train_group_count": 0,
+        "bootstrap_fingerprint": "fingerprint-v1",
+        "next_nemo_gym_task_index": counter,
+    }
+    with pytest.raises(
+        ValueError, match="next_nemo_gym_task_index.*non-negative integer"
+    ):
+        RolloutSnapshotManifest.from_mapping(raw)
