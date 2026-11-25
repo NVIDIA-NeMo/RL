@@ -542,7 +542,7 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
         # as on the existing abandoned-dispatch path.
         if call_id not in pending:
             # Gym is optional for legacy receipts without attempted call IDs.
-            from nemo_gym.token_id_capture.staging.records import staging_key
+            from nemo_gym.models.token_capture.staging.records import staging_key
 
             staging_keys.append(staging_key(owner, call_id))
     return list(dict.fromkeys(staging_keys))
@@ -562,11 +562,11 @@ def _owned_staging_key(
     """
     from types import SimpleNamespace
 
-    from nemo_gym.token_id_capture.staging.rebuild import (
+    from nemo_gym.models.token_capture.staging.rebuild import (
         ReceiptVerificationError,
         _staging_owner,
     )
-    from nemo_gym.token_id_capture.staging.records import staging_key
+    from nemo_gym.models.token_capture.staging.records import staging_key
 
     try:
         source = _staging_owner(

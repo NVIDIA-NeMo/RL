@@ -101,7 +101,7 @@ def _require_inventory_identity(
 ) -> None:
     """Refuse a cut whose inventory entry names another episode than the call."""
     # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
-    from nemo_gym.episode_types import EpisodeId
+    from nemo_gym.core.episode_types import EpisodeId
 
     expected = EpisodeId(rollout_id=prefix.rollout_id, attempt=prefix.attempt)
     if worker_capture_key != expected.capture_key:
@@ -462,7 +462,7 @@ class PrefixRecovery:
     @staticmethod
     def _failed_ack(prefix: Any, *, reason: str, uncut: Counter[str]) -> Any:
         """Acknowledge one uncut call and tally it under ``reason``."""
-        from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
+        from nemo_gym.server_runtime._checkpoint.generation_cut import GenerationCutPrefixAck
 
         uncut[reason] += 1
         return GenerationCutPrefixAck.failure(prefix)
@@ -471,7 +471,7 @@ class PrefixRecovery:
         self, prefix: Any, checkpoint_id: str, uncut: Counter[str]
     ) -> Any:
         """Describe a call whose terminal path won the cut/abort race."""
-        from nemo_gym._checkpoint.generation_cut import (
+        from nemo_gym.server_runtime._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
 
@@ -538,7 +538,7 @@ class PrefixRecovery:
         ``route_pieces`` are the call's router-replay route pieces, copied with
         its tokens by the cut's progress read.
         """
-        from nemo_gym._checkpoint.generation_cut import (
+        from nemo_gym.server_runtime._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
 
@@ -811,7 +811,7 @@ class PrefixRecovery:
         holding the cut-control or pipeline preparation thread for the next
         checkpoint.
         """
-        from nemo_gym._checkpoint.generation_cut import (
+        from nemo_gym.server_runtime._checkpoint.generation_cut import (
             GenerationCutReceipt,
         )
 
@@ -1164,12 +1164,12 @@ class PrefixRecovery:
             )
 
         # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
-        from nemo_gym.token_id_capture.staging.digest import (
+        from nemo_gym.models.token_capture.staging.digest import (
             compute_chain_hash,
             compute_extras_digest,
             hash_token_ids,
         )
-        from nemo_gym.token_id_capture.staging.records import StagedCallRecord
+        from nemo_gym.models.token_capture.staging.records import StagedCallRecord
 
         delta_len = len(token_ids_delta)
         # A cut chain may span retries performed after later weight updates.

@@ -316,7 +316,7 @@ def test_subagent_failures_reach_final_training_rows(
     reverse_manifest: bool,
     failure: str,
 ) -> None:
-    from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+    from nemo_gym.models.token_capture import UNCOMMITTED_CALL_REASON
 
     # Main A -> B / retry C; worker D -> E / H;
     # main compacts into F -> scored G. H completes after G.
@@ -574,8 +574,8 @@ def test_all_captured_does_not_hide_missing_leaf_completion_evidence(
 def test_ordinary_capture_reconstructs_without_framework_output_metadata(
     monkeypatch, tmp_path
 ):
-    from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
-    from nemo_gym.token_id_capture.staging.records import (
+    from nemo_gym.models.token_capture.staging.rebuild import verify_and_linearize
+    from nemo_gym.models.token_capture.staging.records import (
         RolloutReceipt,
         StagedCallBaseSnapshot,
     )

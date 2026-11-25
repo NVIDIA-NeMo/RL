@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Any
 from nemo_rl.environments.checkpointing.interfaces import EnvironmentEpisode
 
 if TYPE_CHECKING:
-    from nemo_gym._checkpoint.coordination import Participants, PrepareResult
-    from nemo_gym.server_utils import ServerClient
+    from nemo_gym.server_runtime._checkpoint.coordination import Participants, PrepareResult
+    from nemo_gym.server_runtime.base_server import ServerClient
 
 
 # Gym's episode identity is the backend-neutral one the recovery ledger uses.
@@ -157,7 +157,7 @@ def _reraise_as_gym_checkpoint_unavailable() -> Iterator[None]:
     Every Gym coordination call goes through this, so its failure reaches the
     driver typed, with Gym's message, instead of as ``UnserializableException``.
     """
-    from nemo_gym._checkpoint.coordination import CoordinationError
+    from nemo_gym.server_runtime._checkpoint.coordination import CoordinationError
 
     try:
         yield
@@ -181,7 +181,7 @@ class GymCheckpointAdapter:
         self._participants: Participants | None = None
 
     async def discover(self) -> None:
-        from nemo_gym._checkpoint.coordination import discover
+        from nemo_gym.server_runtime._checkpoint.coordination import discover
 
         if self._participants is not None:
             return
@@ -228,7 +228,7 @@ class GymCheckpointAdapter:
         return self._participants
 
     async def prepare(self, checkpoint_id: str, *, deadline_ts: float) -> PrepareResult:
-        from nemo_gym._checkpoint.coordination import prepare
+        from nemo_gym.server_runtime._checkpoint.coordination import prepare
 
         with _reraise_as_gym_checkpoint_unavailable():
             return await prepare(
@@ -236,7 +236,7 @@ class GymCheckpointAdapter:
             )
 
     async def renew(self, checkpoint_id: str, *, deadline_ts: float) -> None:
-        from nemo_gym._checkpoint.coordination import renew
+        from nemo_gym.server_runtime._checkpoint.coordination import renew
 
         with _reraise_as_gym_checkpoint_unavailable():
             await renew(
@@ -246,7 +246,7 @@ class GymCheckpointAdapter:
     @staticmethod
     def _episode_ids(episodes: Iterable[GymCheckpointEpisode]) -> list[Any]:
         """Convert the RL wire identity to Gym's validated API model."""
-        from nemo_gym.episode_types import EpisodeId
+        from nemo_gym.core.episode_types import EpisodeId
 
         return [
             EpisodeId(rollout_id=episode.rollout_id, attempt=episode.attempt)
@@ -313,7 +313,7 @@ class GymCheckpointAdapter:
                 for capture_key, keys in reply["staging_keys_by_episode"].items():
                     keys_by_capture_key.setdefault(capture_key, set()).update(keys)
 
-        from nemo_gym.episode_types import EpisodeId
+        from nemo_gym.core.episode_types import EpisodeId
 
         def _episodes(capture_keys: set[str]) -> tuple[GymCheckpointEpisode, ...]:
             return tuple(
@@ -352,7 +352,7 @@ class GymCheckpointAdapter:
         *,
         deadline_ts: float,
     ) -> None:
-        from nemo_gym._checkpoint.coordination import retire
+        from nemo_gym.server_runtime._checkpoint.coordination import retire
 
         with _reraise_as_gym_checkpoint_unavailable():
             await retire(
@@ -369,7 +369,7 @@ class GymCheckpointAdapter:
         *,
         deadline_ts: float,
     ) -> None:
-        from nemo_gym._checkpoint.coordination import forget
+        from nemo_gym.server_runtime._checkpoint.coordination import forget
 
         with _reraise_as_gym_checkpoint_unavailable():
             await forget(
@@ -387,7 +387,7 @@ class GymCheckpointAdapter:
         *,
         deadline_ts: float,
     ) -> GymCheckpointCommitSummary:
-        from nemo_gym._checkpoint.coordination import commit
+        from nemo_gym.server_runtime._checkpoint.coordination import commit
 
         episode_ids = self._episode_ids(episodes)
         checkpoint_dir = self._instance.checkpoint_dir(checkpoint_root)
@@ -418,7 +418,7 @@ class GymCheckpointAdapter:
         state silently dropped; Gym itself fails a live participant that has no
         saved state.
         """
-        from nemo_gym._checkpoint.coordination import restore
+        from nemo_gym.server_runtime._checkpoint.coordination import restore
 
         live = {member.server_name for member in self._require_participants().members}
         missing = sorted(set(participants) - live)
@@ -463,7 +463,7 @@ class GymCheckpointAdapter:
             )
 
     async def resume(self, checkpoint_id: str, *, deadline_ts: float) -> None:
-        from nemo_gym._checkpoint.coordination import resume
+        from nemo_gym.server_runtime._checkpoint.coordination import resume
 
         with _reraise_as_gym_checkpoint_unavailable():
             await resume(

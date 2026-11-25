@@ -123,7 +123,7 @@ class TestHealthCheck:
         self, monkeypatch: pytest.MonkeyPatch, serialize_spinup: bool
     ) -> None:
         import nemo_gym.cli
-        import nemo_gym.server_utils as gym_utils
+        import nemo_gym.server_runtime.base_server as gym_utils
         from omegaconf import OmegaConf
 
         import nemo_rl.environments.nemo_gym as env_module

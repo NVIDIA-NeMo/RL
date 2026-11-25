@@ -18,17 +18,17 @@ from types import SimpleNamespace
 import pytest
 
 pytestmark = pytest.mark.nemo_gym
-pytest.importorskip("nemo_gym.token_id_capture.external_capture")
+pytest.importorskip("nemo_gym.models.token_capture.external_capture")
 
-from nemo_gym.openai_utils import (  # noqa: E402
+from nemo_gym.client.openai_client import (  # noqa: E402
     TOKEN_METADATA_FIELDS,
     NeMoGymAsyncOpenAI,
 )
-from nemo_gym.token_id_capture import (  # noqa: E402
+from nemo_gym.models.token_capture import (  # noqa: E402
     NG_CAPTURE_FIELD,
     NG_COMMIT_COORDS_FIELD,
 )
-from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
+from nemo_gym.models.token_capture.external_capture import (  # noqa: E402
     DYNAMO_GYM_EXTRAS_ANNOTATION_PREFIX,
     add_dynamo_gym_extras,
     pop_dynamo_call_result,

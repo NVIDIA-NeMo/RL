@@ -135,7 +135,7 @@ def _media_items_from_extras(
             when the spans are malformed or do not match the row's tokens.
     """
     # Optional Gym dependency: only captured media calls reach here.
-    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+    from nemo_gym.models.token_capture.adapters.vllm import MEDIA_SPANS_FIELD
 
     if not isinstance(extras, dict) or MEDIA_SPANS_FIELD not in extras:
         raise MediaCaptureRejected(missing_message)
@@ -916,8 +916,8 @@ class VllmAsyncGenerationWorkerImpl(
                 "Token capture with a prefix writer is already installed"
             )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
-        from nemo_gym.token_id_capture.staging import install_capture
+        from nemo_gym.models.token_capture.adapters.vllm import VLLMCaptureAdapter
+        from nemo_gym.models.token_capture.staging import install_capture
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -1162,7 +1162,7 @@ class VllmAsyncGenerationWorkerImpl(
         if self.token_capture is None or not context:
             return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+        from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
         return CaptureAdmission.model_validate(context)
 
@@ -1259,8 +1259,8 @@ class VllmAsyncGenerationWorkerImpl(
         retained_tensors = () if verify_retained_media else None
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
-            from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
-            from nemo_gym.token_id_capture.staging.records import staging_key
+            from nemo_gym.models.token_capture.staging.digest import compute_chain_hash
+            from nemo_gym.models.token_capture.staging.records import staging_key
 
             source = self._staging_source
             if source is None:
@@ -1375,7 +1375,7 @@ class VllmAsyncGenerationWorkerImpl(
                 "media was captured without tensor digests; generation-prefix "
                 "cuts must be enabled before the call is admitted"
             )
-        from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+        from nemo_gym.models.token_capture.adapters.vllm import MEDIA_SPANS_FIELD
 
         return {
             MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
@@ -1575,11 +1575,11 @@ class VllmAsyncGenerationWorkerImpl(
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
-        # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
+        # nemo_gym.models.token_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         if state.media is not None:
             # Optional Gym dependency: only captured media calls reach here.
-            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+            from nemo_gym.models.token_capture.adapters.vllm import MEDIA_SPANS_FIELD
 
             # Placeholder metadata (offsets, token hashes, sizes) rides the
             # digest-covered extras; the pixels themselves are attachments.
@@ -1690,7 +1690,7 @@ class VllmAsyncGenerationWorkerImpl(
         if admission is None:
             return {}
         # Deferred: Gym is optional outside framework-owned capture.
-        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+        from nemo_gym.models.token_capture.protocols import CAPTURE_REFUSAL_HEADER
 
         return {CAPTURE_REFUSAL_HEADER: admission.model_call_id}
 

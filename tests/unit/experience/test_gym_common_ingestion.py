@@ -12,13 +12,13 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.completion import (
+from nemo_gym.models.token_capture.completion import (
     completion_metadata,
     output_item_fingerprint,
     output_validation_item,
 )
-from nemo_gym.token_id_capture.lineage import FileLineageStore, InMemoryLineageStore
-from nemo_gym.token_id_capture.staging.records import (
+from nemo_gym.models.token_capture.lineage import FileLineageStore, InMemoryLineageStore
+from nemo_gym.models.token_capture.staging.records import (
     CallRecord,
     CaptureLedgerCommit,
     OutputItemEvidence,

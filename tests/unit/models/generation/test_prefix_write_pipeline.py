@@ -72,7 +72,7 @@ def _media_cut_rows(
     monkeypatch: pytest.MonkeyPatch, writer_actor: bool
 ) -> dict[str, tuple[dict[str, Any], dict[str, torch.Tensor]]]:
     """Cut two media calls on a media partition; return every written row by key."""
-    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+    from nemo_gym.models.token_capture.adapters.vllm import MEDIA_SPANS_FIELD
 
     item = CapturedMediaItem(
         modality="image",
@@ -174,7 +174,7 @@ def test_preparation_overlaps_put_but_receipts_and_locks_wait_for_durability() -
     pipeline = _pipeline(recovery)
     try:
         # Separate inventories expose preparation overlap across independent calls.
-        from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+        from nemo_gym.server_runtime._checkpoint.generation_cut import GenerationCutInventory
 
         inventories = [
             GenerationCutInventory.build(
@@ -440,7 +440,7 @@ def test_prepared_batch_that_expires_before_put_fails_without_a_write(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A batch prepared in time but written after its deadline is not written."""
-    from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+    from nemo_gym.server_runtime._checkpoint.generation_cut import GenerationCutInventory
 
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3], batch_size=1)
     clock = {"now": 0.0}

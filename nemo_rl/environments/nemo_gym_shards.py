@@ -58,7 +58,7 @@ DEFAULT_PLACEMENT_STRATEGY = "STRICT_SPREAD"
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
-# Gym's log-directory key (``nemo_gym.global_config.NEMO_GYM_LOG_DIR_KEY_NAME``).
+# Gym's log-directory key (``nemo_gym.config.global_config.NEMO_GYM_LOG_DIR_KEY_NAME``).
 # Restated rather than imported: this module is imported on the driver, and
 # nemo_gym is installed only in the actor's venv.
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"

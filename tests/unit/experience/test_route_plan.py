@@ -66,8 +66,8 @@ def test_route_plan_round_trip_is_strict_and_lossless() -> None:
 
 def test_route_span_classification_uses_gyms_decision_table() -> None:
     # The decision table is Gym-owned; RL applies it via span metadata.
-    pytest.importorskip("nemo_gym.token_id_capture.staging")
-    from nemo_gym.token_id_capture.staging.routes import classify_route_span
+    pytest.importorskip("nemo_gym.models.token_capture.staging")
+    from nemo_gym.models.token_capture.staging.routes import classify_route_span
 
     spans = _plan().spans
     assert [

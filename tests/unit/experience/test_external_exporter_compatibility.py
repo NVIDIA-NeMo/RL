@@ -22,12 +22,12 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from nemo_gym import rollout_observability
 from nemo_gym.client import openai_client
-from nemo_gym.config_types import ModelServerRef
-from nemo_gym.core import responses_api_types
-from nemo_gym.openai_utils import (
+from nemo_gym.client.openai_client import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
 )
+from nemo_gym.config.config_types import ModelServerRef
+from nemo_gym.core import responses_api_types
 from responses_api_agents.opencode_agent.app import (
     _INTERNAL_TRAJECTORY_KEY,
     OpenCodeAgent,

@@ -355,7 +355,7 @@ def test_stops_servers_that_gym_run_command_launches(run_dir):
     shutdown budget has seconds, as Gym's own shutdown waits on each in turn.
     """
     from nemo_gym.cli.env import RunHelper
-    from nemo_gym.cli.setup_command import run_command
+    from nemo_gym.server_runtime.supervisor.server_venv import run_command
     from omegaconf import DictConfig
 
     log_dir = run_dir / "logs"

@@ -29,7 +29,7 @@ class RouteSpan:
     """One root-first route contribution to a canonical rollout row.
 
     How a span contributes (full/tail/sentinel) is Gym's decision table —
-    ``nemo_gym.token_id_capture.staging.routes.classify_route_span`` — applied
+    ``nemo_gym.models.token_capture.staging.routes.classify_route_span`` — applied
     by the shared plan executor; this module carries metadata only.
     """
 

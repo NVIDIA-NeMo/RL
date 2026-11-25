@@ -276,7 +276,7 @@ def test_forbidden_keys_cover_gym_staging_fields() -> None:
     ``--nemo-gym-only`` conftest raises when Gym is missing, so here it fails
     rather than skipping.
     """
-    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+    from nemo_gym.models.token_capture.staging.records import StagedCallBaseSnapshot
 
     per_token = {
         name
@@ -402,7 +402,7 @@ def test_dependency_check_propagates_import_error(
     import_error = ModuleNotFoundError("No module named 'nemo_gym'", name="nemo_gym")
 
     def fail_rebuild_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "nemo_gym.token_id_capture.staging.rebuild":
+        if name == "nemo_gym.models.token_capture.staging.rebuild":
             raise import_error
         return original_import(name, *args, **kwargs)
 

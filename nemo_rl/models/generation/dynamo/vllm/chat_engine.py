@@ -146,7 +146,7 @@ def _refusal_error(
     # Native's /tokenize never acknowledges a measure call.
     if acknowledge and extras.ng_capture is not None and not extras.ng_measure:
         # Deferred: Gym is installed wherever a call carries ng_capture.
-        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+        from nemo_gym.models.token_capture.protocols import CAPTURE_REFUSAL_HEADER
 
         if not context.set_response_header(
             CAPTURE_REFUSAL_HEADER, extras.ng_capture["model_call_id"]

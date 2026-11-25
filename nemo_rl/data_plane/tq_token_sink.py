@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
     # uses import locally so this module (and the finalizer actor importing
     # it) stays importable without it.
-    from nemo_gym.token_id_capture.staging.records import (
+    from nemo_gym.models.token_capture.staging.records import (
         StagedCallBaseSnapshot,
         StagedCallRecord,
         StageResult,
@@ -82,7 +82,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
 
-# These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
+# These names come from nemo_gym.models.token_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
 # stage(); a mismatch is caught by test_tq_sink_source_passes_conformance's
 # round-trip equality check -- but only for required StagedCallRecord fields. An
@@ -544,7 +544,7 @@ class TQTokenSink:
         ``_discard_failed_writes``).
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import StageResult
+        from nemo_gym.models.token_capture.staging.records import StageResult
 
         key = record.staging_key
         write_started = False
@@ -1295,7 +1295,7 @@ def _row_text(row: Any, name: str) -> str:
 def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     """Rebuild one normally validated base snapshot; route bytes never enter it."""
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+    from nemo_gym.models.token_capture.staging.records import StagedCallBaseSnapshot
 
     def _digest(name: str) -> str:
         value = bytes(int(item) for item in _row_leaf(row, name).tolist())

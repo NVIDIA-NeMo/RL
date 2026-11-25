@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
 from nemo_rl.data.captured_media import (
     MediaCaptureRejected,

@@ -11,8 +11,8 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.lineage import FileLineageStore
-from nemo_gym.token_id_capture.sink import (
+from nemo_gym.models.token_capture.lineage import FileLineageStore
+from nemo_gym.models.token_capture.sink import (
     CaptureContext,
     reset_token_sink,
     resolve_parent,

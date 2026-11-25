@@ -41,25 +41,25 @@ import torch
 pytestmark = [pytest.mark.vllm, pytest.mark.nemo_gym]
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
-pytest.importorskip("nemo_gym.token_id_capture.staging")
+pytest.importorskip("nemo_gym.models.token_capture.staging")
 
 import httpx  # noqa: E402
 from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+from nemo_gym.server_runtime._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutInventory,
     GenerationCutPrefix,
 )
-from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
-from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER  # noqa: E402
-from nemo_gym.token_id_capture.replay import (  # noqa: E402
+from nemo_gym.models.token_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
+from nemo_gym.models.token_capture.protocols import CAPTURE_REFUSAL_HEADER  # noqa: E402
+from nemo_gym.models.token_capture.replay import (  # noqa: E402
     replay_context,
     summarize_replay,
 )
-from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.capture import (  # noqa: E402
     RolloutTokenCapture,
 )
-from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+from nemo_gym.models.token_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
     StageResult,
 )

@@ -233,16 +233,16 @@ def test_megatron_capture_handler_admits_media_requests(content_part: dict) -> N
     Older Gym revisions reject image and video parts there, which would only
     surface on the first media request of a run.
     """
-    from nemo_gym.token_id_capture.external_capture import (
+    from nemo_gym.models.token_capture.external_capture import (
         make_external_capture_handler,
     )
-    from nemo_gym.token_id_capture.lineage import InMemoryLineageStore
-    from nemo_gym.token_id_capture.sink import (
+    from nemo_gym.models.token_capture.lineage import InMemoryLineageStore
+    from nemo_gym.models.token_capture.sink import (
         CaptureContext,
         reset_token_sink,
         set_token_sink,
     )
-    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+    from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
     admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
     context = CaptureContext(

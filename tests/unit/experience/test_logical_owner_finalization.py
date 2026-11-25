@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.completion import output_validation_item
+from nemo_gym.models.token_capture.completion import output_validation_item
 from responses_api_models.vllm_model.tests import test_framework_context as gym_harness
 from tensordict import TensorDict
 

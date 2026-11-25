@@ -82,7 +82,7 @@ class ReassemblyRequest:
         """Return cleanup receipts only after validating Forest capture ownership."""
         if self.logical_selections is None:
             return self.receipts
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+        from nemo_gym.models.token_capture.staging.records import RolloutReceipt
 
         if len(self.logical_selections) != len(self.rollout_ids) or len(
             self.receipts
@@ -213,12 +213,12 @@ class RolloutReassemblerActor:  # pragma: no cover
     def check_dependencies(self) -> None:
         """Import the finalization API before the controller starts rollouts."""
         # Deferred: only the actor's environment needs the optional Gym extra.
-        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+        from nemo_gym.models.token_capture.staging.rebuild import (  # noqa: F401
             RebuildError,
             ReceiptVerificationError,
             verify_and_linearize,
         )
-        from nemo_gym.token_id_capture.staging.records import (
+        from nemo_gym.models.token_capture.staging.records import (
             RolloutReceipt,  # noqa: F401
         )
 

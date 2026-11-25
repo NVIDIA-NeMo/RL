@@ -165,7 +165,7 @@ def test_prefetch_config_composes_with_gym_parser(config_path):
     keeps the parse from probing ports or exporting environment variables.
     """
     pytest.importorskip("nemo_gym")
-    from nemo_gym.global_config import (
+    from nemo_gym.config.global_config import (
         GlobalConfigDictParser,
         GlobalConfigDictParserConfig,
     )

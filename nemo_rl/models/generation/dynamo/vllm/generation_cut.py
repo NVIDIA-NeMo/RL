@@ -69,7 +69,7 @@ def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]])
     An engine acknowledges only the calls it cut. A call no engine
     acknowledged gets Gym's failure ack, so it regenerates after a restore.
     """
-    from nemo_gym._checkpoint.generation_cut import (
+    from nemo_gym.server_runtime._checkpoint.generation_cut import (
         GenerationCutPrefixAck,
         GenerationCutReceipt,
     )
@@ -214,7 +214,7 @@ def routes() -> list[Any]:
         # Gym points an unset HF_HOME at its own cache directory, where the
         # early render-worker build would then look for a Hub ID's files.
         hf_home = os.environ.get("HF_HOME")
-        importlib.import_module("nemo_gym._checkpoint.generation_cut")
+        importlib.import_module("nemo_gym.server_runtime._checkpoint.generation_cut")
         if hf_home is None:
             os.environ.pop("HF_HOME", None)
     handler = CutRouteHandler(os.environ[CAPTURE_FILE_ENV])

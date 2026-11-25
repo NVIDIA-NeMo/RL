@@ -367,7 +367,7 @@ class TestGymFailureRowsKeepTheirRow:
 
     def test_gym_owns_which_failure_classes_mean_no_result(self, monkeypatch):
         """A class Gym adds to its no-result set is not mistaken for a row that ran."""
-        from nemo_gym import rollout_collection
+        from nemo_gym.rollouts import rollout_collection
 
         row = {**_gym_failure_row(status=503), "_ng_failure_class": "new_gym_class"}
         assert _gym_failure_row_error({"_rowidx": 0}, row) is None
@@ -423,7 +423,7 @@ class TestGymFailureRowsKeepTheirRow:
         self, status, body, expected
     ):
         """Fail if Gym renames a ``_ng_failure_*`` key this mapping reads."""
-        from nemo_gym.rollout_collection import _agent_request_failure_row
+        from nemo_gym.rollouts.rollout_collection import _agent_request_failure_row
 
         if status is None:
             error: BaseException = aiohttp.ServerDisconnectedError()
@@ -563,8 +563,8 @@ def test_a_row_that_ran_needs_no_nemo_gym_import(monkeypatch):
     """Every streamed row is checked, including in environments without the extra."""
     for module in (
         "nemo_gym",
-        "nemo_gym._checkpoint.errors",
-        "nemo_gym.rollout_collection",
+        "nemo_gym.server_runtime._checkpoint.errors",
+        "nemo_gym.rollouts.rollout_collection",
     ):
         monkeypatch.setitem(sys.modules, module, None)
 

@@ -20,11 +20,11 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.openai_utils import (
+from nemo_gym.client.openai_client import (
     NeMoGymAsyncOpenAI,
     NeMoGymResponseCreateParamsNonStreaming,
 )
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.server_runtime.base_server import ServerClient
 from responses_api_agents.browsecomp_agent.app import BrowsecompAgent
 from responses_api_agents.browsecomp_agent.tests.test_progress_tracking import (
     _make_config,

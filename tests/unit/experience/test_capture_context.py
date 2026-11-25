@@ -7,8 +7,8 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.token_id_capture.replay import replay_context, summarize_replay
-from nemo_gym.token_id_capture.staging.records import (
+from nemo_gym.models.token_capture.replay import replay_context, summarize_replay
+from nemo_gym.models.token_capture.staging.records import (
     CaptureAdmission,
     GenerationCutContinuation,
 )

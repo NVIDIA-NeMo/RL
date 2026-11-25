@@ -32,7 +32,7 @@ from nemo_rl.experience.failures import (
 )
 
 pytest.importorskip(
-    "nemo_gym.episode_types", reason="Requires Gym Environment Server contracts"
+    "nemo_gym.core.episode_types", reason="Requires Gym Environment Server contracts"
 )
 pytestmark = pytest.mark.nemo_gym
 

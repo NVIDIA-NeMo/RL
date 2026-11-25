@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+    from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def decide_capture_input(
     harness option. It permits only null/empty Chat assistant tool content.
     """
     # Optional Gym contracts are required only on a captured serving request.
-    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+    from nemo_gym.models.token_capture.staging.records import CaptureAdmission
 
     if admission.mode != "candidate" and admission.request_replay is None:
         return CaptureInputDecision(admission, admission, False)
