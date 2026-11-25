@@ -11,7 +11,7 @@ grpo:
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 loss_fn:
-  token_level_loss: false
+  normalization: sequence_mean
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2.0
   truncated_importance_sampling_ratio_min: 0.5

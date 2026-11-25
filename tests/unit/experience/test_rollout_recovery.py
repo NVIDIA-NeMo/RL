@@ -120,6 +120,80 @@ def _forest_sealed_ledger() -> RolloutRecoveryLedger:
     return ledger
 
 
+@pytest.fixture
+def partially_sealed_ledger() -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    owner = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=owner,
+            receipt={
+                "capture_key": owner,
+                "manifest": [{"staging_key": f"{owner}/call"}],
+            },
+            reward=0.5,
+            mask_sample=False,
+            resolved_agent_name="agent",
+            attribution_key="dataset:train",
+        )
+    )
+    return ledger
+
+
+def test_narrow_identity_and_routing_reads_do_not_copy_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+    partially_sealed_ledger: RolloutRecoveryLedger,
+) -> None:
+    ledger = partially_sealed_ledger
+    group = ledger.get_group("g7")
+
+    def unexpected_copy(record: PromptGroupRecoveryRecord) -> None:
+        pytest.fail("identity/routing lookup copied the sibling group")
+
+    monkeypatch.setattr(ledger, "_copy_group", unexpected_copy)
+    assert ledger.current_gate_rollout_id("g7", 0) == group.gate_rollout_id(0)
+    assert ledger.finalization_routing("g7") == (
+        group.resolved_agent_name,
+        group.attribution_key,
+    )
+    for index in (-1, 2):
+        with pytest.raises(ValueError, match="outside group"):
+            ledger.current_gate_rollout_id("g7", index)
+    with pytest.raises(ValueError, match="unknown recovery group_id"):
+        ledger.current_gate_rollout_id("missing", 0)
+    with pytest.raises(ValueError, match="unknown recovery group_id"):
+        ledger.finalization_routing("missing")
+
+
+def test_narrow_identity_read_follows_replaced_dispatch(
+    partially_sealed_ledger: RolloutRecoveryLedger,
+) -> None:
+    ledger = partially_sealed_ledger
+    sealed = ledger.current_gate_rollout_id("g7", 0)
+    dropped = ledger.current_gate_rollout_id("g7", 1)
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+    assert ledger.current_gate_rollout_id("g7", 0) == sealed
+    assert ledger.current_gate_rollout_id("g7", 1) != dropped
+    assert ledger.current_gate_rollout_id("g7", 1) == ledger.get_group(
+        "g7"
+    ).gate_rollout_id(1)
+
+
 @pytest.mark.nemo_gym
 def test_forest_recovery_disk_round_trip_retains_completed_evidence(
     tmp_path: Path,
@@ -788,6 +862,36 @@ def test_checkpoint_parser_defaults_optional_controller_fields() -> None:
 
     assert parsed.batch_shortfall == {}
     assert parsed.sampler_stamps_target_steps is None
+
+
+def test_sidecar_records_the_multi_harness_routes_it_ran_with() -> None:
+    routes = {
+        "selection": "nemo-rl-multi-harness-v1",
+        "candidates": [
+            [
+                "swe",
+                [["opencode_agent", "swe_opencode", 2.0], ["pi_agent", "swe_pi", 1.0]],
+            ]
+        ],
+    }
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        steps_allowed_short=set(),
+        sampler_stamps_target_steps=True,
+        multi_harness_routes=routes,
+    )
+
+    assert parse_rollout_recovery_state(state).multi_harness_routes == routes
+    # A sidecar saved before routes were recorded reads as saved without them.
+    old = parse_rollout_recovery_state(_sidecar_state(RolloutRecoveryLedger()))
+    assert old.multi_harness_routes is None
+    state["multi_harness_routes"] = {
+        "selection": "nemo-rl-multi-harness-v1",
+        "candidates": [["swe", [["opencode_agent", 2.0]]]],
+    }
+    with pytest.raises(TypeError, match="multi_harness_routes"):
+        parse_rollout_recovery_state(state)
 
 
 @pytest.mark.parametrize(
