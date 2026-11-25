@@ -242,6 +242,7 @@ def _populated_ledger() -> recovery.RolloutRecoveryLedger:
     return ledger
 
 
+@pytest.mark.nemo_gym
 @pytest.mark.parametrize("canonical_ids", [None, set(), {"canonical"}])
 def test_capture_matches_legacy_projection(
     canonical_ids: set[str] | None, monkeypatch: pytest.MonkeyPatch
@@ -318,6 +319,7 @@ def test_capture_matches_legacy_projection(
     assert ledger.state_dict() == original
 
 
+@pytest.mark.nemo_gym
 def test_canonical_groups_are_filtered_before_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,6 +350,7 @@ def test_canonical_groups_are_filtered_before_copy(
         ledger.state_dict(exclude_group_ids={"canonical"})
 
 
+@pytest.mark.nemo_gym
 def test_exclusion_keeps_prompt_identity_validation() -> None:
     ledger = _populated_ledger()
     ledger._groups["canonical"].runtime_prompt_payload = None
