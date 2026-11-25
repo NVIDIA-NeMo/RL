@@ -1,6 +1,8 @@
 defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml
 grpo:
   max_num_steps: 10
+loss_fn:
+  force_on_policy_ratio: true
 policy:
   train_micro_batch_size: 8
   logprob_batch_size: 16
