@@ -724,6 +724,15 @@ def prepare_packed_loss_input(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
         )
+    elif score_centering and use_chunking:
+        # Both outputs use the same next-token roll, packing and CP reconstruction.
+        # Gather them together so backward produces one dense logits gradient;
+        # duplicate sampled/head IDs accumulate in the existing FP32 scatter.
+        joint_logprobs = sampler_topk_logprobs(
+            torch.cat((input_ids.unsqueeze(-1), data["sampler_topk_token_ids"]), dim=-1)
+        )
+        logprobs = joint_logprobs[..., 0]
+        support_head = joint_logprobs[..., 1:]
     else:
         logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             logits_for_logprobs,

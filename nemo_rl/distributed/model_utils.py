@@ -86,6 +86,24 @@ def _compute_distributed_log_softmax(
 
 
 @torch.no_grad()
+def _compute_distributed_softmax(
+    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Compute stable TP softmax in one owned FP32 vocabulary-sized buffer."""
+    probabilities = vocab_parallel_logits.to(dtype=torch.float32, copy=True)
+    logits_max = probabilities.amax(dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        logits_max, op=torch.distributed.ReduceOp.MAX, group=group
+    )
+    probabilities.sub_(logits_max).exp_()
+    sum_exp_logits = probabilities.sum(dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=group
+    )
+    return probabilities.div_(sum_exp_logits)
+
+
+@torch.no_grad()
 def _compute_distributed_selected_logprobs(
     vocab_parallel_logits: torch.Tensor,
     *,
@@ -916,7 +934,9 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
 
             local_vals = torch.gather(log_probs, dim=-1, index=li)
-            local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
+            # Out-of-shard entries contribute zero, including when this shard
+            # has -inf logits but another TP shard keeps the normalizer finite.
+            local_vals.masked_fill_(~in_range, 0.0)
 
             torch.distributed.all_reduce(
                 local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
@@ -949,17 +969,15 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(
-            vocab_parallel_logits, dtype=torch.float32
-        )
+        grad_input = torch.empty_like(vocab_parallel_logits)
 
         for chunk_idx in range(num_chunks):
             s0 = chunk_idx * chunk_size
             s1 = min(int(S), (chunk_idx + 1) * chunk_size)
 
-            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
-            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
-            softmax_output = log_probs.exp()
+            chunk_grad_fp32 = _compute_distributed_softmax(
+                vocab_parallel_logits[:, s0:s1, :], group=tp_group
+            )
 
             gi = global_indices[:, s0:s1, :]
             in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
@@ -969,20 +987,16 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             go_chunk = grad_output[:, s0:s1, :]  # [B, Sc, K]
             go_sum = go_chunk.sum(dim=-1, keepdim=True)  # [B, Sc, 1]
 
-            # Inplace index into the preallocated grad_input tensor
-            grad_input_chunk = grad_input[:, s0:s1, :]
-
-            grad_input_chunk.copy_(softmax_output.neg().mul_(go_sum))  # inplace copy
-
             # Positive scatter term: add gradients to selected indices
             go_masked = go_chunk * in_range.to(dtype=go_chunk.dtype)
-            grad_input_chunk.scatter_add_(2, li, go_masked)
+            chunk_grad_fp32.neg_().mul_(go_sum)
+            chunk_grad_fp32.scatter_add_(2, li, go_masked)
+            # Round only after the entire chunk gradient is accumulated in FP32.
+            grad_input[:, s0:s1, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
             del (
-                softmax_output,
-                log_probs,
-                logits,
+                chunk_grad_fp32,
                 gi,
                 in_range,
                 li,
