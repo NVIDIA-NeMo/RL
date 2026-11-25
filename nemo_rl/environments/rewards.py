@@ -80,7 +80,9 @@ def exact_answer_alphanumeric_reward(
         # Remove all non-alphanumeric characters (including whitespace, punctuation, etc.)
         answer_clean = "".join(c for c in answer if c.isalnum()).lower()
         ground_truth_clean = "".join(c for c in ground_truth if c.isalnum()).lower()
-        if answer_clean == ground_truth_clean:
+        # Empty-after-normalize must not count as a match: otherwise missing /
+        # punctuation-only labels reward contentless <answer> tags (see #4275).
+        if answer_clean and answer_clean == ground_truth_clean:
             return 1.0, True
     return 0.0, False
 
