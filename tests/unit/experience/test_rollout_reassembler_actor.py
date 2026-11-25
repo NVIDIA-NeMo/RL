@@ -102,7 +102,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         drop_reason="test",
     )
     actor._finalizer.finalize_group.return_value = result
-    request = replace(_request(), loss_multiplier=0.25)
+    request = replace(_request(), loss_multiplier=0.25, infra_failure=(True,))
 
     assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
@@ -114,6 +114,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         fallback_weight_version=4,
         prompt_idx=17,
         loss_multiplier=0.25,
+        infra_failure=[True],
         canonical_sample_ids=["group_g0"],
         logical_selections=None,
         execution_row_multiple=1,
@@ -230,6 +231,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "logical_selections",
         "execution_row_multiple",
         "resolved_agent_name",
+        "infra_failure",
         "attribution_key",
         "reward_checks",
         "reward_log_contexts",
@@ -245,6 +247,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "reward_mask_sample",
         "reward_truncated",
         "reward_original",
+        "reward_infra_failure",
         "loss_multiplier",
         "dropped",
         "drop_reason",

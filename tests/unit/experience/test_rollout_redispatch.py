@@ -127,6 +127,7 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager._consecutive_infra_drops = 0
     manager._filter_zero_variance_groups = False
     manager._masked_reward_policy = None
+    manager._policy_failure_kinds = None
     manager._overlong_filtering = False
     manager._step_rewards = {}
     return manager

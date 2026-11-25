@@ -7,9 +7,20 @@ grpo:
   max_num_steps: 1000000
   normalize_rewards: true
   # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
-  # batch normalization, dynamic-sampling admission): include (default) every row,
-  # masked rewards too; exclude only rows with a nonzero loss weight. Loss masks unchanged.
+  # batch normalization, dynamic-sampling admission). Loss masks unchanged.
+  # include (default): every row, masked rewards too; exclude_infra: every row
+  #   except env-masked (mask_sample) rows whose failure_kind is not in
+  #   policy_failure_kinds, or that carry none (infrastructure, judge or verifier
+  #   failures); exclude: only rows with a nonzero loss weight.
   masked_reward_policy: include
+  # Gym failure kinds the policy caused; read only by exclude_infra. Exact match.
+  # A recipe that sets this list replaces it, so list the defaults with any new name.
+  policy_failure_kinds:
+    - agent_timeout
+    - agent_command_not_allowed
+    - agent_limit
+    - agent_invalid_output
+    - model_context_limit
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1

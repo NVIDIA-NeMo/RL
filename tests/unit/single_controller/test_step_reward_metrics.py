@@ -26,10 +26,15 @@ from nemo_rl.experience.dynamic_sampling import (
     voting_rewards_from_record,
 )
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollouts import FAILURE_KIND, infra_failure_flags
+
+_POLICY_FAILURE_KINDS = frozenset({"agent_timeout"})
 
 
 def _manager(
-    masked_reward_policy: str | None = None, overlong_filtering: bool = False
+    masked_reward_policy: str | None = None,
+    overlong_filtering: bool = False,
+    policy_failure_kinds: frozenset[str] | None = None,
 ) -> RolloutManager:
     # The tally methods touch one dict and nothing else, so a full manager (tokenizer,
     # policy, Ray) is not needed to exercise them.
@@ -37,6 +42,7 @@ def _manager(
     manager._step_rewards = {}
     manager._masked_reward_policy = masked_reward_policy
     manager._overlong_filtering = overlong_filtering
+    manager._policy_failure_kinds = policy_failure_kinds
     return manager
 
 
@@ -54,12 +60,22 @@ def test_rewards_carry_no_signal(rewards, expected):
     assert rewards_carry_no_signal(rewards) is expected
 
 
-def _completion(reward, *, truncated=False, mask_sample=False, reward_original=None):
+def _completion(
+    reward,
+    *,
+    truncated=False,
+    mask_sample=False,
+    reward_original=None,
+    failure_kind=None,
+):
+    env_extras = {MASK_SAMPLE: True} if mask_sample else None
+    if env_extras is not None and failure_kind is not None:
+        env_extras[FAILURE_KIND] = failure_kind
     return SimpleNamespace(
         reward=reward,
         reward_original=reward_original,
         truncated=truncated,
-        env_extras={MASK_SAMPLE: True} if mask_sample else None,
+        env_extras=env_extras,
     )
 
 
@@ -99,6 +115,28 @@ def test_a_flagged_row_only_votes_under_include():
     assert rewards_carry_no_signal(_manager("include")._voting_rewards(record)) is False
 
 
+def test_an_infra_failed_row_only_votes_outside_exclude_infra():
+    """Under exclude_infra the zero-variance check drops the rows the advantage stage drops.
+
+    A mask with no failure_kind (OSWorld's evaluator error) is an infrastructure
+    failure; a mask with a listed policy kind still votes.
+    """
+    record = _record(
+        [_completion(0.0, mask_sample=True), _completion(1.0), _completion(1.0)]
+    )
+    excluding_infra = _manager(
+        "exclude_infra", policy_failure_kinds=_POLICY_FAILURE_KINDS
+    )
+
+    assert rewards_carry_no_signal(excluding_infra._voting_rewards(record)) is True
+    assert rewards_carry_no_signal(_manager("include")._voting_rewards(record)) is False
+
+    record.completions[0] = _completion(
+        0.0, mask_sample=True, failure_kind="agent_timeout"
+    )
+    assert rewards_carry_no_signal(excluding_infra._voting_rewards(record)) is False
+
+
 def test_a_zero_weight_group_is_trivial_under_either_policy():
     """processors.py gives an unusable prompt loss_multiplier=0 before any rollout,
     so its rewards are placeholders and no row votes."""
@@ -115,6 +153,9 @@ def test_a_zero_weight_group_is_trivial_under_either_policy():
         ("include", True, [0.0, 1.0, 0.5, 0.25]),
         ("exclude", False, [0.0, 0.5, 0.25]),
         ("exclude", True, [0.5, 0.25]),
+        # The masked 1.0 has no failure_kind, so it is an infrastructure failure.
+        ("exclude_infra", False, [0.0, 0.5, 0.25]),
+        ("exclude_infra", True, [0.0, 0.5, 0.25]),
         (None, True, [0.0, 1.0, 0.5, 0.25]),
     ],
 )
@@ -128,6 +169,13 @@ def test_the_record_and_finalized_adapters_pick_the_same_voters(
         _completion(0.5),
         _completion(0.25),
     ]
+    infra_failure = (
+        infra_failure_flags(
+            [c.env_extras for c in completions], _POLICY_FAILURE_KINDS
+        ).tolist()
+        if policy == "exclude_infra"
+        else None
+    )
 
     from_flags = voting_rewards(
         [c.reward for c in completions],
@@ -136,6 +184,7 @@ def test_the_record_and_finalized_adapters_pick_the_same_voters(
         loss_multiplier=1.0,
         masked_reward_policy=policy,
         overlong_filtering=overlong_filtering,
+        infra_failure=infra_failure,
     )
 
     assert from_flags == expected
@@ -143,11 +192,13 @@ def test_the_record_and_finalized_adapters_pick_the_same_voters(
         _record(completions),
         masked_reward_policy=policy,
         overlong_filtering=overlong_filtering,
+        infra_failure=infra_failure,
     )
     finalized = SimpleNamespace(
         reward_original=[c.reward for c in completions],
         reward_mask_sample=[c.env_extras is not None for c in completions],
         reward_truncated=[c.truncated for c in completions],
+        reward_infra_failure=infra_failure,
         loss_multiplier=1.0,
     )
     assert from_flags == voting_rewards_from_finalized(
