@@ -27,11 +27,20 @@
 #   --build-arg STRIP_UV_CACHE=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
-# Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
+# Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE-...)
 # can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
 # safe to reuse for a multi-node build, so this must be part of the cache identity,
 # not just a fixed hermetic-stage ENV.
 ARG HYBRID_EP_MULTINODE=1
+# GPU types the CUDA source builds compile for (docs/docker.md, "Compiling for Fewer GPU
+# Types"). Global for the same reason as HYBRID_EP_MULTINODE: uv does not key a built
+# wheel on these, so a wheel built for one list must not be reused for another, and
+# every uv cache mount id includes all four. NVCC_THREADS is left out: it does not
+# change the wheel.
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ARG NVTE_CUDA_ARCHS=90;100
+ARG FLASH_ATTN_CUDA_ARCHS
+ARG FLASH_MLA_DISABLE_SM90
 # Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared
 # uv cache and the prebuilt venvs. The image still runs as root by default.
 ARG RUNTIME_UID=65532
@@ -222,7 +231,7 @@ WORKDIR /opt/nemo-rl
 ARG MAX_JOBS
 ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
-ARG NVTE_CUDA_ARCHS=90;100
+ARG NVTE_CUDA_ARCHS
 ARG NVTE_FRAMEWORK=pytorch
 # TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
 # newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
@@ -258,7 +267,13 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+# Build-only knobs read by the flash-attn and FlashMLA source builds. Unset keeps
+# each package's own default.
+ARG FLASH_ATTN_CUDA_ARCHS
+ARG FLASH_MLA_DISABLE_SM90
+ARG NVCC_THREADS
 
 # Build HybridEP with inter-node transport support. Derived from the ARG (not
 # hardcoded) so a non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
@@ -315,7 +330,7 @@ COPY --from=nemo-rl --link \
 
 RUN --mount=type=ssh \
     --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
 # this id (seeded from the :uv-cache registry image on first-ever use), but
 # never part of this or any layer's diff by construction. uv's installs below
@@ -499,7 +514,7 @@ RUN --mount=type=ssh \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
     --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install RUN above,
 # repeated here because a BuildKit cache mount only applies to the RUN
 # instruction it's declared on -- this RUN's own uv sync calls below need the
@@ -717,6 +732,10 @@ FROM hermetic AS release
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
+ARG TORCH_CUDA_ARCH_LIST
+ARG NVTE_CUDA_ARCHS
+ARG FLASH_ATTN_CUDA_ARCHS
+ARG FLASH_MLA_DISABLE_SM90
 ARG BUILD_DYNAMO
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
@@ -772,7 +791,7 @@ EOF
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install and
 # TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
 # the plain, same-filesystem UV_CACHE_DIR to hardlink installs from. Already
@@ -827,7 +846,7 @@ EOF
 ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.29.0
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     # ether0 imports rdkit, whose bundled cairo links these libraries. The dry run below
     # starts ether0, and so does every job that runs it, but the base stage has no X11
@@ -932,9 +951,13 @@ ARG BASE_IMAGE
 ARG TARGETARCH
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
+ARG TORCH_CUDA_ARCH_LIST
+ARG NVTE_CUDA_ARCHS
+ARG FLASH_ATTN_CUDA_ARCHS
+ARG FLASH_MLA_DISABLE_SM90
 ARG UV_CACHE_EXPORT_NONCE
 RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}-${TORCH_CUDA_ARCH_LIST}-${NVTE_CUDA_ARCHS}-${FLASH_ATTN_CUDA_ARCHS}-${FLASH_MLA_DISABLE_SM90},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # The hermetic layer may have been reused from BuildKit without executing its
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
@@ -947,8 +970,9 @@ cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
 # Keep only wheels built from source (e.g. DeepEP) in the next seed. Prebuilt
 # wheels (torch, vLLM, ...) are downloaded again by the next build into
 # UV_CACHE_DIR regardless, so versions the lock no longer uses don't pile up
-# in the seed across every build that doesn't bump BASE_IMAGE, UV_VERSION, or
-# HYBRID_EP_MULTINODE -- the only things that otherwise reset this cache.
+# in the seed across every build that doesn't bump BASE_IMAGE, UV_VERSION,
+# HYBRID_EP_MULTINODE or the GPU-type build args -- the only things that otherwise
+# reset this cache.
 UV_CACHE_DIR=/tmp/uv-cache-export uv cache prune --ci
 echo "uv cache export payload:"
 du -sh /tmp/uv-cache-export
