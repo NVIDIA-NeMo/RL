@@ -797,6 +797,8 @@ data_plane:
       pickup_s: 10.0
       io_threads: 4                  # file-I/O threads per unit (spill writes + cold reads); ~2.5 GB/s each
     nixl: {backend_name: UCX, backend_init_params: {}}
+  # Optional TransferQueue controller metrics port (integer 1024-65535); omit to keep it off.
+  # metrics_port: 8200
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
