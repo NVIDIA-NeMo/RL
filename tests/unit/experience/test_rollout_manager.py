@@ -25,9 +25,11 @@ Two groups:
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import tempfile
 import uuid
+import weakref
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -51,6 +53,7 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
+    GymRowFailure,
     GymTerminalEpisodeFailure,
     RestoredHarnessChanged,
 )
@@ -1611,6 +1614,139 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     assert ("agent/full_result" in metrics) is log_full_result_tables
 
 
+def test_stream_closures_release_completed_receipts_without_cyclic_gc() -> None:
+    class WeakResult(dict):
+        pass
+
+    references: list[weakref.ReferenceType[WeakResult]] = []
+
+    class RunRollouts:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            async def result_ref():
+                result = WeakResult(_mask_gate_receipt_result())
+                references.append(weakref.ref(result))
+                return 0, {"name": "agent"}, result, None
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    async def exercise() -> None:
+        await _nemo_gym_impl(True)._stream_rows(
+            SimpleNamespace(run_rollouts=RunRollouts()),
+            [{"_rowidx": 0}],
+            [None],
+            [None],
+            1,
+            "test",
+        )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _run(exercise())
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def _assert_stream_rows_frees_received_result(stream_tail, run_stream) -> None:
+    """Land row 0, end the group through ``stream_tail``, and check row 0 is freed."""
+
+    class WeakResult(dict):
+        pass
+
+    references: list[weakref.ReferenceType[WeakResult]] = []
+
+    class RunRollouts:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            async def result_ref():
+                result = WeakResult(_mask_gate_receipt_result())
+                references.append(weakref.ref(result))
+                return 0, {"name": "agent"}, result, None
+
+            async def stream():
+                yield result_ref()
+                async for item_ref in stream_tail():
+                    yield item_ref
+
+            return stream()
+
+    async def exercise() -> None:
+        await run_stream(
+            _nemo_gym_impl(True)._stream_rows(
+                SimpleNamespace(run_rollouts=RunRollouts()),
+                [{"_rowidx": 0}, {"_rowidx": 1}],
+                [None, None],
+                [None, None],
+                2,
+                "test",
+            )
+        )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _run(exercise())
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_stream_rows_deadline_releases_received_results_without_cyclic_gc() -> None:
+    async def hang():
+        await asyncio.Event().wait()
+        yield
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(stream_rows, timeout=0.1)
+
+    _assert_stream_rows_frees_received_result(hang, run_stream)
+
+
+def test_stream_rows_failed_stream_releases_received_results_without_cyclic_gc() -> (
+    None
+):
+    async def broken():
+        raise RuntimeError("stream broke")
+        yield
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(RuntimeError, match="stream broke"):
+            await stream_rows
+
+    _assert_stream_rows_frees_received_result(broken, run_stream)
+
+
+def test_stream_rows_deferred_row_failure_releases_received_results_without_cyclic_gc() -> (
+    None
+):
+    async def infra_failure():
+        async def failure_ref():
+            # Built here so the test holds no reference to the raised error.
+            return GymRowFailure(rowidx=1, error=ConnectionError("gym down"))
+
+        yield failure_ref()
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(ConnectionError, match="gym down"):
+            await stream_rows
+
+    _assert_stream_rows_frees_received_result(infra_failure, run_stream)
+
+
 def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     completions = [
         Completion(
@@ -2733,6 +2869,26 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_streamed_identity_and_routing_do_not_copy_sealed_receipts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mgr = _make_capture_manager(_FakeCaptureBuffer())
+        ledger = mgr.recovery_ledger
+        original_copy = ledger._copy_group
+
+        def copy_unsealed_group(record):
+            assert all(
+                sibling.current_attempt.receipt is None for sibling in record.siblings
+            ), "identity/routing lookup copied sealed receipts"
+            return original_copy(record)
+
+        monkeypatch.setattr(ledger, "_copy_group", copy_unsealed_group)
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert len(request.receipts) == 2
+        assert request.resolved_agent_name == "resolved-agent"
+        assert request.attribution_key == "resolved-agent"
+
     @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
     @pytest.mark.parametrize("materialized", [False, True])
     def test_resolved_route_survives_all_sealed_restore(

@@ -81,6 +81,8 @@ Counts greater than one require:
 
 Use multiple frontends when CPU-side HTTP handling, chat-template rendering, or tokenization limits throughput. Additional frontends consume CPU and host memory; they share GPU inference capacity. A count of one keeps the single-frontend construction path.
 
+Prefix-level rollout recovery (`rollout_recovery.target_level: prefix`) works with multiple frontends. A model call's decoding state lives only in the frontend that accepted its request, so each frontend also listens on a loopback control port. Gym's generation-cut call reaches one frontend through the shared socket; that frontend asks every other one to cut the calls it serves and returns one merged receipt. A frontend that does not answer within `token_capture.control_timeout_s` leaves its calls uncut, and they restart from their last saved turn. On a TransferQueue data plane, each frontend also starts its own prefix-writer actor, which needs one free CPU on the generation node.
+
 See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 
 ### Dataset formats and routing

@@ -20,7 +20,14 @@ import enum
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -1568,8 +1575,13 @@ class AsyncNemoGymRolloutImpl:
                 if timing_metrics is not None:
                     env_timing_metrics = timing_metrics
 
+        consume_stream: (
+            Callable[[list[dict], int], Coroutine[Any, Any, None]] | None
+        ) = consume
+
         def submit(pending_rows: list[dict], refusal_streak: int = 0) -> None:
-            task = asyncio.create_task(consume(pending_rows, refusal_streak))
+            assert consume_stream is not None
+            task = asyncio.create_task(consume_stream(pending_rows, refusal_streak))
             streams.add(task)
             # A re-send can fail while the original stream is still blocked;
             # see its failure without waiting for that stream to end.
@@ -1584,12 +1596,27 @@ class AsyncNemoGymRolloutImpl:
         finally:
             # A failed stream or the group deadline must not leave a refused
             # row's re-send dispatching after the caller has moved on.
-            for task in streams:
-                task.cancel()
-            await asyncio.gather(*streams, return_exceptions=True)
+            try:
+                for task in streams:
+                    task.cancel()
+                await asyncio.gather(*streams, return_exceptions=True)
+            finally:
+                # The mutually recursive closures, and a failed task's traceback,
+                # otherwise retain receipt results until cyclic GC runs.
+                consume_stream = None
+                streams.clear()
+                while not finished.empty():
+                    finished.get_nowait()
+                task = None
 
         if row_failure is not None:
-            raise row_failure
+            # The closure cell would otherwise hold the raised error, whose
+            # traceback holds this frame.
+            failure, row_failure = row_failure, None
+            try:
+                raise failure
+            finally:
+                failure = None
         return env_timing_metrics
 
     async def _replace_unreturned_rows(
@@ -3266,9 +3293,9 @@ class RolloutManager:
                 )
             # Read from the ledger: a row re-sent after a broken stream runs
             # under a fresh attempt, not the ID this dispatch started with.
-            expected_gate_rollout_id = self._recovery_ledger.get_group(
-                group_id
-            ).gate_rollout_id(generation_index)
+            expected_gate_rollout_id = self._recovery_ledger.current_gate_rollout_id(
+                group_id, generation_index
+            )
             if gate_rollout_id != expected_gate_rollout_id:
                 raise ValueError(
                     "streamed rollout identity mismatch: "
@@ -3378,6 +3405,9 @@ class RolloutManager:
                 reward_checks,
                 reward_log_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            resolved_agent_name, attribution_key = (
+                self._recovery_ledger.finalization_routing(group_id)
+            )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -3401,12 +3431,8 @@ class RolloutManager:
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
-                resolved_agent_name=self._recovery_ledger.get_group(
-                    group_id
-                ).resolved_agent_name,
-                attribution_key=self._recovery_ledger.get_group(
-                    group_id
-                ).attribution_key,
+                resolved_agent_name=resolved_agent_name,
+                attribution_key=attribution_key,
             )
             assert_metadata_only(request)
             return request, rollout_metrics
