@@ -156,6 +156,9 @@ def _reward_checks_state(checks: RewardChecks) -> dict[str, Any]:
         "duplicated_reasoning": _copy_checkpoint_value(checks.duplicated_reasoning),
         "empty_final_answer": _copy_checkpoint_value(checks.empty_final_answer),
         "low_effort": _copy_checkpoint_value(checks.low_effort),
+        "length_penalty": dataclasses.asdict(checks.length_penalty)
+        if checks.length_penalty is not None
+        else None,
     }
 
 

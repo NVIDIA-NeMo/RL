@@ -33,6 +33,7 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
 )
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
+from nemo_rl.utils.length_penalty import LengthPenaltyInput
 
 
 @pytest.mark.parametrize(
@@ -90,6 +91,29 @@ def test_deepcopy_failures_propagate() -> None:
 def test_checks_projection_matches_dataclass_schema(flags: tuple[bool, ...]) -> None:
     checks = RewardChecks(*flags)
     assert recovery._reward_checks_state(checks) == dataclasses.asdict(checks)
+
+
+def _length_penalty_input() -> LengthPenaltyInput:
+    return LengthPenaltyInput(
+        "agent",
+        2,
+        4,
+        False,
+        False,
+        [1.0, 1.0],
+        [3.0, 5.0],
+        {"total": {"a": 3, "b": 6, "f": 0.5}},
+    )
+
+
+def test_checks_projection_copies_length_penalty() -> None:
+    length_penalty = _length_penalty_input()
+    checks = RewardChecks(False, True, False, length_penalty)
+    state = recovery._reward_checks_state(checks)
+    assert state == dataclasses.asdict(checks)
+    state["length_penalty"]["profiled_rewards"].append(0.0)
+    state["length_penalty"]["profile_band"]["total"]["a"] = 0
+    assert length_penalty == _length_penalty_input()
 
 
 @pytest.mark.parametrize("full_result_json", [None, '{"answer":"ok"}'])
@@ -203,7 +227,9 @@ def _populated_ledger() -> recovery.RolloutRecoveryLedger:
                     mask_sample=False,
                     resolved_agent_name="agent",
                     attribution_key="taskset",
-                    reward_checks=RewardChecks(True, False, True),
+                    reward_checks=RewardChecks(
+                        True, False, True, _length_penalty_input()
+                    ),
                     reward_log_context=RewardLogContext("taskset", '{"answer":"ok"}'),
                     logical_selection=RolloutSelection(
                         ("response0",),
@@ -251,6 +277,7 @@ def test_capture_matches_legacy_projection(
         steps_allowed_short=[3, 5],
         sampler_stamps_target_steps=True,
         reward_settings=None,
+        multi_harness_routes=None,
         finalizer_metrics_by_group={
             name: {"metric": 1.0}
             for name in rewards
@@ -280,9 +307,13 @@ def test_capture_matches_legacy_projection(
             dataclasses.asdict(restored_attempt.logical_selection)
             == attempt["logical_selection"]
         )
+        assert restored_attempt.reward_checks == RewardChecks(
+            True, False, True, _length_penalty_input()
+        )
         attempt["receipt"]["manifest"][0]["metadata"]["sizes"].append(9)
         attempt["staging_keys"].append("other")
         attempt["reward_checks"]["low_effort"] = False
+        attempt["reward_checks"]["length_penalty"]["profiled_rewards"].append(0.0)
         attempt["reward_log_context"]["agent_name"] = "changed"
     assert ledger.state_dict() == original
 
