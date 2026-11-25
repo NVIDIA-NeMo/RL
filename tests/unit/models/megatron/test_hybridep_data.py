@@ -303,6 +303,7 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
         cp_size=2,
         cp_rank=0,
         device=input_ids.device,
+        cp_group=None,
     )
 
 

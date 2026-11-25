@@ -449,6 +449,14 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Megatron-Core dynamic context parallelism: its scheduler sizes the CP group
+    # of every packed microbatch from its sequence lengths, so short sequences
+    # run on one rank and a longer one on as many adjacent data-parallel ranks as
+    # it needs. Requires sequence_packing with context_parallel_size 1 and
+    # pipeline_model_parallel_size 1; sequence_packing.train_mb_tokens and
+    # logprob_mb_tokens are then the token capacity of one rank per microbatch.
+    # Recommended: false; see docs/design-docs/sequence-packing-and-dynamic-batching.md.
+    dynamic_context_parallel: NotRequired[bool]
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     radio_force_eval_mode: NotRequired[bool]

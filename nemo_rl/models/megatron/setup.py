@@ -992,8 +992,20 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
 
 def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> None:
-    """Validate Bridge config, then preserve explicit NeMo-RL prepadding."""
+    """Validate Bridge config, then apply the settings NeMo-RL owns."""
     megatron_cfg.validate()
+
+    if config["megatron_cfg"].get("dynamic_context_parallel"):
+        # Bridge accepts these fields only together with its own packing
+        # dataset; here the driver schedules the packs.
+        packing_cfg = config["sequence_packing"]
+        tokens_per_rank = [packing_cfg["train_mb_tokens"]]
+        if "logprob_mb_tokens" in packing_cfg:
+            tokens_per_rank.append(packing_cfg["logprob_mb_tokens"])
+        megatron_cfg.model.dynamic_context_parallel = True
+        megatron_cfg.model.max_seqlen_per_dp_cp_rank = max(tokens_per_rank)
+        # Re-runs MCore's config checks, now with its dynamic-CP requirements.
+        megatron_cfg.model.finalize()
 
     if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):
         # Bridge 5ed9799 does not auto-enable per-layer padding because NeMo-RL
@@ -1327,6 +1339,24 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
+        )
+
+    if config["megatron_cfg"].get("dynamic_context_parallel"):
+        # Every data-parallel rank is one lane of MCore's runtime DPxCP domain:
+        # the scheduler sizes each microbatch's CP group, the built group stays 1.
+        assert config["sequence_packing"]["enabled"], (
+            "Sequence Packing must be enabled to use dynamic Context Parallelism."
+        )
+        assert model_cfg.context_parallel_size == 1, (
+            "Dynamic Context Parallelism sizes the CP group of every microbatch "
+            "at runtime, please set context_parallel_size to 1"
+        )
+        assert model_cfg.pipeline_model_parallel_size == 1, (
+            "Dynamic Context Parallelism is not supported with pipeline "
+            "parallelism, please set pipeline_model_parallel_size to 1"
+        )
+        assert not config["megatron_cfg"].get("use_fused_linear_logprobs"), (
+            "Dynamic Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
 
 
