@@ -52,6 +52,7 @@ from nemo_rl.models.generation.vllm.metric_names import (
     PROMPT_TOKENS_KEY,
     REQUEST_SUCCESS_COUNTERS,
 )
+from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 
@@ -97,6 +98,10 @@ def extract_generation_logprobs(
             "vLLM generation output with token IDs did not include logprobs"
         )
     end = start + len(token_ids)
+    if isinstance(logprobs, PackedSelectedLogprobs):
+        return logprobs.selected_values(
+            token_ids, start=start, stop=end, floor=VLLM_LOGPROB_FLOOR
+        )
     flat = _flat_logprob_arrays(logprobs)
     published = len(logprobs) if flat is None else min(len(flat[0]), len(flat[1]))
     if published < end:

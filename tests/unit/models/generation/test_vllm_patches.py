@@ -34,18 +34,23 @@ source-sensitive compatibility patches:
 
 import ast
 import asyncio
+import gc
 import inspect
 import logging
 import os
 import shutil
 import sys
 import types
+import weakref
+from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from nemo_rl.models.generation.vllm import patches
+from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 from tests.unit.models.generation.vllm_patch_source_utils import (
     patch_snippets,
     write_unpatched_copy,
@@ -952,3 +957,165 @@ async def test_pinned_vllm_output_loops_match_the_patch() -> None:
     finally:
         socket.close(linger=0)
         context.term()
+
+
+@dataclass
+class _PackedLogprob:
+    logprob: float
+    rank: int
+    decoded_token: str | None
+
+
+def _installed_vllm(monkeypatch: pytest.MonkeyPatch, version: str = "0.33.0") -> None:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.importlib.metadata.version",
+        lambda name: version,
+    )
+
+
+@pytest.mark.parametrize(
+    "eligible", ["yes", "uncaptured", "not_flat", "topk", "prompt", "stream"]
+)
+def test_hook_only_changes_eligible_requests(
+    monkeypatch: pytest.MonkeyPatch, eligible: str
+) -> None:
+    class FlatLogprobs(list):
+        pass
+
+    logprob_module = types.ModuleType("vllm.logprobs")
+    logprob_module.FlatLogprobs = FlatLogprobs
+    logprob_module.Logprob = _PackedLogprob
+    params = types.ModuleType("vllm.sampling_params")
+    params.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final")
+    monkeypatch.setitem(sys.modules, "vllm.logprobs", logprob_module)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", params)
+    _installed_vllm(monkeypatch)
+
+    class Processor:
+        def __init__(self) -> None:
+            self.logprobs = [] if eligible == "not_flat" else FlatLogprobs()
+            self.num_logprobs = 1 if eligible == "topk" else 0
+            self.num_prompt_logprobs = 1 if eligible == "prompt" else None
+            self.cumulative_logprob = 0.0
+
+        def _update_sample_logprobs(self, lists: object) -> None:
+            raise AssertionError("Original updater must remain unused in this test")
+
+    lp = Processor()
+    original_update = lp._update_sample_logprobs
+    state = SimpleNamespace(
+        logprobs_processor=lp, output_kind="stream" if eligible == "stream" else "final"
+    )
+    marker = object()
+    processor = SimpleNamespace(
+        request_states={"call": state}, add_request=lambda request: marker
+    )
+    original_add = processor.add_request
+    hook = patches.PackedCaptureLogprobs(
+        processor,
+        lambda: eligible != "uncaptured",
+        history_factory=PackedSelectedLogprobs,
+    )
+    assert processor.add_request(SimpleNamespace(request_id="call")) is marker
+    enabled = eligible == "yes"
+    assert isinstance(lp.logprobs, PackedSelectedLogprobs) is enabled
+    assert (lp._update_sample_logprobs != original_update) is enabled
+    if enabled:
+        lp._update_sample_logprobs(
+            (np.array([[7]]), np.array([[-0.125]]), np.array([2]), None)
+        )
+        assert lp.logprobs.selected_values([7], start=0, stop=1, floor=-1000.0) == [
+            -0.125
+        ]
+        assert lp.cumulative_logprob == -0.125
+    hook.close()
+    assert processor.add_request is original_add
+    reference = weakref.ref(lp)
+    del state, lp, original_update
+    processor.request_states.clear()
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_packed_capture_matches_installed_vllm_selected_logprobs(dtype: object) -> None:
+    from vllm.logprobs import FlatLogprobs
+    from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+
+    def new_processor() -> LogprobsProcessor:
+        return LogprobsProcessor(
+            tokenizer=None,
+            logprobs=FlatLogprobs(),
+            prompt_logprobs=None,
+            cumulative_logprob=0.0,
+            num_logprobs=0,
+            num_prompt_logprobs=None,
+        )
+
+    native = new_processor()
+    packed = new_processor()
+    processor = SimpleNamespace(
+        request_states={
+            "call": SimpleNamespace(
+                logprobs_processor=packed, output_kind=RequestOutputKind.FINAL_ONLY
+            )
+        },
+        add_request=lambda request: None,
+    )
+    hook = patches.PackedCaptureLogprobs(
+        processor, lambda: True, history_factory=PackedSelectedLogprobs
+    )
+    try:
+        processor.add_request(SimpleNamespace(request_id="call"))
+        assert isinstance(packed.logprobs, PackedSelectedLogprobs)
+        for count in (1, 16, 0, 257):
+            arrays = (
+                np.arange(count, dtype=np.int64).reshape(count, 1),
+                np.linspace(-100.0, -0.001, count, dtype=dtype).reshape(count, 1),
+                np.arange(count, dtype=np.int64) + 1,
+                None,
+            )
+            native._update_sample_logprobs(arrays)
+            packed._update_sample_logprobs(arrays)
+            assert packed.cumulative_logprob == native.cumulative_logprob
+            assert list(packed.logprobs) == list(native.logprobs)
+    finally:
+        hook.close()
+
+
+def test_packed_capture_close_preserves_later_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = types.ModuleType("vllm.logprobs")
+    module.FlatLogprobs = list
+    module.Logprob = _PackedLogprob
+    params = types.ModuleType("vllm.sampling_params")
+    params.RequestOutputKind = SimpleNamespace(FINAL_ONLY="final")
+    monkeypatch.setitem(sys.modules, "vllm.logprobs", module)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", params)
+    _installed_vllm(monkeypatch)
+    processor = SimpleNamespace(add_request=lambda request: None)
+    hook = patches.PackedCaptureLogprobs(
+        processor, lambda: False, history_factory=PackedSelectedLogprobs
+    )
+    later = lambda request: None
+    processor.add_request = later
+    hook.close()
+    hook.close()
+    assert processor.add_request is later
+
+
+@pytest.mark.parametrize("version", ["0.32.1", "0.34.0"])
+def test_packed_capture_refuses_an_unchecked_vllm(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    _installed_vllm(monkeypatch, version)
+    original_add = lambda request: None
+    processor = SimpleNamespace(add_request=original_add)
+    with pytest.raises(RuntimeError, match=f"vLLM {version} is installed"):
+        patches.PackedCaptureLogprobs(
+            processor, lambda: True, history_factory=PackedSelectedLogprobs
+        )
+    assert processor.add_request is original_add
