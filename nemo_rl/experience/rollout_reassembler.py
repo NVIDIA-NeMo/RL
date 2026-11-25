@@ -70,7 +70,12 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.environments.nemo_gym_task import serialize_nemo_gym_harness_routing
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    harness_routing_metrics,
+    pct,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
@@ -244,6 +249,9 @@ def _capture_token_metrics(
     rows: list[FinalizedRollout],
     slots: list[int],
     contexts: Sequence[RewardLogContext | None],
+    *,
+    rewards_by_slot: dict[int, float] | None = None,
+    masks_by_slot: dict[int, bool] | None = None,
 ) -> dict[str, Any]:
     """Count verified output per logical owner, before sample-level filtering.
 
@@ -283,6 +291,23 @@ def _capture_token_metrics(
                     [values[i] for i in indices], len(indices), f"{agent}/{name}"
                 )
             )
+    for slot, context in enumerate(contexts):
+        if context is None or context.harness_routing is None:
+            continue
+        if rewards_by_slot is None or masks_by_slot is None:
+            raise ValueError(
+                "routing counters require finalized reward and mask metadata"
+            )
+        counters = harness_routing_metrics(
+            context.harness_routing,
+            reward=rewards_by_slot.get(slot, 0.0),
+            valid=slot in rewards_by_slot,
+            masked=masks_by_slot[slot],
+            generation_tokens=generated[slot],
+            total_tokens=total[slot],
+        )
+        for name, value in counters.items():
+            metrics[name] = metrics.get(name, 0.0) + value
     return metrics
 
 
@@ -909,6 +934,7 @@ class RolloutReassembler:
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
         )
+        owner_masks = dict(enumerate(mask_sample))
         if canonical_sample_ids is None:
             canonical_sample_ids = rollout_ids
         assert len(canonical_sample_ids) == len(rollout_ids), (
@@ -1158,6 +1184,10 @@ class RolloutReassembler:
             if logical is not None
             else list(range(len(rows))),
             log_contexts,
+            rewards_by_slot={
+                slot: row.reward for _, slot, row in reward_rows if row.valid
+            },
+            masks_by_slot=owner_masks,
         )
         slot_agent_names = (
             [c.agent_name if c is not None else None for c in log_contexts]
@@ -1183,6 +1213,7 @@ class RolloutReassembler:
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
+            routing_contexts=log_contexts,
         )
         # Length metrics are already pooled in finalize/length_penalty/*_sum.
         # Keep them separate from token metrics.
@@ -1266,6 +1297,7 @@ class RolloutReassembler:
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
         loss_multiplier: float,
+        routing_contexts: Sequence[RewardLogContext | None],
     ) -> FinalizedGroup:
         """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
@@ -1455,6 +1487,14 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        for index, tag in enumerate(tags):
+            slot = logical.tags[index]["logical_slot"] if logical is not None else index
+            if slot is not None:
+                context = routing_contexts[slot]
+                if context is not None and context.harness_routing is not None:
+                    tag["harness_routing"] = serialize_nemo_gym_harness_routing(
+                        context.harness_routing
+                    )
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

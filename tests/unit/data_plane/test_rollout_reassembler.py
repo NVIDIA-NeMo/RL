@@ -27,6 +27,7 @@ rebuild semantics to Gym's staging package.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
@@ -227,7 +228,10 @@ def _fetch_rows(tq_client, sample_ids):
     )
 
 
-def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions):
+@pytest.mark.parametrize("routing_metadata", [False, True])
+def test_finalize_group_publishes_n_rows_with_placeholder(
+    tq_client, partitions, routing_metadata
+):
     group_id = "grp1"
     receipt, expected = _stage_fixture(
         tq_client, "worked_example", rollout_id=f"{group_id}_g0"
@@ -244,6 +248,18 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # (seq_len floored to 1) should not.
     valid_len = len(expected.token_ids)
     finalizer = _finalizer(tq_client, max_seq_len=valid_len)
+    routing = {
+        "benchmark": "avb",
+        "dataset": "avb-dss",
+        "env": "harbor-avb",
+        "task_type": "agentic",
+        "selected_harness": "codex",
+        "executed_harness": "codex",
+        "routing_version": "benchmark-harness-v1",
+        "routing_seed": 42,
+        "group_id": group_id,
+        "group_index": 1,
+    }
     finalized = finalizer.finalize_group(
         group_id,
         rollout_ids,
@@ -253,12 +269,30 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         fallback_weight_version=9,
         prompt_idx=17,
         loss_multiplier=0.25,
-        reward_log_contexts=[RewardLogContext("agent", None)] * 2,
+        reward_log_contexts=[
+            RewardLogContext(
+                "agent", None, harness_routing=routing if routing_metadata else None
+            )
+        ]
+        * 2,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
     assert finalized.meta.sample_ids == rollout_ids
     assert [tag["prompt_idx"] for tag in finalized.meta.tags] == [17, 17]
+    if routing_metadata:
+        assert all(
+            json.loads(tag["harness_routing"]) == routing for tag in finalized.meta.tags
+        )
+        prefix = "nemo_gym/routing/benchmark/avb/harness/codex"
+        assert finalized.token_metrics[f"{prefix}/rollout_count"] == 2
+        assert finalized.token_metrics[f"{prefix}/valid_rollout_count"] == 1
+        assert finalized.token_metrics[f"{prefix}/invalid_rollout_count"] == 1
+        assert finalized.token_metrics[f"{prefix}/masked_rollout_count"] == 1
+        assert finalized.token_metrics[f"{prefix}/reward_sum"] == 1.0
+        assert finalized.token_metrics[f"{prefix}/generation_token_count"] == sum(
+            expected.token_mask
+        )
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5

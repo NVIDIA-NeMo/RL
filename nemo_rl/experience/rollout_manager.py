@@ -50,8 +50,11 @@ from nemo_rl.environments.nemo_gym_multi_harness import (
     harness_metric_namespace,
 )
 from nemo_rl.environments.nemo_gym_task import (
+    bind_nemo_gym_harness_group,
     get_nemo_gym_attribution_key,
+    get_nemo_gym_harness_routing,
     is_nemo_gym_task,
+    validate_nemo_gym_harness_result,
 )
 from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
@@ -85,7 +88,11 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    harness_routing_metrics,
+    pct,
+)
 from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -1295,6 +1302,7 @@ class AsyncNemoGymRolloutImpl:
                 "token-capture rollout ids must be one per generation"
             )
         group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
+        template_row = bind_nemo_gym_harness_group(template_row, group_id=group_id)
         group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
         if (
             not isinstance(group_attempt, int)
@@ -1504,6 +1512,9 @@ class AsyncNemoGymRolloutImpl:
                     raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
                 received.add(rowidx)
                 input_row = inputs_by_rowidx[rowidx]
+                routing = validate_nemo_gym_harness_result(result, input_row)
+                if routing is not None:
+                    result["harness_routing"] = routing
                 if resolved_agent_ref is not None:
                     input_row["agent_ref"] = resolved_agent_ref
                     result["agent_ref"] = copy.deepcopy(resolved_agent_ref)
@@ -1536,6 +1547,7 @@ class AsyncNemoGymRolloutImpl:
                             ),
                         )
                     result["reward_log_context"] = RewardLogContext(
+                        harness_routing=routing,
                         agent_name=harness_metric_namespace(
                             _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                             result["full_result"],
@@ -1970,6 +1982,9 @@ class AsyncNemoGymRolloutImpl:
         completions = []
         for result in results:
             env_extras = dict(completion_extras(result["full_result"]))
+            routing = get_nemo_gym_harness_routing(result)
+            if routing is not None:
+                env_extras["harness_routing"] = routing
             attribution_key = get_nemo_gym_attribution_key(result)
             if attribution_key is not None:
                 env_extras["attribution_key"] = attribution_key
@@ -2204,6 +2219,22 @@ class AsyncNemoGymRolloutImpl:
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
                 columns=["Full result"],
             )
+        if not receipt_mode:
+            for completion, generated, total in zip(
+                completions, assistant_tokens, total_tokens, strict=True
+            ):
+                routing = get_nemo_gym_harness_routing(completion.env_extras or {})
+                if routing is not None:
+                    counters = harness_routing_metrics(
+                        routing,
+                        reward=completion.reward,
+                        valid=True,
+                        masked=mask_sample_flagged(completion.env_extras),
+                        generation_tokens=generated,
+                        total_tokens=total,
+                    )
+                    for name, value in counters.items():
+                        rollout_metrics[name] = rollout_metrics.get(name, 0.0) + value
 
         # Necessary for downstream nemo rl logging/printing.
         if not receipt_mode:

@@ -15,6 +15,7 @@
 """Capture reward parity with the standard path (think-tag checks use a stub decoder)."""
 
 import json
+from dataclasses import asdict
 from itertools import product
 
 import pytest
@@ -32,6 +33,7 @@ from nemo_rl.experience.reward_penalties import (
     has_duplicated_reasoning,
     has_empty_final_answer,
     has_malformed_think_tag,
+    parse_reward_log_context,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -727,3 +729,37 @@ def test_checkpoint_inventory_retains_length_penalty_settings():
     }
     restored = CaptureRewardSettings.from_state(saved.to_state())
     restored.require_compatible(saved)
+
+
+def test_harness_routing_roundtrips_without_changing_finalized_rewards():
+    routing = {
+        "benchmark": "avb",
+        "dataset": "avb-dss",
+        "env": "harbor-avb",
+        "task_type": "agentic",
+        "selected_harness": "codex",
+        "executed_harness": "codex",
+        "routing_version": "benchmark-harness-v1",
+        "routing_seed": 42,
+        "group_id": "durable-group",
+        "group_index": 1,
+    }
+    old_context = parse_reward_log_context(
+        {"agent_name": "agent", "full_result_json": None}
+    )
+    assert old_context == RewardLogContext("agent", None)
+    context = RewardLogContext("agent", None, harness_routing=routing)
+    assert parse_reward_log_context(asdict(context)) == context
+    plain = [
+        FinalizedReward(str(i), f"r{i}", value, old_context)
+        for i, value in enumerate([0.0, 1.0])
+    ]
+    tagged = [
+        FinalizedReward(str(i), f"r{i}", value, context)
+        for i, value in enumerate([0.0, 1.0])
+    ]
+    assert [row.reward for row in plain] == [row.reward for row in tagged]
+    assert FinalizedReward.from_state(asdict(tagged[0])) == tagged[0]
+    assert aggregate_capture_reward_metrics(
+        plain, {}
+    ) == aggregate_capture_reward_metrics(tagged, {})

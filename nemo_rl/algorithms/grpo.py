@@ -113,7 +113,10 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.experience.metric_utils import (
+    aggregate_harness_routing_metrics,
+    is_histogram_metric,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -5264,6 +5267,7 @@ def aggregate_rollout_metrics(
             )
         else:
             aggregated[k] = sum(v) / len(v)
+    aggregated.update(aggregate_harness_routing_metrics(per_group_metrics))
     return aggregated
 
 

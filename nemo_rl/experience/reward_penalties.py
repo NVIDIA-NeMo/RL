@@ -26,7 +26,11 @@ from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
+from nemo_rl.environments.nemo_gym_task import (
+    NemoGymHarnessRouting,
+    get_nemo_gym_task_input,
+    validate_nemo_gym_harness_routing,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyInput
 
@@ -417,8 +421,15 @@ class RewardLogContext:
 
     agent_name: str
     full_result_json: str | None
+    harness_routing: NemoGymHarnessRouting | None = None
 
     def __post_init__(self) -> None:
+        if self.harness_routing is not None:
+            object.__setattr__(
+                self,
+                "harness_routing",
+                validate_nemo_gym_harness_routing(self.harness_routing),
+            )
         if not isinstance(self.agent_name, str) or not self.agent_name:
             raise ValueError("reward log agent_name must be a nonempty string")
         if self.full_result_json is not None:
@@ -465,9 +476,16 @@ def parse_reward_log_context(value: object) -> RewardLogContext | None:
     """Validate the optional log context stored with an unfinished attempt."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"agent_name", "full_result_json"}:
+    required = {"agent_name", "full_result_json"}
+    if not isinstance(value, dict) or not required <= value.keys() <= required | {
+        "harness_routing"
+    }:
         raise ValueError("invalid reward log context")
-    return RewardLogContext(value["agent_name"], value["full_result_json"])
+    return RewardLogContext(
+        value["agent_name"],
+        value["full_result_json"],
+        harness_routing=value.get("harness_routing"),
+    )
 
 
 def compute_reward_checks(

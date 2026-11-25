@@ -17,6 +17,66 @@
 import math
 import statistics
 from collections.abc import Sequence
+from typing import Any
+from urllib.parse import quote
+
+from nemo_rl.environments.nemo_gym_task import NemoGymHarnessRouting
+
+HARNESS_ROUTING_METRIC_PREFIX = "nemo_gym/routing/"
+
+
+def harness_routing_metrics(
+    routing: NemoGymHarnessRouting,
+    *,
+    reward: float,
+    valid: bool,
+    masked: bool,
+    generation_tokens: int,
+    total_tokens: int,
+) -> dict[str, float]:
+    """Count one logical rollout using declared task and actual execution tags."""
+    scopes = [
+        f"benchmark/{quote(routing['benchmark'], safe='')}",
+        f"env/{quote(routing['env'], safe='')}",
+    ]
+    if routing["executed_harness"] is not None:
+        scopes.append(f"harness/{quote(routing['executed_harness'], safe='')}")
+        scopes.append(
+            f"benchmark/{quote(routing['benchmark'], safe='')}/harness/"
+            f"{quote(routing['executed_harness'], safe='')}"
+        )
+    values = {
+        "rollout_count": 1.0,
+        "valid_rollout_count": float(valid),
+        "invalid_rollout_count": float(not valid),
+        "masked_rollout_count": float(masked),
+        "reward_count": float(valid),
+        "reward_sum": float(reward) if valid else 0.0,
+        "generation_token_count": float(generation_tokens),
+        "total_token_count": float(total_tokens),
+        "masked_generation_token_count": float(generation_tokens if masked else 0),
+    }
+    return {
+        f"{HARNESS_ROUTING_METRIC_PREFIX}{scope}/{name}": value
+        for scope in scopes
+        for name, value in values.items()
+    }
+
+
+def aggregate_harness_routing_metrics(
+    per_group_metrics: dict[str, list[Any]],
+) -> dict[str, float]:
+    """Pool additive counters before computing reward means over unequal groups."""
+    totals = {
+        name: float(sum(values))
+        for name, values in per_group_metrics.items()
+        if name.startswith(HARNESS_ROUTING_METRIC_PREFIX)
+    }
+    for name, count in tuple(totals.items()):
+        if name.endswith("/reward_count") and count:
+            prefix = name.removesuffix("/reward_count")
+            totals[f"{prefix}/reward_mean"] = totals[f"{prefix}/reward_sum"] / count
+    return totals
 
 
 def is_histogram_metric(name: str) -> bool:

@@ -50,6 +50,10 @@ from nemo_rl.data_plane.schema import (
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
 )
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_harness_routing,
+    serialize_nemo_gym_harness_routing,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1326,6 +1330,10 @@ class TQReplayBuffer:
             group_id=group_id,
             prompt_idx=record.prompt_idx,
         )
+        for tag, completion in zip(tags, record.completions, strict=True):
+            routing = get_nemo_gym_harness_routing(completion.env_extras or {})
+            if routing is not None:
+                tag["harness_routing"] = serialize_nemo_gym_harness_routing(routing)
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "
