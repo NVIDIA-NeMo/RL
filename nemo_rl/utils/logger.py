@@ -1705,8 +1705,8 @@ def flatten_dict(
 ) -> dict[str, Any]:
     """Flatten a nested dictionary.
 
-    Handles nested dictionaries and lists by creating keys with separators.
-    For lists, the index is used as part of the key.
+    Handles nested dictionaries and lists, at any depth, by creating keys with
+    separators. For lists, the index is used as part of the key.
 
     Args:
         d: Dictionary to flatten
@@ -1728,25 +1728,25 @@ def flatten_dict(
 
         >>> flatten_dict({"a": [{"b": 1}, {"c": 2}]})
         {'a.0.b': 1, 'a.1.c': 2}
+
+        >>> flatten_dict({"a": [[1, 2], [3, 4]]})
+        {'a.0.0': 1, 'a.0.1': 2, 'a.1.0': 3, 'a.1.1': 4}
         ```
     """
     result: dict[str, Any] = {}
 
+    def _flatten_value(value: Any, key: str) -> None:
+        if isinstance(value, dict):
+            _flatten(value, key)
+        elif isinstance(value, list) and expand_lists:
+            for i, item in enumerate(value):
+                _flatten_value(item, f"{key}{sep}{i}")
+        else:
+            result[key] = value
+
     def _flatten(d: Mapping[str, Any], parent_key: str = "") -> None:
         for key, value in d.items():
-            new_key = f"{parent_key}{sep}{key}" if parent_key else key
-
-            if isinstance(value, dict):
-                _flatten(value, new_key)
-            elif isinstance(value, list) and expand_lists:
-                for i, item in enumerate(value):
-                    list_key = f"{new_key}{sep}{i}"
-                    if isinstance(item, dict):
-                        _flatten(item, list_key)
-                    else:
-                        result[list_key] = item
-            else:
-                result[new_key] = value
+            _flatten_value(value, f"{parent_key}{sep}{key}" if parent_key else key)
 
     _flatten(d)
     return result
