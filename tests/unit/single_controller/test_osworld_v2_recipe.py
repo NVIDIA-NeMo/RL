@@ -296,8 +296,29 @@ def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
     assert resolved_agent.concurrency == 8
     assert resolved_agent.history_policy.name == "hysteresis"
     assert resolved_agent.exact_trace_transport_version == 3
+    assert resolved_agent.reward_mode == "raw"
+    assert resolved_agent.rollout_timeout_s == 1200
+    assert dict(resolved_agent.agent_kwargs) == {
+        "history_layout": "cc_chat",
+        "cc_keep_last_groups": 2,
+        "cc_max_active_images": 10,
+        "cc_actions_per_chunk": 100,
+        "cc_chunk_turns_as_generated": True,
+        "cc_prompt_token_guard": 38000,
+        "assistant_history_replay": "raw_full",
+        "legacy_response_parser": True,
+        "parse_retries": 1,
+        "validate_python_syntax": False,
+        "require_clean_finish": False,
+        "train_invalid_terminal_call": True,
+        "unterminated_episode_policy": "fail",
+        "context_overflow_policy": "stop",
+        "context_prompt_token_limit": None,
+        "mask_context_limit": False,
+    }
 
     monkeypatch.setenv("OSWORLD_MAX_STEPS", "20")
+    monkeypatch.setenv("OSWORLD_HISTORY_LAYOUT", "osworld")
     monkeypatch.setenv("OSWORLD_MAX_PARALLEL_ROLLOUTS", "4")
     smoke_config = compose_and_validate_config([], config_path=MOLT_CONFIG_PATH)
     smoke_agent = _resolve_gym_config(
@@ -305,6 +326,7 @@ def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
     ).osworld_nano_omni_agent.responses_api_agents.osworld_agent
     assert smoke_agent.max_steps == 20
     assert smoke_agent.concurrency == 4
+    assert smoke_agent.agent_kwargs.history_layout == "osworld"
 
 
 def test_launcher_selects_molt_recipe_and_preserves_hydra_overrides(monkeypatch):

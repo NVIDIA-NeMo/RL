@@ -19,6 +19,41 @@ The exact recipe is
 Mid-turn VM snapshots are not part of this release; recovery is at a completed
 optimizer-step boundary.
 
+### Agent settings
+
+The recipe trains through Gym's
+`benchmarks/osworld/configs/osworld_nemo_rl_opensandbox.yaml` profile, and
+`grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8.yaml` pins the agent
+settings below under `env.nemo_gym.osworld_nano_omni_agent`. Several of them
+differ from the Gym profile's defaults, so a run that composes the recipe
+(for example inside a multi-environment config) trains the same agent without
+these scripts or `env.example`. Each value can still be overridden with its
+environment variable.
+
+| Setting | Value | Variable |
+|---|---|---|
+| `agent_kwargs.history_layout` | `cc_chat` | `OSWORLD_HISTORY_LAYOUT` |
+| `agent_kwargs.cc_keep_last_groups` | `2` | `OSWORLD_CC_KEEP_LAST_GROUPS` |
+| `agent_kwargs.cc_max_active_images` | `10` | `OSWORLD_CC_MAX_ACTIVE_IMAGES` |
+| `agent_kwargs.cc_actions_per_chunk` | `100` | `OSWORLD_CC_ACTIONS_PER_CHUNK` |
+| `agent_kwargs.cc_chunk_turns_as_generated` | `true` | `OSWORLD_CC_CHUNK_TURNS_AS_GENERATED` |
+| `agent_kwargs.cc_prompt_token_guard` | `38000` | `OSWORLD_CC_PROMPT_TOKEN_GUARD` |
+| `agent_kwargs.assistant_history_replay` | `raw_full` | `OSWORLD_ASSISTANT_HISTORY_REPLAY` |
+| `agent_kwargs.legacy_response_parser` | `true` | `OSWORLD_LEGACY_RESPONSE_PARSER` |
+| `agent_kwargs.parse_retries` | `1` | `OSWORLD_PARSE_RETRIES` |
+| `agent_kwargs.validate_python_syntax` | `false` | `OSWORLD_VALIDATE_PYTHON_SYNTAX` |
+| `agent_kwargs.require_clean_finish` | `false` | `OSWORLD_REQUIRE_CLEAN_FINISH` |
+| `agent_kwargs.train_invalid_terminal_call` | `true` | `OSWORLD_TRAIN_INVALID_TERMINAL_CALL` |
+| `agent_kwargs.unterminated_episode_policy` | `fail` | `OSWORLD_UNTERMINATED_EPISODE_POLICY` |
+| `agent_kwargs.context_overflow_policy` | `stop` | `OSWORLD_CONTEXT_OVERFLOW_POLICY` |
+| `reward_mode` | `raw` | `OSWORLD_REWARD_MODE` |
+| `rollout_timeout_s` | `1200` | `OSWORLD_ROLLOUT_TIMEOUT_S` |
+
+The Gym profile supplies the rest: up to 150 agent steps, temperature 1.0,
+top_p 1.0, and 8 concurrent rollouts (`OSWORLD_MAX_PARALLEL_ROLLOUTS`; the
+validated run used 128 sandboxes with 16 prompt groups in flight). The
+sandbox side needs the OpenSandbox variables listed in section 5.
+
 ## 1. Prerequisites
 
 The validated launcher requires:

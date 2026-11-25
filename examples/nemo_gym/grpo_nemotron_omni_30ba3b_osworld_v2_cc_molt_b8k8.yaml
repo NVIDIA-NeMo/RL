@@ -112,6 +112,29 @@ env:
     # observed cold start reached the old 1800s deadline as its final shards
     # became ready, so retain enough margin for uncached continuation nodes.
     model_endpoint_readiness_timeout_seconds: ${oc.decode:${oc.env:OSWORLD_MODEL_ENDPOINT_READINESS_TIMEOUT_SECONDS,2700}}
+    # The agent settings this recipe trains with. Gym's
+    # osworld_nemo_rl_opensandbox.yaml defaults differ; the OSWORLD_* variables
+    # still override each value. See osworld_v2/README.md, "Agent settings".
+    osworld_nano_omni_agent:
+      responses_api_agents:
+        osworld_agent:
+          reward_mode: ${oc.env:OSWORLD_REWARD_MODE,raw}
+          rollout_timeout_s: ${oc.decode:${oc.env:OSWORLD_ROLLOUT_TIMEOUT_S,1200}}
+          agent_kwargs:
+            history_layout: ${oc.env:OSWORLD_HISTORY_LAYOUT,cc_chat}
+            cc_keep_last_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_GROUPS,2}}
+            cc_max_active_images: ${oc.decode:${oc.env:OSWORLD_CC_MAX_ACTIVE_IMAGES,10}}
+            cc_actions_per_chunk: ${oc.decode:${oc.env:OSWORLD_CC_ACTIONS_PER_CHUNK,100}}
+            cc_chunk_turns_as_generated: ${oc.decode:${oc.env:OSWORLD_CC_CHUNK_TURNS_AS_GENERATED,true}}
+            cc_prompt_token_guard: ${oc.decode:${oc.env:OSWORLD_CC_PROMPT_TOKEN_GUARD,38000}}
+            assistant_history_replay: ${oc.env:OSWORLD_ASSISTANT_HISTORY_REPLAY,raw_full}
+            legacy_response_parser: ${oc.decode:${oc.env:OSWORLD_LEGACY_RESPONSE_PARSER,true}}
+            parse_retries: ${oc.decode:${oc.env:OSWORLD_PARSE_RETRIES,1}}
+            validate_python_syntax: ${oc.decode:${oc.env:OSWORLD_VALIDATE_PYTHON_SYNTAX,false}}
+            require_clean_finish: ${oc.decode:${oc.env:OSWORLD_REQUIRE_CLEAN_FINISH,false}}
+            train_invalid_terminal_call: ${oc.decode:${oc.env:OSWORLD_TRAIN_INVALID_TERMINAL_CALL,true}}
+            unterminated_episode_policy: ${oc.env:OSWORLD_UNTERMINATED_EPISODE_POLICY,fail}
+            context_overflow_policy: ${oc.env:OSWORLD_CONTEXT_OVERFLOW_POLICY,stop}
 
 async_rl:
   sampler:
