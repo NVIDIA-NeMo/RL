@@ -126,7 +126,11 @@ from nemo_rl.algorithms.single_controller_utils.step_assembly import (
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
-from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import (
+    GROUP_ID_TAG,
+    ROUTE_PLAN_TAG,
+    forest_step_padding_id,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
@@ -560,9 +564,9 @@ class _FakeDPClient:
 @pytest.mark.parametrize("step_padding", ["reject", "allow", "clear"])
 def test_replay_inventory_step_padding(step_padding):
     """forest_padding_scope=step copies are tolerated or cleared, nothing else."""
-    dp_client = _FakeDPClient(
-        sample_ids=["g0-0", "g0-1", "g0-0_pad0", "g0-0_pad1", "other_pad0"]
-    )
+    # Built with the controller's helper, so the parser must recognise its IDs.
+    copies = [forest_step_padding_id("g0-0", index) for index in range(2)]
+    dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", *copies, "other_pad0"])
     replay_metadata = {
         "groups": [
             {
@@ -586,14 +590,10 @@ def test_replay_inventory_step_padding(step_padding):
                 step_padding=step_padding,
             )
         )
-    unexpected = (
-        ["g0-0_pad0", "g0-0_pad1", "other_pad0"]
-        if step_padding == "reject"
-        else ["other_pad0"]
-    )
+    unexpected = [*copies, "other_pad0"] if step_padding == "reject" else ["other_pad0"]
     assert f"unexpected={unexpected!r}" in str(error.value)
     assert dp_client.clear_calls == (
-        [(["g0-0_pad0", "g0-0_pad1"], _PARTITION_ID)] if step_padding == "clear" else []
+        [(copies, _PARTITION_ID)] if step_padding == "clear" else []
     )
 
 

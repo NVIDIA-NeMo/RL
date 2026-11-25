@@ -19,7 +19,6 @@ Saving and restoring both run them, so they are plain functions.
 
 from __future__ import annotations
 
-import re
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -38,6 +37,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     ROUTE_PLAN_TAG,
+    forest_step_padding_source,
 )
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
@@ -63,10 +63,6 @@ def capture_reward_settings(
     )
 
 
-# Sample IDs _pad_forest_step_rows gives the copies it writes for one step.
-_STEP_PADDING_ID = re.compile(r"(.+)_pad\d+")
-
-
 def _step_padding_sample_ids(
     sample_ids: set[str], expected_sample_ids: set[str]
 ) -> set[str]:
@@ -74,8 +70,7 @@ def _step_padding_sample_ids(
     return {
         sample_id
         for sample_id in sample_ids
-        if (match := _STEP_PADDING_ID.fullmatch(sample_id)) is not None
-        and match.group(1) in expected_sample_ids
+        if forest_step_padding_source(sample_id) in expected_sample_ids
     }
 
 

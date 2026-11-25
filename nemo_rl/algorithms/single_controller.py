@@ -180,6 +180,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    forest_step_padding_id,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -5377,7 +5378,7 @@ class SingleControllerActor:
         assert meta.tags is not None
         sources = [0] * num_pad
         pad_ids = [
-            f"{meta.sample_ids[source]}_pad{index}"
+            forest_step_padding_id(meta.sample_ids[source], index)
             for index, source in enumerate(sources)
         ]
         fields = await self._call_dp(

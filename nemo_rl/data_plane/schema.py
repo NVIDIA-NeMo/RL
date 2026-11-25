@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
+import re
 from dataclasses import dataclass
 from typing import Literal, Optional, Sequence
 
@@ -270,3 +271,14 @@ def forest_row_ids(
         f"{group_id}_pad{index}"
         for index in range(-len(real_ids) % execution_row_multiple)
     )
+
+
+def forest_step_padding_id(source_id: str, index: int) -> str:
+    """Sample ID of a step-padding copy of row ``source_id``."""
+    return f"{source_id}_pad{index}"
+
+
+def forest_step_padding_source(sample_id: str) -> Optional[str]:
+    """Source row of a step-padding copy, or None for any other sample ID."""
+    match = re.fullmatch(r"(.+)_pad\d+", sample_id)
+    return match.group(1) if match is not None else None
