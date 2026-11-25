@@ -2085,8 +2085,9 @@ class RolloutRecoveryLedger:
                     raise ValueError(
                         "resumed environment attempts require gym_instance_id"
                     )
-                # Older schemas never recorded it: a continued attempt from one
-                # is re-sent under a fresh task index and Gym starts it over.
+                # Older schemas never recorded it. They could only hold legacy_agent
+                # episodes, which Gym continues without checking the task, so a
+                # continued attempt from one resumes under a fresh task index.
                 if (
                     schema_version >= _ENVIRONMENT_TASK_INDEX_SCHEMA_VERSION
                     and "environment_task_index" not in attempt_state
