@@ -333,9 +333,7 @@ class RolloutRestorer(_UsesRolloutParts):
             expected_manifest_digest=expected_manifest_digest_value,
         )
         await validate_replay_inventory(
-            buffer_state,
-            dp_client=self._dp_client,
-            partition_id=self._partition_id,
+            buffer_state, dp_client=self._dp_client, partition_id=self._partition_id
         )
 
         if not self._master_config.checkpointing.load_replay_buffer:

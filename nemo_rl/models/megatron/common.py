@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import logging
 from typing import Any, Optional
 
 import torch
@@ -22,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import unwrap_model
 
@@ -29,6 +32,8 @@ from nemo_rl.data.multimodal_utils import (
     chunks_accept_media_token_validity_mask,
     media_placeholder_token_id_from_chunks,
 )
+
+log = logging.getLogger(__name__)
 
 
 def _unwrapped_chunks(model: Any) -> list[Any]:
@@ -220,6 +225,131 @@ def get_aux_loss_track_names(model_config: Any) -> list[str]:
         track_names.append("z_loss")
 
     return track_names
+
+
+def validate_forest_routers(model: Any) -> None:
+    """Reject routers that Forest execution padding could perturb.
+
+    Padding rows and failed owners' borrowed inputs run through the model, so
+    routing must be dropless and per-token.
+    """
+    # TODO: Exclude artificial inputs from expert-bias update counts; see
+    # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+    # meanwhile: dummy rows can affect the counts despite zero policy loss.
+    for chunk in _unwrapped_chunks(model):
+        for module in chunk.modules():
+            if not isinstance(module, Router):
+                continue
+            config = module.config
+            if (
+                not isinstance(module, TopKRouter)
+                or module.routing_type in ("sinkhorn", "quantile_balancing")
+                or config.moe_expert_capacity_factor is not None
+                or config.moe_expert_rank_capacity_factor is not None
+                or config.moe_pad_experts_for_cuda_graph_inference
+                or config.moe_token_dropping
+                or get_aux_loss_track_names(config)
+            ):
+                raise ValueError(
+                    "Forest execution padding requires dropless per-token MoE routing "
+                    "without auxiliary losses"
+                )
+
+
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
+    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
+    pre-packing + CP-sharding itself. New wrappers advertise the capability
+    through ``model_owns_packing``. The Qwen3VL type check remains as a
+    compatibility fallback until that upstream model exposes the capability.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(
+        bool(getattr(chunk, "model_owns_packing", False))
+        or isinstance(chunk, Qwen3VLModel)
+        for chunk in chunks
+    )
+
+
+def _model_has_chunkwise_cp(model: Any) -> bool:
+    return any(
+        getattr(
+            getattr(owner, "decoder", None),
+            "_has_linear_layer_with_chunkwise_cp",
+            False,
+        )
+        for chunk in _unwrapped_chunks(model)
+        for owner in (chunk, getattr(chunk, "language_model", None))
+    )
+
+
+def require_router_padding_exclusion(model: Any, *, pack_sequences: bool) -> bool:
+    """Back token_capture.exclude_padding_from_router_stats on one model.
+
+    Returns whether its expert-bias statistics need the padding mask, and
+    raises when the model cannot take one, so the option is never ignored.
+    """
+    try:
+        return _model_needs_router_padding_mask(model, pack_sequences=pack_sequences)
+    except ValueError as error:
+        raise ValueError(
+            f"token_capture.exclude_padding_from_router_stats=true: {error}"
+        ) from error
+
+
+def _model_needs_router_padding_mask(
+    model: Any,
+    *,
+    pack_sequences: bool = False,
+    allow_unmasked_chunkwise_cp: bool = False,
+) -> bool:
+    """Resolve masks once for nonzero, unfrozen expert-bias updates."""
+    chunks = _unwrapped_chunks(model)
+    # Training/eval mode is transient at setup; rate and frozen buffers define
+    # whether subsequent training can update any expert bias.
+    if not any(
+        getattr(chunk.config, "moe_router_enable_expert_bias", False)
+        and getattr(chunk.config, "moe_router_bias_update_rate", 0.0) != 0.0
+        and any(
+            getattr(module, "expert_bias", None) is not None
+            and not getattr(module, "frozen_expert_bias", False)
+            for module in chunk.modules()
+        )
+        for chunk in chunks
+    ):
+        return False
+    if pack_sequences and _model_self_packs_for_cp(model):
+        raise ValueError(
+            "Expert-bias padding masks are unsupported with model-owned sequence "
+            "packing. Disable sequence packing or expert-bias updates; the model "
+            "does not preserve real-token validity through delegated packing."
+        )
+    for chunk in chunks:
+        if "padding_mask" not in inspect.signature(chunk.forward).parameters:
+            raise ValueError(
+                "Expert-bias padding masks require a model forward that "
+                f"explicitly accepts padding_mask; got {type(chunk).__name__}."
+            )
+    if _model_has_chunkwise_cp(model):
+        if allow_unmasked_chunkwise_cp:
+            log.warning(
+                "HybridBlock chunkwise context parallelism does not support padding "
+                "masks. Proceeding with padding_mask=None for prepacked HybridEP "
+                "training, keeping expert bias enabled. Padding tokens will contribute "
+                "to expert-load counts and may affect bias updates."
+            )
+            return False
+        raise ValueError(
+            "Expert-bias padding masks are unsupported for "
+            "HybridBlock chunkwise context parallelism."
+        )
+    return True
 
 
 def get_moe_metrics(

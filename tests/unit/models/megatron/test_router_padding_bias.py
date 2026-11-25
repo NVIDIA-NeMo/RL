@@ -46,6 +46,7 @@ pytestmark = pytest.mark.mcore
 def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     monkeypatch, overrides, rejected
 ):
+    from nemo_rl.models.megatron import common
     from nemo_rl.models.policy.workers import megatron_policy_worker as module
 
     class Router:
@@ -71,10 +72,10 @@ def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     for key, value in overrides.items():
         if key != "routing_type":
             setattr(config, key, value)
-    monkeypatch.setattr(module, "Router", Router)
-    monkeypatch.setattr(module, "TopKRouter", TopKRouter)
+    monkeypatch.setattr(common, "Router", Router)
+    monkeypatch.setattr(common, "TopKRouter", TopKRouter)
     monkeypatch.setattr(
-        module,
+        common,
         "_unwrapped_chunks",
         lambda _: [SimpleNamespace(modules=lambda: [router])],
     )
@@ -104,10 +105,11 @@ def test_forest_router_exclusion_is_checked_only_when_requested(
 ):
     """Without the option, a model that cannot mask padding (e.g. chunkwise CP)
     still runs; with it, setup fails instead of ignoring the option."""
+    from nemo_rl.models.megatron import common
     from nemo_rl.models.policy.workers import megatron_policy_worker as policy
     from nemo_rl.models.value.workers import megatron_value_worker as value
 
-    monkeypatch.setattr(policy, "_model_needs_router_padding_mask", _unmaskable)
+    monkeypatch.setattr(common, "_model_needs_router_padding_mask", _unmaskable)
     monkeypatch.setattr(policy, "validate_forest_routers", lambda _model: None)
     monkeypatch.setattr(value, "validate_forest_routers", lambda _model: None)
     packing = {"sequence_packing": {"enabled": True}}
@@ -133,11 +135,11 @@ def test_forest_router_exclusion_is_checked_only_when_requested(
 
 @pytest.mark.parametrize("needs_mask", [False, True])
 def test_forest_critic_masks_router_padding_when_requested(monkeypatch, needs_mask):
-    from nemo_rl.models.policy.workers import megatron_policy_worker as policy
+    from nemo_rl.models.megatron import common
     from nemo_rl.models.value.workers import megatron_value_worker as value
 
     monkeypatch.setattr(
-        policy, "_model_needs_router_padding_mask", lambda *_a, **_k: needs_mask
+        common, "_model_needs_router_padding_mask", lambda *_a, **_k: needs_mask
     )
     monkeypatch.setattr(value, "validate_forest_routers", lambda _model: None)
     worker = SimpleNamespace(
@@ -227,9 +229,7 @@ def test_nonpacked_router_mask_requires_lengths(monkeypatch):
 def test_router_mask_uses_effective_update_config(
     enabled, rate, frozen, has_bias, expected
 ):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_router_padding_mask,
-    )
+    from nemo_rl.models.megatron.common import _model_needs_router_padding_mask
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -248,9 +248,7 @@ def test_router_mask_uses_effective_update_config(
 
 @pytest.mark.parametrize("chunkwise", [False, True])
 def test_router_mask_rejects_unsupported_model(chunkwise):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_router_padding_mask,
-    )
+    from nemo_rl.models.megatron.common import _model_needs_router_padding_mask
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -392,9 +390,7 @@ def test_packed_router_mask_with_alltoall_dispatcher(
 
 @pytest.mark.parametrize("chunkwise", [False, True])
 def test_nested_language_decoder_router_mask(chunkwise):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_router_padding_mask,
-    )
+    from nemo_rl.models.megatron.common import _model_needs_router_padding_mask
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -419,9 +415,7 @@ def test_nested_language_decoder_router_mask(chunkwise):
 
 @pytest.mark.parametrize("packing", [False, True])
 def test_self_packing_expert_bias_rejected_at_setup(packing):
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_router_padding_mask,
-    )
+    from nemo_rl.models.megatron.common import _model_needs_router_padding_mask
 
     class Model(torch.nn.Module):
         model_owns_packing = True
@@ -513,9 +507,7 @@ def test_hybridep_self_packing_requests_mask_only_for_bias_updates(
 def test_prepacked_hybridep_chunkwise_fallback(monkeypatch, caplog, chunkwise):
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.megatron import data as module
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_router_padding_mask,
-    )
+    from nemo_rl.models.megatron.common import _model_needs_router_padding_mask
 
     class Model(torch.nn.Module):
         def __init__(self):
@@ -655,9 +647,7 @@ def test_router_valid_lengths_needs_one_flag_per_row():
 def test_forest_router_check_allows_bias_updates_but_not_capacity():
     from megatron.core.transformer.moe.router import TopKRouter
 
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        validate_forest_routers,
-    )
+    from nemo_rl.models.megatron.common import validate_forest_routers
 
     router = TopKRouter.__new__(TopKRouter)
     torch.nn.Module.__init__(router)

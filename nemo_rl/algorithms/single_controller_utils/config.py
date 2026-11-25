@@ -1097,12 +1097,7 @@ def validate_forest_objective(
     unsupported = {
         f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
         != ("gae" if is_ppo else "grpo"),
-        # Name whichever selector the user set; the default is global_token_mean.
-        (
-            "loss_fn.token_level_loss"
-            if loss.normalization is None and loss.token_level_loss is not None
-            else "loss_fn.normalization"
-        ): loss.resolved_normalization != "global_token_mean",
+        "loss_fn.normalization": loss.resolved_normalization != "global_token_mean",
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",
@@ -1145,40 +1140,78 @@ def logprob_passes_required(
     )
 
 
-def forest_execution_row_multiple(
-    policy: PolicyConfig | ValueConfig, *, dp_size: int, logprobs_required: bool
+def _forest_consumer_row_multiple(
+    config: PolicyConfig | ValueConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
-    """Common row divisibility for fixed or packed Megatron consumers.
+    """Row divisibility for one fixed or packed Megatron consumer.
 
-    Policy and reference forwards share this trainer's mesh and logprob MBS.
-    A PPO critic is a second consumer on its own mesh; its value forward uses
-    ``logprob_batch_size`` when set, so callers pass ``logprobs_required`` from
-    that key's presence.
     Packed consumers form their own bins and only need complete DP shards.
     Non-interleaved PP admits any positive microbatch count; interleaved PP
     and dynamic batching require separate qualification.
     """
     if (
-        not policy["megatron_cfg"]["enabled"]
-        or policy["dynamic_batching"]["enabled"]
-        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
+        not config["megatron_cfg"]["enabled"]
+        or config["dynamic_batching"]["enabled"]
+        or config["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
         is not None
     ):
         raise ValueError(
             "Forest execution padding requires fixed or packed, non-interleaved Megatron"
         )
-    if policy["sequence_packing"]["enabled"]:
+    if config["sequence_packing"]["enabled"]:
         if type(dp_size) is not int or dp_size < 1:
             raise ValueError("Forest consumer DP size must be a positive integer")
         return dp_size
-    sizes = [policy["train_micro_batch_size"]]
+    sizes = [config["train_micro_batch_size"]]
     if logprobs_required:
-        sizes.append(policy["logprob_batch_size"])
+        sizes.append(config["logprob_batch_size"])
     if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
         raise ValueError(
             "Forest consumer DP and microbatch sizes must be positive integers"
         )
     return dp_size * math.lcm(*sizes)
+
+
+def forest_execution_row_multiple(
+    master_config: MasterConfig,
+    algo_cfg: GRPOConfig | PPOConfig,
+    *,
+    policy_dp: int,
+    value_dp: Optional[int] = None,
+) -> int:
+    """Rows per Forest group must split evenly for the policy and any PPO critic.
+
+    Policy and reference forwards share the policy mesh and logprob MBS. A PPO
+    critic is a second consumer on its own mesh; its value forward uses
+    ``logprob_batch_size`` when set.
+
+    Args:
+        master_config: Run config holding the policy and, on PPO, the critic.
+        algo_cfg: Active GRPO or PPO block, which decides the logprob passes.
+        policy_dp: Data-parallel size of the policy.
+        value_dp: Data-parallel size of the critic; required on a PPO run.
+
+    Returns:
+        The least common multiple of the policy's and the critic's row multiples.
+    """
+    multiple = _forest_consumer_row_multiple(
+        master_config.policy,
+        dp_size=policy_dp,
+        logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
+    )
+    if not is_ppo_run(master_config):
+        return multiple
+    if value_dp is None:
+        raise ValueError("a PPO run needs the critic DP size for Forest row sizing")
+    value_config = cast(ValueConfig, master_config.value)
+    return math.lcm(
+        multiple,
+        _forest_consumer_row_multiple(
+            value_config,
+            dp_size=value_dp,
+            logprobs_required="logprob_batch_size" in value_config,
+        ),
+    )
 
 
 def is_ppo_run(master_config: MasterConfig) -> bool:
@@ -2280,7 +2313,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
-        # PPO rejects ppo.length_penalty below for every SingleController run.
+        # _validate_algo_settings already rejects ppo.length_penalty on every SingleController PPO run.
         if (
             master_config.grpo is not None
             and master_config.grpo.length_penalty is not None
@@ -2296,20 +2329,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         # Validate the fixed-batch policy and critic shapes before
         # workers/generation start. Setup recomputes Q from the actual DP meshes.
         forest_execution_row_multiple(
-            master_config.policy, dp_size=1, logprobs_required=True
+            master_config, forest_algo_cfg, policy_dp=1, value_dp=1
         )
         if is_ppo_run(master_config):
             if forest_algo_cfg.value_training_mode != "whole_batch":  # type: ignore
-                # Forest pads the whole step to the critic's DP and microbatch
-                # sizes; split mode shards each chunk on its own.
+                # Not yet validated with Forest: group padding aligns every chunk to
+                # both models, but no test or run covers the per-chunk critic update.
                 raise ValueError(
                     "forest training requires ppo.value_training_mode=whole_batch"
                 )
-            forest_execution_row_multiple(
-                master_config.value,  # type: ignore
-                dp_size=1,
-                logprobs_required="logprob_batch_size" in master_config.value,  # type: ignore
-            )
     if recovery_config.turn_checkpointing_enabled:
         # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
         # drain, and the stall watchdog keeps counting meanwhile.
