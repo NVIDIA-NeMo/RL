@@ -74,6 +74,7 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.utils.outdated_config_checks import reject_outdated_token_level_loss
 from nemo_rl.utils.tensor_ops import masked_mean
 
 if TYPE_CHECKING:
@@ -178,12 +179,9 @@ LossNormalization = Literal["global_token_mean", "sequence_mean", "group_token_m
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
-    # Select one reduction; when both selectors are unset, use global_token_mean.
+    # None selects global_token_mean.
     # group_token_mean requires SingleController GRPO with Megatron.
     normalization: LossNormalization | None = None
-    # Deprecated: True selects global_token_mean, False selects sequence_mean.
-    # Must remain unset when normalization is supplied.
-    token_level_loss: bool | None = None
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
@@ -272,25 +270,14 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     score_centering: bool = False
 
     @model_validator(mode="after")
-    def validate_normalization(self) -> "ClippedPGLossConfig":
-        # Validate without storing a second selector in serialized configs.
-        _ = self.resolved_normalization
+    def reject_removed_loss_selector(self) -> "ClippedPGLossConfig":
+        reject_outdated_token_level_loss(self.model_extra or {})
         return self
 
     @property
     def resolved_normalization(self) -> LossNormalization:
-        """Resolve the new selector or its legacy alias into one concrete mode."""
-        if self.normalization is not None:
-            if self.token_level_loss is not None:
-                raise ValueError(
-                    "Set only one of loss_fn.normalization and "
-                    "loss_fn.token_level_loss; set token_level_loss=null "
-                    "to override an inherited legacy value."
-                )
-            return self.normalization
-        if self.token_level_loss is False:
-            return "sequence_mean"
-        return "global_token_mean"
+        """Return the selected mode, treating None as global_token_mean."""
+        return self.normalization or "global_token_mean"
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -381,14 +368,6 @@ class ClippedPGLossFn(LossFunction):
                 stepping the optimizer. See ``requires_survivor_normalization``.
         """
         self.normalization = cfg.resolved_normalization
-        if cfg.token_level_loss is not None:
-            warnings.warn(
-                "loss_fn.token_level_loss is deprecated; use "
-                f"loss_fn.normalization={self.normalization!r} and remove "
-                "token_level_loss (or set it to null).",
-                FutureWarning,
-                stacklevel=2,
-            )
         self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
         self.seq_logprob_error_threshold = seq_logprob_error_threshold
         if self.seq_logprob_error_in_loss:
@@ -402,7 +381,7 @@ class ClippedPGLossFn(LossFunction):
             ):
                 raise ValueError(
                     "In-loss sequence filtering requires force_on_policy_ratio "
-                    "and normalization=global_token_mean (legacy token_level_loss=True)"
+                    "and normalization=global_token_mean"
                 )
             if cfg.positive_example_nll_weight != 0:
                 raise ValueError("In-loss sequence filtering does not support NLL")
@@ -505,8 +484,7 @@ class ClippedPGLossFn(LossFunction):
                 "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
             )
             assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires global_token_mean or group_token_mean normalization "
-                "(legacy token_level_loss=True)."
+                "use_cispo requires global_token_mean or group_token_mean normalization."
             )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
@@ -601,6 +579,7 @@ class ClippedPGLossFn(LossFunction):
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "token_abs_logprob_error": MetricNormalizer.TOKENS,
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
@@ -614,6 +593,7 @@ class ClippedPGLossFn(LossFunction):
             # Raw count — the downstream per-microbatch sum IS the value.
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "num_valid_samples": MetricNormalizer.NONE,
+            "gen_prev_logprob_mismatch_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
             "num_masked_seqs_by_logprob_error": MetricNormalizer.NONE,
@@ -634,6 +614,8 @@ class ClippedPGLossFn(LossFunction):
                 "policy_support_excluded_tokens",
                 "positive_nll_loss",
                 "token_mult_prob_error",
+                "gen_prev_logprob_mismatch_tokens",
+                "token_abs_logprob_error",
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
@@ -1208,6 +1190,12 @@ class ClippedPGLossFn(LossFunction):
         metric_tensors = {"loss": loss.detach()}
         with torch.no_grad():
             lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            metric_tensors["gen_prev_logprob_mismatch_tokens"] = (
+                (lp_error != 0) & mask.bool()
+            ).sum()
+            metric_tensors["token_abs_logprob_error"] = masked_mean(
+                lp_error, mask, global_normalization_factor=global_valid_toks
+            )
             metric_tensors["token_mult_prob_error"] = masked_mean(
                 torch.exp(lp_error * mask),
                 mask,

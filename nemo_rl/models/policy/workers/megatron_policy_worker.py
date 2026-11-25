@@ -53,7 +53,6 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
-from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -104,6 +103,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
+    validate_forest_routers,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -333,35 +333,6 @@ def _model_has_chunkwise_cp(model: Any) -> bool:
         for chunk in _unwrapped_chunks(model)
         for owner in (chunk, getattr(chunk, "language_model", None))
     )
-
-
-def validate_forest_routers(model: Any) -> None:
-    """Reject routers that Forest execution padding could perturb.
-
-    Padding rows and failed owners' borrowed inputs run through the model, so
-    routing must be dropless and per-token.
-    """
-    # TODO: Exclude artificial inputs from expert-bias update counts; see
-    # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
-    # meanwhile: dummy rows can affect the counts despite zero policy loss.
-    for chunk in _unwrapped_chunks(model):
-        for module in chunk.modules():
-            if not isinstance(module, Router):
-                continue
-            config = module.config
-            if (
-                not isinstance(module, TopKRouter)
-                or module.routing_type in ("sinkhorn", "quantile_balancing")
-                or config.moe_expert_capacity_factor is not None
-                or config.moe_expert_rank_capacity_factor is not None
-                or config.moe_pad_experts_for_cuda_graph_inference
-                or config.moe_token_dropping
-                or get_aux_loss_track_names(config)
-            ):
-                raise ValueError(
-                    "Forest execution padding requires dropless per-token MoE routing "
-                    "without auxiliary losses"
-                )
 
 
 def _model_needs_router_padding_mask(

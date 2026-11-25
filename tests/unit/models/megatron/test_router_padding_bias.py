@@ -46,6 +46,7 @@ pytestmark = pytest.mark.mcore
 def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     monkeypatch, overrides, rejected
 ):
+    from nemo_rl.models.megatron import common
     from nemo_rl.models.policy.workers import megatron_policy_worker as module
 
     class Router:
@@ -71,10 +72,10 @@ def test_forest_allows_bias_updates_but_keeps_other_router_guards(
     for key, value in overrides.items():
         if key != "routing_type":
             setattr(config, key, value)
-    monkeypatch.setattr(module, "Router", Router)
-    monkeypatch.setattr(module, "TopKRouter", TopKRouter)
+    monkeypatch.setattr(common, "Router", Router)
+    monkeypatch.setattr(common, "TopKRouter", TopKRouter)
     monkeypatch.setattr(
-        module,
+        common,
         "_unwrapped_chunks",
         lambda _: [SimpleNamespace(modules=lambda: [router])],
     )
@@ -526,9 +527,7 @@ def test_prepacked_hybridep_chunkwise_fallback(monkeypatch, caplog, chunkwise):
 def test_forest_router_check_allows_bias_updates_but_not_capacity():
     from megatron.core.transformer.moe.router import TopKRouter
 
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        validate_forest_routers,
-    )
+    from nemo_rl.models.megatron.common import validate_forest_routers
 
     router = TopKRouter.__new__(TopKRouter)
     torch.nn.Module.__init__(router)

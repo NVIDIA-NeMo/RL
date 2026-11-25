@@ -32,6 +32,7 @@ policy:
     sequence_parallel: false
     activation_checkpointing: false
     mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers; override base stage default of 5
+    moe_router_enable_expert_bias: false  # Qwen3 routes with softmax; override base stage default
 
   generation:
     colocated:

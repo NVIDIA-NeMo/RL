@@ -143,15 +143,11 @@ env:
             type: responses_api_agents
             name: browsecomp_agent
 logger:
-  log_dir: logs/grpo-workplace-assistant-nemotron-nano-v2-9b
+  log_dir: logs/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
   wandb_enabled: true
   monitor_gpus: true
   wandb:
-    project: grpo-workplace-assistant
-    name: nemotron-nano-v2-9b-workplace-assistant
-  mlflow:
-    experiment_name: grpo-workplace-assistant
-    run_name: nemotron-nano-v2-9b-workplace-assistant
+    name: ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
 async_rl:
   sampler:
     max_lookahead_versions: 0
@@ -164,6 +160,5 @@ token_capture:
   enabled: true
   forest_training: true
   forest_padding_scope: step
-grpo: null
 cluster:
   gpus_per_node: 8
