@@ -22,8 +22,8 @@ Covers:
   - async-save finalization (rename deferred until finalize_async_save,
     background failure re-raised at the next save and, for the last save,
     at shutdown);
-  - metric_name behavior (non-"train:" rejected at config validation,
-    train:* value recorded);
+  - metric_name behavior (current_step and train:* recorded; other bare
+    metrics rejected at config validation);
   - dataloader state: train_dataloader.pt written at save, position
     round-trip through a real StatefulDataLoader, dataset-swap guard,
     setup restore wiring + missing-file corruption check;
@@ -5136,6 +5136,33 @@ class TestPPOWarmupCheckpoint:
 
         assert not hasattr(actor._save_state, "train:loss")
 
+    @pytest.mark.parametrize(
+        ("is_policy_training_step", "step_metrics"),
+        [
+            (False, {"current_step": 999}),
+            (True, {"skipped_step": 1, "current_step": 999}),
+        ],
+    )
+    def test_current_step_metric_survives_warmup_and_skipped_steps(
+        self,
+        actor: Any,
+        is_policy_training_step: bool,
+        step_metrics: dict[str, int],
+    ) -> None:
+        actor._master_config.checkpointing["metric_name"] = "current_step"
+        actor._train_steps = 2
+
+        asyncio.run(
+            actor._save_checkpoint(
+                step_metrics,
+                is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=False,
+            )
+        )
+
+        step, info, _ = actor._checkpointer.init_tmp_checkpoint.call_args.args
+        assert step == info["current_step"] == 2
+
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
         actor._master_config.checkpointing.metric_name = "train:loss"
@@ -5163,6 +5190,47 @@ class TestMetricName:
 
         with pytest.raises(ValueError, match="no validation loop yet"):
             validate_single_controller_config(mc)
+
+    def test_current_step_keeps_original_seed_and_latest_checkpoints(
+        self, tmp_path: Path
+    ) -> None:
+        config = _actor_master_config(
+            tmp_path, max_num_steps=5, save_period=1, metric_name="current_step"
+        )
+        config.checkpointing.update(
+            higher_is_better=False, keep_top_k=1, ft_keep_latest_k=2
+        )
+        validate_single_controller_config(config)
+        save_state = _get_grpo_save_state(
+            {"current_step": 2, "total_steps": 2, "trainer_version": 2}
+        )
+        with CheckpointManager(config.checkpointing) as manager:
+            staged = manager.init_tmp_checkpoint(2, vars(save_state))
+            manager.finalize_checkpoint(staged)
+        checkpoint_dir = tmp_path / "checkpoints"
+        seed = checkpoint_dir / "step_2/training_info.json"
+        seed_bytes, seed_inode = seed.read_bytes(), seed.stat().st_ino
+        trainer = _FakeTrainer(step_metrics={"current_step": 999})
+
+        actor = _run_train_pump(
+            config, _make_actor_args(trainer=trainer, save_state=save_state)
+        )
+
+        assert {path.name for path in checkpoint_dir.glob("step_*")} == {
+            "step_2",
+            "step_4",
+            "step_5",
+        }
+        for step in (2, 4, 5):
+            assert _training_info(checkpoint_dir, step)["current_step"] == step
+        assert seed.read_bytes() == seed_bytes
+        assert seed.stat().st_ino == seed_inode
+        assert actor._checkpointer.get_latest_checkpoint_path() == str(
+            checkpoint_dir / "step_5"
+        )
+        assert actor._checkpointer.get_best_checkpoint_path() == str(
+            checkpoint_dir / "step_2"
+        )
 
     def test_train_metric_lands_in_training_info(self, tmp_path):
         mc = _actor_master_config(
@@ -5217,9 +5285,12 @@ class TestMetricName:
         with pytest.raises(ValueError, match="not found in train metrics"):
             _run_train_pump(mc, _make_actor_args())
 
-    def test_metric_name_requires_train_prefix(self, tmp_path):
+    @pytest.mark.parametrize("metric_name", ["reward", "current_steps", "eval:reward"])
+    def test_other_metric_names_require_train_prefix(
+        self, tmp_path: Path, metric_name: str
+    ) -> None:
         mc = _actor_master_config(
-            tmp_path, max_num_steps=2, save_period=2, metric_name="reward"
+            tmp_path, max_num_steps=2, save_period=2, metric_name=metric_name
         )
 
         with pytest.raises(ValueError, match="is not usable on the SingleController"):

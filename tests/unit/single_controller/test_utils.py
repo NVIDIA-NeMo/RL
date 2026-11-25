@@ -83,6 +83,32 @@ class TestTensorField:
 
 
 class TestAggregateStepMetrics:
+    @pytest.mark.parametrize("status", [True, False])
+    def test_all_rank_optimizer_status_overrides_microbatch_metrics(
+        self, status: bool
+    ) -> None:
+        out = aggregate_step_metrics(
+            {
+                "optimizer_update_successful": status,
+                "all_mb_metrics": {"optimizer_update_successful": [1, 1]},
+            }
+        )
+        assert type(out["optimizer_update_successful"]) is int
+        assert out["optimizer_update_successful"] == int(status)
+
+    def test_microbatch_status_cannot_substitute_for_missing_all_rank_status(
+        self,
+    ) -> None:
+        out = aggregate_step_metrics(
+            {"all_mb_metrics": {"optimizer_update_successful": [1, 1]}}
+        )
+        assert "optimizer_update_successful" not in out
+
+    @pytest.mark.parametrize("status", [None, 1, "true"])
+    def test_optimizer_status_rejects_non_boolean_rank_verdicts(self, status) -> None:
+        with pytest.raises(ValueError, match="must be an all-rank bool"):
+            aggregate_step_metrics({"optimizer_update_successful": status})
+
     def test_scalar_loss_and_grad_norm_tensors(self) -> None:
         result = {
             "loss": torch.tensor([1.0, 3.0]),

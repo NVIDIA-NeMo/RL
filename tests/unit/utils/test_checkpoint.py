@@ -14,6 +14,7 @@
 import json
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1448,3 +1449,116 @@ def test_a_non_numeric_staging_name_costs_only_the_span_label(
 
     assert (checkpoint_dir / "step_final").exists()
     assert not staged.exists()
+
+
+@pytest.fixture
+def current_step_manager(tmp_path: Path) -> Iterator[CheckpointManager]:
+    with CheckpointManager(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=tmp_path / "checkpoints",
+            metric_name="current_step",
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=1,
+            ft_keep_latest_k=2,
+            save_optimizer=True,
+        )
+    ) as manager:
+        yield manager
+
+
+class TestCurrentStepRetention:
+    def test_original_seed_and_latest_union(
+        self, current_step_manager: CheckpointManager
+    ) -> None:
+        manager = current_step_manager
+        seed_bytes = None
+        seed_inode = None
+        for step in range(2, 8):
+            staged = manager.init_tmp_checkpoint(step, {"current_step": step})
+            manager.finalize_checkpoint(staged)
+            seed = Path(manager.checkpoint_dir) / "step_2/training_info.json"
+            if step == 2:
+                seed_bytes, seed_inode = seed.read_bytes(), seed.stat().st_ino
+            kept = {
+                int(path.name.removeprefix("step_"))
+                for path in Path(manager.checkpoint_dir).glob("step_*")
+            }
+            assert kept == {2, max(2, step - 1), step}
+            assert seed.read_bytes() == seed_bytes
+            assert seed.stat().st_ino == seed_inode
+        assert manager.get_latest_checkpoint_path() == str(
+            Path(manager.checkpoint_dir) / "step_7"
+        )
+        assert manager.get_best_checkpoint_path() == str(
+            Path(manager.checkpoint_dir) / "step_2"
+        )
+
+    def test_async_publish_retains_fallback_until_writer_finishes(
+        self, current_step_manager: CheckpointManager
+    ) -> None:
+        manager = current_step_manager
+        for step in (2, 3, 4):
+            staged = manager.init_tmp_checkpoint(step, {"current_step": step})
+            manager.finalize_checkpoint(staged)
+        started, release = threading.Event(), threading.Event()
+
+        def wait_for_writer() -> None:
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("Test writer was not released")
+
+        staged = manager.init_tmp_checkpoint(5, {"current_step": 5})
+        try:
+            manager.begin_finalization(staged, wait_fn=wait_for_writer)
+            assert started.wait(timeout=5)
+            assert {
+                path.name for path in Path(manager.checkpoint_dir).glob("step_*")
+            } == {"step_2", "step_3", "step_4"}
+            assert Path(staged).is_dir()
+            assert manager.get_latest_checkpoint_path() == str(
+                Path(manager.checkpoint_dir) / "step_4"
+            )
+        finally:
+            release.set()
+            manager.shutdown()
+        assert {path.name for path in Path(manager.checkpoint_dir).glob("step_*")} == {
+            "step_2",
+            "step_4",
+            "step_5",
+        }
+        assert manager.get_latest_checkpoint_path() == str(
+            Path(manager.checkpoint_dir) / "step_5"
+        )
+
+    def test_failed_policy_write_does_not_publish_or_prune(
+        self, current_step_manager: CheckpointManager
+    ) -> None:
+        manager = current_step_manager
+        for step in (2, 3, 4):
+            staged = manager.init_tmp_checkpoint(step, {"current_step": step})
+            manager.finalize_checkpoint(staged)
+        seed = Path(manager.checkpoint_dir) / "step_2/training_info.json"
+        seed_bytes, seed_inode = seed.read_bytes(), seed.stat().st_ino
+
+        def fail_writer() -> None:
+            raise OSError("Policy checkpoint write failed")
+
+        staged = manager.init_tmp_checkpoint(5, {"current_step": 5})
+        manager.begin_finalization(staged, wait_fn=fail_writer)
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ):
+            manager.finalize_pending()
+        assert Path(staged).is_dir()
+        assert {path.name for path in Path(manager.checkpoint_dir).glob("step_*")} == {
+            "step_2",
+            "step_3",
+            "step_4",
+        }
+        assert manager.get_latest_checkpoint_path() == str(
+            Path(manager.checkpoint_dir) / "step_4"
+        )
+        assert seed.read_bytes() == seed_bytes
+        assert seed.stat().st_ino == seed_inode

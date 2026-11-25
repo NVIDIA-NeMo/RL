@@ -1808,6 +1808,7 @@ class MegatronPolicyWorkerImpl(
 
         metrics = {
             "global_loss": global_loss.cpu(),
+            "optimizer_update_successful": update_successful,
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
@@ -2699,6 +2700,7 @@ class MegatronPolicyWorkerImpl(
 
         metrics = {
             "global_loss": global_loss.cpu(),
+            "optimizer_update_successful": update_successful,
             "rank": torch.distributed.get_rank(),
             "gpu_name": torch.cuda.get_device_name(),
             "model_dtype": self.dtype,
