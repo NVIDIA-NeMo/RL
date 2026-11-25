@@ -17,14 +17,16 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import json
+import math
 import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from typing import Any, Callable, Optional
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -34,6 +36,7 @@ from pydantic import ValidationError
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
     OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -52,6 +55,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     WindowedSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import (
+    AgentOverrideConfig,
     GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
@@ -83,13 +87,17 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     RolloutRecoveryConfig,
     TokenCaptureConfig,
+    TrainerWarmupConfig,
+    _forest_consumer_row_multiple,
     _validate_opd_full_config,
     forest_execution_row_multiple,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
+    GROUP_TOKEN_MEAN_WEIGHT,
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
@@ -290,6 +298,7 @@ def patched_factories():
                 MagicMock(name="train_cluster"),
                 MagicMock(name="inference_cluster"),
                 None,
+                None,
             ),
         ) as mock_clusters,
         patch.object(
@@ -487,6 +496,61 @@ def test_forest_retains_shared_checkpoint_requirements(
     patched_factories["_build_trainer"].assert_not_called()
 
 
+@pytest.mark.parametrize("packing", [False, True])
+def test_forest_ppo_restores_discovered_checkpoint(
+    tmp_path: Path, patched_factories: dict[str, Any], packing: bool
+) -> None:
+    mc = _forest_ppo_config(_make_forest_master_config())
+    mc.policy["sequence_packing"]["enabled"] = packing
+    mc.value["sequence_packing"]["enabled"] = packing
+    mc.checkpointing.checkpoint_dir = str(tmp_path)
+    mc.checkpointing.enabled = True
+    mc.checkpointing.save_data_plane = True
+    mc.checkpointing.save_period = 1
+    checkpoint = tmp_path / "step_3"
+    for component in ("policy", "value"):
+        (checkpoint / component / "weights").mkdir(parents=True)
+        (checkpoint / component / "optimizer").mkdir()
+    (checkpoint / DATA_PLANE_CHECKPOINT_DIR).mkdir()
+    (checkpoint / REPLAY_BUFFER_METADATA_FILENAME).touch()
+    (checkpoint / "training_info.json").write_text(json.dumps(vars(_save_state())))
+    torch.save({"cursor": 3}, checkpoint / "train_dataloader.pt")
+    policy = patched_factories["fake_policy"]
+    policy.cfg = mc.policy
+    policy.sharding_annotations.get_axis_size.return_value = 1
+    policy.load_data_plane_checkpoint.return_value = _native_tq_metadata()
+    value = MagicMock(name="value")
+    value.cfg = mc.value
+    value.sharding_annotations.get_axis_size.return_value = 1
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    with (
+        patch.object(
+            sc_setup_mod, "_build_value", return_value=(value, 0.0)
+        ) as build_value,
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", return_value=None),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock()],
+        ),
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert actor_args.last_checkpoint_path == str(checkpoint)
+    assert actor_args.save_state.current_step == 3
+    assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+    assert actor_args.value_handle is value
+    policy.load_data_plane_checkpoint.assert_called_once_with(
+        checkpoint / DATA_PLANE_CHECKPOINT_DIR
+    )
+    trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
+    assert trainer_kwargs["weights_path"] == checkpoint / "policy" / "weights"
+    assert trainer_kwargs["optimizer_path"] == checkpoint / "policy" / "optimizer"
+    value_kwargs = build_value.call_args.kwargs
+    assert value_kwargs["weights_path"] == checkpoint / "value" / "weights"
+    assert value_kwargs["optimizer_path"] == checkpoint / "value" / "optimizer"
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
@@ -538,11 +602,12 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 
     monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
 
-    _, _, teacher_topology = sc_setup_mod._build_clusters(master_config)
+    _, _, value_cluster, teacher_topology = sc_setup_mod._build_clusters(master_config)
 
     assert constructed[0]["bundle_ct_per_node_list"] == [8]
     assert constructed[1]["bundle_ct_per_node_list"] == [8]
     assert teacher_topology is None
+    assert value_cluster is None
 
 
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
@@ -571,13 +636,87 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
 
     monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", FakeCluster)
 
-    train_cluster, inference_cluster, teacher_topology = sc_setup_mod._build_clusters(
-        master_config
+    train_cluster, inference_cluster, value_cluster, teacher_topology = (
+        sc_setup_mod._build_clusters(master_config)
     )
 
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [4]
     assert teacher_topology is None
+    assert value_cluster is None
+
+
+@pytest.mark.parametrize(
+    ("shared_tp", "prefill", "decode", "inference_nodes", "segment_size"),
+    [
+        # Every engine TP 4: two 12-GPU replicas fill three nodes, but only one
+        # engine needs NVLink, so a segment is one node.
+        (4, {}, {}, 3, 1),
+        # Per-role widths, not the shared TP 2, size the segment: a TP 8 prefill
+        # engine fills one node.
+        (
+            2,
+            {"tensor_model_parallel_size": 8},
+            {"tensor_model_parallel_size": 4},
+            2,
+            1,
+        ),
+        # A TP 16 prefill engine spans two 8-GPU nodes, so a segment is two.
+        (
+            2,
+            {"tensor_model_parallel_size": 16},
+            {"tensor_model_parallel_size": 8},
+            4,
+            2,
+        ),
+    ],
+    ids=["uniform_tp4", "prefill_tp8_decode_tp4", "prefill_tp16"],
+)
+def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
+    monkeypatch, shared_tp, prefill, decode, inference_nodes, segment_size
+):
+    """Behind Dynamo the NVLink segment is the widest engine, not the replica."""
+    from tests.unit.models.generation.test_megatron_dynamo_config import (
+        MEGATRON_POLICY,
+        _megatron_config,
+    )
+
+    master_config = _make_master_config(backend="megatron", megatron_enabled=True)
+    generation = _megatron_config(prefill_engine=prefill, decode_engine=decode)
+    generation["mcore_generation_config"]["tensor_model_parallel_size"] = shared_tp
+    generation["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 8, "num_nodes": inference_nodes},
+    }
+    master_config.policy["megatron_cfg"] = dict(MEGATRON_POLICY["megatron_cfg"])
+    master_config.policy["generation"] = generation
+    cluster_nodes = 2 + inference_nodes
+    master_config.cluster = ClusterConfig(
+        num_nodes=cluster_nodes, gpus_per_node=8, segment_size=1
+    )
+    segment_calls = []
+
+    def fake_prepare_segment_topology(segment_size, num_nodes, *, topology=None, role):
+        segment_calls.append((role, segment_size, num_nodes))
+        if topology is None:
+            topology = {f"node{i}": ("nvlink_domain", i) for i in range(cluster_nodes)}
+        node_ids = list(topology)
+        return [{}] * num_nodes, node_ids[num_nodes:], topology
+
+    monkeypatch.setattr(
+        sc_setup_mod, "prepare_segment_topology", fake_prepare_segment_topology
+    )
+    monkeypatch.setattr(
+        sc_setup_mod, "RayVirtualCluster", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    _, inference_cluster, _, _ = sc_setup_mod._build_clusters(master_config)
+
+    assert segment_calls == [
+        ("training", 1, 2),
+        ("inference", segment_size, inference_nodes),
+    ]
+    assert inference_cluster.segment_size == segment_size
 
 
 def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
@@ -646,8 +785,11 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_prefix_recovery_rejects_sampler_top_k_capture():
-    # A restored prefix has no sampler top-k for its spliced tokens.
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_rollout_recovery_accepts_sampler_top_k_capture(target_level):
+    # Each prefix cut stages its tokens' sampler top-k with them.
     mc = _make_master_config(
         env={"should_use_nemo_gym": True},
         loss_cfg=ClippedPGLossConfig(score_centering=True),
@@ -656,13 +798,7 @@ def test_prefix_recovery_rejects_sampler_top_k_capture():
     mc.policy["generation"].update(
         top_logprobs=4, temperature=1.0, top_p=1.0, top_k=None
     )
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-    with pytest.raises(
-        ValueError, match="does not support policy.generation.top_logprobs"
-    ):
-        validate_single_controller_config(mc)
-
-    mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+    mc.rollout_recovery.target_level = target_level
     validate_single_controller_config(mc)
 
 
@@ -828,7 +964,7 @@ def test_recovery_target_enables_required_checkpoint_capabilities(
 
 
 @contextlib.contextmanager
-def _patched_gym_token_capture(finalizer_actors):
+def _patched_gym_token_capture(finalizer_actors, *, router_replay: bool = False):
     """Patch the Gym and finalizer actors a Gym token-capture setup builds.
 
     Yields the Gym spin-up and finalizer-creation mocks.
@@ -838,8 +974,8 @@ def _patched_gym_token_capture(finalizer_actors):
         patch.object(
             sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
         ) as spinup,
-        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=router_replay),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch(
             "nemo_rl.experience.rollout_reassembler_actor."
             "create_rollout_reassembler_actors",
@@ -1191,6 +1327,18 @@ class TestSetup:
         with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_agent_overrides_require_token_capture(self):
+        """Without token capture no row is tagged, so the overrides would be ignored."""
+        mc = _make_master_config()
+        mc.grpo.agent_overrides = {
+            "rubric_judge_agent": AgentOverrideConfig(normalize_rewards=False)
+        }
+
+        with pytest.raises(
+            ValueError, match="grpo.agent_overrides requires token_capture.enabled=true"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_periodic_checkpointing_requires_replay_capable_sampler(self):
         mc = _make_master_config(
             sampler_cfg=CustomSamplerConfig(
@@ -1307,7 +1455,6 @@ class TestSetup:
     @pytest.mark.parametrize(
         ("feature", "match"),
         [
-            ("router_replay", "does not yet support router replay"),
             (
                 "megatron",
                 "target_level='prefix' currently supports only the vllm generation",
@@ -1328,8 +1475,6 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        if feature == "router_replay":
-            mc.policy["router_replay"] = {"enabled": True}
 
         with pytest.raises(NotImplementedError, match=match):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1516,12 +1661,15 @@ class TestSetup:
 
         assert gym_log_dirs_at_build == [str(tmp_path / "exp_001" / "nemo_gym")]
 
+    @pytest.mark.parametrize("router_replay", [False, True])
     def test_prefix_recovery_accepts_multimodal_capture(
         self,
         tmp_path: Path,
         patched_factories,
+        router_replay: bool,
     ):
         mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.policy["router_replay"] = {"enabled": router_replay}
         mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
         mc.checkpointing.enabled = True
         mc.checkpointing.save_data_plane = True
@@ -1543,7 +1691,9 @@ class TestSetup:
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         tokenizer = MagicMock(pad_token_id=0)
 
-        with _patched_gym_token_capture([MagicMock(name="finalizer")]):
+        with _patched_gym_token_capture(
+            [MagicMock(name="finalizer")], router_replay=router_replay
+        ):
             setup_single_controller(
                 mc, tokenizer, processor=MagicMock(tokenizer=tokenizer)
             )
@@ -1551,6 +1701,7 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is True
+        assert setup_kwargs["media_family"] == "omni"
         assert setup_kwargs["generation_prefix_cuts_enabled"] is True
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
@@ -2409,6 +2560,33 @@ class TestSetup:
         ):
             yield
 
+    def test_gym_vllm_starts_communicator_before_gym_finishes(self, patched_factories):
+        """The refit communicator needs only the trainer and generation, so it starts
+        when both return, not after Gym: Gym's build waits here for the communicator,
+        which a start after Gym could never satisfy."""
+        mc = self._gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        communicator_started = threading.Event()
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = communicator_started.set
+
+        def _build_gym(*args: Any, **kwargs: Any) -> Any:
+            assert communicator_started.wait(timeout=30), (
+                "the communicator did not start while Gym was still building"
+            )
+            return MagicMock(name="nemo_gym_shards")
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "build_nemo_gym_actors", side_effect=_build_gym),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+
     def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
         """The dataset load waits for the trainer build to start; in the old order
         (load first, then build) it would time out."""
@@ -2665,7 +2843,7 @@ class TestSetup:
         assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             mc.env,
-            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
+            base_urls=patched_factories["fake_gen"].client_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
@@ -2681,6 +2859,7 @@ class TestSetup:
         mock_validate.assert_called_once_with(
             fake_gym_shards,
             {"training": list(range(8)), "validation": None},
+            agent_names={"training": set(), "validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
@@ -2773,9 +2952,287 @@ class TestSetup:
                 "training": patched_factories["setup_response_data"].return_value[0],
                 "validation": None,
             },
+            # The taskset rows need the running stack's routes, so the scan
+            # leaves that split to the check.
+            agent_names={"validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
+
+    @staticmethod
+    def _setup_tail_config(patched_factories: dict[str, Any]) -> MasterConfig:
+        """NeMo-Gym + vLLM with token capture and advantage workers: all three tail lanes run."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            penalize_malformed_think_tag=False,
+            token_ids={"unwanted": [99], "think_open": 12, "think_close": 13},
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        mc.async_rl.num_advantage_workers = 1
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        return mc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _setup_tail_patches(
+        create_finalizers: Callable[..., Any],
+        create_advantage: Callable[..., Any],
+        start_early: bool,
+    ):
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod, "_start_communicator_early", return_value=start_early
+            ),
+            # The partial test config does not build a real stage config; the lane only needs one.
+            patch.object(sc_setup_mod, "AdvantageStageConfig"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                side_effect=create_finalizers,
+            ),
+            patch(
+                "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                side_effect=create_advantage,
+            ),
+        ):
+            yield
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_starts_communicator_and_actor_pools_together(
+        self, patched_factories, start_early: bool
+    ):
+        """The refit communicator and both actor pools share no state, so they run
+        together: each waits here for the other two, which a serial order or a
+        thread pool too small for all three could never satisfy. Covers the
+        communicator started with the builds and the one started in the tail."""
+        mc = self._setup_tail_config(patched_factories)
+        together = threading.Barrier(3, timeout=10)
+        arrived: list[str] = []
+        fake_finalizers = [MagicMock(name="finalizer")]
+        fake_advantage = [MagicMock(name="advantage")]
+
+        def _meet(lane: str) -> None:
+            arrived.append(lane)
+            together.wait()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("finalizers")
+            return fake_finalizers
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("advantage")
+            return fake_advantage
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: _meet("communicator")
+
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
+            try:
+                actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+            except threading.BrokenBarrierError:
+                pytest.fail(f"tail lanes did not run together; arrived: {arrived}")
+
+        weight_sync.init_communicator.assert_called_once_with()
+        assert actor_args.weight_synchronizer is weight_sync
+        assert actor_args.finalizer_actors == fake_finalizers
+        assert actor_args.advantage_actors == fake_advantage
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_communicator_failure_after_joining_the_pools(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pools_done: list[str] = []
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("finalizers")
+            return [MagicMock()]
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("advantage")
+            return [MagicMock()]
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = RuntimeError("rendezvous boom")
+
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
+            with pytest.raises(RuntimeError, match="rendezvous boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert sorted(pools_done) == ["advantage", "finalizers"]
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_pool_failure_after_joining_the_communicator(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pool_failed = threading.Event()
+        communicator_done = threading.Event()
+
+        def _init_communicator() -> None:
+            # Still running when the pool fails; setup must wait for it before raising.
+            assert pool_failed.wait(timeout=10), "the pool lane never ran"
+            communicator_done.set()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pool_failed.set()
+            raise RuntimeError("pool boom")
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = _init_communicator
+
+        with self._setup_tail_patches(
+            _create_finalizers, lambda *a, **k: [MagicMock()], start_early
+        ):
+            with pytest.raises(RuntimeError, match="pool boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert communicator_done.is_set()
+
+    @pytest.mark.parametrize(
+        ("backend", "colocated", "has_teachers", "expected"),
+        [
+            ("vllm", False, False, True),
+            ("vllm", True, False, False),
+            ("vllm", False, True, False),
+            ("sglang", False, False, False),
+            ("megatron", False, False, False),
+        ],
+    )
+    def test_start_communicator_early_only_for_non_colocated_vllm_without_teachers(
+        self, backend: str, colocated: bool, has_teachers: bool, expected: bool
+    ):
+        assert (
+            sc_setup_mod._start_communicator_early(
+                backend, colocated=colocated, has_teachers=has_teachers
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize("with_teachers", [False, True])
+    def test_teachers_move_the_communicator_from_the_builds_to_the_tail(
+        self, patched_factories, capsys, with_teachers: bool
+    ):
+        """The real predicate decides where the rendezvous runs: OPD teachers keep it
+        out of the builds, whose teacher LM-head collectives it must not interleave
+        with. Started early, it runs on a daemon thread and is reported apart from
+        the tail lanes it does not belong to."""
+        mc = self._setup_tail_config(patched_factories)
+        teacher_patches: list[Any] = []
+        if with_teachers:
+            mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+            mc.on_policy_distillation = OnPolicyDistillationConfig(
+                enabled=True,
+                teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+                default_teacher_alias="teacher",
+                non_colocated_teachers={"enabled": True},
+            )
+            teacher_patches = [
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "reserve_teacher_clusters",
+                    return_value={"teacher": MagicMock()},
+                ),
+                patch.object(
+                    sc_setup_mod.opd_module,
+                    "create_teacher_worker_groups",
+                    return_value=({"teacher": MagicMock()}, {"teacher": "teacher"}),
+                ),
+            ]
+        communicator_threads: list[threading.Thread] = []
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: communicator_threads.append(
+            threading.current_thread()
+        )
+
+        with contextlib.ExitStack() as stack:
+            for teacher_patch in teacher_patches:
+                stack.enter_context(teacher_patch)
+            stack.enter_context(
+                patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+                )
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "validate_dataset_agent_coverage")
+            )
+            stack.enter_context(
+                patch.object(sc_setup_mod, "router_replay_enabled", return_value=False)
+            )
+            stack.enter_context(patch.object(sc_setup_mod, "AdvantageStageConfig"))
+            stack.enter_context(
+                patch(
+                    "nemo_rl.experience.rollout_reassembler_actor."
+                    "create_rollout_reassembler_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
+                    return_value=[MagicMock()],
+                )
+            )
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        (thread,) = communicator_threads
+        tail_line = next(
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "Setup tail:" in line
+        )
+        if with_teachers:
+            assert thread.name.startswith("setup-tail")
+            assert "refit communicator" in tail_line
+        else:
+            assert thread.name == "refit-communicator"
+            assert thread.daemon
+            assert "refit communicator" not in tail_line
+
+    def test_start_on_daemon_thread_returns_the_result_or_the_error(self):
+        threads: list[threading.Thread] = []
+
+        def _record() -> int:
+            threads.append(threading.current_thread())
+            return 7
+
+        assert (
+            sc_setup_mod._start_on_daemon_thread(_record, name="lane").result(10) == 7
+        )
+        assert threads[0].daemon and threads[0].name == "lane"
+
+        def _fail() -> None:
+            raise RuntimeError("lane boom")
+
+        future = sc_setup_mod._start_on_daemon_thread(_fail, name="lane")
+        with pytest.raises(RuntimeError, match="lane boom"):
+            future.result(10)
 
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
@@ -2833,6 +3290,9 @@ class TestSetup:
                 default_teacher_alias="teacher",
                 non_colocated_teachers={"enabled": True},
             )
+        mc.rollout_recovery.prefix_write_max_rows = 17
+        mc.rollout_recovery.prefix_write_max_tokens = 4096
+        mc.rollout_recovery.prefix_read_max_rows = 5
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2901,11 +3361,83 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+        assert setup_kwargs["media_family"] == ("omni" if with_processor else None)
         # Workers bound a generation cut by Gym's control timeout, counted
         # from when the cut request reaches them.
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
             mc.token_capture.control_timeout_s
         )
+        assert setup_kwargs["prefix_write_max_rows"] == 17
+        assert setup_kwargs["prefix_write_max_tokens"] == 4096
+        assert setup_kwargs["prefix_read_max_rows"] == 5
+
+    @pytest.mark.parametrize("with_overrides", [False, True])
+    def test_finalizers_stamp_agent_names_only_with_agent_overrides(
+        self, patched_factories, with_overrides: bool
+    ):
+        """grpo.agent_overrides turns on the finalizers' per-row agent tag."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
+        if with_overrides:
+            mc.grpo.agent_overrides = {
+                "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+            }
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            _patched_gym_token_capture([MagicMock(name="finalizer")]) as (
+                _,
+                mock_create_finalizer_actors,
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (_, actor_config), _ = mock_create_finalizer_actors.call_args
+        assert actor_config.stamp_agent_names is with_overrides
+
+    def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
+        """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "dynamo": True,
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock()],
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert mc.token_capture.generation_backend == "dynamo"
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
@@ -3499,21 +4031,21 @@ def test_forest_row_multiple_depends_on_packing(packing: bool, logprobs: bool) -
         train_micro_batch_size=4,
         logprob_batch_size=6,
     )
-    assert forest_execution_row_multiple(
+    assert _forest_consumer_row_multiple(
         mc.policy, dp_size=2, logprobs_required=logprobs
     ) == (2 if packing else (24 if logprobs else 8))
     for invalid_dp in (0, -1, True):
         with pytest.raises(ValueError, match="positive"):
-            forest_execution_row_multiple(
+            _forest_consumer_row_multiple(
                 mc.policy, dp_size=invalid_dp, logprobs_required=logprobs
             )
     mc.policy["dynamic_batching"]["enabled"] = True
     with pytest.raises(ValueError, match="non-interleaved Megatron"):
-        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+        _forest_consumer_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
     mc.policy["dynamic_batching"]["enabled"] = False
     mc.policy["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = 2
     with pytest.raises(ValueError, match="non-interleaved Megatron"):
-        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+        _forest_consumer_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
 
 
 def test_grpo_setup_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp(
@@ -3612,6 +4144,81 @@ def test_forest_router_is_validated_before_rollout_manager(
         trainer.worker_group.run_all_workers_single_data.assert_not_called()
 
 
+def test_forest_groups_pad_to_the_row_multiple(patched_factories) -> None:
+    mc = _make_master_config(megatron_enabled=True)
+    mc.policy.update(
+        sequence_packing={"enabled": True},
+        dynamic_batching={"enabled": False},
+        train_micro_batch_size=1,
+        logprob_batch_size=1,
+    )
+    mc.policy["generation"].update(
+        model_name="test-model",
+        stop_strings=None,
+        stop_token_ids=None,
+        top_k=None,
+        vllm_cfg={"async_engine": True},
+    )
+    mc.token_capture = TokenCaptureConfig(enabled=True, forest_training=True)
+    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    # Packed consumers pad to their data-parallel size.
+    trainer.sharding_annotations.get_axis_size.return_value = 4
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[],
+        ),
+        patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert rollout_manager.call_args.kwargs["execution_row_multiple"] == 4
+
+
+def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
+    patched_factories,
+) -> None:
+    mc = _forest_ppo_config(_make_forest_master_config())
+    mc.token_capture = TokenCaptureConfig(enabled=True, forest_training=True)
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    trainer.sharding_annotations.get_axis_size.return_value = 1
+    value = MagicMock(name="value")
+    value.cfg = mc.value
+    # Critic DP 3 makes the Forest multiple differ from the policy's (1).
+    value.sharding_annotations.get_axis_size.return_value = 3
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    trainer_check = trainer.worker_group.run_all_workers_single_data.return_value
+    value_check = value.worker_group.run_all_workers_single_data.return_value
+    events: list[Any] = []
+
+    def rollout_manager(**kwargs):
+        events.append(("rollout_manager", kwargs["execution_row_multiple"]))
+
+    with (
+        patch.object(sc_setup_mod, "_build_value", return_value=(value, 0.0)),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", side_effect=events.append),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[],
+        ),
+        patch.object(sc_setup_mod, "RolloutManager", side_effect=rollout_manager),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert events == [trainer_check, value_check, ("rollout_manager", 3)]
+    for consumer in (trainer, value):
+        consumer.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "validate_forest_execution_padding"
+        )
+
+
 class TestAdaptiveLossRestore:
     def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
         checkpoint_path = tmp_path / "step_3"
@@ -3640,6 +4247,332 @@ class TestAdaptiveLossRestore:
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
+def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+    # One epoch of the patched 4-batch dataloader; more steps get clamped by the
+    # dataset, which rebuilds the trainer.
+    kwargs.setdefault("max_num_steps", 4)
+    mc = TestSetup._gym_vllm_config(**kwargs)
+    mc.policy["model_name"] = "test-model"
+    return mc
+
+
+class TestStartupOverlap:
+    """Startup work that setup overlaps with the generation and trainer builds."""
+
+    def test_early_submit_starts_the_trainer_before_the_vllm_reserve(
+        self, patched_factories
+    ):
+        mc = _gym_vllm_config()
+        mc.cluster.segment_size = 1
+        mc.async_rl.early_trainer_build = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        trainer_started = threading.Event()
+        trainer_started_before_reserve: list[bool] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            trainer_started.set()
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Blocks the reserve until the trainer starts; times out if it starts later.
+            trainer_started_before_reserve.append(trainer_started.wait(timeout=5))
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_reserve == [True]
+        patched_factories["_build_trainer"].assert_called_once()
+        train_cluster = patched_factories["_build_clusters"].return_value[0]
+        train_cluster.get_placement_groups.assert_called()
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert mc.policy["generation"]["model_name"] == "test-model"
+
+    @staticmethod
+    def _build_order(mc: MasterConfig, patched_factories) -> list[str]:
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        order: list[str] = []
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            order.append("trainer")
+            return patched_factories["fake_policy"], 0.0
+
+        def build_generation(*args: Any, **kwargs: Any):
+            order.append("reserve")
+            return patched_factories["fake_gen"], 0.0
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+        patched_factories["_build_generation"].side_effect = build_generation
+
+        with TestSetup._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        return order
+
+    def test_no_early_submit_by_default(self, patched_factories):
+        mc = _gym_vllm_config()
+        mc.cluster.segment_size = 1
+
+        assert self._build_order(mc, patched_factories) == ["reserve", "trainer"]
+
+    def test_no_early_submit_without_a_segment_size(self, patched_factories):
+        mc = _gym_vllm_config()
+        mc.async_rl.early_trainer_build = True
+
+        assert self._build_order(mc, patched_factories) == ["reserve", "trainer"]
+
+    def test_early_trainer_is_rebuilt_when_the_dataset_clamps_the_steps(
+        self, patched_factories
+    ):
+        mc = _gym_vllm_config(
+            megatron_enabled=True, max_num_steps=100, max_num_epochs=1
+        )
+        mc.cluster.segment_size = 1
+        mc.async_rl.early_trainer_build = True
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with TestSetup._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert patched_factories["_build_trainer"].call_count == 2
+        patched_factories["fake_policy"].shutdown.assert_called_once_with()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 4
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+
+    def test_route_scan_hands_its_names_to_the_check(self, patched_factories):
+        mc = _gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        names = {"training": {"alpha"}, "validation": set()}
+
+        with (
+            TestSetup._gym_patches(fake_gym_shards),
+            patch.object(
+                sc_setup_mod, "collect_dataset_agent_names", return_value=names
+            ) as mock_collect,
+            patch.object(
+                sc_setup_mod, "validate_dataset_agent_coverage"
+            ) as mock_validate,
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        datasets = {"training": list(range(8)), "validation": None}
+        mock_collect.assert_called_once_with(datasets)
+        mock_validate.assert_called_once_with(
+            fake_gym_shards, datasets, agent_names=names
+        )
+
+    def test_vllm_generation_config_writes_are_idempotent(self):
+        # The early submit applies them before the reserve applies them again.
+        mc = _make_master_config(backend="vllm")
+        mc.policy["model_name"] = "test-model"
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+
+        sc_setup_mod._apply_vllm_generation_config(mc)
+        keys_after_first = set(mc.policy["generation"])
+        sc_setup_mod._apply_vllm_generation_config(mc)
+
+        assert set(mc.policy["generation"]) == keys_after_first
+        assert mc.policy["generation"]["model_name"] == "test-model"
+        assert mc.policy["generation"]["vllm_kwargs"] == {
+            "hf_overrides": {"rope_theta": 1.0}
+        }
+
+    @staticmethod
+    def _warmup_config() -> MasterConfig:
+        mc = _make_master_config(megatron_enabled=True)
+        mc.async_rl.trainer_warmup = TrainerWarmupConfig(enabled=True)
+        # Read by AdvantageStageConfig, which the warm-up's step fields come from.
+        mc.policy["generation"]["top_k"] = None
+        mc.policy["generation"]["top_p"] = 1.0
+        return mc
+
+    def test_trainer_warmup_starts_once_the_trainer_is_built(
+        self, patched_factories, capsys
+    ):
+        mc = self._warmup_config()
+        fake_policy = patched_factories["fake_policy"]
+        warmup_started = threading.Event()
+        order: list[str] = []
+
+        def start_warmup(*args: Any, **kwargs: Any) -> list[str]:
+            warmup_started.set()
+            return ["warmup_ref"]
+
+        def build_generation(*args: Any, **kwargs: Any):
+            # Generation stays down until the warm-up starts; times out without it.
+            order.append(f"generation waited: {warmup_started.wait(timeout=5)}")
+            return patched_factories["fake_gen"], 0.0
+
+        real_get = sc_setup_mod.ray.get
+
+        def get(refs: Any, *args: Any, **kwargs: Any) -> Any:
+            if refs == ["warmup_ref"]:
+                order.append("warmup waited")
+                return [{"total_s": 1.0}]
+            return real_get(refs, *args, **kwargs)
+
+        fake_policy.start_warmup_first_pass.side_effect = start_warmup
+        patched_factories["_build_generation"].side_effect = build_generation
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: order.append(
+            "init_communicator"
+        )
+
+        with patch.object(sc_setup_mod.ray, "get", side_effect=get):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert order == [
+            "generation waited: True",
+            "warmup waited",
+            "init_communicator",
+        ]
+        fake_policy.start_warmup_first_pass.assert_called_once_with(
+            patched_factories["ClippedPGLossFn"].return_value,
+            train_fields=ANY,
+            run_logprobs=True,
+            seqlens=None,
+        )
+        assert actor_args.trainer_warmup_kwargs is None
+        assert "Trainer warm-up (rank 0)" in capsys.readouterr().out
+
+    def test_generation_up_first_leaves_the_warmup_to_the_controller(
+        self, patched_factories
+    ):
+        mc = self._warmup_config()
+        trainer_released = threading.Event()
+        real_wait = sc_setup_mod.wait
+
+        def build_trainer(*args: Any, **kwargs: Any):
+            # Held until setup has seen generation finish first.
+            assert trainer_released.wait(timeout=5)
+            return patched_factories["fake_policy"], 0.0
+
+        def wait_then_release(*args: Any, **kwargs: Any):
+            done = real_wait(*args, **kwargs)
+            trainer_released.set()
+            return done
+
+        patched_factories["_build_trainer"].side_effect = build_trainer
+
+        with patch.object(sc_setup_mod, "wait", side_effect=wait_then_release):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["fake_policy"].start_warmup_first_pass.assert_not_called()
+        stage_cfg = AdvantageStageConfig.from_master_config(mc)
+        assert actor_args.trainer_warmup_kwargs == {
+            "train_fields": stage_cfg.train_fields(mc),
+            "run_logprobs": True,
+            "seqlens": None,
+        }
+
+
+class TestTrainerWarmupKwargs:
+    """Setup decides once whether the trainer warm-up runs, and prints why not."""
+
+    @staticmethod
+    def _master_config(
+        *,
+        enabled: bool = True,
+        megatron: bool = True,
+        colocated: bool = False,
+        score_centering: bool = False,
+        sampler_replay: bool = False,
+    ) -> Any:
+        return SimpleNamespace(
+            policy={
+                "megatron_cfg": {"enabled": megatron},
+                "generation": {
+                    "colocated": {"enabled": colocated},
+                    "sampler_replay": {"enabled": sampler_replay},
+                },
+            },
+            loss_fn=SimpleNamespace(score_centering=score_centering),
+            async_rl=SimpleNamespace(
+                trainer_warmup=TrainerWarmupConfig(enabled=enabled, seqlens=[64])
+            ),
+        )
+
+    @staticmethod
+    def _use_stage(monkeypatch, **overrides: Any) -> None:
+        stage_cfg = SimpleNamespace(
+            **{
+                "is_ppo": False,
+                "teacher_logprobs_required": False,
+                "policy_logprobs_required": True,
+                "algo": SimpleNamespace(max_num_steps=10),
+                "train_fields": lambda master_config: ("input_ids", "sample_mask"),
+                **overrides,
+            }
+        )
+        monkeypatch.setattr(
+            sc_setup_mod.AdvantageStageConfig,
+            "from_master_config",
+            lambda master_config: stage_cfg,
+        )
+
+    def test_off_returns_none_quietly(self, capsys):
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(enabled=False), current_step=0
+        )
+
+        assert kwargs is None
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("config", "stage", "current_step", "reason"),
+        [
+            ({"megatron": False}, {}, 0, "the trainer is not Megatron"),
+            ({"colocated": True}, {}, 0, "generation shares the trainer's GPUs"),
+            ({}, {"is_ppo": True}, 0, "PPO steps are not covered"),
+            (
+                {},
+                {"teacher_logprobs_required": True},
+                0,
+                "on-policy distillation is not covered",
+            ),
+            ({"score_centering": True}, {}, 0, "score centering is not covered"),
+            ({"sampler_replay": True}, {}, 0, "sampler replay is not covered"),
+            ({}, {}, 10, "no train step is left"),
+        ],
+        ids=[
+            "not-megatron",
+            "colocated",
+            "ppo",
+            "opd",
+            "score-centering",
+            "sampler-replay",
+            "no-step-left",
+        ],
+    )
+    def test_skipped_where_it_does_not_apply(
+        self, monkeypatch, capsys, config, stage, current_step, reason
+    ):
+        self._use_stage(monkeypatch, **stage)
+
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(**config), current_step=current_step
+        )
+
+        assert kwargs is None
+        assert f"Trainer warm-up skipped: {reason}." in capsys.readouterr().out
+
+    def test_applies_with_the_step_fields_and_seqlens(self, monkeypatch):
+        self._use_stage(monkeypatch)
+
+        kwargs = sc_setup_mod._trainer_warmup_kwargs(
+            self._master_config(), current_step=0
+        )
+
+        assert kwargs == {
+            "train_fields": ("input_ids", "sample_mask"),
+            "run_logprobs": True,
+            "seqlens": [64],
+        }
 
 
 class TestNativeTQRecoverySetup:
@@ -3827,6 +4760,7 @@ class TestNativeTQRecoverySetup:
             save_state=save_state,
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3848,6 +4782,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3865,6 +4800,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
@@ -3897,6 +4833,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_checkpoint_without_replay_artifacts_does_not_load_tq(
@@ -3912,6 +4849,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored is None
@@ -3934,6 +4872,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_rejects_tq_checkpoint_from_different_training_step(self, tmp_path):
@@ -3950,6 +4889,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     @pytest.mark.parametrize(
@@ -3986,6 +4926,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
                 opd_full_teacher_checkpoints=current,
             )
 
@@ -4004,7 +4945,71 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
             opd_full_teacher_checkpoints=["ckpt-a", "ckpt-b"],
+        )
+
+        assert restored == metadata
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("global_token_mean", "sequence_mean"),
+            ("sequence_mean", "global_token_mean"),
+            # Written before the field existed, so it can only have been one
+            # of the two original modes.
+            (None, "group_token_mean"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_written_under_another_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        with pytest.raises(ValueError, match="new checkpoint_dir"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=policy.load_data_plane_checkpoint,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+                loss_normalization=current,
+            )
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("sequence_mean", "sequence_mean"),
+            (None, "global_token_mean"),
+            (None, "sequence_mean"),
+        ],
+    )
+    def test_accepts_tq_checkpoint_with_a_compatible_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=policy.load_data_plane_checkpoint,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            loss_normalization=current,
         )
 
         assert restored == metadata
@@ -4363,7 +5368,13 @@ def forest_config():
     ],
 )
 def test_forest_startup_rejects_unsupported_setting(forest_config, path, value, reason):
-    obj = forest_config
+    _set_config_path(forest_config, path, value)
+    with pytest.raises(ValueError, match=reason):
+        validate_single_controller_config(forest_config)
+
+
+def _set_config_path(mc: MasterConfig, path: str, value: Any) -> None:
+    obj = mc
     *parents, key = path.split(".")
     for name in parents:
         obj = obj[name] if isinstance(obj, dict) else getattr(obj, name)
@@ -4371,8 +5382,6 @@ def test_forest_startup_rejects_unsupported_setting(forest_config, path, value, 
         obj[key] = value
     else:
         setattr(obj, key, value)
-    with pytest.raises(ValueError, match=reason):
-        validate_single_controller_config(forest_config)
 
 
 @pytest.mark.parametrize("field", ["train_micro_batch_size", "logprob_batch_size"])
@@ -4382,7 +5391,7 @@ def test_forest_row_multiple_rejects_invalid_microbatch_sizes(
 ):
     forest_config.policy[field] = value
     with pytest.raises(ValueError, match="positive integers"):
-        forest_execution_row_multiple(
+        _forest_consumer_row_multiple(
             forest_config.policy, dp_size=2, logprobs_required=True
         )
 
@@ -4423,6 +5432,111 @@ def test_setup_and_advantage_share_logprob_requirements(
 def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
     forest_config.async_rl.rollout_failure.min_step_batch_fraction = fraction
     validate_single_controller_config(forest_config)
+
+
+def _forest_ppo_config(mc, **adv_estimator):
+    # Only fields PPOConfig declares, so GRPO-only fields cannot mask a bug.
+    fields = {k: v for k, v in dict(mc.grpo).items() if k in PPOConfig.model_fields}
+    mc.ppo = PPOConfig.model_construct(
+        **(fields | {"adv_estimator": GAEConfig(**adv_estimator)})
+    )
+    mc.grpo = None
+    mc.value = copy.deepcopy(mc.policy)
+    mc.value_loss_fn = MseValueLossConfig()
+    return mc
+
+
+def test_forest_startup_accepts_ppo_with_gae(forest_config):
+    validate_single_controller_config(_forest_ppo_config(forest_config))
+
+
+def test_forest_startup_rejects_split_value_training(forest_config):
+    mc = _forest_ppo_config(forest_config)
+    mc.ppo.value_training_mode = "split"
+    with pytest.raises(ValueError, match="value_training_mode=whole_batch"):
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "field", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
+)
+def test_forest_startup_accepts_ppo_drop_budget(forest_config, field):
+    # The Forest critic trains on the step's actual rows, so a short step fits.
+    mc = _forest_ppo_config(forest_config)
+    setattr(mc.async_rl.rollout_failure, field, 1)
+    validate_single_controller_config(mc)
+
+
+def test_forest_startup_rejects_unsupported_critic_shape(forest_config):
+    mc = _forest_ppo_config(forest_config)
+    mc.value["dynamic_batching"] = {"enabled": True}
+    with pytest.raises(ValueError, match="non-interleaved Megatron"):
+        validate_single_controller_config(mc)
+
+
+def test_forest_startup_rejects_ppo_without_gae(forest_config):
+    with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
+        validate_single_controller_config(
+            _forest_ppo_config(forest_config, name="raw_reward")
+        )
+
+
+@pytest.mark.parametrize(
+    "path,value,reason",
+    [
+        ("ppo.invalid_tool_call_advantage", 0.0, "message-level advantage"),
+        ("ppo.malformed_thinking_advantage", 0.0, "message-level advantage"),
+        ("loss_fn.use_kl_in_reward", True, "loss_fn.use_kl_in_reward"),
+        # The PPO path needs a Megatron critic before Forest checks its shape.
+        ("value.megatron_cfg.enabled", False, "requires a Megatron critic"),
+        (
+            "value.megatron_cfg.virtual_pipeline_model_parallel_size",
+            2,
+            "non-interleaved Megatron",
+        ),
+        ("value.train_micro_batch_size", 0, "positive integers"),
+        # A set value logprob_batch_size joins the critic's row multiple.
+        ("value.logprob_batch_size", 0, "positive integers"),
+    ],
+)
+def test_forest_ppo_startup_rejects_unsupported_setting(
+    forest_config, path, value, reason
+):
+    mc = _forest_ppo_config(forest_config)
+    _set_config_path(mc, path, value)
+    with pytest.raises(ValueError, match=reason):
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("value_packing", [False, True])
+def test_forest_row_multiple_includes_the_critic(forest_config, value_packing):
+    policy_only = forest_execution_row_multiple(
+        forest_config, forest_config.grpo, policy_dp=2
+    )
+    assert policy_only == _forest_consumer_row_multiple(
+        forest_config.policy,
+        dp_size=2,
+        logprobs_required=any(
+            logprob_passes_required(forest_config, forest_config.grpo)
+        ),
+    )
+    mc = _forest_ppo_config(forest_config)
+    mc.value = {
+        "megatron_cfg": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": value_packing},
+        "train_micro_batch_size": 5,
+    }
+    with pytest.raises(ValueError, match="critic DP size"):
+        forest_execution_row_multiple(mc, mc.ppo, policy_dp=2)
+    # Packed critics need whole DP shards; fixed ones DP x lcm(train, value MBS).
+    assert forest_execution_row_multiple(
+        mc, mc.ppo, policy_dp=2, value_dp=3
+    ) == math.lcm(policy_only, 3 if value_packing else 15)
+    mc.value["logprob_batch_size"] = 7
+    assert forest_execution_row_multiple(
+        mc, mc.ppo, policy_dp=2, value_dp=3
+    ) == math.lcm(policy_only, 3 if value_packing else 105)
 
 
 def test_forest_startup_rejects_mismatched_configured_batch_size(forest_config):
@@ -4467,9 +5581,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 ):
     """Capture rows carry their own media, so dedup has nothing to share: a GRPO
     run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
-    must not read it. The guard is the last check in the token-capture block,
-    so reaching the OPD lookup that follows it proves the guard let the PPO
-    config through.
+    must not read it. Reaching seed initialization after the token-capture
+    block proves that the PPO config passed the guard.
     """
 
     class _PassedTokenCaptureBlock(Exception):
@@ -4488,10 +5601,10 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
-            sc_setup_mod.opd_module,
-            "get_opd_full_config",
+            sc_setup_mod,
+            "set_seed",
             side_effect=_PassedTokenCaptureBlock,
         ) as mock_gate,
         expectation,
@@ -4508,6 +5621,33 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         mock_gate.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("processor_name", "message"),
+    [
+        ("Qwen2VLProcessor", "got Qwen2VLProcessor"),
+        ("PixtralProcessor", "no learner yet"),
+    ],
+    ids=["unknown-processor", "pixtral"],
+)
+def test_token_capture_media_family_is_picked_by_the_driver(
+    patched_factories, processor_name, message
+):
+    """The driver picks the media family from the processor class. A processor
+    without one is rejected by name, and Pixtral until a learner reads its
+    captured layout; both before any data or cluster setup."""
+    mc = _make_gym_megatron_capture_config()
+    processor = type(processor_name, (MagicMock,), {})()
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        pytest.raises(ValueError, match=message),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
+
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 @pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
 def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     patched_factories, multimodal
@@ -4522,7 +5662,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "media_capture_family", return_value="omni"),
         patch.object(
             sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
         ) as mock_spinup,
@@ -4566,6 +5706,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     setup_args, setup_kwargs = actor_args.gen_handle.setup_token_capture.call_args
     assert setup_args[1] == mc.token_capture.staging_partition
     assert setup_kwargs["capture_media"] is multimodal
+    assert setup_kwargs["media_family"] == ("omni" if multimodal else None)
     assert setup_kwargs["top_logprobs"] == 0
     # What the workers pinned the media column to is what the finalizers get.
     assert (
@@ -4734,3 +5875,16 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_partition_warmup_registers_reducer_columns(patched_factories, normalization):
+    mc = _make_master_config(
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(normalization=normalization),
+    )
+    actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+    assert (GROUP_TOKEN_MEAN_WEIGHT in warmup_fields) is (
+        normalization == "group_token_mean"
+    )

@@ -459,6 +459,7 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
             self.train_called = True
 
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     model = _TrainableModel()
     worker.model = model
     worker.optimizer = object()
@@ -517,6 +518,7 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
 
     worker = SimpleNamespace(
         _train_step_state=None,
+        _keep_resident=False,
         model=model,
         optimizer=object(),
         optimizer_cpu_offload=optimizer_cpu_offload,
@@ -535,6 +537,34 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
     assert events == ["eval", "model_cpu"] + (
         [] if optimizer_cpu_offload else ["optimizer_cpu"]
     )
+
+
+def test_resident_value_lifecycle_never_moves_model_or_optimizer():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    model = MagicMock()
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        _keep_resident=True,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        move_model=MagicMock(side_effect=AssertionError("model moved")),
+        move_optimizer=MagicMock(side_effect=AssertionError("optimizer moved")),
+    )
+
+    MegatronValueWorkerImpl.prepare_for_training(worker)
+    MegatronValueWorkerImpl.prepare_for_inference(worker)
+    MegatronValueWorkerImpl.finish_inference(worker)
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert model.train.call_count == 1
+    assert model.eval.call_count == 2
+    worker.move_model.assert_not_called()
+    worker.move_optimizer.assert_not_called()
 
 
 def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
@@ -610,6 +640,77 @@ def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
     assert "media_token_validity_mask" not in data
 
 
+def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    module = "nemo_rl.models.value.workers.megatron_value_worker"
+    increments = []
+    for gbs in (4, 8):
+        worker = SimpleNamespace(
+            _train_step_state=None,
+            media_placeholder_token_id=None,
+            model=MagicMock(spec=["zero_grad_buffer", "train"]),
+            optimizer=MagicMock(**{"step.return_value": (True, 0.0, 0)}),
+            scheduler=MagicMock(),
+            cfg={
+                "train_global_batch_size": 2,
+                "train_micro_batch_size": 1,
+                "megatron_cfg": {"empty_unused_memory_level": 0},
+            },
+            dp_size=1,
+            _policy_like_cfg={},
+            mcore_state=SimpleNamespace(straggler_timer=None),
+            model_slices_context_parallel_inputs=None,
+            defer_fp32_logits=False,
+            _maybe_run_manual_gc=MagicMock(),
+        )
+        data = BatchedDataDict(
+            {"input_ids": torch.ones((gbs, 2), dtype=torch.long, device="cuda")}
+        )
+        rerun = SimpleNamespace(
+            should_run_forward_backward=MagicMock(side_effect=[True, False])
+        )
+        with (
+            patch(f"{module}.parallel_state"),
+            patch(
+                f"{module}.process_global_batch",
+                return_value={
+                    "batch": data,
+                    "global_valid_seqs": torch.tensor(1.0),
+                    "global_valid_toks": torch.tensor(1.0),
+                },
+            ),
+            patch(
+                f"{module}.get_microbatch_iterator",
+                return_value=(iter(()), 1, 1, None, 2),
+            ),
+            patch(f"{module}.get_rerun_state_machine", return_value=rerun),
+            patch(f"{module}.LossPostProcessor"),
+            patch(f"{module}.megatron_forward_backward", return_value=[]),
+            patch(f"{module}.get_pg_collection"),
+            patch(f"{module}.logical_and_across_model_parallel_group"),
+            patch(
+                f"{module}.reduce_max_stat_across_model_parallel_group",
+                return_value=0.0,
+            ),
+            patch(f"{module}.is_pipeline_last_stage", return_value=True),
+            patch(f"{module}.get_pipeline_model_parallel_last_rank"),
+            patch(f"{module}.get_pipeline_model_parallel_group"),
+            patch("torch.distributed.all_reduce"),
+            patch("torch.distributed.broadcast_object_list"),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.cuda.nvtx.range_push"),
+            patch("torch.cuda.nvtx.range_pop"),
+        ):
+            MegatronValueWorkerImpl.train(worker, data, loss_fn=object(), gbs=gbs)
+        worker.optimizer.step.assert_called_once_with()
+        increments.append(worker.scheduler.step.call_args.kwargs["increment"])
+
+    assert increments == [2, 2]
+
+
 def test_finish_training_preserves_model_move_contract(monkeypatch):
     """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
@@ -623,6 +724,7 @@ def test_finish_training_preserves_model_move_contract(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     worker._train_step_state = None
     worker.model = _EvalModel()
     worker.optimizer = None
@@ -652,11 +754,12 @@ def test_finish_training_clears_transient_caches_when_configured(
     events: list[str] = []
     model = SimpleNamespace(eval=lambda: events.append("eval"))
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     worker.model = model
     worker.optimizer = None
     worker._train_step_state = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
-    worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
+    worker.move_model = lambda m, device, **kwargs: events.append("move_model") or m
     monkeypatch.setattr(
         megatron_value_worker,
         "clear_transient_megatron_caches",

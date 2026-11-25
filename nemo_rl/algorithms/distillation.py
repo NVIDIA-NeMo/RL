@@ -65,6 +65,9 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
     should_use_async_rollouts,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
@@ -264,6 +267,8 @@ def setup(
     )
     checkpoint_engine_config = None
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(
             policy_config, entry_point="distillation"
@@ -562,7 +567,7 @@ def setup(
             def init_nemo_gym():
                 shard_set = build_nemo_gym_actors(
                     env_configs,
-                    base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
+                    base_urls=cast(list[str], deferred_vllm.client_base_urls),
                     model_name=generation_config["model_name"],
                     tokenizer=tokenizer,
                     # Distillation does not configure vLLM for router replay.

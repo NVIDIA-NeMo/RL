@@ -58,7 +58,7 @@ def test_legacy_in_loss_filter_rejects_excluded_reward_statistics() -> None:
     "overrides, message",
     [
         ({"force_on_policy_ratio": False}, "force_on_policy_ratio"),
-        ({"token_level_loss": False}, "token_level_loss"),
+        ({"normalization": "sequence_mean"}, "normalization"),
         ({"positive_example_nll_weight": 0.1}, "NLL"),
     ],
 )
@@ -123,7 +123,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
     data, values = _batch()
     cfg = ClippedPGLossConfig(
         force_on_policy_ratio=True,
-        token_level_loss=True,
+        normalization="global_token_mean",
         reference_policy_kl_penalty=kl_penalty,
         use_importance_sampling_correction=True,
         truncated_importance_sampling_type="seq-mask-tis",
@@ -179,6 +179,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=6 / kept_toks,
             sequence_factor=3 / kept_seqs,
+            loss_divisor_factor=6 / kept_toks,
         )
         for m in metrics
     ]
@@ -205,7 +206,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
     data, values = _batch()
     cfg = ClippedPGLossConfig(
         force_on_policy_ratio=True,
-        token_level_loss=True,
+        normalization="global_token_mean",
         reference_policy_kl_penalty=kl_penalty,
         use_importance_sampling_correction=True,
         truncated_importance_sampling_type="seq-mask-tis",
@@ -253,6 +254,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=1 / kept_toks,
             sequence_factor=1 / kept_seqs,
+            loss_divisor_factor=1 / kept_toks,
         )
         for m in metrics
     ]
@@ -276,13 +278,20 @@ def test_rescale_loss_metrics_scales_listed_metrics():
         },
         token_factor=3.0,
         sequence_factor=5.0,
+        loss_divisor_factor=7.0,
     )
     assert rescaled == {"tok": 6.0, "seq": 10.0, "raw": 2.0}
 
 
 def test_rescale_loss_metrics_rejects_unlisted_metric():
     with pytest.raises(ValueError, match="'other' is missing"):
-        rescale_loss_metrics({"other": 2.0}, {}, token_factor=3.0, sequence_factor=5.0)
+        rescale_loss_metrics(
+            {"other": 2.0},
+            {},
+            token_factor=3.0,
+            sequence_factor=5.0,
+            loss_divisor_factor=3.0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -343,7 +352,7 @@ def test_rejected_nonfinite_logprobs_stay_contained_under_reference_kl(
         ClippedPGLossConfig(
             seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
-            token_level_loss=True,
+            normalization="global_token_mean",
             reference_policy_kl_penalty=0.1,
         ),
         seq_logprob_error_threshold=2.0,

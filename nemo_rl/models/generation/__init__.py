@@ -160,11 +160,12 @@ def configure_generation_config(
             "extend the training worker instead."
         )
 
-    if dynamo_enabled(config) and config["backend"] != "vllm":
+    if dynamo_enabled(config) and config["backend"] not in ("vllm", "megatron"):
         raise ValueError(
-            "policy.generation.dynamo=true serves NeMo RL's vLLM workers through "
-            f"Dynamo and does not apply to backend={config['backend']!r}. Set "
-            "policy.generation.backend=vllm, or remove policy.generation.dynamo."
+            "policy.generation.dynamo=true serves NeMo RL's vLLM workers or "
+            "Megatron prefill/decode engines through Dynamo and does not apply to "
+            f"backend={config['backend']!r}. Set policy.generation.backend=vllm or "
+            "policy.generation.backend=megatron, or remove policy.generation.dynamo."
         )
     if config.get("dynamo_cfg") is not None and not dynamo_enabled(config):
         raise ValueError(
@@ -222,6 +223,14 @@ def configure_generation_config(
                     "supported with policy.generation.dynamo=true: the Dynamo "
                     "frontend serves the same engines on 0.0.0.0 and checks no "
                     "bearer token."
+                )
+            if config["vllm_cfg"].get("http_api_server_count", 1) > 1:
+                raise ValueError(
+                    "policy.generation.vllm_cfg.http_api_server_count > 1 is not "
+                    "supported with policy.generation.dynamo=true: NeMo-Gym's calls "
+                    "go through the Dynamo frontend, so the extra vLLM HTTP "
+                    "frontends would serve none of them. Size "
+                    "dynamo_cfg.frontend_args.render_workers instead."
                 )
             colocated = config.get("colocated")
             if colocated is not None and colocated["enabled"]:

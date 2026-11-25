@@ -18,9 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.evals.eval import (
+    EvalConfig,
     _run_env_eval_impl,
     eval_cons_k,
     eval_pass_k,
@@ -256,12 +258,12 @@ def test_run_env_eval_impl_builds_vllm_multi_modal_prompts(
     )
     master_config = SimpleNamespace(
         generation={"backend": "vllm"},
-        eval={
-            "metric": "pass@k",
-            "num_tests_per_prompt": 1,
-            "k_value": 1,
-            "save_path": None,
-        },
+        eval=EvalConfig(
+            metric="pass@k",
+            num_tests_per_prompt=1,
+            k_value=1,
+            save_path=None,
+        ),
     )
 
     class _SingleBatchDataloader(list):
@@ -287,3 +289,11 @@ def test_run_env_eval_impl_builds_vllm_multi_modal_prompts(
         "multi_modal_data": {"image": image},
     }
     assert prompts[3] == str(truncated_content)
+
+
+def test_eval_config_rejects_fewer_tests_than_k():
+    with pytest.raises(
+        ValidationError,
+        match="num_tests_per_prompt must be greater than or equal to k_value",
+    ):
+        EvalConfig(num_tests_per_prompt=1, k_value=2)

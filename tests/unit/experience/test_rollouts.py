@@ -51,10 +51,12 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2474,6 +2476,79 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
     assert rollout_result.rollout_metrics[f"{attribution_key}/reward/mean"] == 0.2
 
 
+def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
+    rows = [
+        {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {"responses_create_params": {"input": []}},
+        }
+        for _ in range(4)
+    ]
+    results = []
+    for index, harness in enumerate(
+        ["opencode_agent", "opencode_agent", "pi_agent", "pi_agent"]
+    ):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": float(index), "_ng_harness": harness},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        group_size=2,
+        multi_harness=MultiHarnessRoutes(
+            candidates=(
+                (
+                    "swe",
+                    (
+                        ("hermes_agent", "swe_hermes", 1.0),
+                        ("opencode_agent", "swe_opencode", 1.0),
+                        ("pi_agent", "swe_pi", 1.0),
+                    ),
+                ),
+            )
+        ),
+    )
+
+    metrics = rollout_result.rollout_metrics
+    assert metrics["swe/opencode_agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(2.5)
+    assert "swe/reward/mean" not in metrics
+    # Groups per harness; a configured harness that ran none counts 0.
+    assert metrics["swe/opencode_agent/num_groups"] == 1
+    assert metrics["swe/pi_agent/num_groups"] == 1
+    assert metrics["swe/hermes_agent/num_groups"] == 0
+    # Taskset-keyed settings and attribution keep the taskset name.
+    assert rollout_result.final_batch["attribution_key"] == ["swe"] * 4
+
+
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
@@ -3144,7 +3219,7 @@ def test_nemo_gym_group_task_index_checks_each_prompt_group():
         rollouts_mod._nemo_gym_group_task_index(rows, group_size=4)
 
 
-def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
+def test_prepare_nemo_gym_rows_stamps_sampling_beside_mixed_materialized_and_flat_inputs():
     materialized_row = {
         "task_id": {"taskset": "workplace:train", "task_id": "17"},
         "task_input": {
@@ -3173,14 +3248,75 @@ def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
     }
     assert materialized_row["task_input"]["task_data"] == {"state": ["meeting-1"]}
     assert "responses_create_params" not in materialized_row
-    materialized_params = materialized_row["task_input"]["responses_create_params"]
-    assert materialized_params["metadata"] == {"extra_body": '{"seed": 8}'}
-    for params in (rows[0]["responses_create_params"], materialized_params):
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 64
+    # The task is left as the dataset wrote it; Gym caps each call at the smaller
+    # of its own limit (128 here) and max_new_tokens.
+    assert materialized_row["task_input"]["responses_create_params"] == {
+        "input": [{"role": "user", "content": "Check my meetings."}],
+        "max_output_tokens": 128,
+        "metadata": {"extra_body": '{"seed": 8}'},
+    }
+    assert rows[0]["responses_create_params"] == {}
+    for row in rows:
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
     assert [row["_rowidx"] for row in rows] == [0, 1]
     assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
+
+
+def test_run_nemo_gym_rollout_sync_stamps_a_task_without_responses_create_params(
+    monkeypatch,
+):
+    """Rows carry the sampling profile the caller passes, whatever the task holds.
+
+    Validation passes val_* as sampling_params while generation_config keeps the
+    train values, and a task may carry no responses_create_params.
+    """
+    rows = [
+        {"agent_ref": {"name": "agent"}, "responses_create_params": {}},
+        # A multi-turn Harbor task has no top-level responses_create_params.
+        {
+            "task_id": {"taskset": "harbor:validation", "task_id": "7"},
+            "task_input": {"task_data": {"repo": "demo"}},
+        },
+    ]
+
+    class _StopAfterStamping(Exception):
+        pass
+
+    def stop_after_stamping(_environment):
+        raise _StopAfterStamping
+
+    monkeypatch.setattr(rollouts_mod, "as_nemo_gym_shard_set", stop_after_stamping)
+    with pytest.raises(_StopAfterStamping):
+        run_nemo_gym_rollout_sync(
+            policy_generation=SimpleNamespace(cfg={"max_total_sequence_length": 128}),
+            input_batch=BatchedDataDict({"extra_env_info": rows}),
+            tokenizer=None,
+            task_to_env={"nemo_gym": object()},
+            generation_config={
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "max_new_tokens": 16,
+                "stop_strings": [],
+                "stop_token_ids": [],
+            },
+            log_full_result_tables=False,
+            num_generations_per_prompt=1,
+            sampling_params=SimpleNamespace(temperature=0.6, top_p=0.95, top_k=None),
+        )
+
+    assert rows[0]["responses_create_params"] == {}
+    assert rows[1]["task_input"] == {"task_data": {"repo": "demo"}}
+    for row in rows:
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "max_output_tokens": 16,
+        }
 
 
 def test_rollout_manager_rotates_replicas_and_reports_group_share():
@@ -3342,8 +3478,8 @@ def test_run_async_nemo_gym_rollout(
     assert len(rows) >= 2, "test expects the fixture to provide at least two rows"
 
     max_new_tokens = nemo_gym_vllm_generation.cfg["max_new_tokens"]
-    # Row 0: per-agent override looser than the configured cap — min() should clamp down to max_new_tokens.
-    # Row 1: no per-agent override — should fall back to max_new_tokens.
+    # Row 0: per-agent limit looser than the configured cap; Gym's model server clamps each call to max_new_tokens.
+    # Row 1: no per-agent limit; the call gets max_new_tokens.
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
 
@@ -3360,7 +3496,8 @@ def test_run_async_nemo_gym_rollout(
         debug_payload_metrics=True,
     )
     for row in rows:
-        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
+        # Gym's model server applies min(row's own limit, max_new_tokens) per call.
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
@@ -3474,6 +3611,8 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/reward/median": 0.0,
             "example_multi_step_simple_agent/reward/min": 0.0,
             "example_multi_step_simple_agent/reward/stddev": 0.0,
+            # Two prompts of one generation each, so two groups ran on this agent.
+            "example_multi_step_simple_agent/num_groups": 2,
             "example_multi_step_simple_agent/truncation_rate": 0.0,
             "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
             "example_multi_step_simple_agent/total_tokens_per_sample/max": None,

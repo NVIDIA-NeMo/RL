@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
@@ -66,6 +67,7 @@ from nemo_rl.algorithms.single_controller import (
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
     AdvantageStageConfig,
+    _train_fields_for_step,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -78,6 +80,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
     JsonDebugWriter,
     TrainChunk,
 )
@@ -88,6 +91,7 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GROUP_ID_TAG,
+    GROUP_TOKEN_MEAN_WEIGHT,
     ROLLOUT_METRICS,
     SAMPLER_TOPK_FIELDS,
 )
@@ -113,12 +117,12 @@ from tests.unit.single_controller._rollout_checkpoints import (
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
-    without = single_controller._train_fields_for_step(
+    without = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
-    with_topk = single_controller._train_fields_for_step(
+    with_topk = _train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
         sampler_head_required=True,
@@ -251,6 +255,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         restored_from_rollout_snapshot=False,
         ppo_group_multiple=1,
         ppo_min_remaining_groups=0,
+        trainer_warmup_kwargs=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -363,6 +368,28 @@ def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
         async_rl=AsyncRLConfig(min_groups_for_streaming_train=2),
     )
     assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
+
+
+@pytest.mark.parametrize("forest", [False, True])
+def test_ppo_chunk_alignment_skips_group_counts_under_forest(forest: bool) -> None:
+    """Forest chunks are aligned by execution padding, not by group count."""
+    packed = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True},
+    }
+    config = MasterConfig.model_construct(
+        # Six one-row groups do not split into DP=4 shards by group count.
+        ppo=PPOConfig(num_prompts_per_step=6, num_generations_per_prompt=1),
+        policy=packed,
+        value=packed,
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=4),
+        token_capture=TokenCaptureConfig.model_construct(forest_training=forest),
+    )
+    if forest:
+        assert resolve_ppo_chunk_alignment(config, 4, 4) == (1, 2)
+    else:
+        with pytest.raises(ValueError, match="num_prompts_per_step"):
+            resolve_ppo_chunk_alignment(config, 4, 4)
 
 
 @pytest.mark.parametrize(("min_groups", "expected"), [(32, (2, 0)), (2, (2, 1))])
@@ -555,7 +582,10 @@ def _stamp_advantage_stage_config(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
+        objective_reduction=make_objective_reduction("global_token_mean"),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+        # The dumps installed here are JsonDebugWriters, so the stage writes JSONL.
+        debug_writer=DebugWriterConfig(target="json"),
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -896,6 +926,41 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     assert (
         "reference_policy_logprobs" in controller._train_fields
     ) is expected_reference_required
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_train_fields_carry_the_reducer_columns(
+    monkeypatch, tmp_path, normalization
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
+        policy={
+            "train_global_batch_size": 8,
+            "generation": {
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
+        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+            skip_reference_policy_logprobs_calculation=False,
+        ),
+        loss_fn=ClippedPGLossConfig(normalization=normalization),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger=LoggerConfig.model_construct(),
+        env={},
+        checkpointing=_checkpointing_config(tmp_path),
+    )
+    controller = _init_controller(master_config, _actor_args_for_init())
+    assert (GROUP_TOKEN_MEAN_WEIGHT in controller._train_fields) is (
+        normalization == "group_token_mean"
+    )
 
 
 @pytest.mark.parametrize("with_critic", [True, False], ids=["ppo", "grpo"])
@@ -2617,7 +2682,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         sampler_head_required=False,
@@ -2631,8 +2696,10 @@ def _train_pump_controller(*, sampler) -> object:
     attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._trainer_warmup_task = None
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
+    ctrl._value_dedicated = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
@@ -3485,7 +3552,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
-    ctrl._train_fields = single_controller._train_fields_for_step(
+    ctrl._train_fields = _train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
         sampler_head_required=False,
@@ -3670,6 +3737,7 @@ def test_run_pumps_snapshots_generation_before_dispatch(
     )
     ctrl._trainer_version = 0
     ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._trainer_warmup_kwargs = None
     events = []
 
     def snapshot() -> None:
@@ -4001,12 +4069,15 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.resident_calls: list[tuple[str, bool]] = []
+        self._keep_resident = False
         self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
     def prepare_for_inference(self) -> None:
+        self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
@@ -4014,18 +4085,20 @@ class _NoOpValue:
         self._record("get_values_from_meta")
 
     def finish_inference(self) -> None:
+        self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
     def prepare_for_training(self) -> None:
+        self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
-    def begin_train_step(self, loss_fn) -> None:
+    def begin_train_step(self, loss_fn, **kwargs) -> None:
         self._record("begin_train_step")
 
     def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         self._record("train_microbatches_from_meta")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_sample_ids.append(meta.sample_ids)
         self._record("train_from_meta")
         return {
@@ -4046,6 +4119,7 @@ class _NoOpValue:
         }
 
     def finish_training(self) -> None:
+        self.resident_calls.append(("finish_training", self._keep_resident))
         self._record("finish_training")
 
 
@@ -4171,6 +4245,45 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.train_microbatches_from_meta",
         "critic.finish_train_step",
         "critic.finish_training",
+    ]
+
+
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
+    monkeypatch, policy_logprobs_required
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    ctrl._value_dedicated = True
+    value._keep_resident = True
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    trainer = _OrderRecordingTrainer(calls)
+    trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
+    trainer.offload_to_cpu = MagicMock(wraps=trainer.offload_to_cpu)
+    trainer.finish_inference = MagicMock(wraps=trainer.finish_inference)
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.offload_to_cpu.assert_not_called()
+    trainer.finish_inference.assert_not_called()
+    if policy_logprobs_required:
+        trainer.prepare_for_lp_inference.assert_called_once_with(
+            keep_train_buffers=True
+        )
+    else:
+        trainer.prepare_for_lp_inference.assert_not_called()
+    assert value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+        ("prepare_for_training", True),
+        ("finish_training", True),
     ]
 
 
@@ -4534,9 +4647,9 @@ class _StreamingPPOValue(_NoOpValue):
         assert not self.inference_prepared
         super().prepare_for_training()
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_metas.append(meta)
-        return super().train_from_meta(meta, loss_fn)
+        return super().train_from_meta(meta, loss_fn, **kwargs)
 
 
 class _StreamingPPODataPlane(_NoOpDataPlane):
@@ -4636,6 +4749,25 @@ def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
     assert "critic.train_from_meta" not in calls
     assert calls.index("refit") < calls.index("critic.begin_train_step")
     assert controller._trainer_version == controller._train_steps == 1
+
+
+def test_streaming_ppo_dedicated_value_keeps_policy_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch)
+    controller._value_dedicated = True
+    controller._value._keep_resident = True
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert "policy.offload_to_cpu" not in calls
+    assert controller._value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+    ] * len(metas) + [("prepare_for_training", True), ("finish_training", True)]
 
 
 @pytest.mark.parametrize("warmup", [False, True])
@@ -5149,6 +5281,7 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
+                token_capture=SimpleNamespace(forest_training=False),
             ),
             policy_dp,
             value_dp,
@@ -5203,6 +5336,7 @@ def test_streaming_ppo_rejects_unshardable_full_batch_during_setup(
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
+                token_capture=SimpleNamespace(forest_training=False),
             ),
             8,
             4,

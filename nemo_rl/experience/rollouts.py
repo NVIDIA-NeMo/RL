@@ -66,6 +66,10 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.environments.nemo_gym_multi_harness import (
+    MultiHarnessRoutes,
+    harness_metric_namespace,
+)
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
@@ -79,6 +83,7 @@ from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -2422,7 +2427,12 @@ def _prepare_nemo_gym_rows(
     sampling_params: GenerationSamplingParams,
     num_generations: int,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place, plus task indices for flat rows."""
+    """Stamp NeMo-RL sampling values, stable row indices and flat rows' task indices onto rows in place.
+
+    The values go beside the task, under ``_ng_model_sampling``, and the task is
+    left unchanged. Gym applies them to the model calls that the trained agent
+    makes through Gym's model servers.
+    """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
 
@@ -2488,23 +2498,13 @@ def _prepare_nemo_gym_rows(
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = get_nemo_gym_task_input(row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-
-        responses_create_params["temperature"] = sampling_params.temperature
-        responses_create_params["top_p"] = sampling_params.top_p
-        configured_max_tokens = generation_config["max_new_tokens"]
-        row_max_tokens = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(row_max_tokens, configured_max_tokens)
-            if row_max_tokens is not None
-            else configured_max_tokens
-        )
+        # Gym's model server caps each call at the smaller of its own limit and
+        # max_new_tokens, so a task's smaller max_output_tokens is kept.
+        row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": sampling_params.temperature,
+            "top_p": sampling_params.top_p,
+            "max_output_tokens": generation_config["max_new_tokens"],
+        }
         row["_rowidx"] = row_index
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
@@ -2787,8 +2787,7 @@ async def run_async_nemo_gym_rollout(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a row lacks a valid ``responses_create_params`` dictionary or
-            the actor returns a non-integer row index.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If either generation count is not positive, the batch is empty
             or not divisible by the relevant generation count,
             ``returns_entire_batch`` has an incompatible size, a streamed row index
@@ -2953,6 +2952,7 @@ async def run_async_nemo_gym_rollout(
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                         group_size=identity_num_generations,
+                        multi_harness=shard_set.multi_harness,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -3042,7 +3042,7 @@ def run_nemo_gym_rollout_sync(
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
-        TypeError: If a NeMo-Gym row or streamed row index has an invalid type.
+        TypeError: If the actor returns a non-integer row index.
         ValueError: If streamed rows violate the ordering, uniqueness, grouping,
             or task-index invariants documented by
             :func:`run_async_nemo_gym_rollout`.
@@ -3303,6 +3303,7 @@ def _postprocess_single_nemo_gym_group(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     group_size: Optional[int] = None,
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream.
 
@@ -3440,18 +3441,26 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
-    # Namespace metrics by taskset for materialized rows or agent for flat rows.
+    # Namespace metrics by taskset for materialized rows or agent for flat rows,
+    # and by agent within a multi-harness taskset.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
         for result, sample_metrics in zip(results, all_sample_metrics):
-            agent_name = result["attribution_key"]
+            agent_name = harness_metric_namespace(
+                result["attribution_key"], result["full_result"]
+            )
             agent_to_results[agent_name].append(result["full_result"])
             agent_to_sample_metrics[agent_name].append(sample_metrics)
 
-        per_agent_metrics = {}
+        per_agent_metrics: dict[str, Any] = {}
         for agent_name, agent_results in agent_to_results.items():
             agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            if group_size:
+                # Groups that ran on this harness, for one group or a whole batch.
+                per_agent_metrics[f"{agent_name}/num_groups"] = (
+                    len(agent_results) // group_size
+                )
             agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
             per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
                 agent_truncations
@@ -3498,6 +3507,12 @@ def _postprocess_single_nemo_gym_group(
                     data=to_log, columns=["Full result"]
                 )
 
+        if group_size and multi_harness is not None:
+            # A harness of a multi-harness taskset that ran no group counts 0.
+            for taskset in {result["attribution_key"] for result in results}:
+                if taskset is not None and multi_harness.covers(taskset):
+                    for agent in multi_harness.agents_for(taskset):
+                        per_agent_metrics.setdefault(f"{taskset}/{agent}/num_groups", 0)
         rollout_metrics.update(per_agent_metrics)
 
     # Necessary for downstream nemo rl logging/printing.

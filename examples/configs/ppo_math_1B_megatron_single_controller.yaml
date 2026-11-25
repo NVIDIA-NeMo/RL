@@ -41,6 +41,10 @@ async_rl:
     # warmup is not also a generation stall. null keeps the value above
     # throughout. Buffer capacity below must cover the wider of the two.
     warmup_lookahead_versions: null
+  # Run the weight synchronizer in its own CPU Ray actor instead of the controller's
+  # process. Requires non-colocated generation and an NCCL refit transport.
+  refit_actor:
+    enabled: false
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
@@ -58,17 +62,26 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
-  # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
+  # Write every consumed sample to the log dir (debug); the format follows debug_writer.
   log_full_train_data: false
-  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # Writer used by log_full_train_data. parquet writes Parquet chunks, json writes
+  # train_data_step<N>.jsonl files; set target to a
   # dotted import path of a DebugWriter defined outside this repo to store the dump
   # elsewhere (extra keys are passed to its constructor).
   debug_writer:
-    target: json
+    target: parquet
   # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
   # later step boundary so the disk write overlaps training. The overlap is shorter
   # here than for GRPO: the critic handoff blocks on the finalize once per chunk.
   defer_async_checkpoint_finalize: false
+  # Build the trainer while setup reserves the vLLM workers (NeMo-Gym runs with
+  # non-colocated vLLM, cluster.segment_size and no resume). Adds load on the Ray GCS.
+  early_trainer_build: false
+  # Synthetic first training pass on a Megatron trainer. PPO steps are not covered,
+  # so setup skips it and logs why.
+  trainer_warmup:
+    enabled: false
+    seqlens: null
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
@@ -90,9 +103,11 @@ async_rl:
     # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
     max_skipped_prompts: 0
     # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
-    # committed rollout resets the count. Must stay 0 on a PPO run: a drop shortens the
-    # step, and the critic shards it against the configured value.train_global_batch_size
-    # rather than its actual size, so _validate_algo_settings rejects a non-zero budget.
+    # committed rollout resets the count. Must stay 0 on a PPO run without
+    # token_capture.forest_training: a drop shortens the step, and the critic shards it
+    # against the configured value.train_global_batch_size rather than its actual size,
+    # so _validate_algo_settings rejects a non-zero budget. A Forest PPO critic trains on
+    # the step's actual row count.
     # (On GRPO you may raise it on a large fleet where losing the odd shard is expected.)
     max_consecutive_dropped_prompts: 0
     # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
@@ -293,6 +308,8 @@ data_plane:
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
     num_storage_units: null          # null = 2 per selected node
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+  # Optional TransferQueue controller metrics port (integer 1024-65535); omit to keep it off.
+  # metrics_port: 8200
   # observability:                    # NotRequired
   #   enabled: false
 
@@ -300,6 +317,10 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
+  # Optional multi-path reconstruction; one reward per rollout, GAE per row.
+  forest_training: false
+  # returned_history (default) or all_captured, including discarded attempts.
+  selection_policy: returned_history
   staging_partition: rollout_staging
 
 # Target recovery boundary for unfinished token-capture groups. "prefix" also
@@ -333,6 +354,13 @@ rollout_recovery:
   # rollouts start over after a crash.
   # Set true to accept that with a warning; only valid with target_level: turn or prefix.
   allow_restart_only_gym_servers: false
+  # Per-generation-owner TQ I/O limits for saved partial responses with
+  # target_level: prefix. Rows per TQ write at a checkpoint cut.
+  prefix_write_max_rows: 256
+  # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
+  prefix_write_max_tokens: 4194304
+  # Rows per TQ read at restore. 1 = each restore reads on its own.
+  prefix_read_max_rows: 256
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
