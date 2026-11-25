@@ -661,6 +661,7 @@ def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
             },
             dp_size=1,
             _policy_like_cfg={},
+            _forest_router_padding_mask=False,
             mcore_state=SimpleNamespace(straggler_timer=None),
             model_slices_context_parallel_inputs=None,
             defer_fp32_logits=False,
