@@ -633,7 +633,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         num_chunks = (BS + effective_chunk_size - 1) // effective_chunk_size
         grad_output_flat = grad_output.flatten()
 
-        all_grad_chunks = []
+        grad_vocab_parallel = None
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * effective_chunk_size
@@ -685,9 +685,18 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
             # Convert back to vocab-parallel
             grad_vocab_parallel_chunk = all_to_all_sq2vp(grad_logits_local, tp_group)
-            all_grad_chunks.append(grad_vocab_parallel_chunk)
 
-        grad_vocab_parallel = torch.cat(all_grad_chunks, dim=0)
+            # Otherwise these tensors stay alive while the next chunk is filtered.
+            del logits_chunk, keep_mask, log_probs_chunk, softmax_chunk
+            del is_chosen, grad_logits_local
+
+            # The gradient is allocated here, so that the first chunk's filter runs
+            # before it exists.
+            if grad_vocab_parallel is None:
+                grad_vocab_parallel = grad_vocab_parallel_chunk.new_empty(BS, V_local)
+            grad_vocab_parallel[chunk_start:chunk_end] = grad_vocab_parallel_chunk
+            del grad_vocab_parallel_chunk
+
         grad_vocab_parallel = grad_vocab_parallel.view(B, S, V_local)
 
         return grad_vocab_parallel, None, None, None, None, None, None
