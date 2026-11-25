@@ -554,9 +554,13 @@ class RayWorkerGroup:
         )
 
         # Update env_vars with the current environment variables
-        for k, v in driver_env_for_workers().items():
+        for k, v in os.environ.items():
             if k not in env_vars:
                 env_vars[k] = v
+
+        # Excluded names must retain their worker-local values.
+        for key in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(","):
+            env_vars.pop(key.strip(), None)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(

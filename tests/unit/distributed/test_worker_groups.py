@@ -531,7 +531,7 @@ def test_custom_environment_variables_override_existing(
 def test_excluded_driver_environment_variables_are_not_forwarded(
     register_test_actor, virtual_cluster, monkeypatch
 ):
-    """Test that NRL_WORKER_ENV_EXCLUDE drops driver values but keeps explicit env_vars."""
+    """Test that NRL_WORKER_ENV_EXCLUDE drops both driver values and explicit env_vars."""
     monkeypatch.setenv("DUMMY_DRIVER_ONLY", "driver_value")
     monkeypatch.setenv("DUMMY_EXPLICIT", "driver_value")
     monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", "DUMMY_DRIVER_ONLY,DUMMY_EXPLICIT")
@@ -545,7 +545,7 @@ def test_excluded_driver_environment_variables_are_not_forwarded(
     worker = worker_group.workers[0]
 
     assert ray.get(worker.get_env_var.remote("DUMMY_DRIVER_ONLY")) is None
-    assert ray.get(worker.get_env_var.remote("DUMMY_EXPLICIT")) == "explicit_value"
+    assert ray.get(worker.get_env_var.remote("DUMMY_EXPLICIT")) is None
 
     worker_group.shutdown(force=True)
 
