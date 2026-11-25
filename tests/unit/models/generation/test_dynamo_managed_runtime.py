@@ -411,6 +411,9 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
     # What the driver sets after init_ray() is only in its own environment.
     monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
+    # A name the driver must not forward stays out of the frontends' environment.
+    monkeypatch.setenv("POD_NAME", "driver-pod")
+    monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", "POD_NAME")
 
     node_a, node_b = "a" * 56, "b" * 56  # Ray node IDs are hex
     runtime._start_frontends([node_a, node_b])
@@ -431,6 +434,7 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         assert started["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
         assert started["env"]["VIRTUAL_ENV"] == "/venvs/vllm"
         assert started["env"]["VLLM_USE_FASTOKENS"] == "1"
+        assert "POD_NAME" not in started["env"]
         # The open-file limit a frontend had as the driver's child.
         assert started["env"]["DYN_FRONTEND_FD_LIMIT_TARGET"] == "65536"
         # The Ray cluster its chat engine reads token-capture prefixes through.

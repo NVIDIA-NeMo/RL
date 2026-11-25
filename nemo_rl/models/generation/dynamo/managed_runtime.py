@@ -47,6 +47,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, trace_export_env
+from nemo_rl.utils.venvs import driver_env_for_workers
 
 # The engines register on this component and endpoint (see engine_adapter).
 DYNAMO_COMPONENT = "backend"
@@ -429,11 +430,14 @@ class FrontendHost:
 _FrontendHostActor = ray.remote(num_cpus=0)(FrontendHost)
 
 
-def _service_env(managed_env: dict[str, str]) -> dict[str, str]:
-    """This process's environment with ``managed_env`` replacing every Dynamo setting."""
+def _service_env(
+    managed_env: dict[str, str], base_env: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Return base_env, or this process's environment, with managed_env replacing every Dynamo setting."""
+    source_env = os.environ if base_env is None else base_env
     env = {
         key: value
-        for key, value in os.environ.items()
+        for key, value in source_env.items()
         if not key.startswith(("DYN_", "ETCD_", "NATS_"))
     }
     env.update(managed_env)
@@ -644,9 +648,9 @@ class ManagedDynamoRuntime:
                 f"Dynamo frontend environment {clashing} is set by both the managed "
                 "runtime and dynamo_cfg.frontend_args.extra_env."
             )
-        # The driver's environment as it is now, as the engines get it
-        # (RayWorkerGroup): an actor has only what the driver had at init_ray().
-        env = _service_env({**env, **extra_env})
+        # The driver's current environment minus NRL_WORKER_ENV_EXCLUDE, as the engines get
+        # it (RayWorkerGroup): an actor has only what the driver had at init_ray().
+        env = _service_env({**env, **extra_env}, driver_env_for_workers())
         # ray.init() raises a driver's open-file limit to 65,536, but not a Ray
         # worker's: a frontend started from one would stop at Dynamo's 8,192.
         env.setdefault("DYN_FRONTEND_FD_LIMIT_TARGET", "65536")
