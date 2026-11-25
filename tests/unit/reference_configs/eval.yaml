@@ -30,6 +30,9 @@ generation:
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: False
+    actor_gil_switch_interval_ms: null # Requires async_engine: true. e.g. 0.5: threads that release the GIL (TransferQueue client, HTTP server) get it back sooner from vLLM's output loop
+    actor_gc_freeze: false # Requires async_engine: true. Freeze the post-startup heap out of later garbage collections
+    actor_gc_threshold: null # Requires async_engine: true. e.g. [50000, 50, 100]: collect less often with many requests in flight
     # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
     refit_with_reload_api: false
   colocated:
