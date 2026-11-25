@@ -14,10 +14,10 @@
 # limitations under the License.
 
 # End-to-end non-colocated Megatron train -> Megatron generation refit over
-# nccl_reshard with CUDA graphs. The default CI environment may exercise the
-# exact-transfer Python implementation. Set REQUIRE_REAL_NCCL_M2N=1 in an
-# environment with nccl-extensions installed to require nccl.m2n.reshard
-# instead. Set REFIT_PRECISION=mxfp8 on Blackwell to cover MXFP8 training
+# nccl_reshard with CUDA graphs. The default uses the exact-transfer Python
+# implementation. Set REQUIRE_REAL_NCCL_M2N=1 in an environment with
+# nccl-extensions installed to opt into and require nccl.m2n.reshard.
+# Set REFIT_PRECISION=mxfp8 on Blackwell to cover MXFP8 training
 # parameters, inference-side MXFP8 refit, and Torch-layout weights; BF16 is the
 # portable default.
 
@@ -71,10 +71,13 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 rm -rf "$EXP_DIR"
 mkdir -p "$LOG_DIR"
 
-# Exercise the default dispatcher with all backend overrides unset.
+# Keep the test independent of inherited backend overrides.
 unset NRL_XFERDTENSOR_GOLDEN
 unset NRL_XFERDTENSOR_PYTHON
 unset NRL_XFERDTENSOR_NCCL
+if [[ "${REQUIRE_REAL_NCCL_M2N:-0}" == "1" ]]; then
+    export NRL_XFERDTENSOR_NCCL=1
+fi
 
 cd "$PROJECT_ROOT"
 uv run coverage run -a \
