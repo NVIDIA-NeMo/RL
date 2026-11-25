@@ -396,6 +396,9 @@ tests/test_suites/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-cont
 # SingleController PPO with router replay (R3) and an MoE critic (Qwen3-30B-A3B, Megatron TP4+PP2+CP2+EP4)
 tests/test_suites/llm/ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-controller.sh
 
+# SingleController Forest PPO on context-compaction rows (Qwen3-0.6B, Gym BrowseComp), with checkpoint/resume
+tests/test_suites/llm/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest.sh
+
 ########
 # GDPO #
 ########

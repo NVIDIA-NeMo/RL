@@ -381,9 +381,8 @@ def test_raw_reward_basic_broadcast_and_masking():
     """RawRewardAdvantageEstimator broadcasts scalar reward across the response.
 
     Validates the no-value-model path: advantages are the per-sample reward
-    expanded to ``mask.shape`` (broadcast at every position, including
-    masked-out trailing pads — the downstream loss masking is responsible
-    for zeroing those out). ``returns`` is None since there is no value head.
+    expanded to ``mask.shape``, zero at masked-out positions as with GAE.
+    ``returns`` is None since there is no value head.
     """
     estimator_config = GAEConfig(name="raw_reward", normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
@@ -406,8 +405,8 @@ def test_raw_reward_basic_broadcast_and_masking():
 
     expected = torch.tensor(
         [
-            [2.0, 2.0, 2.0, 2.0],
-            [-1.0, -1.0, -1.0, -1.0],
+            [2.0, 2.0, 2.0, 0.0],
+            [-1.0, -1.0, 0.0, 0.0],
         ]
     )
     torch.testing.assert_close(advantages, expected)

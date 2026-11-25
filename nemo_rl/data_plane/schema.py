@@ -168,6 +168,15 @@ ROUTE_ENCODING_ENVELOPE = 1
 ROUTE_ENCODING_LIST = 2
 ROUTE_ENCODING_TENSOR = 3
 
+# Wire codes for a staged row's ``capture_mode`` column, shared by the sink's
+# per-row and direct batch encoders and the source that decodes them.
+CAPTURE_MODE_TO_CODE = {"text": 0, "token_in": 1}
+CAPTURE_CODE_TO_MODE = {code: mode for mode, code in CAPTURE_MODE_TO_CODE.items()}
+
+# Staging-key prefix of generation-cut chunk rows; the prefix writer accepts
+# only these keys.
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
+
 # Deferred route storage. Canonical rows carry one strict encoded route plan
 # per tag; policy workers omit the absent canonical route column and assemble
 # it from staging immediately before previous-policy logprob or training.

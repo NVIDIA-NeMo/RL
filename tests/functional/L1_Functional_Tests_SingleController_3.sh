@@ -62,8 +62,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Score centering through capture, canonical TQ columns, trainer gather and loss.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
-# BrowseComp hides old tool results; valid rows must prove a context boundary.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
+# BrowseComp compaction smoke (valid rows must prove a context boundary), then
+# resumed from step 10 to 12.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction_resume.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
