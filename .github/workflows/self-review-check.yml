@@ -36,8 +36,9 @@ permissions:
   statuses: write
 
 concurrency:
-  # Fork review events get a read-only token; their own group keeps them from cancelling a run that can post.
-  group: self-review-${{ github.event.pull_request.number }}-${{ github.event_name != 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository }}
+  # One group per PR and trigger type: a run cancels only older runs of its own type, so the check list keeps no
+  # cancelled run. Fork review runs (read-only token) also can't cancel a push run that can post.
+  group: self-review-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:

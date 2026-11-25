@@ -36,6 +36,14 @@ G_VENV_BUILD_LOCKS: dict[tuple[str, str, frozenset[str]], Lock] = {}
 G_VENV_CACHE_LOCK = Lock()
 
 
+def driver_env_for_workers() -> dict[str, str]:
+    """Return a copy of os.environ without the names listed in NRL_WORKER_ENV_EXCLUDE."""
+    excluded = {
+        name.strip() for name in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(",")
+    }
+    return {k: v for k, v in os.environ.items() if k not in excluded}
+
+
 def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, str]:
     """Make Hugging Face ``trust_remote_code`` modules importable by Ray actors."""
     result = env_vars.copy()
@@ -278,7 +286,7 @@ def make_actor_runtime_env(
     venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
     env_vars = add_hf_modules_cache_to_pythonpath(
         {
-            **os.environ,
+            **driver_env_for_workers(),
             "VIRTUAL_ENV": venv,
             "UV_PROJECT_ENVIRONMENT": venv,
         }
