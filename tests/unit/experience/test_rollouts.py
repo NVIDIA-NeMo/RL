@@ -51,6 +51,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -2522,6 +2523,79 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
     assert rollout_result.rollout_metrics[f"{attribution_key}/reward/mean"] == 0.2
 
 
+def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
+    rows = [
+        {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {"responses_create_params": {"input": []}},
+        }
+        for _ in range(4)
+    ]
+    results = []
+    for index, harness in enumerate(
+        ["opencode_agent", "opencode_agent", "pi_agent", "pi_agent"]
+    ):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": float(index), "_ng_harness": harness},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        group_size=2,
+        multi_harness=MultiHarnessRoutes(
+            candidates=(
+                (
+                    "swe",
+                    (
+                        ("hermes_agent", "swe_hermes", 1.0),
+                        ("opencode_agent", "swe_opencode", 1.0),
+                        ("pi_agent", "swe_pi", 1.0),
+                    ),
+                ),
+            )
+        ),
+    )
+
+    metrics = rollout_result.rollout_metrics
+    assert metrics["swe/opencode_agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(2.5)
+    assert "swe/reward/mean" not in metrics
+    # Groups per harness; a configured harness that ran none counts 0.
+    assert metrics["swe/opencode_agent/num_groups"] == 1
+    assert metrics["swe/pi_agent/num_groups"] == 1
+    assert metrics["swe/hermes_agent/num_groups"] == 0
+    # Taskset-keyed settings and attribution keep the taskset name.
+    assert rollout_result.final_batch["attribution_key"] == ["swe"] * 4
+
+
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
@@ -3584,6 +3658,8 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/reward/median": 0.0,
             "example_multi_step_simple_agent/reward/min": 0.0,
             "example_multi_step_simple_agent/reward/stddev": 0.0,
+            # Two prompts of one generation each, so two groups ran on this agent.
+            "example_multi_step_simple_agent/num_groups": 2,
             "example_multi_step_simple_agent/truncation_rate": 0.0,
             "example_multi_step_simple_agent/total_tokens_per_sample/mean": None,
             "example_multi_step_simple_agent/total_tokens_per_sample/max": None,

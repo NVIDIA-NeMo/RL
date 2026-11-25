@@ -1000,7 +1000,7 @@ class TestProcessGlobalBatch:
         assert result["batch"]["token_mask"].shape == (4, 64)
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
-    def test_token_level_loss_requires_token_mask(self, mock_all_reduce, mock_dp_mesh):
+    def test_global_token_mean_requires_token_mask(self, mock_all_reduce, mock_dp_mesh):
         # Create loss function with token-level loss
         loss_fn = MagicMock()
         loss_fn.loss_type = LossType.TOKEN_LEVEL
