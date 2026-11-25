@@ -125,6 +125,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -133,13 +134,13 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
-from nemo_rl.models.generation.trtllm.config import (
-    replica_width,
-    resolve_disagg_layout,
-)
+from nemo_rl.models.generation.trtllm.config import replica_width
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -892,6 +893,8 @@ def setup(
             "SingleController token-capture path"
         )
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
