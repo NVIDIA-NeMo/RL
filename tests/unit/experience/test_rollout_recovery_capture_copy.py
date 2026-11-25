@@ -225,7 +225,7 @@ def test_capture_matches_legacy_projection(
         name: [FinalizedReward(f"sample-{name}", f"rollout-{name}", 1.0, None)]
         for name in ("canonical", "pending")
     }
-    original = ledger.state_dict()
+    original = copy.deepcopy(ledger.state_dict())
     state = recovery.build_rollout_recovery_state(
         ledger,
         batch_shortfall={1: 2},

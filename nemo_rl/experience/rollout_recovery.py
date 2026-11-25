@@ -2379,12 +2379,11 @@ def build_rollout_recovery_state(
         if canonical_group_ids is None or group_id in canonical_group_ids
     }
     if canonical_group_ids is not None:
-        for key in ("finalizer_metrics_by_group", "finalizer_rewards_by_group"):
-            state[key] = {
-                group_id: value
-                for group_id, value in state[key].items()
-                if group_id in canonical_group_ids
-            }
+        state["finalizer_metrics_by_group"] = {
+            group_id: metrics
+            for group_id, metrics in state["finalizer_metrics_by_group"].items()
+            if group_id in canonical_group_ids
+        }
     # Run the same validation seam used by readers before writing a sidecar.
     parse_rollout_recovery_state(state)
     return state
