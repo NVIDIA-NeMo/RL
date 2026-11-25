@@ -184,6 +184,9 @@ tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-automodel-tp2-temp0.8-topp0.9-topk50.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-is.sh
+# Megatron (tensor parallel 2) with policy.logprob_chunk_size set: training computes
+# the filtered logprobs and the unfiltered ones of the reference-KL penalty in chunks.
+tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-chunk128.sh
 
 # Yarn
 tests/test_suites/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.sh
