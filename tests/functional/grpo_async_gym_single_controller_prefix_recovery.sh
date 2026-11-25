@@ -38,9 +38,10 @@ GYM_ROOT=$PROJECT_ROOT/3rdparty/Gym-workspace/Gym
 SENTINEL_EVENT="NeMo RL prefix recovery parity sentinel"
 
 # Cuttable Workplace prompts per step, one per list length.
-# Above ~500 the model overruns its list (stray tags, a second list) and hits a
-# near-tied token where runs diverge; keep every list in the well-behaved range.
-LIST_LENGTHS=(${SC_PREFIX_RECOVERY_LIST_LENGTHS:-150 250 350 450})
+# At 450 the closing reply's first token is near-tied between the list and a
+# stray <tool_call>, so runs diverge before the cut; keep every list at 350 or
+# below.
+LIST_LENGTHS=(${SC_PREFIX_RECOVERY_LIST_LENGTHS:-150 200 250 350})
 NUM_PROMPTS=${#LIST_LENGTHS[@]}
 NUM_GENERATIONS=${SC_PREFIX_RECOVERY_NUM_GENERATIONS:-2}
 # Qwen tokenizes each digit separately, so "N\n" costs at most digits + 1 tokens.
