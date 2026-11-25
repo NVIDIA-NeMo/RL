@@ -601,6 +601,7 @@ class ClippedPGLossFn(LossFunction):
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "token_abs_logprob_error": MetricNormalizer.TOKENS,
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
@@ -614,6 +615,7 @@ class ClippedPGLossFn(LossFunction):
             # Raw count — the downstream per-microbatch sum IS the value.
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "num_valid_samples": MetricNormalizer.NONE,
+            "gen_prev_logprob_mismatch_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
             "num_masked_seqs_by_logprob_error": MetricNormalizer.NONE,
@@ -634,6 +636,8 @@ class ClippedPGLossFn(LossFunction):
                 "policy_support_excluded_tokens",
                 "positive_nll_loss",
                 "token_mult_prob_error",
+                "gen_prev_logprob_mismatch_tokens",
+                "token_abs_logprob_error",
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
@@ -1208,6 +1212,12 @@ class ClippedPGLossFn(LossFunction):
         metric_tensors = {"loss": loss.detach()}
         with torch.no_grad():
             lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            metric_tensors["gen_prev_logprob_mismatch_tokens"] = (
+                (lp_error != 0) & mask.bool()
+            ).sum()
+            metric_tensors["token_abs_logprob_error"] = masked_mean(
+                lp_error, mask, global_normalization_factor=global_valid_toks
+            )
             metric_tensors["token_mult_prob_error"] = masked_mean(
                 torch.exp(lp_error * mask),
                 mask,
