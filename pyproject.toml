@@ -58,8 +58,8 @@ dependencies = [
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.22.0). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.22.0",
+  # 5.16.1). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.16.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -79,7 +79,7 @@ dependencies = [
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "multi-storage-client[boto3]>=0.50",                                                                        # for msc:// (S3) checkpoint storage; the driver's CheckpointManager runs in the base venv
   "zstandard",                                                                                                # for sparse refit body compression
-  "fastokens>=0.3.5",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
+  "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the
@@ -170,13 +170,11 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.34.0 cu130 wheels.
+  # ABI of the vLLM 0.33.0 cu130 wheels.
   "torch==2.14.0",
   "torchvision==0.29.0",
   "apache-tvm-ffi==0.1.11",
-  # vLLM 0.34.0 requires huggingface-hub>=2.0, which transformers accepts from 5.18;
-  # 5.22.0 is the version vLLM 0.34.0's own test requirements pin.
-  "transformers==5.22.0",
+  "transformers==5.16.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   # No standalone deep_gemm: the vLLM wheel ships its own prebuilt DeepGEMM
@@ -186,25 +184,24 @@ vllm = [
   # headers reject, and NeMo-RL's vLLM engines use vLLM's default
   # allgather_reducescatter all2all backend, which does not need it.
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.34.0
-  "vllm==0.34.0",
+  # https://github.com/vllm-project/vllm/releases/tag/v0.33.0
+  "vllm==0.33.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.7.3",
-  "flashinfer-cubin==0.7.3",
-  "flashinfer-jit-cache==0.7.3",
-  # flashinfer-jit-cache 0.7.3 is a meta package over one wheel per GPU arch. They only
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  "flashinfer-jit-cache==0.7.2.post1",
+  # flashinfer-jit-cache 0.7.2 is a meta package over one wheel per GPU arch. They only
   # exist on the flashinfer cu130 index, and [tool.uv.sources] index pins only apply to
   # direct requirements, so each one is named here.
-  # sm110a and sm121a ship aarch64 wheels only (see the flashinfer-jit-cache
-  # [[tool.uv.dependency-metadata]] entries).
-  "flashinfer-jit-cache-sm80==0.7.3",
-  "flashinfer-jit-cache-sm89==0.7.3",
-  "flashinfer-jit-cache-sm90a==0.7.3",
-  "flashinfer-jit-cache-sm100a==0.7.3",
-  "flashinfer-jit-cache-sm103a==0.7.3",
-  "flashinfer-jit-cache-sm110a==0.7.3; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm120f==0.7.3",
-  "flashinfer-jit-cache-sm121a==0.7.3; platform_machine == 'aarch64'",
+  # sm110a and sm121a ship aarch64 wheels only (see the matching override-dependencies).
+  "flashinfer-jit-cache-sm80==0.7.2.post1",
+  "flashinfer-jit-cache-sm89==0.7.2.post1",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
   "nvidia-cutlass-dsl[cu13]==4.8.0",
   # Dynamo serving (policy.generation.dynamo=true) hosts these vLLM workers behind
   # dynamo.frontend through Dynamo's engine-agnostic backend SDK. Only the base
@@ -261,8 +258,7 @@ mcore = [
   # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  # Megatron-Bridge accepts >=5.15,<5.21; ModelOpt (cc4b76d7) warns from 5.19. The vllm
-  # extra runs a newer transformers (vLLM 0.34 needs huggingface-hub 2.x); separate venvs.
+  # Matches main and the vllm extra. Megatron-Bridge accepts >=5.15,<5.21; ModelOpt (cc4b76d7) warns from 5.19.
   "transformers==5.16.1",
   "tilelang==0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -508,6 +504,10 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
+  # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
   # Preserve TRT-LLM's existing frontend and TVM-FFI overrides without constraining Megatron.
   { package = { name = "tensorrt-llm" }, dependencies = [
     "nvidia-cudnn-frontend==1.25.0",
@@ -719,40 +719,6 @@ name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
-
-# flashinfer-jit-cache is a meta package whose requirements differ per wheel: only
-# the aarch64 wheel lists sm110a and sm121a, which have no x86_64 wheels. uv reads
-# one wheel's metadata for every platform, so the lists are restated here with the
-# architecture marker. One entry per version in use (vllm extra, mcore extra).
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache"
-version = "0.7.3+cu130"
-requires-python = ">=3.9"
-requires-dist = [
-  "flashinfer-jit-cache-sm100a==0.7.3+cu130",
-  "flashinfer-jit-cache-sm103a==0.7.3+cu130",
-  "flashinfer-jit-cache-sm110a==0.7.3+cu130; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm120f==0.7.3+cu130",
-  "flashinfer-jit-cache-sm121a==0.7.3+cu130; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm80==0.7.3+cu130",
-  "flashinfer-jit-cache-sm89==0.7.3+cu130",
-  "flashinfer-jit-cache-sm90a==0.7.3+cu130",
-]
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache"
-version = "0.7.2.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = [
-  "flashinfer-jit-cache-sm100a==0.7.2.post1+cu130",
-  "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130",
-  "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130",
-  "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
-  "flashinfer-jit-cache-sm80==0.7.2.post1+cu130",
-  "flashinfer-jit-cache-sm89==0.7.2.post1+cu130",
-  "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130",
-]
 
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
