@@ -16,7 +16,7 @@
 
 Implements ``EnvironmentCheckpoint`` (``nemo_rl.environments.checkpointing.interfaces``)
 over a ``GymCheckpointCoordinator``. Everything that knows Gym episodes, Gym
-participants, retire/forget, and ``gym_checkpoint.json`` lives here, so the
+participants, retire/forget/release, and ``gym_checkpoint.json`` lives here, so the
 single controller only pauses, snapshots, validates and restores through the
 interface.
 """
@@ -37,6 +37,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarr
 from nemo_rl.environments.checkpointing.interfaces import RestoredEnvironmentRollouts
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     GymCheckpointOperationError,
@@ -599,3 +600,43 @@ class GymEnvironmentCheckpoint:
                     key for keys in manifest.staging_keys.values() for key in keys
                 ),
             )
+
+    # ── release ───────────────────────────────────────────────────────────
+
+    async def release(self, snapshot_dirs: Iterable[Path]) -> None:
+        """Have Gym delete external state no snapshot in ``snapshot_dirs`` uses.
+
+        Sandbox snapshots live in the sandbox service, not under RL's checkpoint
+        directory, so pruning a rollout snapshot leaves them behind until Gym is
+        told which checkpoints RL still keeps. Skipped when a Gym manifest
+        cannot be read: leaving its checkpoint out would delete state RL can
+        still restore.
+        """
+        try:
+            kept = await asyncio.to_thread(_gym_checkpoint_ids, list(snapshot_dirs))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            warnings.warn(
+                "Skipping the Gym checkpoint release: a rollout snapshot's Gym "
+                f"manifest could not be read: {type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+            return
+        try:
+            failures = await self.coordinator.release(kept)
+        except GymCheckpointOperationError as error:
+            failures = error.failures
+        if failures:
+            warnings.warn(
+                "Gym could not delete external state of checkpoints RL no longer "
+                f"keeps; the next release retries: {failures!r}",
+                stacklevel=2,
+            )
+
+
+def _gym_checkpoint_ids(snapshot_dirs: list[Path]) -> frozenset[str]:
+    """Return the Gym checkpoint ID each snapshot directory's Gym manifest names."""
+    return frozenset(
+        load_gym_checkpoint_manifest(snapshot_dir).checkpoint_id
+        for snapshot_dir in snapshot_dirs
+        if (snapshot_dir / GYM_CHECKPOINT_MANIFEST_FILENAME).is_file()
+    )

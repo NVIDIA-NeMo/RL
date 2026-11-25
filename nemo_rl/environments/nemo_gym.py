@@ -1612,6 +1612,20 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         )
 
+    async def checkpoint_release(
+        self,
+        checkpoint_id: str,
+        kept: tuple[str, ...],
+        *,
+        deadline_ts: float,
+    ) -> dict[str, str]:
+        """Delete external state, such as sandbox snapshots, no kept checkpoint uses."""
+        return await self._require_checkpoint_adapter().release(
+            checkpoint_id,
+            kept,
+            deadline_ts=deadline_ts,
+        )
+
     async def checkpoint_commit(
         self,
         checkpoint_id: str,

@@ -967,3 +967,77 @@ def test_adapter_names_the_restart_only_servers_gym_reports(tmp_path: Path) -> N
 
     # The session-capable agent and the policy model are not restart-only.
     assert asyncio.run(exercise()) == ["restart_only", "restarting_tools"]
+
+
+class _SnapshotDeletingSessions(_NoResourceSessions):
+    """Resources hooks of a server whose checkpoints keep sandbox snapshots."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.kept: list[frozenset[str]] = []
+        self._error = error
+
+    async def delete_external_state(self, kept: frozenset[str]) -> None:
+        self.kept.append(kept)
+        if self._error is not None:
+            raise self._error
+
+
+async def _released_servers(
+    adapter: GymCheckpointAdapter, monkeypatch, kept: list[str]
+) -> tuple[dict[str, str], set[str]]:
+    """Release through ``adapter``; return its failures and the servers asked."""
+    asked: set[str] = set()
+    client_type = type(adapter._client)
+    request = client_type.request
+
+    async def recording_request(self, server_name, url_path, method, **kwargs):
+        if url_path.endswith("/release"):
+            asked.add(server_name)
+        return await request(self, server_name, url_path, method, **kwargs)
+
+    monkeypatch.setattr(client_type, "request", recording_request)
+    failures = await adapter.release("save-2", kept, deadline_ts=time.time() + 5)
+    return failures, asked
+
+
+def test_release_reaches_only_the_participants_that_keep_external_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Fail if RL stops telling Gym's sandbox owners which checkpoints it keeps."""
+    from nemo_gym._checkpoint.resources import ResourcesParticipant
+
+    sandboxes = _SnapshotDeletingSessions()
+    failing = _SnapshotDeletingSessions(RuntimeError("snapshot in use"))
+
+    async def exercise() -> tuple[dict[str, str], set[str]]:
+        adapter, _, _ = _in_process_gym(
+            tmp_path / "ledger",
+            resources={
+                "sandboxes": ResourcesParticipant(sandboxes, "exported"),
+                "failing_sandboxes": ResourcesParticipant(failing, "exported"),
+                "tools": ResourcesParticipant(_NoResourceSessions(), "exported"),
+            },
+        )
+        await adapter.discover()
+        return await _released_servers(adapter, monkeypatch, ["save-1", "save-2"])
+
+    failures, asked = asyncio.run(exercise())
+
+    # The policy, the agent and the tools server keep nothing outside Gym.
+    assert asked == {"sandboxes", "failing_sandboxes"}
+    assert sandboxes.kept == [frozenset({"save-1", "save-2"})]
+    # Gym reports a failed release instead of raising it.
+    assert set(failures) == {"failing_sandboxes"}
+
+
+def test_release_asks_no_one_when_no_participant_keeps_external_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def exercise() -> tuple[dict[str, str], set[str]]:
+        adapter, _, _ = _in_process_gym(
+            tmp_path / "ledger", resources=_stateless_resources()
+        )
+        await adapter.discover()
+        return await _released_servers(adapter, monkeypatch, ["save-2"])
+
+    assert asyncio.run(exercise()) == ({}, set())

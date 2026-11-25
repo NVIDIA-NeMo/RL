@@ -3824,6 +3824,98 @@ class TestPeriodicRolloutCheckpoint:
         assert not (checkpoints / "step_1").exists()
         assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
 
+    @staticmethod
+    def _record_releases(actor) -> list[list[Path]]:
+        """Record the snapshot directories each environment release keeps."""
+        released: list[list[Path]] = []
+
+        async def release(snapshot_dirs) -> None:
+            released.append(list(snapshot_dirs))
+
+        actor._environment_checkpoint.release = release
+        return released
+
+    def test_a_published_snapshot_releases_the_environment_keeping_it(
+        self, tmp_path: Path
+    ):
+        """The release comes after the publish, so the new snapshot is kept."""
+        checkpoints = tmp_path / "checkpoints"
+        actor = self._staged_actor(tmp_path)
+        released = self._record_releases(actor)
+        (checkpoints / "tmp_step_1").mkdir(parents=True)
+        actor._checkpointer.begin_finalization(checkpoints / "tmp_step_1")
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result.saved
+        assert released == [
+            [checkpoints / "step_1" / "rollout_snapshots" / "snapshot_000001"]
+        ]
+
+    def test_a_skipped_snapshot_does_not_release_the_environment(self, tmp_path: Path):
+        actor = self._staged_actor(tmp_path)
+        released = self._record_releases(actor)
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert not result.saved
+        assert released == []
+
+    def test_the_end_of_run_release_keeps_every_published_snapshot(
+        self, tmp_path: Path
+    ):
+        checkpoints = tmp_path / "checkpoints"
+        actor = self._staged_actor(tmp_path)
+        released = self._record_releases(actor)
+        published = [
+            checkpoints / "step_1" / "rollout_snapshots" / "snapshot_000002",
+            checkpoints / "step_2" / "rollout_snapshots" / "snapshot_000001",
+        ]
+        for path in published:
+            path.mkdir(parents=True)
+
+        asyncio.run(actor._rollout_snapshots.release_environment_state())
+
+        assert released == [published]
+
+    def test_a_release_that_cannot_list_the_snapshots_warns_and_skips(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Releasing with an incomplete kept list would delete restorable state."""
+        actor = self._staged_actor(tmp_path)
+        released = self._record_releases(actor)
+
+        def unlistable(checkpoint_dir: Path) -> list[Path]:
+            raise OSError(f"cannot list {checkpoint_dir}")
+
+        monkeypatch.setattr(snapshots_module, "published_snapshot_dirs", unlistable)
+
+        with pytest.warns(UserWarning, match="Skipping the environment release"):
+            asyncio.run(actor._rollout_snapshots.release_environment_state())
+        assert released == []
+
+    def test_a_backend_without_rollout_state_is_not_released(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Every run releases at its end; one without such a backend lists nothing."""
+        actor = self._actor(tmp_path)
+        actor._environment_checkpoint = NoEnvironmentCheckpoint()
+        attach_rollout_checkpointing(actor)
+        listed: list[Path] = []
+        monkeypatch.setattr(snapshots_module, "published_snapshot_dirs", listed.append)
+
+        asyncio.run(actor._rollout_snapshots.release_environment_state())
+
+        assert listed == []
+
     @pytest.mark.parametrize(
         ("prefix_cuts_enabled", "restore_level", "expect_save"),
         [

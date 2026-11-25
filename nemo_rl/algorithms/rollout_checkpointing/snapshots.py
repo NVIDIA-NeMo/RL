@@ -83,6 +83,7 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     prepare_snapshot_paths,
     prepare_staged_snapshot_path,
     prune_bootstrap_snapshots,
+    published_snapshot_dirs,
 )
 from nemo_rl.algorithms.rollout_checkpointing.state import (
     CapturedRolloutState,
@@ -1168,7 +1169,38 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 + ")",
                 flush=True,
             )
+            await self._release_environment_state()
             return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+    async def release_environment_state(self) -> None:
+        """Let the environment delete outside state no published snapshot uses.
+
+        Called once at the end of the run, after the last trainer checkpoint's
+        old checkpoints are pruned; each published snapshot already releases.
+        """
+        async with self._save_lock:
+            await self._release_environment_state()
+
+    async def _release_environment_state(self) -> None:
+        """Release with every published snapshot as kept.
+
+        Callers hold the save lock, so no snapshot can start between listing
+        the published ones and the release, which names the latest checkpoint.
+        """
+        if not self._environment_checkpoint.holds_rollout_state:
+            return
+        try:
+            snapshot_dirs = await asyncio.to_thread(
+                published_snapshot_dirs, self._checkpointer.checkpoint_dir
+            )
+        except OSError as error:
+            warnings.warn(
+                "Skipping the environment release: cannot list the published "
+                f"rollout snapshots: {type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+            return
+        await self._environment_checkpoint.release(snapshot_dirs)
 
     def _warn_if_snapshots_keep_losing_to_train_steps(
         self, consecutive_discards: int
