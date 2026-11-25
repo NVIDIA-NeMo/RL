@@ -124,7 +124,7 @@ loss_fn:
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
-  token_level_loss: true
+  normalization: global_token_mean
   force_on_policy_ratio: true
   use_kl_in_reward: false
 

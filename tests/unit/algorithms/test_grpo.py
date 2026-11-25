@@ -8567,6 +8567,16 @@ class TestAggregateRolloutMetrics:
         assert result["min_completion_rate"] == pytest.approx(0.5)
         assert result["max_completion_rate"] == pytest.approx(0.6)
 
+    def test_harness_group_counts_summed(self):
+        metrics = {
+            "swe/pi_agent/num_groups": [1, 0, 1],
+            "swe/pi_agent/reward/mean": [1, 0, 1],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        # Counts add up over a step's groups; other per-group values average.
+        assert result["swe/pi_agent/num_groups"] == 2
+        assert result["swe/pi_agent/reward/mean"] == pytest.approx(2 / 3)
+
     def test_total_turns_summed(self):
         metrics = {"total_turns": [10, 20, 30]}
         result = aggregate_rollout_metrics(metrics)
@@ -8782,7 +8792,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     if draft is not None:
         config.policy["draft"] = draft
@@ -8800,7 +8810,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     [
         ({"grpo": {"seq_logprob_error_threshold": None}}, "requires seq_logprob"),
         ({"loss_fn": {"force_on_policy_ratio": False}}, "force_on_policy_ratio"),
-        ({"loss_fn": {"token_level_loss": False}}, "token_level_loss"),
+        ({"loss_fn": {"normalization": "sequence_mean"}}, "normalization"),
         ({"loss_fn": {"use_kl_in_reward": True}}, "advantage estimator"),
         ({"loss_fn": {"positive_example_nll_weight": 0.1}}, "NLL"),
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
@@ -8816,7 +8826,7 @@ def test_single_forward_rejects_unsupported_configs(
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     config.policy["draft"] = {"enabled": False}
     for section, values in override.items():
