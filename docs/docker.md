@@ -78,11 +78,11 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 ## Overriding Packages in the vLLM Worker Venvs
 
-`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to try the vLLM wheel on a torch built for a newer CUDA toolkit than the one `uv.lock` pins, which the lock cannot express for a single extra:
+`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to run a newer vLLM than the one `uv.lock` pins, on a torch built for a newer CUDA toolkit, which the lock cannot express for a single extra:
 
 ```sh
 docker buildx build -f docker/Dockerfile \
-    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
+    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
     --tag <registry>/nemo-rl:latest \
     .
 ```

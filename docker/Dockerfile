@@ -28,7 +28,7 @@
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
 # Optional: install packages over the locked ones in the worker venvs that carry the vllm extra:
-#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
@@ -750,7 +750,7 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # Opt-in, off by default: packages to install over the locked ones in every worker venv
 # that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
 # toolkit than the one uv.lock pins:
-#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
 # Comma-separated requirements, so the value survives build systems that pass it unquoted.
 # VLLM_VENV_PACKAGE_OVERRIDES_INDEX is a comma-separated list of extra indexes. Nightly
 # wheels work too: a requirement that names a pre-release (torch==2.16.0.dev20261116+cu135,
