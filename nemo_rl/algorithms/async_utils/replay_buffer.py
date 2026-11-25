@@ -1801,8 +1801,7 @@ class TQReplayBuffer:
         In-flight reservations are intentionally omitted. ``already_claimed_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
         streamed optimizer step. These groups are saved first, in selection
-        order, so a restore retries the interrupted batch before waiting groups.
-        They restore as ordinary ready groups, not as orphaned training claims.
+        order, ahead of the waiting ready groups.
         """
         groups: list[TQReplayGroupMetadata] = []
         existing_group_ids: set[str] = set()
@@ -1824,7 +1823,7 @@ class TQReplayBuffer:
             existing_group_ids.add(group_id)
             existing_sample_ids.update(entry["meta"].sample_ids)
 
-        # Retry the interrupted batch before groups still waiting for training.
+        # Save the interrupted batch ahead of groups still waiting for training.
         for group in already_claimed_groups or []:
             append_group(copy.deepcopy(group))
 
