@@ -101,7 +101,9 @@ async_rl:
     max_data_attempts_per_prompt: 1
     max_skipped_prompts: 0
     max_consecutive_dropped_prompts: 0
-    min_step_batch_fraction: 1
+    # A group the finalizer drops (every rollout lost its token capture) gets no
+    # replacement; train that step on 31 of 32 groups instead of failing the run.
+    min_step_batch_fraction: 0.96875
     # Keep the B=32 gradient estimate when a structurally empty group (for
     # example, every logical row masked) cannot be trained.
     on_dropped_prompt: replace
