@@ -1,0 +1,163 @@
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
+ppo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 4
+  policy_training_start_step: 1
+  skip_reference_policy_logprobs_calculation: false
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
+  keep_top_k: 3
+  checkpoint_must_save_by: 00:03:30:00
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  offload_optimizer_for_logprob: false
+  automodel_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    clear_cache_every_n_steps: null
+  megatron_cfg:
+    activation_checkpointing: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_permute_fusion: true
+    moe_token_dispatcher_type: alltoall
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+    optimizer:
+      lr: 2.0e-06
+      min_lr: ${policy.megatron_cfg.optimizer.lr}
+      weight_decay: 0.01
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: ${policy.megatron_cfg.optimizer.lr}
+      override_opt_param_scheduler: true
+    checkpoint:
+      async_save: true
+    train_iters: 100000
+  sequence_packing:
+    enabled: false
+  generation:
+    mcore_generation_config:
+      buffer_size_gb: 10
+      max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      enable_prefix_caching: true
+      kv_cache_management_mode: persist
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      parsers: []
+      expose_http_server: false
+    vllm_cfg:
+      gpu_memory_utilization: 0.7
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+        reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      compilation_config:
+        backend: eager
+      mamba_ssm_cache_dtype: float32
+    colocated:
+      resources:
+        gpus_per_node: 4
+value:
+  train_micro_batch_size: 2
+  megatron_cfg:
+    scheduler:
+      override_opt_param_scheduler: true
+data:
+  max_input_seq_length: null
+  num_workers: 0
+  train:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl
+  default:
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+    dataset_name: NemoGymDataset
+env:
+  math: null
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - responses_api_agents/browsecomp_agent/configs/browsecomp_agent.yaml
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: ${mul:64, ${cluster.num_nodes}}
+    browsecomp_agent:
+      responses_api_agents:
+        browsecomp_agent:
+          resources_server:
+            type: resources_servers
+            name: workplace_assistant
+          allow_host_execution: true
+          max_steps: 6
+          keep_rounds: 1
+          max_context_tokens: 0
+          nudge_steps: false
+    browsecomp_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: browsecomp_agent
+logger:
+  log_dir: logs/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
+  wandb_enabled: true
+  monitor_gpus: true
+  wandb:
+    name: ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
+async_rl:
+  sampler:
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: 4
+  max_inflight_prompts: 4
+  max_buffered_rollouts: 4
+  rollout_failure:
+    min_step_batch_fraction: 1
+token_capture:
+  enabled: true
+  forest_training: true
+cluster:
+  gpus_per_node: 8

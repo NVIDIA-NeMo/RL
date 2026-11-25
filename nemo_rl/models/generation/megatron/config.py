@@ -12,13 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
+from collections.abc import Mapping
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NotRequired,
+    Optional,
+    TypedDict,
+    cast,
+)
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.dynamo.config import DynamoCfg
 
 
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
@@ -57,12 +69,31 @@ class MultimodalPromptConfigOverrides(BaseModel):
     content_part_order: Optional[Literal["preserve", "media_first"]] = None
 
 
+class EngineLayoutOverrides(BaseModel, extra="forbid"):
+    """Parallel layout a prefill or decode engine uses instead of the shared one.
+
+    A field left ``None`` keeps the shared layout for that dimension. The KV
+    handoff reshards the cache between the two sides, so prefill and decode
+    engines may span different numbers of GPUs.
+    """
+
+    tensor_model_parallel_size: PositiveInt | None = None
+    pipeline_model_parallel_size: PositiveInt | None = None
+
+
+# Per-role layout keys of mcore_generation_config: they size one prefill or
+# decode engine behind Dynamo and never reach a model's megatron_cfg.
+ENGINE_ROLE_KEYS = ("prefill_engine", "decode_engine")
+
+
 class MCoreGenerationSpecificArgs(TypedDict):
     """Megatron fields related only to inference.
 
     Any fields not declared here but declared in the training-side config can be overwritten.
     For example, Megatron inference might want `transformer_impl: "inference_optimized"`,
     while Megatron training might want `transformer_impl: "transformer_engine"`.
+    `prefill_engine` and `decode_engine` are the exception: they are popped before
+    the merge and never reach `megatron_cfg`.
     """
 
     expose_http_server: bool
@@ -187,6 +218,11 @@ class MCoreGenerationSpecificArgs(TypedDict):
     fp8_cfg: NotRequired[Fp8Config]
     # Megatron Bridge provider fields without a first-class NeMo-RL setting.
     model_overrides: NotRequired[dict[str, Any]]
+    # Per-role layouts of the prefill and decode engines behind Dynamo
+    # (policy.generation.dynamo=true), on top of the layout above; as
+    # trtllm_cfg keeps its own prefill_engine / decode_engine.
+    prefill_engine: NotRequired[EngineLayoutOverrides]
+    decode_engine: NotRequired[EngineLayoutOverrides]
 
 
 class MCoreGenerationConfig(GenerationConfig):
@@ -196,12 +232,40 @@ class MCoreGenerationConfig(GenerationConfig):
     # refit, and nccl_reshard selects the non-colocated NCCL M-to-N transport.
     refit_transport: NotRequired[Literal["mcore", "nccl_reshard"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs
+    # Serve prefill/decode engines through a managed Dynamo frontend. The
+    # engines are dedicated inference policies, one per role per replica, laid
+    # out by `disaggregation` and sized by mcore_generation_config's
+    # prefill_engine / decode_engine; `dynamo_cfg` tunes the frontend and the
+    # timeouts.
+    dynamo: NotRequired[bool]
+    dynamo_cfg: NotRequired["DynamoCfg"]
+    # Not a user key: the Dynamo engine fleet sets it on each engine's own copy
+    # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
+    # worker whose config carries it builds the prefill/decode handoff engine.
+    _dynamo_role: NotRequired[Literal["prefill", "decode"]]
 
 
-def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
-    """The `megatron_cfg` a dedicated inference model runs with."""
+def merged_inference_megatron_cfg(
+    policy_config: PolicyConfig, overrides: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """The `megatron_cfg` a dedicated inference model runs with.
+
+    Args:
+        policy_config: The policy config whose ``megatron_cfg`` is the base and
+            whose ``generation.mcore_generation_config`` overrides it.
+        overrides: Layout keys applied on top of ``mcore_generation_config``,
+            for an inference model whose layout differs from the shared one
+            (a prefill or decode worker with its own TP or PP). Applied before
+            the keys this merge pins, so context parallelism stays off.
+    """
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
-    overrides = dict(generation_config.get("mcore_generation_config") or {})
+    gen_overrides: dict[str, Any] = {
+        **(generation_config.get("mcore_generation_config") or {}),
+        **(overrides or {}),
+    }
+    for role_key in ENGINE_ROLE_KEYS:
+        gen_overrides.pop(role_key, None)
+    overrides = dict(gen_overrides)
     explicit_cp = overrides.pop("context_parallel_size", None)
     if explicit_cp is not None and explicit_cp != 1:
         raise ValueError(
@@ -236,9 +300,6 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
     # for dense models). An explicitly requested gen-side ETP>1 is unsatisfiable,
     # so name the config key rather than letting MCore assert at model build.
     if merged.get("transformer_impl") == "inference_optimized":
-        gen_overrides = cast(
-            dict[str, Any], generation_config.get("mcore_generation_config") or {}
-        )
         explicit_etp = cast(
             Optional[int], gen_overrides.get("expert_tensor_parallel_size")
         )

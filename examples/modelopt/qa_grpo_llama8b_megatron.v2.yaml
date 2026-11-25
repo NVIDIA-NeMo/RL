@@ -63,7 +63,7 @@ loss_fn:
   ratio_clip_c: null
 
   # DAPO: Token-level loss.
-  token_level_loss: true
+  normalization: global_token_mean
 
   # Truncated Importance Sampling (ICE-POP).
   use_importance_sampling_correction: true
