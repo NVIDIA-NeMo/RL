@@ -8567,6 +8567,16 @@ class TestAggregateRolloutMetrics:
         assert result["min_completion_rate"] == pytest.approx(0.5)
         assert result["max_completion_rate"] == pytest.approx(0.6)
 
+    def test_harness_group_counts_summed(self):
+        metrics = {
+            "swe/pi_agent/num_groups": [1, 0, 1],
+            "swe/pi_agent/reward/mean": [1, 0, 1],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        # Counts add up over a step's groups; other per-group values average.
+        assert result["swe/pi_agent/num_groups"] == 2
+        assert result["swe/pi_agent/reward/mean"] == pytest.approx(2 / 3)
+
     def test_total_turns_summed(self):
         metrics = {"total_turns": [10, 20, 30]}
         result = aggregate_rollout_metrics(metrics)
