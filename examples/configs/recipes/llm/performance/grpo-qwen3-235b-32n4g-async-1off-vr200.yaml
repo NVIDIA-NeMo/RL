@@ -1,7 +1,4 @@
 defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
-grpo:
-  async_grpo:
-    recompute_kv_cache_after_weight_updates: true
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200
 policy:
