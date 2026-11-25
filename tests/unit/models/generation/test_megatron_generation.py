@@ -43,9 +43,7 @@ from nemo_rl.models.generation.megatron.utils import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.weight_sync.megatron_weight_synchronizer import (
-    MegatronWeightSynchronizer,
-)
+from nemo_rl.weight_sync.megatron_weight_synchronizer import MegatronWeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership
 from tests.unit.test_utils import SimpleLossFn
 
@@ -592,6 +590,7 @@ def test_sampling_params_can_ignore_eos(
             "top_k": None,
             "top_p": 1.0,
             "max_new_tokens": 8,
+            "stop_token_ids": None,
             "ignore_eos": ignore_eos,
         }
     }
@@ -740,6 +739,7 @@ def test_direct_megatron_multimodal_generate_round_trip(
             "top_k": None,
             "top_p": 1.0,
             "max_new_tokens": 2,
+            "stop_token_ids": [71],
             "stop_strings": None,
             "mcore_generation_config": {},
         }
@@ -811,6 +811,7 @@ def test_direct_megatron_multimodal_generate_round_trip(
     else:
         assert "num_frames" not in media["image"]
     assert captured["sampling_params"][0].return_prompt_tokens is True
+    assert captured["sampling_params"][0].stop_token_ids == [71]
 
     assert output["output_ids"][0].tolist() == [10, 99, 99, 20, 71, 72]
     assert output["logprobs"][0].tolist() == [0.0, 0.0, 0.0, 0.0, -0.25, -0.5]
