@@ -146,7 +146,7 @@ def test_loss_chunking_splits_the_sequence_into_chunks(
 def test_top_k_filtering_keeps_the_local_unchunked_path(
     singleton_tp_mesh: DeviceMesh, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Sampling cannot chunk, so it must not be routed through the vocab-parallel kernel."""
+    """Top-k/top-p filtering stays on the local unchunked path, not the vocab-parallel kernel."""
     calls: list[int] = []
     original = model_utils.from_parallel_logits_to_logprobs
 
