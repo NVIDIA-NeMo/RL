@@ -11,12 +11,14 @@ policy:
       moe_hybridep_pad_uneven_dispatch_inputs: true
     env_vars:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
+      # Keep HybridEP collectives in the same order across learner ranks.
+      TORCH_COMPILE_DISABLE: "1"
   generation:
     # The packed collective refits the verifier while the external drafter stays fixed.
     refit_transport: null
     vllm_cfg:
-      # K1 reserves two engine positions beyond the 8,192-token request budget.
-      max_model_len: 8194
+      # K3 reserves four engine positions beyond the 8,192-token request budget.
+      max_model_len: 8196
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.02"
     vllm_kwargs:
@@ -25,18 +27,18 @@ policy:
         method: eagle3
         model: RedHatAI/Qwen3-235B-A22B-speculator.eagle3
         revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe  # pragma: allowlist secret
-        num_speculative_tokens: 1
-        draft_sample_method: greedy
+        num_speculative_tokens: 3
+        draft_sample_method: probabilistic
         draft_load_config:
           load_format: safetensors
       compilation_config:
-        # K1 verifies two tokens per request. Chunked prefill can use the
+        # K3 verifies four tokens per request. Chunked prefill can use the
         # larger token buckets even when only a few requests are active.
         cudagraph_capture_sizes: [
-          2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128,
-          144, 160, 176, 192, 208, 224, 240, 256,
-          272, 288, 304, 320, 336, 352, 368, 384,
-          400, 416, 432, 448, 464, 480, 496, 512,
+          4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256,
+          288, 320, 352, 384, 416, 448, 480, 512,
+          544, 576, 608, 640, 672, 704, 736, 768,
+          800, 832, 864, 896, 928, 960, 992, 1024,
         ]
 logger:
   log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200
