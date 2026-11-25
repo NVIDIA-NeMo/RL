@@ -234,3 +234,25 @@ Metric names use the **application scope** (`rl.*`); attribute names in the `rl.
 ## Filtering across runs
 
 Every `rl.*` data point carries the `nemo.run.id` resource attribute. Use it to isolate or compare runs in your backend (Grafana/Prometheus, or any OTLP-compatible backend). See [Configuration — Run identification](configuration.md#run-identification).
+
+
+## Passive Gym looping metrics (draft)
+
+The matching Gym draft supplies the detector, extractor, and process executor. The current pinned Gym submodule does not yet provide that API: install the Gym draft in the rollout actor environment for local validation, and update the pin after the Gym change is available upstream.
+
+Enable under `env.nemo_gym` for the single-controller integration:
+
+```yaml
+observability_enabled: true
+model_call_capture_dir: /absolute/node-local/model-call-captures
+looping:
+  enabled: true
+  workers: 1
+  max_pending: 16
+```
+
+The block may be enabled globally or by an individual shard overlay. The actor builder reserves one additional CPU per configured analysis worker. Workers use Gym's model-call captures and returned ownership evidence; collector enrichment remains disabled. Capturing model exchanges still has its existing I/O cost and needs representative throughput measurement.
+
+Each successful completed dispatch is submitted without waiting for analysis. The controller reads ready snapshots concurrently from the actual Gym shard/replica handles on its watchdog telemetry cadence. One shared tick deadline bounds collection; unavailable actors are reported explicitly, and partial snapshots do not publish a pooled rate. Counts and assessed rates reach the regular logger. Actor-specific metrics retain an epoch timestamp so a counter reset on actor restart is visible. Pending, capped, missing, changed, and failed evidence never count as clean. Counters are process-local and reset on restart; these are generated-completion metrics, not fixed-checkpoint evaluations or final loss-eligible rates. Graceful shutdown stops producers before a bounded drain and final snapshot.
+
+This draft changes no rewards, sample masks, token masks, dynamic-sampling decisions, or generation stop settings. Full GPU/Ray training validation, saved training replay, and operational load tests remain required before enabling it in a production recipe.

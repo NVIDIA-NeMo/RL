@@ -76,6 +76,11 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointInstance,
     GymCheckpointPrepareSummary,
 )
+from nemo_rl.environments.gym_looping import (
+    GymLoopingConfig,
+    collect_looping_snapshots,
+    looping_worker_cpus,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
@@ -298,6 +303,7 @@ class NemoGymPostprocessConfig(BaseModel):
     invalid_tool_call_patterns: list[str] | None = None
     thinking_tags: list[str] | None = None
     truncate_noncontiguous_episodes: bool = False
+    looping: GymLoopingConfig | None = None
 
 
 def _prepare_materialized_nemo_gym_rows(
@@ -697,6 +703,7 @@ def get_nemo_gym_venv_dir() -> str | None:
 
 class NemoGymConfig(TypedDict):
     model_name: str
+    looping: NotRequired[dict[str, Any] | None]
     base_urls: List[str]
     # The bearer token the generation server requires on its OpenAI routes, handed
     # to the Gym model server as policy_api_key. None when the server checks none.
@@ -1156,6 +1163,7 @@ class NemoGym(EnvironmentInterface):
         if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
             instrument_aiohttp_client()
         self.cfg = cfg
+        self._looping_metrics: Any = None
         capture_config = cfg.get("token_capture")
         self._forest_training = bool(
             capture_config and capture_config.get("forest_training")
@@ -1479,6 +1487,14 @@ Depending on your data shape, you may want to change these values."""
                 return rollout_client
 
         self.rch = DeploymentRolloutCollectionHelper()
+        looping_config = self.cfg.get("looping")
+        if looping_config is not None and looping_config["enabled"]:
+            # Gym is optional and installed only in rollout actor environments.
+            from nemo_gym.rollouts import LoopingExecutor
+
+            self._looping_metrics = LoopingExecutor.from_config(
+                rollout_client.global_config_dict, config=looping_config
+            )
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
@@ -1941,6 +1957,8 @@ Depending on your data shape, you may want to change these values."""
                     )
                 except (GymTransportError, RolloutDataFailure) as error:
                     return nemo_gym_row, error
+                if self._looping_metrics is not None:
+                    self._looping_metrics.submit_completed(nemo_gym_row, result)
                 return nemo_gym_row, result
             if not isinstance(failure, GymAdmissionClosed):
                 # A refusal is expected while a checkpoint is open; only a real
@@ -2851,6 +2869,20 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
+    async def finish_looping_metrics(
+        self, *, timeout_s: float
+    ) -> dict[str, float | str | None]:
+        """Drain passive analysis after training stops submitting rollouts."""
+        if self._looping_metrics is not None:
+            await asyncio.to_thread(self._looping_metrics.close, timeout_s=timeout_s)
+        return self.looping_metrics_snapshot()
+
+    def looping_metrics_snapshot(self) -> dict[str, float | str | None]:
+        """Read generated-rollout diagnostics without waiting for unfinished scans."""
+        if self._looping_metrics is None:
+            return {}
+        return self._looping_metrics.metrics_snapshot()
+
     def shutdown(self) -> None:
         """Stop the Gym servers. Safe to call more than once, and before spinup.
 
@@ -2863,6 +2895,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         whatever it leaves running is stopped too; see _shut_down_gym_servers.
         """
         try:
+            if self._looping_metrics is not None:
+                self._looping_metrics.close(timeout_s=self._control_timeout_s)
             rh, self.rh = self.rh, None
             if rh is not None:
                 _shut_down_gym_servers(rh)
@@ -3144,6 +3178,11 @@ def _build_gym_actor_config(
         for key, value in nemo_gym_dict.items()
         if key not in NemoGymPostprocessConfig.model_fields
     }
+    if postprocess_cfg.looping is not None and postprocess_cfg.looping.enabled:
+        if not nemo_gym_dict.get("observability_enabled"):
+            raise ValueError(
+                "looping metrics require observability_enabled=true and model_call_capture_dir"
+            )
     if postprocess_cfg.truncate_noncontiguous_episodes:
         if enable_router_replay:
             raise ValueError(
@@ -3242,6 +3281,10 @@ def _build_gym_actor_config(
         if generation_prefix_cuts_enabled:
             policy_overrides["checkpoint"]["generation_cuts"] = True
 
+    looping_config = None
+    if postprocess_cfg.looping is not None:
+        looping_config = postprocess_cfg.looping.model_dump()
+
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
@@ -3253,6 +3296,7 @@ def _build_gym_actor_config(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         truncate_noncontiguous_episodes=postprocess_cfg.truncate_noncontiguous_episodes,
+        looping=looping_config,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=instance_token_capture,
@@ -3322,18 +3366,30 @@ class NemoGymShardSet:
             names, read from the actors' resolved Gym configuration.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
+        looping_enabled: Whether any actor is configured for passive looping metrics.
     """
 
     handles: Dict[str, List[ray.actor.ActorHandle]]
     route_to_shard: Dict[str, str] = field(default_factory=dict)
     environment_server_routes: Dict[str, str] = field(default_factory=dict)
     placement_group: Optional[PlacementGroup] = None
+    looping_enabled: bool = False
     _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
     _replica_lock: threading.Lock = field(
         default_factory=threading.Lock,
         repr=False,
         compare=False,
     )
+
+    async def collect_looping_metrics(
+        self, *, timeout_s: float, drain: bool = False
+    ) -> dict[str, float]:
+        """Read each enabled stack's actor snapshots without blocking rollout delivery."""
+        if not self.looping_enabled:
+            return {}
+        return await collect_looping_snapshots(
+            self.checkpoint_handles, timeout_s=timeout_s, drain=drain
+        )
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -3643,6 +3699,9 @@ def _build_single_gym_actor(
     actor_options: dict[str, Any] = {
         "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
     }
+    worker_cpus = looping_worker_cpus(nemo_gym_dict)
+    if worker_cpus:
+        actor_options["num_cpus"] = 1 + worker_cpus
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(),
@@ -3650,7 +3709,10 @@ def _build_single_gym_actor(
         )
 
     actor = NemoGym.options(**actor_options).remote(actor_config)
-    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
+    shard_set = NemoGymShardSet(
+        handles={DEFAULT_SHARD_NAME: [actor]},
+        looping_enabled=bool(worker_cpus),
+    )
     try:
         ray.get(actor._spinup.remote())
         _, routes = ray.get(
@@ -3732,6 +3794,7 @@ def _build_sharded_gym_actors(
                     if shard.actor_cpus is not None
                     else DEFAULT_SHARD_CPUS
                 )
+                + looping_worker_cpus(merged_by_shard[shard.name])
             }
             for shard, _ in instances
         ],
@@ -3749,7 +3812,13 @@ def _build_sharded_gym_actors(
             f"allocation may be too small or its nodes too busy."
         ) from error
 
-    shard_set = NemoGymShardSet(handles={}, placement_group=pg)
+    shard_set = NemoGymShardSet(
+        handles={},
+        placement_group=pg,
+        looping_enabled=any(
+            looping_worker_cpus(config) for config in merged_by_shard.values()
+        ),
+    )
     try:
         for bundle_index, (shard, replica) in enumerate(instances):
             instance_gym_dict = apply_shard_log_dir(
@@ -3757,13 +3826,17 @@ def _build_sharded_gym_actors(
                 shard.name,
                 replica_index=replica if shard.replicas > 1 else None,
             )
-            actor = NemoGym.options(
-                runtime_env=actor_runtime_env,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
+            actor_options: dict[str, Any] = {
+                "runtime_env": actor_runtime_env,
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=bundle_index,
                 ),
-            ).remote(
+            }
+            worker_cpus = looping_worker_cpus(instance_gym_dict)
+            if worker_cpus:
+                actor_options["num_cpus"] = 1 + worker_cpus
+            actor = NemoGym.options(**actor_options).remote(
                 _build_gym_actor_config(
                     instance_gym_dict,
                     base_urls=base_urls,

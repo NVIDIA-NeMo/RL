@@ -20,6 +20,7 @@ metrics roll-up -- with fake actors, so they need neither Ray nor a GPU.
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+from unittest.mock import AsyncMock
 
 import pytest
 from ray import cloudpickle
@@ -589,3 +590,35 @@ def test_replicas_report_separately_rather_than_overwriting_each_other():
 
 def test_no_shard_reported_timing_yields_no_metrics():
     assert _merge_nemo_gym_timing_metrics({}, "timing/rollout") == {}
+
+
+@pytest.mark.parametrize(
+    "known,unavailable,rate", [(9, False, 0.1), (0, False, None), (9, True, None)]
+)
+def test_looping_metrics_cover_shards_replicas_and_unavailable_snapshots(
+    known, unavailable, rate
+):
+    prefix = "looping/severe_union"
+    actors = [AsyncMock() for _ in range(3)]
+    for actor, assessed, flagged in zip(
+        actors, [int(bool(known)), known, 0], [1, 0, 0]
+    ):
+        actor.looping_metrics_snapshot.remote.return_value = {
+            f"{prefix}/assessed_total": assessed,
+            f"{prefix}/flagged_total": flagged if assessed else 0,
+        }
+    if unavailable:
+        actors[1].looping_metrics_snapshot.remote.side_effect = RuntimeError()
+    shards = NemoGymShardSet(
+        handles={"judged": actors[:1], "tools": actors[1:]}, looping_enabled=True
+    )
+
+    metrics = asyncio.run(shards.collect_looping_metrics(timeout_s=1))
+
+    for actor in actors:
+        actor.looping_metrics_snapshot.remote.assert_awaited_once()
+    assert metrics.get(f"{prefix}/rate_assessed") == rate
+    assert metrics["looping/snapshot_unavailable_actors"] == int(unavailable)
+    assert metrics[f"judged/replica-0/{prefix}/flagged_total"] == int(bool(known))
+    if not unavailable:
+        assert metrics[f"{prefix}/assessed_total"] == known + int(bool(known))

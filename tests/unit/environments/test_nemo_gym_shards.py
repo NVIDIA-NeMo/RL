@@ -860,3 +860,19 @@ def test_external_service_readiness_reaches_every_shard():
     for shard in plan.shards:
         merged = apply_shard_overlay(config, plan, shard)
         assert merged["external_service_readiness"] == readiness
+
+
+def test_looping_settings_are_shared_and_overridable_per_shard():
+    config = _sharded_config(looping={"enabled": True, "workers": 2})
+    config["shards"][1]["overrides"] = {"looping": {"enabled": False}}
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    settings = [
+        apply_shard_overlay(config, plan, shard)["looping"] for shard in plan.shards
+    ]
+    assert settings == [
+        {"enabled": True, "workers": 2},
+        {"enabled": False, "workers": 2},
+    ]

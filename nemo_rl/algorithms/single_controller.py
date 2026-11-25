@@ -186,7 +186,7 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -963,6 +963,21 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                final_looping_metrics = await self._collect_looping_metrics(
+                    timeout_s=self._async_cfg.stall_watchdog.interval_s, drain=True
+                )
+                if final_looping_metrics:
+                    self._logger.log_metrics(
+                        final_looping_metrics,
+                        step=self._train_steps,
+                        step_metric="rollout/train_steps",
+                    )
+            except Exception:
+                log.warning(
+                    "Could not finish passive looping metrics during teardown",
+                    exc_info=True,
+                )
             try:
                 # With the train pump stopped, publish a save that
                 # defer_async_checkpoint_finalize left pending: a failure ends the
@@ -3945,6 +3960,16 @@ class SingleControllerActor:
                 break
         await self._finish_pending_save(blocking=True)
 
+    async def _collect_looping_metrics(
+        self, *, timeout_s: float, drain: bool = False
+    ) -> dict[str, float]:
+        """Read diagnostics through the actual Gym actor topology."""
+        environment = self._env_handles.get("nemo_gym")
+        if environment is None:
+            return {}
+        shard_set = as_nemo_gym_shard_set(environment)
+        return await shard_set.collect_looping_metrics(timeout_s=timeout_s, drain=drain)
+
     async def _stall_watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
 
@@ -3982,6 +4007,10 @@ class SingleControllerActor:
             metrics = dict(stats.as_metrics())
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
+            looping_metrics = await self._collect_looping_metrics(
+                timeout_s=watchdog_cfg.interval_s
+            )
+            metrics.update(looping_metrics)
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())

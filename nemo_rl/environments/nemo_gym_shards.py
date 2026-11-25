@@ -41,6 +41,7 @@ NEMO_RL_DICT_CONFIG_KEYS = frozenset(
     {
         "effort_levels",
         "external_service_readiness",
+        "looping",
         "tokenizer_config",
     }
 )
