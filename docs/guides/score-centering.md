@@ -49,7 +49,7 @@ Apply these settings to a SingleController NeMo Gym GRPO configuration with the 
 ```yaml
 loss_fn:
   score_centering: true
-  token_level_loss: true
+  normalization: global_token_mean
   sequence_level_importance_ratios: false
   use_importance_sampling_correction: false
   truncated_importance_sampling_type: null

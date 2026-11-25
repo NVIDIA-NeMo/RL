@@ -650,6 +650,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                         for group_id, rewards in runtime.finalizer_rewards_by_group.items()
                     },
                     reward_settings=capture_reward_settings(self._master_config),
+                    multi_harness_routes=self._rollout_manager.multi_harness_routes_state(),
                     canonical_group_ids={
                         group["group_id"] for group in replay_metadata["groups"]
                     }
