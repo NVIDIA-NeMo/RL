@@ -1873,6 +1873,11 @@ class AsyncNemoGymRolloutImpl:
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
+    # Declared on the class so an instance unpickled from an older build, or built without __init__ in tests,
+    # runs with the observer off.
+    _completion_observer: Optional[Callable[[str, int, dict[str, Any], float], None]] = None
+    completion_observer_errors: int = 0
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -1965,6 +1970,18 @@ class RolloutManager:
         # keyed by group_id until the controller attaches them to the group's
         # replay metadata (the echo path commits them with the record itself).
         self._capture_rollout_metrics: dict[str, dict[str, Any]] = {}
+        # grpo.turn_credit: the turn-judge coordinator's per-rollout callback (group id, generation index,
+        # env_extras, reward), called with every streamed completion before its seal. Set by the controller.
+        self._completion_observer: Optional[
+            Callable[[str, int, dict[str, Any], float], None]
+        ] = None
+        self.completion_observer_errors = 0
+
+    def set_completion_observer(
+        self, observer: Optional[Callable[[str, int, dict[str, Any], float], None]]
+    ) -> None:
+        """Install the callback that sees every streamed completion's full Gym result (token-capture path)."""
+        self._completion_observer = observer
 
     @property
     def stats(self) -> RolloutStats:
@@ -2609,6 +2626,19 @@ class RolloutManager:
             rollout_infos[generation_index] = json.loads(
                 json.dumps(rollout_debug_info(env_extras), default=str)
             )
+            if self._completion_observer is not None:
+                # Only place the full Gym result exists on the trainer; an observer failure must never
+                # fail the rollout.
+                try:
+                    self._completion_observer(
+                        group_id, generation_index, env_extras, float(completion.reward)
+                    )
+                except Exception as error:
+                    self.completion_observer_errors += 1
+                    print(
+                        f"  turn_judge observer failed for {group_id}/{generation_index}: {error!r}",
+                        flush=True,
+                    )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2616,6 +2646,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    rollout_info=rollout_infos[generation_index],
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2645,6 +2676,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    rollout_info=rollout_infos[generation_index],
                 )
 
         try:
@@ -2682,6 +2714,7 @@ class RolloutManager:
                 rewards,
                 mask_sample,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            ledger_infos = self._recovery_ledger.finalization_rollout_infos(group_id)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2693,7 +2726,8 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 rollout_infos=tuple(
-                    rollout_infos.get(i, {}) for i in range(len(physical_rollout_ids))
+                    rollout_infos.get(i) or ledger_infos[i] or {}
+                    for i in range(len(physical_rollout_ids))
                 ),
             )
             from nemo_rl.experience.rollout_reassembler_actor import (

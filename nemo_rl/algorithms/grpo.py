@@ -334,6 +334,8 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
+    # SingleController-only feature; parsed by TurnCreditConfig at validation.
+    turn_credit: Optional[dict[str, Any]] = None
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
@@ -607,6 +609,11 @@ def setup(
             teacher_worker_groups, alias_to_group_alias.
     """
     # Start timing the entire setup process
+    # Import locally: single_controller_utils imports this legacy schema.
+    from nemo_rl.algorithms.single_controller_utils.turn_credit import turn_credit_config
+
+    if turn_credit_config(master_config.grpo) is not None:
+        raise NotImplementedError("turn_credit requires examples/run_single_controller.py, not legacy GRPO setup")
     setup_start_time = time.perf_counter()
 
     # Extract individual configs for easier access

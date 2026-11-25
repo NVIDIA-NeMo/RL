@@ -73,6 +73,14 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import branch_replay as branch_replay_module
+from nemo_rl.algorithms.single_controller_utils.turn_credit import (
+    TurnCreditStats,
+    turn_credit_config,
+)
+from nemo_rl.algorithms.single_controller_utils.turn_credit_adapter import apply_turn_credit
+from nemo_rl.algorithms.single_controller_utils.turn_judge_coordinator import (
+    TurnJudgeCoordinator,
+)
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.critic_training_mask import CRITIC_SAMPLE_MASK, build_critic_sample_mask
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
@@ -282,6 +290,9 @@ PENDING_PROMPTS_FILENAME = "pending_prompts.pt"
 # SWE privileged critic prefix cache, saved with a checkpointed replay buffer so the
 # restored groups keep their reference blocks.
 PRIVILEGE_PREFIXES_FILENAME = "privilege_prefixes.pt"
+# grpo.turn_credit: the turn-judge coordinator's restart state (TurnJudgeCoordinator.state_dict), captured under
+# the checkpoint barrier with the replay metadata and the recovery ledger.
+TURN_JUDGE_STATE_FILENAME = "turn_judge_state.pt"
 
 
 def _restorable_dispatch_index(
@@ -439,6 +450,8 @@ class SingleControllerActor:
     # blind critic, tracks no pending prompts and has none to re-dispatch.
     _multi_trace: bool = False
     _privilege_store: Optional[SwePrivilegePrefixStore] = None
+    _turn_judge: Optional[TurnJudgeCoordinator] = None
+    _turn_credit_stats: Optional[TurnCreditStats] = None
     _pending_prompt_idx: Optional[set[int]] = None
     _resume_pending_prompts: Sequence[DatumSpec] = ()
 
@@ -575,6 +588,18 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        # grpo.turn_credit: the turn judge runs as part of each group's verification (after the seal, before
+        # the commit); its coordinator stashes every rollout's judge fields from the completion callback.
+        turn_credit = turn_credit_config(self._algo_cfg)
+        if turn_credit is not None:
+            # Restart state rides in every full checkpoint (TURN_JUDGE_STATE_FILENAME); the optional event log
+            # (turn_credit.state_dir) is off unless set.
+            self._turn_judge = TurnJudgeCoordinator(
+                turn_credit, state_dir=turn_credit.state_dir
+            )
+            self._rollout_manager.set_completion_observer(
+                self._turn_judge.observe_completion
+            )
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
@@ -917,6 +942,11 @@ class SingleControllerActor:
             ):
                 result = await self._run_pumps()
         finally:
+            if self._turn_judge is not None:
+                try:
+                    await self._turn_judge.close()
+                except BaseException as error:  # teardown must not mask the run's own error
+                    print(f"turn_judge: close failed: {error!r}", flush=True)
             # Outside the span so the job span is flushed too, and off the
             # event loop because the exporter's flush blocks. Shielded, and a
             # cancel swallowed, because teardown is exactly when cancellation
@@ -958,6 +988,25 @@ class SingleControllerActor:
         await self._maybe_restore_replacement_reserve()
         await self._maybe_restore_pending_prompts()
         self._validate_restored_sampler_cursor()
+        if self._turn_judge is not None:
+            # Before the pumps: restored replay groups need their labels at their first selection, and restored
+            # in-flight groups their rollouts' judge fields when they seal (sealed rollouts are not re-observed).
+            turn_judge_state = None
+            if self._last_checkpoint_path is not None:
+                state_path = os.path.join(
+                    self._last_checkpoint_path, TURN_JUDGE_STATE_FILENAME
+                )
+                if os.path.exists(state_path):
+                    # weights_only=False: plain dicts written by this controller (a trusted same-run artifact).
+                    turn_judge_state = await asyncio.to_thread(
+                        torch.load, state_path, weights_only=False
+                    )
+            await asyncio.to_thread(
+                self._turn_judge.resume,
+                self._buffer.group_ids,
+                [group.group_id for group in self._rollout_recovery_ledger.groups()],
+                turn_judge_state,
+            )
         recovery_prepare_seconds = time.monotonic() - recovery_prepare_started
         self._log_rollout_restore_metrics(
             replay_metadata_load_seconds=replay_restore_seconds,
@@ -2401,6 +2450,7 @@ class SingleControllerActor:
                     # generation permits as soon as the tokens are staged, then
                     # hand the metadata-only request to the finalizer actor pool.
                     ownership_transferred = False
+                    judged_group_id: Optional[str] = None
                     try:
                         while True:
                             # Scope only, no span: dispatched per prompt like
@@ -2446,8 +2496,28 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
+                            if self._turn_judge is not None:
+                                judged_group_id = request.group_id
+                                env_info = prompt.get("extra_env_info") or {}
+                                agent_ref = env_info.get("agent_ref") or {}
+                                agent_name = (
+                                    agent_ref.get("name", "")
+                                    if isinstance(agent_ref, dict)
+                                    else str(agent_ref)
+                                )
+                                try:
+                                    await self._turn_judge.judge_sealed_group(
+                                        request, prompt, agent_name
+                                    )
+                                except Exception as error:
+                                    log.warning(
+                                        "Turn judge failed for %s; using GRPO: %s",
+                                        request.group_id, error,
+                                    )
                             finalized = await self._finalize_with_actor(request)
                             if finalized is None:
+                                if self._turn_judge is not None:
+                                    self._turn_judge.discard_group(request.group_id)
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed
                                 # data yet); ownership was already cleaned up,
@@ -2468,7 +2538,11 @@ class SingleControllerActor:
                             if not below_threshold:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
+                                if self._turn_judge is not None:
+                                    self._turn_judge.committed(request.group_id)
                                 break
+                            if self._turn_judge is not None:
+                                self._turn_judge.discard_group(request.group_id)
                             # Enough rows verified to publish, but too few to
                             # be worth training on. Unlike the finalizer's own
                             # structural drops above, this is a policy call
@@ -2528,6 +2602,8 @@ class SingleControllerActor:
                         # releases this permit after consuming the committed group.
                         if not ownership_transferred:
                             self._buffer_capacity.release()
+                            if self._turn_judge is not None and judged_group_id is not None:
+                                self._turn_judge.discard_group(judged_group_id)
                         raise
                 else:
                     while True:
@@ -3764,6 +3840,14 @@ class SingleControllerActor:
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
+                if self._turn_credit_stats is not None:
+                    step_metrics.update(self._turn_credit_stats.to_metrics())
+                    self._turn_credit_stats = None
+                if self._turn_judge is not None:
+                    step_metrics.update(self._turn_judge.pop_step_metrics())
+                    step_metrics["turn_judge/observer_errors_total"] = float(
+                        self._rollout_manager.completion_observer_errors
+                    )
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
@@ -5339,6 +5423,19 @@ class SingleControllerActor:
                 if self._privilege_store is not None and checkpoint_replay_buffer
                 else None
             )
+            # Same cut as the replay metadata and the recovery ledger: labels of the groups this checkpoint
+            # restores, and the judge fields of its in-flight groups' sealed rollouts.
+            turn_judge_state = (
+                self._turn_judge.state_dict(
+                    self._buffer.group_ids,
+                    [
+                        group.group_id
+                        for group in self._rollout_manager.recovery_ledger.groups()
+                    ],
+                )
+                if self._turn_judge is not None and checkpoint_replay_buffer
+                else None
+            )
 
             checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
                 self._checkpointer.init_tmp_checkpoint,
@@ -5476,6 +5573,12 @@ class SingleControllerActor:
                 torch.save,
                 privilege_state,
                 os.path.join(checkpoint_path, PRIVILEGE_PREFIXES_FILENAME),
+            )
+        if turn_judge_state is not None:
+            await asyncio.to_thread(
+                torch.save,
+                turn_judge_state,
+                os.path.join(checkpoint_path, TURN_JUDGE_STATE_FILENAME),
             )
         if replay_metadata is not None:
             await asyncio.to_thread(
@@ -6315,6 +6418,26 @@ class SingleControllerActor:
             advantages = torch.zeros_like(mask)
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
+
+        if self._turn_judge is not None and has_valid_training_tokens:
+            if has_extra_rows:
+                raise NotImplementedError(
+                    "turn_credit requires one canonical row per rollout"
+                )
+            advantages, stats, records = await apply_turn_credit(
+                self._dp_client,
+                meta,
+                advantages,
+                train_mask=mask,
+                token_mask=token_mask,
+                labels=self._turn_judge.labels_for(meta.sample_ids, self._train_steps + 1),
+                config=self._turn_judge.config,
+                tokenizer_config=self._master_config.policy["tokenizer"],
+            )
+            if self._turn_credit_stats is None:
+                self._turn_credit_stats = TurnCreditStats(applied=stats.applied)
+            self._turn_credit_stats.merge(stats)
+            self._turn_judge.record_shaping(self._train_steps + 1, records)
 
         if self._message_level_advantage_penalties_enabled:
             # Sequence-error filtering and the pre-existing sample mask remain

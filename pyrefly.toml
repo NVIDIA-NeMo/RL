@@ -24,6 +24,9 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/algorithms/single_controller_utils/turn_credit.py",
+  "nemo_rl/algorithms/single_controller_utils/turn_credit_adapter.py",
+  "nemo_rl/algorithms/single_controller_utils/turn_judge_coordinator.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",

@@ -1312,6 +1312,70 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """
     algo_cfg = algo_config(master_config)
 
+    # turn_credit: the turn judge runs at group seal on the token-capture path (completion callback, finalizer
+    # request) and shapes the canonical rows' GRPO advantages.
+    from nemo_rl.algorithms.single_controller_utils.turn_credit import turn_credit_config
+
+    if is_ppo_run(master_config) and turn_credit_config(master_config.grpo) is not None:
+        raise NotImplementedError("grpo.turn_credit cannot be enabled on a PPO run; use a separate GRPO experiment")
+    if turn_credit_config(algo_cfg) is not None:
+        if is_ppo_run(master_config):
+            raise NotImplementedError("turn_credit is implemented for GRPO only (the grpo block).")
+        if not should_use_nemo_gym(master_config) or not master_config.token_capture.enabled:
+            raise NotImplementedError(
+                "turn_credit needs NeMo-Gym rollouts on the token-capture path (env.should_use_nemo_gym=true, "
+                "token_capture.enabled=true): the judge reads the Gym results there and labels map to the "
+                "captured rows' generated-token runs."
+            )
+        if master_config.token_capture.segment_rows.enabled:
+            raise NotImplementedError(
+                "turn_credit shapes one canonical row per rollout; disable token_capture.segment_rows."
+            )
+        if algo_cfg.adv_estimator.name != "grpo":
+            raise ValueError(
+                f"turn_credit needs grpo.adv_estimator.name='grpo' (one advantage per rollout), got "
+                f"{algo_cfg.adv_estimator.name!r}."
+            )
+        if opd_module.is_opd_enabled(master_config):
+            raise ValueError("turn_credit redistributes reward advantages; it does not apply with OPD.")
+        if (
+            getattr(algo_cfg, "advantage_clip_low", None) is not None
+            or getattr(algo_cfg, "advantage_clip_high", None) is not None
+        ):
+            # A clip after the shaping would break its zero-sum per rollout.
+            raise ValueError(
+                "turn_credit with grpo.advantage_clip_low/high is not supported: the clip runs after the "
+                "shaping and would break its zero-sum per rollout."
+            )
+        # Not supported together yet (user, 2026-11-15; iterations/PHASE3_IMPL.md): reward penalties change the
+        # trained reward while the judge labels on the test outcome (a penalized pass has A < 0 but only good labels),
+        # and the per-turn advantage hooks run after the shaping and overwrite or clip it. Both need a decided rule
+        # (skip penalized rollouts; hook order) before they can run with turn credit.
+        conflicts = [f"reward_penalties.{flag}" for flag in _REWARD_PENALTY_FLAGS
+                     if getattr(master_config.reward_penalties, flag, False)]
+        if master_config.env.get("reward_penalty_rules"):
+            conflicts.append("env.reward_penalty_rules")
+        if getattr(getattr(algo_cfg, "reward_shaping", None), "enabled", False):
+            conflicts.append("grpo.reward_shaping.enabled")
+        for name in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+            if getattr(algo_cfg, name, None) is not None:
+                conflicts.append(f"grpo.{name}")
+        if getattr(algo_cfg, "tool_failure_credit", None):
+            conflicts.append("grpo.tool_failure_credit")
+        if getattr(algo_cfg, "malformed_think_credit", None):
+            conflicts.append("grpo.malformed_think_credit")
+        if getattr(getattr(getattr(algo_cfg, "adv_estimator", None), "positive_length_reweight", None),
+                   "enabled", False):
+            conflicts.append("grpo.adv_estimator.positive_length_reweight")
+        if conflicts:
+            raise NotImplementedError(
+                "turn_credit cannot run with reward penalties or per-turn advantage hooks yet: "
+                f"{', '.join(conflicts)}. Penalties change the trained reward while the judge labels on the test "
+                "outcome, and the hooks run after the shaping and overwrite it; see "
+                "docs/turn-credit.md."
+            )
+
+
     # None means no epoch bound. SC has no -1 convention though: the rollout pump
     # gates on _current_epoch < max_num_epochs, so <= 0 trains nothing and exits 0.
     if algo_cfg.max_num_epochs is not None and algo_cfg.max_num_epochs <= 0:

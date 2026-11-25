@@ -57,6 +57,28 @@ def _all_sampler_names() -> list[str]:
     return [variant.model_fields["name"].default for variant in variants]
 
 
+@pytest.mark.parametrize("conflict", ["ppo", "capture", "segments", "clip", "penalty"])
+def test_turn_credit_rejects_incompatible_recipes(conflict):
+    from nemo_rl.algorithms.single_controller_utils.config import _validate_algo_settings
+
+    cfg = _master_config()
+    cfg.grpo.turn_credit = {"enabled": True, "judge": {"endpoint_file": "/unused"}}
+    cfg.policy["generation"]["vllm_cfg"] = {"async_engine": True, "expose_http_server": True}
+    cfg.token_capture.enabled = True
+    if conflict == "ppo":
+        cfg.ppo = PPOConfig.model_construct()
+    elif conflict == "capture":
+        cfg.token_capture.enabled = False
+    elif conflict == "segments":
+        cfg.token_capture.segment_rows.enabled = True
+    elif conflict == "clip":
+        cfg.grpo.advantage_clip_high = 1.0
+    else:
+        cfg.grpo.invalid_tool_call_advantage = -5.0
+    with pytest.raises((ValueError, NotImplementedError), match="turn_credit"):
+        _validate_algo_settings(cfg)
+
+
 def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterConfig:
     """A config the SC validator accepts, with the fields under test overridable."""
     return MasterConfig.model_construct(

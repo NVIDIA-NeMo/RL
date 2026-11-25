@@ -243,6 +243,32 @@ def _controller(
     return ctrl
 
 
+def test_turn_credit_shapes_real_controller_stage():
+    from unittest.mock import Mock
+
+    from nemo_rl.algorithms.single_controller_utils.turn_credit import (
+        RolloutTurnLabels, TurnCreditConfig,
+    )
+
+    data, meta = _batch([_Row(group="g", rollout=0, reward=1), _Row(group="g", rollout=1, reward=0)])
+    data["token_mask"] = torch.tensor([[0., 1., 1., 0., 1., 1.]] * 2)
+    plane = _DataPlane(data)
+    ctrl = _controller(plane, num_generations_per_prompt=2, segment_rows_enabled=False)
+    ctrl._master_config.policy = {"tokenizer": {}}
+    ctrl._train_steps = 0
+    cfg = TurnCreditConfig(enabled=True, judge={"endpoint_file": "/unused"})
+    labels = {meta.sample_ids[0]: RolloutTurnLabels("g", 0, 2, ((0, 1), (1, -1)), aligned=True, step_tokens=(2, 2))}
+    ctrl._turn_judge = SimpleNamespace(config=cfg, labels_for=Mock(return_value=labels), record_shaping=Mock())
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    shaped = _written(plane, "advantages")
+    assert shaped[0, 1] > shaped[0, 4]
+    assert shaped[1, 1] == shaped[1, 4]  # no label on the failed rollout
+    assert ctrl._turn_credit_stats.shaped_rows == 1
+    assert ctrl._turn_credit_stats.sign_flips == 0
+    ctrl._turn_judge.record_shaping.assert_called_once()
+
+
 def _run(rows: list[_Row], **controller_kwargs):
     data, meta = _batch(rows)
     plane = _DataPlane(data)

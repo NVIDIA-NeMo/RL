@@ -1,0 +1,19 @@
+# Merge-only fragment for an existing Nano SingleController GRPO + OpenCode recipe.
+# Do not pass this alone as --config. No model, data, or node allocation is selected here.
+# Keep your baseline's sampler/loss/GPP; this feature needs mixed-outcome groups.
+grpo:
+  turn_credit:
+    enabled: true
+    apply: true # false = shadow judge (no advantage change)
+    lam: 0.5
+    kappa: 0.8
+    shape_rollouts: all # all, passing (A > 0), failing (A < 0)
+    require_token_match: true
+    shuffle_within_rollout: false
+    judge:
+      endpoint_file: /shared/turn-judge/service.env # edit; HTTP service discovery, NOT model endpoint
+      agents: null # or a list of agent_ref names to judge
+token_capture:
+  enabled: true
+  segment_rows:
+    enabled: false

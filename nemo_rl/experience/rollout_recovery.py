@@ -73,6 +73,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward",
         "mask_sample",
         "staging_keys",
+        "rollout_info",
     }
 )
 
@@ -178,6 +179,8 @@ class RolloutAttemptRecord:
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
+    # Preserve turn/token mapping metadata for sealed siblings across restart.
+    rollout_info: Optional[dict[str, Any]] = None
 
     @property
     def attempt_id(self) -> str:
@@ -282,6 +285,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    rollout_info: Optional[dict[str, Any]] = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -448,6 +452,7 @@ class RolloutRecoveryLedger:
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
             attempt.reward = None
+            attempt.rollout_info = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -578,6 +583,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        rollout_info: Optional[dict[str, Any]] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -622,6 +628,7 @@ class RolloutRecoveryLedger:
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
+        attempt.rollout_info = copy.deepcopy(rollout_info)
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -691,6 +698,7 @@ class RolloutRecoveryLedger:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
+            attempt.rollout_info = copy.deepcopy(result.rollout_info)
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -766,6 +774,11 @@ class RolloutRecoveryLedger:
             rewards,
             mask_sample,
         )
+
+    def finalization_rollout_infos(self, group_id: str) -> list[Optional[dict[str, Any]]]:
+        """Return saved per-sibling metadata in finalization order."""
+        record = self._require_group(group_id)
+        return [copy.deepcopy(s.current_attempt.rollout_info) for s in record.siblings]
 
     def mark_finalization_started(
         self,
@@ -867,6 +880,7 @@ class RolloutRecoveryLedger:
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "rollout_info": copy.deepcopy(attempt.rollout_info),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -1054,6 +1068,10 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
+                # Optional in the sidecar: a missing key reads as None.
+                rollout_info = attempt_state.get("rollout_info")
+                if rollout_info is not None and not isinstance(rollout_info, dict):
+                    raise ValueError("rollout_info must be a mapping or None")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1094,6 +1112,11 @@ class RolloutRecoveryLedger:
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
+                        rollout_info=(
+                            copy.deepcopy(rollout_info)
+                            if attempt_status == RolloutAttemptStatus.SEALED
+                            else None
+                        ),
                     )
                 )
             siblings.append(

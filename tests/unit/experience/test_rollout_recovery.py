@@ -59,6 +59,51 @@ def _mutate(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
     return asyncio.run(apply())
 
 
+def test_rollout_info_survives_restart_and_defaults_none() -> None:
+    """grpo.unfinished_rollouts reads the mask provenance from the rollout_debug info of each sibling; a sibling sealed
+    before a checkpoint must keep it after the restore (older sidecars without the key read as None)."""
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g8",
+        admission_id="batch-8",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=8,
+        start_weight_version=7,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g8"))
+    info = {"reward": 0.0, "mask_rules": ["context_limited"], "env_masked": False}
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g8",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={"rollout_id": gate_id, "manifest": [{"staging_key": "g8/sibling-0/call-0"}]},
+            reward=0.0,
+            mask_sample=True,
+            rollout_info=info,
+        )
+    )
+    info["mask_rules"].append("mutated after the seal")  # the ledger keeps its own copy
+    assert ledger.finalization_rollout_infos("g8") == [
+        {"reward": 0.0, "mask_rules": ["context_limited"], "env_masked": False},
+        None,
+    ]
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert restored.finalization_rollout_infos("g8") == ledger.finalization_rollout_infos("g8")
+    for sibling in state["groups"][0]["siblings"]:
+        for attempt in sibling["attempts"]:
+            del attempt["rollout_info"]
+    older = RolloutRecoveryLedger.from_state_dict(state)
+    assert older.finalization_rollout_infos("g8") == [None, None]
+
+
 def _reserve(ledger: RolloutRecoveryLedger, **kwargs: Any):
     return _mutate(lambda cut: ledger.reserve_group(cut, **kwargs))
 
