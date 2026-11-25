@@ -766,8 +766,9 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # a torch built for a different CUDA version, and the workers import it through transformers.
 ARG VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
 # The same for the worker venvs that carry the mcore extra (same index list): a Triton
-# whose compiler knows sm_107, which the Triton 3.7.1 pinned by the locked torch does not.
-ARG MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
+# whose compiler knows sm_107, which the Triton 3.7.1 pinned by the locked torch does not,
+# and the fla release whose kernels pass the autotune key validation of that Triton.
+ARG MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0,flash-linear-attention==0.6.0,fla-core==0.6.0
 ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
