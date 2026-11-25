@@ -36,7 +36,7 @@ class DistributedContext(NamedTuple):
     dp_size: int
     tp_size: int
     cp_size: int
-    pp_size: int = 1
+    pp_size: int
 
 
 class RuntimeConfig(NamedTuple):

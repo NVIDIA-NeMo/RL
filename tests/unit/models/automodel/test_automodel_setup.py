@@ -57,6 +57,7 @@ def mock_config():
             "cpu_offload": False,
             "tensor_parallel_size": 1,
             "context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
             "expert_parallel_size": 1,
             "sequence_parallel": False,
             "activation_checkpointing": False,
@@ -1059,6 +1060,38 @@ class TestSetupDistributed:
 
 
 @pytest.mark.automodel
+def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_rl.models.automodel.pipeline_parallel import pipeline_loss_fn
+    from nemo_rl.models.automodel.setup import build_pipeline_config
+
+    fsdp2_config = SimpleNamespace(
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    )
+    config = {
+        "train_micro_batch_size": 2,
+        "max_total_sequence_length": 128,
+        "automodel_cfg": {"pipeline": {"microbatches_per_step": 4}},
+    }
+
+    pipeline_config = build_pipeline_config(config, fsdp2_config)
+
+    assert pipeline_config.pp_schedule == "1F1B"
+    assert pipeline_config.pp_microbatch_size == 2
+    assert pipeline_config.pp_batch_size == 8
+    assert pipeline_config.layers_per_stage is None
+    assert pipeline_config.dtype == torch.float32
+    assert pipeline_config.scale_grads_in_schedule is False
+    assert pipeline_config.pp_seq_len == 128
+    assert pipeline_config.loss_fn is pipeline_loss_fn
+
+
+@pytest.mark.automodel
 class TestSetupModelAndOptimizer:
     """Test suite for setup_model_and_optimizer function."""
 
@@ -1094,6 +1127,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=1,
+            pp_size=1,
         )
 
     @pytest.fixture
@@ -1812,6 +1846,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1856,6 +1891,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=2,  # TP enabled
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1900,6 +1936,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         # Set model_type to gemma3 to trigger validation
@@ -1941,6 +1978,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,
+            pp_size=1,
         )
 
         mock_runtime_config.model_config.model_type = "gemma4_unified"

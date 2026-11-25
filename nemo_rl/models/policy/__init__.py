@@ -209,11 +209,11 @@ class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (pp * tp * cp * ep)
+    # data_parallel_size is derived from world_size / (pp * tp * cp)
     tensor_parallel_size: int
     context_parallel_size: int
-    # Omitted means PP=1. See docs/design-docs/automodel-pipeline-parallel.md.
-    pipeline_parallel_size: NotRequired[int]
+    # See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: int
     pipeline: NotRequired[AutomodelPipelineConfig]
     expert_parallel_size: NotRequired[int]
     # Size of the HSDP replicate dimension within the data-parallel axis.

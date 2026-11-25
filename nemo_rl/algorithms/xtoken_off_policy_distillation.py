@@ -63,9 +63,8 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import automodel_pipeline_parallel_size
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -276,7 +275,7 @@ def setup(
             f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
         # The teacher's get_full_logits_ipc has no pipeline-parallel implementation.
-        if automodel_pipeline_parallel_size(tc["automodel_cfg"]) > 1:
+        if cast(AutomodelConfig, tc["automodel_cfg"])["pipeline_parallel_size"] > 1:
             raise ValueError(
                 "xtoken distillation does not support "
                 f"teachers.{i}.automodel_cfg.pipeline_parallel_size > 1."

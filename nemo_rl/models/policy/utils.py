@@ -16,7 +16,6 @@ import gc
 import os
 import traceback
 import warnings
-from collections.abc import Mapping
 from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
@@ -165,13 +164,6 @@ def configure_lora_refit(policy_config: "PolicyConfig") -> None:
     configure_vllm_lora_refit(policy_config)
 
 
-def automodel_pipeline_parallel_size(automodel_cfg: Mapping[str, Any]) -> int:
-    """Return the pipeline size; older configs omit the key and use PP=1."""
-    if "pipeline_parallel_size" not in automodel_cfg:
-        return 1
-    return automodel_cfg["pipeline_parallel_size"]
-
-
 def validate_automodel_pipeline_config(
     config: "PolicyConfig",
     *,
@@ -183,7 +175,7 @@ def validate_automodel_pipeline_config(
     from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
     automodel_cfg = cast("AutomodelConfig", config["automodel_cfg"])
-    pp_size = automodel_pipeline_parallel_size(automodel_cfg)
+    pp_size = automodel_cfg["pipeline_parallel_size"]
     if pp_size < 1:
         raise ValueError(
             f"policy.automodel_cfg.pipeline_parallel_size must be >= 1, got {pp_size}."
@@ -252,6 +244,12 @@ def validate_automodel_pipeline_config(
         raise ValueError(
             f"PP > 1 does not support tied embeddings ({config['model_name']} "
             "sets tie_word_embeddings=true)."
+        )
+    if getattr(text_config, "num_nextn_predict_layers", 0):
+        raise ValueError(
+            f"PP > 1 does not support MTP ({config['model_name']} sets "
+            "num_nextn_predict_layers > 0). Set "
+            "policy.hf_config_overrides.num_nextn_predict_layers: 0."
         )
 
 

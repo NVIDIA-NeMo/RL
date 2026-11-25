@@ -43,6 +43,7 @@ def _make_worker(with_draft: bool = True) -> AutomodelPolicyWorkerImpl:
     worker = AutomodelPolicyWorkerImpl.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(4, 4, bias=False)
     worker.pipeline = None
+    worker._weight_exporter = None
     worker.draft_model = _TinyDraft() if with_draft else None
     worker.dtype = torch.bfloat16
     worker.cpu_offload = False

@@ -648,7 +648,14 @@ class AutomodelPolicyWorkerImpl(
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
-        self._weight_exporter: Optional[PipelineWeightExporter] = None
+        self._weight_exporter = (
+            PipelineWeightExporter(
+                self.pipeline,
+                local_params=lambda: _module_params_generator(self.model, self.dtype),
+            )
+            if self.pipeline is not None
+            else None
+        )
 
         if defer_checkpoint_load:
             self.load_checkpoint(weights_path, optimizer_path)
@@ -806,7 +813,7 @@ class AutomodelPolicyWorkerImpl(
                 else:
                     processed_iterator, iterator_len = get_microbatch_iterator(
                         batch,
-                        self.cfg,
+                        cast(dict[str, Any], self.cfg),
                         mbs,
                         self.dp_mesh,
                         tokenizer=self.tokenizer,
@@ -1075,7 +1082,7 @@ class AutomodelPolicyWorkerImpl(
             microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
             dp_group=self.dp_mesh.get_group(),
             tokenizer=self.tokenizer,
-            cfg=self.cfg,
+            cfg=cast(dict[str, Any], self.cfg),
             allow_flash_attn_args=self.allow_flash_attn_args,
             device_mesh=self.device_mesh,
             cp_size=self.cp_size,
@@ -1482,8 +1489,8 @@ class AutomodelPolicyWorkerImpl(
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        if self.pipeline is not None:
-            return self._pipeline_weight_exporter().refit_info()
+        if self._weight_exporter is not None:
+            return self._weight_exporter.refit_info()
         if self.lora_enabled and self.lora_refit_mode == "native":
             return {
                 name: (tensor.shape, tensor.dtype)
@@ -1519,28 +1526,28 @@ class AutomodelPolicyWorkerImpl(
 
         return state_dict_info
 
-    def _pipeline_weight_exporter(self) -> PipelineWeightExporter:
-        """The full-model weight stream of a pipeline-parallel policy."""
-        if self._weight_exporter is None:
-            self._weight_exporter = PipelineWeightExporter(
-                self.pipeline,
-                local_params=lambda: _module_params_generator(self.model, self.dtype),
-            )
-        return self._weight_exporter
+    def _iter_refit_params(
+        self, *, include_draft: bool
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield full-model refit weights, with or without pipeline parallelism."""
+        if self._weight_exporter is not None:
+            assert self.draft_model is None
+            yield from self._weight_exporter.iter_params()
+            return
+        yield from automodel_params_generator(
+            self.model,
+            self.dtype,
+            draft_model=self.draft_model if include_draft else None,
+        )
 
     def _refit_params_generator(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Yield native A/B tensors or the unchanged merged full state."""
-        if self.pipeline is not None:
-            yield from self._pipeline_weight_exporter().iter_params()
-            return
         if self.lora_enabled and self.lora_refit_mode == "native":
             yield from automodel_lora_params_generator(self.model, self.dtype)
             return
-        yield from automodel_params_generator(
-            self.model, self.dtype, draft_model=self.draft_model
-        )
+        yield from self._iter_refit_params(include_draft=True)
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1618,13 +1625,8 @@ class AutomodelPolicyWorkerImpl(
             send_hf_buckets_via_ipc_actor_impl,
         )
 
-        params = (
-            self._pipeline_weight_exporter().iter_params()
-            if self.pipeline is not None
-            else automodel_params_generator(self.model, self.dtype)
-        )
         bucket_iter = iter_named_tensor_buckets(
-            params,
+            self._iter_refit_params(include_draft=False),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -1636,9 +1638,7 @@ class AutomodelPolicyWorkerImpl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return automodel_params_generator(
-            self.model, self.dtype, draft_model=self.draft_model
-        )
+        return self._iter_refit_params(include_draft=True)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

@@ -198,38 +198,6 @@ def test_loss_fn_logprobs_records_token_logprobs_and_frees_logits():
     assert pipeline_input.untyped_storage().size() == 0
 
 
-def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
-    from types import SimpleNamespace
-
-    from torch.distributed.fsdp import MixedPrecisionPolicy
-
-    from nemo_rl.models.automodel.setup import build_pipeline_config
-
-    fsdp2_config = SimpleNamespace(
-        mp_policy=MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
-        )
-    )
-    config = {
-        "train_micro_batch_size": 2,
-        "max_total_sequence_length": 128,
-        "automodel_cfg": {"pipeline": {"microbatches_per_step": 4}},
-    }
-
-    pipeline_config = build_pipeline_config(config, fsdp2_config)
-
-    assert pipeline_config.pp_schedule == "1F1B"
-    assert pipeline_config.pp_microbatch_size == 2
-    assert pipeline_config.pp_batch_size == 8
-    assert pipeline_config.layers_per_stage is None
-    assert pipeline_config.dtype == torch.float32
-    assert pipeline_config.scale_grads_in_schedule is False
-    assert pipeline_config.pp_seq_len == 128
-    assert pipeline_config.loss_fn is pipeline_loss_fn
-
-
 class _Forward(nn.Module):
     def forward(self, input_ids, **kwargs):
         return input_ids
@@ -461,35 +429,3 @@ def test_plan_execution_batches_checks_model_chunk_dims(monkeypatch, chunk_dims)
         assert execution_batch.model_inputs["position_ids"].shape == (4, _SEQ_LEN)
     # The hook sees one microbatch's inputs, not the concatenated batch.
     assert model.seen_position_ids_shapes == [(2, _SEQ_LEN)]
-
-
-def _check_tq_coordinates(rank: int, world_size: int) -> None:
-    from torch.distributed.device_mesh import init_device_mesh
-
-    from nemo_rl.models.policy.workers.automodel_policy_worker import (
-        AutomodelPolicyWorkerImpl,
-    )
-
-    # PP=2, DP=1: both pipeline stages of the single DP rank are replicas.
-    worker = object.__new__(AutomodelPolicyWorkerImpl)
-    worker.device_mesh = init_device_mesh(
-        "cuda",
-        (2, 1, 1, 1, 1),
-        mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp"),
-    )
-    coords = worker._local_coords()
-    assert coords == {
-        "tensor_parallel": 0,
-        "context_parallel": 0,
-        "pipeline_parallel": rank,
-    }
-    # Exactly one rank of the DP replica writes back to TQ.
-    leaders = [None] * world_size
-    torch.distributed.all_gather_object(leaders, worker._is_replica_leader())
-    assert leaders == [True, False]
-    replica_group = worker._get_replica_group()
-    assert torch.distributed.get_process_group_ranks(replica_group) == [0, 1]
-
-
-def test_tq_coordinates_include_pipeline_stage(distributed_test_runner):
-    distributed_test_runner(_check_tq_coordinates, world_size=2)

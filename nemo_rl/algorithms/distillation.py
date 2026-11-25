@@ -74,13 +74,10 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import (
-    automodel_pipeline_parallel_size,
-    configure_lora_refit,
-)
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -270,7 +267,7 @@ def setup(
     if (
         teacher_automodel_cfg is not None
         and teacher_automodel_cfg["enabled"]
-        and automodel_pipeline_parallel_size(teacher_automodel_cfg) > 1
+        and cast(AutomodelConfig, teacher_automodel_cfg)["pipeline_parallel_size"] > 1
     ):
         raise ValueError(
             "Distillation does not support "

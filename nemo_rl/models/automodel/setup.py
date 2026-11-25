@@ -19,7 +19,7 @@ import inspect
 import json
 import os
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import torch
 from hydra.utils import get_class
@@ -83,15 +83,13 @@ from nemo_rl.models.automodel.utils import resolve_model_class
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
+    AutomodelConfig,
     AutomodelPipelineConfig,
     LoRAConfig,
     PolicyConfig,
     TokenizerConfig,
 )
-from nemo_rl.models.policy.utils import (
-    automodel_pipeline_parallel_size,
-    configure_dynamo_cache,
-)
+from nemo_rl.models.policy.utils import configure_dynamo_cache
 from nemo_rl.models.value.config import ValueConfig
 
 STRING_TO_DTYPE = {
@@ -535,12 +533,12 @@ def setup_distributed(
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
     ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
-    pp_size = automodel_pipeline_parallel_size(config["automodel_cfg"])
+    pp_size = cast(AutomodelConfig, config["automodel_cfg"])["pipeline_parallel_size"]
     dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
-    model_parallel_size = pp_size * tp_size * cp_size * ep_size
+    model_parallel_size = pp_size * tp_size * cp_size
     dp_size = world_size // model_parallel_size
     if dp_size % dp_replicate_size != 0:
         raise ValueError(
@@ -1233,7 +1231,7 @@ def build_pipeline_config(
     sequence length and FSDP's output dtype for inter-stage activations.
     """
     pipeline_cfg = AutomodelPipelineConfig.model_validate(
-        config["automodel_cfg"]["pipeline"]
+        cast(AutomodelConfig, config["automodel_cfg"])["pipeline"]
     )
     micro_batch_size = config["train_micro_batch_size"]
     return PipelineConfig(

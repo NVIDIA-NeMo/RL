@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import numpy as np
 import torch
@@ -35,10 +35,9 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import automodel_pipeline_parallel_size
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -203,7 +202,7 @@ def setup(
     if (
         automodel_cfg is not None
         and automodel_cfg["enabled"]
-        and automodel_pipeline_parallel_size(automodel_cfg) > 1
+        and cast(AutomodelConfig, automodel_cfg)["pipeline_parallel_size"] > 1
     ):
         raise ValueError(
             "DPO does not support policy.automodel_cfg.pipeline_parallel_size > 1."

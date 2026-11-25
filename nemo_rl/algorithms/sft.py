@@ -18,7 +18,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional, cast
 
 import numpy as np
 import torch
@@ -45,10 +45,9 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import automodel_pipeline_parallel_size
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -256,7 +255,7 @@ def _validate_automodel_pipeline_sft_setup(master_config: MasterConfig) -> None:
     automodel_cfg = policy_config.get("automodel_cfg")
     if automodel_cfg is None or not automodel_cfg["enabled"]:
         return
-    if automodel_pipeline_parallel_size(automodel_cfg) == 1:
+    if cast(AutomodelConfig, automodel_cfg)["pipeline_parallel_size"] == 1:
         return
     if (
         master_config.sft.val_micro_batch_size

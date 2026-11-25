@@ -20,10 +20,7 @@ from typing import Any
 import pydantic
 import pytest
 
-from nemo_rl.models.policy.utils import (
-    automodel_pipeline_parallel_size,
-    validate_automodel_pipeline_config,
-)
+from nemo_rl.models.policy.utils import validate_automodel_pipeline_config
 
 
 def _config(**automodel_overrides: Any) -> dict[str, Any]:
@@ -52,11 +49,6 @@ def _config(**automodel_overrides: Any) -> dict[str, Any]:
 
 def _validate(config: dict[str, Any], *, is_vlm: bool = False, model_config=None):
     validate_automodel_pipeline_config(config, is_vlm=is_vlm, model_config=model_config)
-
-
-def test_pipeline_parallel_size_defaults_to_one_when_absent():
-    assert automodel_pipeline_parallel_size({"enabled": True}) == 1
-    assert automodel_pipeline_parallel_size({"pipeline_parallel_size": 4}) == 4
 
 
 def test_pp_size_one_needs_no_pipeline_block():
@@ -204,3 +196,9 @@ def test_rejects_tied_embeddings():
                 text_config=SimpleNamespace(tie_word_embeddings=True)
             ),
         )
+
+
+def test_rejects_mtp():
+    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
+        _validate(_config(), model_config=SimpleNamespace(num_nextn_predict_layers=1))
+    _validate(_config(), model_config=SimpleNamespace(num_nextn_predict_layers=0))

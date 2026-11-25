@@ -404,7 +404,7 @@ def pipeline_forward_logprobs(
 def pipeline_optimizer_part_ids(
     pipeline: Optional[AutoPipeline],
 ) -> Optional[list[int]]:
-    """Global stage indices used to namespace optimizer checkpoints, or None without PP."""
+    """Global stage indices of this rank's pipeline stages, or None without PP."""
     if pipeline is None:
         return None
     return [stage.stage_index for stage in pipeline.info.stages]
