@@ -383,9 +383,12 @@ The first step is the same in both arms, as expected when the two paths build th
 
 A longer run with the interface on, eight steps and sixteen rollouts on the same two tasks, finished without a bridge error or a poisoned rollout:
 
-| Calls | Token-in | `first_call` roots | `no_prefix_match` roots | Other root reasons | `finalize/rerooted_tokens` |
-| --- | --- | --- | --- | --- | --- |
-| 299 | 276 (92.3%) | 16 | 7 (2.3%) | 0 | 53224 |
+| Arm | Calls | Token-in | `first_call` roots | `no_prefix_match` roots | Other root reasons | `finalize/rerooted_tokens` | Rollout time |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| On | 299 | 276 (92.3%) | 16 | 7 (2.3%) | 0 | 53224 | 691 s |
+| Off | 154 | 135 (87.7%) | 16 | 3 (1.9%) | 0 | 21681 | 659 s |
+
+The same eight steps were then run with the interface off. The two arms made different numbers of calls, so their totals are not comparable. Rollout time is not either: a step took about 70 seconds with two or three calls in both arms, which is sandbox startup and patch verification. The closest matched steps are one with 105 calls in 133.4 seconds with the interface off and one with 103 calls in 132.5 seconds with it on. These runs show no rollout-throughput difference between the paths, and they are too few to bound one.
 
 The only root reason other than `first_call` was `no_prefix_match`, which no design that accepts text histories can recover. `ambiguous_candidate`, `non_user_suffix`, `render_options_changed`, and `worker_rooted` did not occur, so these runs give no reason to change the matching rules. They cover two tasks, one agent harness, and a 0.6B model; a different harness can produce a different distribution.
 
@@ -490,7 +493,7 @@ Yes. The design is built on it. The TITO path is the token capture path with one
 ## Not yet verified
 
 - No root-reason distribution has been measured at a useful sample size, so the share of token shift this design removes is unknown.
-- The interface has run 16 SWE rollouts of two tasks with one agent harness. Throughput is unmeasured, and the root-reason distribution of other harnesses and tasks is unknown.
+- The interface has run 16 SWE rollouts of two tasks with one agent harness. No rollout-throughput difference was seen, on a sample too small to bound one, and the root-reason distribution of other harnesses and tasks is unknown.
 - Only the Qwen3 template has been qualified. Qualification is what establishes the bridge for any other template.
 - The bridge assumes every turn-close token ends a turn. A recipe whose `stop_token_ids` include a token that the template also emits inside a turn is not supported, and qualification does not detect it.
 - vLLM's own render, generate, and derender routes were read in the v0.33.0 source. The implementation calls the engine directly and does not use them.
