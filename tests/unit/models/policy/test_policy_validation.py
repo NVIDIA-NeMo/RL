@@ -836,3 +836,79 @@ def test_world_size_validation_megatron(
             )
         # For failing cases, worker group should not be created
         mock_ray_worker_group.assert_not_called()
+
+
+def _dynamic_cp_config(**packing_overrides: object) -> PolicyConfig:
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["dynamic_context_parallel"] = True
+    config["dynamic_batching"]["enabled"] = False
+    config["make_sequence_length_divisible_by"] = 1
+    config["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": 128,
+        "logprob_mb_tokens": 128,
+        "algorithm": "modified_first_fit_decreasing",
+        **packing_overrides,
+    }
+    return config
+
+
+@pytest.mark.parametrize(
+    ("packing_overrides", "rejected"),
+    [
+        ({"pair_grouping_key": "pair_index"}, "pair_grouping_key"),
+        ({"max_sequences_per_bin": 1}, "max_sequences_per_bin"),
+        ({"microbatch_order": "largest_first"}, "microbatch_order=largest_first"),
+    ],
+)
+def test_dynamic_context_parallel_rejects_packer_options(
+    packing_overrides: dict[str, object], rejected: str
+) -> None:
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        pytest.raises(ValueError, match=f"dynamic_context_parallel.*{rejected}"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=_dynamic_cp_config(**packing_overrides),
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_dynamic_context_parallel_schedules_through_a_megatron_worker() -> None:
+    policy = construct_policy_with_mocks(_dynamic_cp_config())
+    schedule = policy.sequence_packing_args["dynamic_cp_schedule"]
+    rounds = [[[0, 1]], [[2]]]
+
+    with patch("nemo_rl.models.policy.lm_policy.ray.get", return_value=rounds) as get:
+        assert schedule((8, 16, 64), 128) == rounds
+
+    policy.worker_group.run_single_worker_single_data.assert_called_once_with(
+        "schedule_dynamic_cp",
+        worker_idx=0,
+        seq_lengths=(8, 16, 64),
+        max_tokens_per_rank=128,
+    )
+    get.assert_called_once_with(
+        policy.worker_group.run_single_worker_single_data.return_value
+    )
+
+
+def test_dynamic_context_parallel_reuses_the_schedule_of_an_unchanged_batch() -> None:
+    policy = construct_policy_with_mocks(_dynamic_cp_config())
+    schedule = policy.sequence_packing_args["dynamic_cp_schedule"]
+    one_pack, two_packs, two_rounds = [[[0, 1]]], [[[0], [1]]], [[[0]], [[1]]]
+
+    with patch(
+        "nemo_rl.models.policy.lm_policy.ray.get",
+        side_effect=[one_pack, two_packs, two_rounds],
+    ) as get:
+        assert schedule((8, 16), 128) == one_pack
+        assert schedule((8, 16), 128) == one_pack
+        assert schedule((8, 16), 16) == two_packs
+        assert schedule((8, 24), 16) == two_rounds
+
+    assert get.call_count == 3
