@@ -19,7 +19,13 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from nemo_rl.models.policy.lm_policy import _aggregate_megatron_flops_metrics
-from nemo_rl.utils.flops_formulas import FLOPSConfig, glm_moe_dsa, qwen3
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    _moe_ffn_params,
+    deepseekv3,
+    glm_moe_dsa,
+    qwen3,
+)
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     convert_config_to_flops_config,
@@ -52,6 +58,32 @@ class GlmMoeDsaConfigForTest(PretrainedConfig):
             "index_n_heads": 32,
             "index_head_dim": 128,
             "index_topk": 2048,
+        }
+        defaults.update(kwargs)
+        super().__init__(**defaults)
+
+
+class MoonlightConfigForTest(PretrainedConfig):
+    model_type = "deepseek_v3"
+
+    def __init__(self, **kwargs):
+        # moonshotai/Moonlight-16B-A3B shapes.
+        defaults = {
+            "hidden_size": 2048,
+            "num_hidden_layers": 27,
+            "intermediate_size": 11264,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts_per_tok": 6,
+            "vocab_size": 163840,
+            "q_lora_rank": None,
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "first_k_dense_replace": 1,
+            "moe_intermediate_size": 1408,
+            "n_shared_experts": 2,
         }
         defaults.update(kwargs)
         super().__init__(**defaults)
@@ -234,6 +266,30 @@ def test_glm_5_2_reused_indices_reduce_indexer_flops():
         seq_len * projection_params + dense_causal_pairs * 32 * 128
     )
     assert actual_difference == (78 - 21) * per_layer_indexer_flops
+
+
+def test_deepseek_v3_config_counts_dense_layers_and_all_shared_experts():
+    flops_config, flops_formula = convert_config_to_flops_config(
+        MoonlightConfigForTest()
+    )
+
+    assert flops_formula is deepseekv3
+    assert flops_config.moe_layer_freq == [0] + [1] * 26
+    assert flops_config.moe_shared_expert_intermediate_size == 2 * 1408
+
+    # Moonlight sizes its dense FFN as (top-k + shared) experts:
+    # 11264 == (6 + 2) * 1408, so every layer activates the same FFN width.
+    dense_ffn_params = 2048 * 11264 * 3
+    assert _moe_ffn_params(flops_config) == 27 * dense_ffn_params
+
+
+def test_deepseek_v3_config_without_shared_experts():
+    flops_config, _ = convert_config_to_flops_config(
+        MoonlightConfigForTest(n_shared_experts=None, first_k_dense_replace=None)
+    )
+
+    assert flops_config.moe_layer_freq == [1] * 27
+    assert flops_config.moe_shared_expert_intermediate_size == 0
 
 
 def test_worker_total_flops_aggregation_megatron_path():
