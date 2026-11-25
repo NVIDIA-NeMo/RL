@@ -1893,7 +1893,9 @@ class SingleControllerActor:
                                             cut, lineage_group_id
                                         )
                                 self._buffer_capacity.release()
-                                self._step_assembler.credit_shortfall(target_step)
+                                self._step_assembler.credit_shortfall(
+                                    target_step, prompt_idx=prompt.get("idx")
+                                )
                                 return
                             request, rollout_metrics = captured
                             async with self._claim_filtered_spare():
@@ -1911,7 +1913,9 @@ class SingleControllerActor:
                                 # train pump will never release this permit
                                 # and the step must be allowed to close short.
                                 self._buffer_capacity.release()
-                                self._step_assembler.credit_shortfall(target_step)
+                                self._step_assembler.credit_shortfall(
+                                    target_step, prompt_idx=prompt.get("idx")
+                                )
                                 return
                             self._rollout_manager.record_group_rewards(
                                 target_step,

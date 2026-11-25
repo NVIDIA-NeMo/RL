@@ -3253,6 +3253,28 @@ def test_a_loss_racing_selection_defers_only_under_reconciliation(
         assert not ctrl._rollout_runtime.shortfall_reconciliation_pending
 
 
+def test_a_lost_group_names_its_prompt(capsys) -> None:
+    """Losses that cluster on some prompts can only be traced if each names its own."""
+
+    class Sampler(_EmptySampler):
+        uses_pooled_replacements = True
+        closes_short_at_exhaustion = False
+        requires_shortfall_reconciliation = False
+
+        def charge_step_for_lost_group(self, *, target_step, assembling_version):
+            return target_step
+
+    asm = _train_pump_controller(sampler=Sampler())._step_assembler
+    asm.begin_step(0)
+
+    asm.credit_shortfall(3, prompt_idx=17)
+    asm.credit_shortfall(3)
+
+    out = capsys.readouterr().out
+    assert "target_step=3 is one group short (lost prompt idx=17) (1 total)" in out
+    assert "target_step=3 is one group short (2 total)" in out
+
+
 def test_a_group_lost_while_the_last_chunk_trains_counts_toward_the_next_step(
     monkeypatch,
 ) -> None:
