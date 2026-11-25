@@ -3,7 +3,7 @@ grpo:
   async_grpo:
     recompute_kv_cache_after_weight_updates: true
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-eagle3-k1-vr200
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-vr200
 policy:
   megatron_cfg:
     tensor_model_parallel_size: 2
@@ -33,8 +33,15 @@ policy:
         draft_load_config:
           load_format: safetensors
       compilation_config:
-        cudagraph_capture_sizes: [2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+        # K1 verifies two tokens per request. Chunked prefill can use the
+        # larger token buckets even when only a few requests are active.
+        cudagraph_capture_sizes: [
+          2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128,
+          144, 160, 176, 192, 208, 224, 240, 256,
+          272, 288, 304, 320, 336, 352, 368, 384,
+          400, 416, 432, 448, 464, 480, 496, 512,
+        ]
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-eagle3-k1-vr200
+  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-vr200
   wandb:
-    name: grpo-qwen3-235b-32n4g-async-1off-eagle3-k1-vr200
+    name: grpo-qwen3-235b-32n4g-async-1off-vr200

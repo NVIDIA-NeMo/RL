@@ -108,8 +108,8 @@ research/template_project/tests/test_suites/llm/single_update_1n8g.sh
 research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
 
 # Manual VR200 performance benchmarks.
-tests/test_suites/llm/performance/grpo-qwen3-235b-32n4g-async-1off-eagle3-k1-vr200.sh
-tests/test_suites/llm/performance/grpo-qwen3-235b-32n4g-eagle3-k5-vr200.sh
+tests/test_suites/llm/performance/grpo-qwen3-235b-32n4g-async-1off-vr200.sh
+tests/test_suites/llm/performance/grpo-qwen3-235b-32n4g-vr200.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-e2e-vr200.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-vr200.sh
 tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-vr200.sh

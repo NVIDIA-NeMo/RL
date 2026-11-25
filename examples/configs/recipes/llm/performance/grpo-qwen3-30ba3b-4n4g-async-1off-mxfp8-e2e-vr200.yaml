@@ -1,8 +1,6 @@
 defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml
 grpo:
   max_num_steps: 10
-loss_fn:
-  force_on_policy_ratio: true
 policy:
   train_micro_batch_size: 8
   logprob_batch_size: 16
@@ -21,8 +19,6 @@ policy:
       fp8_recipe: mxfp8
     model_overrides:
       moe_use_grouped_tensor: true
-    env_vars:
-      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "4"
   generation:
     stop_token_ids: [151645]
     vllm_kwargs:

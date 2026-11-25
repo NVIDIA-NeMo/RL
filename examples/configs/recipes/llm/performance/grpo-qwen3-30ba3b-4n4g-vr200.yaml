@@ -3,7 +3,7 @@ policy:
   logprob_batch_size: 16
   generation:
     vllm_cfg:
-      # Reserve the K3 lookahead while keeping the 4,096-token rollout cap.
+      # The rollout worker reserves K + 1 positions, so 4,100 leaves 4,096 usable with K=3.
       max_model_len: 4100
     vllm_kwargs:
       speculative_config:

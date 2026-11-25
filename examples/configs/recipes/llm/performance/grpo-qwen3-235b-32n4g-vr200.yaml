@@ -1,6 +1,6 @@
 defaults: ./grpo-qwen3-235b-32n4g.yaml
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-eagle3-k5-vr200
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200
 policy:
   offload_optimizer_for_refit: false
   megatron_cfg:
@@ -18,6 +18,7 @@ policy:
       max_num_seqs: 128
       max_num_batched_tokens: 2048
       compilation_config:
+        # K5 verifies six tokens per request, so 64 requests use the 384-token graph.
         cudagraph_capture_sizes: [6, 12, 24, 48, 96, 192, 384]
       speculative_config:
         method: eagle3
@@ -27,6 +28,6 @@ policy:
         draft_load_config:
           load_format: safetensors
 logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-eagle3-k5-vr200
+  log_dir: logs/grpo-qwen3-235b-32n4g-vr200
   wandb:
-    name: grpo-qwen3-235b-32n4g-eagle3-k5-vr200
+    name: grpo-qwen3-235b-32n4g-vr200
