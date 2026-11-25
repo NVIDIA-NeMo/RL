@@ -1,0 +1,7 @@
+diff --git a/setup.py b/setup.py
+index a586a2b..ee8b5d2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -29 +29 @@ nvcc_flags = [
+-    "-std=c++17",  # NOTE: CUTLASS requires c++17
++    "-std=c++20",  # PyTorch requires C++20

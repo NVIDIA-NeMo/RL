@@ -1,19 +1,35 @@
-# This Dockerfile is used to build a Docker image for NeMo RL with the NGC PyTorch base image.
-# However, it is still a work in progress and is not yet ready for production use.
-#
+# syntax=docker/dockerfile:1
 # Usage:
-# Self-contained build (default: builds from main): docker buildx build -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
-# Self-contained build (specific git ref): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
-# Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL): docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
-# Local NeMo RL source override: docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
+#   Self-contained build (default: builds from main):
+#     docker buildx build -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
 #
-# If installing new dependencies in the container, then use "uv pip install new-dependency"
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.06-py3
+#   Self-contained build (specific git ref):
+#     docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push .
+#
+#   Self-contained build (remote NeMo RL source; no need for a local clone of NeMo RL):
+#     docker buildx build -f docker/Dockerfile.ngc_pytorch --build-arg NRL_GIT_REF=r0.6.0 --tag <registry>/nemo-rl:r0.6.0 --push https://github.com/NVIDIA-NeMo/RL.git
+#
+#   Local NeMo RL source override:
+#     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.ngc_pytorch --tag <registry>/nemo-rl:latest --push .
+#
+# Optional build args to skip vLLM or SGLang dependencies:
+#   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
+#   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+
+# NGC vLLM base: ships torch, vLLM, FlashInfer and CUDA 13.5 built for every current GPU,
+# including Rubin (sm_107). This Dockerfile keeps those and layers NeMo RL on top; pass a
+# different tag or a pre-release image through --build-arg BASE_IMAGE.
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:26.11-py3
+# CUDA "devel" image that ships the COMPLETE cuDNN (with libcudnn_engines_precompiled.so). The
+# inference-flavored vLLM base trims that sublib; build_te copies the exact matching one from here.
+ARG CUDA_DEVEL_IMAGE=nvcr.io/nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
 FROM ${BASE_IMAGE} AS base
+# An environment variable to indicate that we are in a container.
+ENV NRL_CONTAINER=1
 
 # It is more convenient for users to run as root
 USER root
@@ -27,11 +43,21 @@ apt-get install -y --no-install-recommends \
     jq \
     curl \
     git \
+    patch \
     rsync \
     wget \
     less \
     vim \
 
+# Nsight
+apt install -y --no-install-recommends gnupg
+echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
+apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
+apt update
+apt install -y nsight-systems-cli
+
+# To fix CVE-2025-68973
+apt install -y --only-upgrade gnupg
 
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
@@ -45,11 +71,11 @@ rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION=0.11.18
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
-# Users are encouraged to enable if they wish.
+# Users are encouraged to enable if the wish.
 ENV RAY_USAGE_STATS_ENABLED=0
 # After ray>=2.47, this feature is enabled by default which creates uv venvs for any py_executable starting with `uv run`.
 # There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
@@ -61,19 +87,95 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 FROM base AS build_vllm
 
 ARG MAX_JOBS=32
+ARG SKIP_VLLM_BUILD=1
 WORKDIR /opt
 COPY --from=nemo-rl uv.lock /tmp/uv.lock
 
 RUN <<"EOF" bash -exu
-echo "Building vLLM from source for PyTorch base image"
-VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
-echo "Building vLLM version: $VLLM_VERSION"
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout v$VLLM_VERSION
-python use_existing_torch.py
-pip install -r requirements/build.txt
-pip wheel --no-deps --no-build-isolation -v .
+if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
+    echo "Building vLLM from source for PyTorch base image"
+    VLLM_VERSION=$(grep -A 1 '^name = "vllm"$' /tmp/uv.lock | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/' | cut -d+ -f1) && \
+    echo "Building vLLM version: $VLLM_VERSION"
+    git clone https://github.com/vllm-project/vllm.git
+    cd vllm
+    git checkout v$VLLM_VERSION
+    python use_existing_torch.py
+    pip install -r requirements/build/cuda.txt
+    pip wheel --no-deps --no-build-isolation -v .
+else
+    echo "Skipping vLLM build for PyTorch base image"
+fi
+EOF
+
+# CUDA devel image (CUDA_DEVEL_IMAGE) that carries the complete cuDNN; build_te copies the exact
+# libcudnn_engines_precompiled.so from its rootfs. Only used when TE is built.
+FROM ${CUDA_DEVEL_IMAGE} AS cuda_devel
+
+# Build the Transformer Engine wheel from TE_REPO_URL at TE_REPO_REF. Mirrors the build_vllm
+# stage: it produces a wheel that the hermetic stage installs alongside the other dependencies.
+# The clone is anonymous unless GIT_USER is set and a ci_token BuildKit secret is mounted (for a
+# fork that needs credentials). TE's only mandatory CUDA deps are cublas/cudart/cudnn/cuda_driver
+# (cuSolverMp/cuBLASMp are optional CMake flags, off by default), so the only gap on the inference
+# base is the trimmed cuDNN engines_precompiled sublib, copied from CUDA_DEVEL_IMAGE below. Set
+# TE_REPO_URL to an empty string to skip the build (the hermetic install is then a no-op).
+FROM base AS build_te
+
+ARG NVTE_BUILD_THREADS_PER_JOB
+ARG TE_REPO_URL=github.com/NVIDIA/TransformerEngine.git
+ARG TE_REPO_REF=6ea2a74a9e98c99e6d7b164a33775cc457520027
+ARG GIT_USER=
+# Always create the output dir so the hermetic stage can bind-mount it even when TE is skipped.
+RUN mkdir -p /opt/te_wheel
+# Mount the CUDA devel image's rootfs whole (no source -> always resolves, even when CUDA_DEVEL_IMAGE
+# is the base image for non-TE builds); its cuDNN libs are only read when TE is built.
+RUN --mount=from=cuda_devel,target=/cuda-devel,readonly \
+    --mount=type=secret,id=ci_token \
+    <<"EOF" bash -exu
+if [[ -z "${TE_REPO_URL:-}" ]]; then
+    echo "TE_REPO_URL not set; skipping Transformer Engine wheel build"
+    exit 0
+fi
+TE_CLONE_URL="https://${TE_REPO_URL}"
+if [[ -n "${GIT_USER:-}" && -f /run/secrets/ci_token ]]; then
+    TE_CLONE_URL="https://${GIT_USER}:$(cat /run/secrets/ci_token)@${TE_REPO_URL}"
+fi
+
+# 1) cuDNN engines_precompiled: the inference-flavored base trims libcudnn_engines_precompiled.so,
+#    which this TE branch's cmake/cuDNN.cmake requires. Copy the EXACT matching sublib out of the
+#    CUDA devel image (same source the PyTorch base inherits its complete cuDNN from) -- no pip, no
+#    version/ABI skew. Debug-list what cuDNN libs exist in both images so a path change is easy to
+#    diagnose if this ever fails.
+echo "=== [debug] cuDNN in CUDA_DEVEL_IMAGE (/cuda-devel) ==="
+find /cuda-devel -name "libcudnn*" 2>/dev/null | sort || true
+echo "=== [debug] cuDNN currently in base ==="
+find /usr/lib /usr/local -name "libcudnn*" 2>/dev/null | sort || true
+SRC=$(find /cuda-devel -name "libcudnn_engines_precompiled.so*" 2>/dev/null | head -1)
+if [[ -z "${SRC:-}" ]]; then
+    echo "ERROR: libcudnn_engines_precompiled.so not found in CUDA_DEVEL_IMAGE (=${CUDA_DEVEL_IMAGE:-unset})." >&2
+    echo "       Adjust CUDA_DEVEL_IMAGE to a cuDNN-complete devel image, or check the paths listed above." >&2
+    exit 1
+fi
+# Destination = wherever the base already keeps its cuDNN libs (arch-agnostic: x86_64 vs aarch64).
+DEST=$(dirname "$(find /usr/lib /usr/local -name 'libcudnn.so.9' 2>/dev/null | head -1)")
+test -n "$DEST" || DEST="/usr/lib/$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-linux-gnu")"
+echo "Copying engines_precompiled from ${SRC} -> ${DEST}"
+cp -av "$(dirname "$SRC")"/libcudnn_engines_precompiled.so* "$DEST"/
+ldconfig
+
+# 2) TE build deps + clone + wheel. (cuSolverMp/cuBLASMp are optional in TE -- gated behind
+#    NVTE_WITH_CUSOLVERMP/NVTE_WITH_CUBLASMP, off by default -- so they are not installed here.)
+pip install --no-cache-dir setuptools packaging pybind11 ninja wheel
+# The base's CUDA_ARCH_LIST may carry a "+PTX" suffix that TE's arch list does not accept.
+NVTE_CUDA_ARCHS=$(echo "${CUDA_ARCH_LIST}" | sed 's/+PTX//g' | tr -d '.' | tr ' ' ';')
+git init /opt/transformerengine
+git -C /opt/transformerengine remote add origin "${TE_CLONE_URL}"
+git -C /opt/transformerengine fetch --depth 1 origin "${TE_REPO_REF:-main}"
+git -C /opt/transformerengine checkout --detach FETCH_HEAD
+git -C /opt/transformerengine submodule update --init --recursive --depth 1
+env NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS};89;100a;103a;107a" \
+    NVTE_BUILD_THREADS_PER_JOB="${NVTE_BUILD_THREADS_PER_JOB:-8}" \
+    pip wheel --no-deps --no-build-isolation --wheel-dir /opt/te_wheel /opt/transformerengine
+rm -rf /opt/transformerengine
 EOF
 
 FROM base AS hermetic
@@ -84,19 +186,57 @@ WORKDIR /opt/nemo-rl
 # setting these to 1.
 ARG MAX_JOBS
 ARG NVTE_BUILD_THREADS_PER_JOB
+# Only use for custom flashinfer installs.
+ARG BUILD_CUSTOM_FLASHINFER
+ARG BUILD_CUSTOM_FLASHINFER_URL
+ARG BUILD_CUSTOM_FLASHINFER_REF
+# Locked native-extension revisions rebuilt with Rubin compatibility patches below.
+ARG CAUSAL_CONV1D_REF=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
+ARG MAMBA_SSM_REF=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec
+ARG NV_GROUPED_GEMM_REF=v1.1.4.post7
+ARG DEEP_GEMM_REF=67fc64863d43521080bf2005e6528d0fceee9510
+ARG DEEPEP_REF=17cfb817bccec3a9c247013360cc550c2bac441e
+# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
+ARG SKIP_VLLM_BUILD=1
+ARG SKIP_SGLANG_BUILD=1
+# Regenerate uv.lock in-container instead of requiring the committed lock to match
+# pyproject.toml (set to any non-empty value to enable). Useful for building from a
+# source tree whose uv.lock was intentionally left unchanged -- e.g. applying a minimal
+# patch on top of main without carrying the regenerated lock. This trades hermeticity
+# (the resolution may drift with upstream indexes) for not shipping the lock diff.
+ARG UV_RELOCK=1
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
-ENV UV_CACHE_DIR=/opt/uv_cache
 ENV UV_LINK_MODE=copy
+ENV UV_PYTHON_PREFERENCE=only-system
 
-# Define the no-install-package arguments for PyTorch base images
-ARG BASE_IMAGE
-ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas-cu12 --no-install-package nvidia-cuda-cupti-cu12 --no-install-package nvidia-cuda-nvrtc-cu12 --no-install-package nvidia-cuda-runtime-cu12 --no-install-package nvidia-cudnn-cu12 --no-install-package nvidia-cufft-cu12 --no-install-package nvidia-cufile-cu12 --no-install-package nvidia-curand-cu12 --no-install-package nvidia-cusolver-cu12 --no-install-package nvidia-cusparse-cu12 --no-install-package nvidia-cusparselt-cu12 --no-install-package nvidia-nccl-cu12 --no-install-package vllm --no-install-package flash-attn --no-install-package transformer-engine --no-install-package transformer-engine-cu12 --no-install-package transformer-engine-torch --no-install-package numpy"
+# Architectures for the native extensions built below (DeepEP, mamba-ssm, causal-conv1d, ...).
+# sm_100 code also runs on Rubin (sm_107) through CUDA binary compatibility; add 10.7 once the
+# base image's torch accepts it in TORCH_CUDA_ARCH_LIST. mcore's inference unified-memory API
+# also invokes a torch API that requires this to be set.
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
+# Do not reinstall torch and related dependencies when using the NGC PyTorch base image.
+# The trailing flashinfer/apache-tvm-ffi/cutlass/openai entries keep the base image's vendor-tuned
+# builds: the base pins apache-tvm-ffi==0.1.11 (<0.1.10 breaks the base's cutlass-dsl build's
+# make_kwargs_wrapper and crashes `import flashinfer`) and its custom flashinfer 0.6.15 build. openai is
+# kept at the base's 2.47.0 because vLLM 0.25's entrypoints import openai.types.responses.NamespaceTool
+# (absent in the lockfile's 2.6.1). Letting uv resolve the lockfile versions silently downgrades these
+# (apache-tvm-ffi->0.1.9, flashinfer->0.6.8.post1, openai->2.6.1), breaking flashinfer/cutlass and the
+# vLLM OpenAI-serving imports at runtime.
+# quack-kernels is kept at the base's patched 0.4.1: the base image rewrites the removed
+# cute.core.ThrMma API (see its cute-dsl WAR) in the system quack, but uv would install an
+# unpatched 0.4.1 into the venv that shadows it and breaks `import megatron.bridge`
+# (via mamba_ssm -> quack). Same version, so mamba_ssm's quack-kernels>=0.3.4 is satisfied.
+# Native extensions patched and installed explicitly below stay excluded from these syncs so uv
+# cannot attempt their unpatched source builds first. They are present in the completed image.
+ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package torchaudio --no-install-package torchcodec --no-install-package triton --no-install-package tilelang --no-install-package z3-solver --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package deep-gemm --no-install-package deep-ep --no-install-package flash-attn --no-install-package mamba-ssm --no-install-package causal-conv1d --no-install-package nv-grouped-gemm --no-install-package numpy --no-install-package nixl --no-install-package nixl-cu13 --no-install-package nixl-cu12 --no-install-package cuda-bindings --no-install-package cuda-python --no-install-package transformer-engine --no-install-package transformer-engine-cu13 --no-install-package transformer-engine-torch --no-install-package nvidia-cutlass-dsl --no-install-package nvidia-cutlass-dsl-libs-base --no-install-package nvidia-cutlass-dsl-libs-core --no-install-package nvidia-cutlass-dsl-libs-cu12 --no-install-package nvidia-cutlass-dsl-libs-cu13 --no-install-package apache-tvm-ffi --no-install-package flashinfer-python --no-install-package flashinfer-cubin --no-install-package flashinfer-jit-cache --no-install-package flashinfer-jit-cache-sm80 --no-install-package flashinfer-jit-cache-sm89 --no-install-package flashinfer-jit-cache-sm90a --no-install-package flashinfer-jit-cache-sm100a --no-install-package flashinfer-jit-cache-sm103a --no-install-package flashinfer-jit-cache-sm110a --no-install-package flashinfer-jit-cache-sm120f --no-install-package flashinfer-jit-cache-sm121a --no-install-package openai --no-install-package quack-kernels"
 ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
-ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
-# Ensure DeepEP is built for H100 and B200
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
-
 # Build HybridEP with inter-node transport support.
 ENV HYBRID_EP_MULTINODE=1
 
@@ -106,21 +246,119 @@ ENV CUDA_HOME=/usr/local/cuda
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transformers_compat.py ./nemo_rl/
+COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
+COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY \
+    docker/patches/causal_conv1d_cxx20_arch_list.patch \
+    docker/patches/deep_gemm_cxx20.patch \
+    docker/patches/deepep_inherit_torch_cxx_standard.patch \
+    docker/patches/mamba_ssm_cxx20_arch_list.patch \
+    docker/patches/nv_grouped_gemm_cxx20.patch \
+    /tmp/native-extension-patches/
+COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 
-RUN --mount=type=bind,from=build_vllm,source=/opt/,target=/tmp/build_vllm/ <<"EOF" bash -exu
-# Remove torch requirements from extra-build-dependencies for build with NGC PyTorch base image
-sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyproject.toml
+RUN --mount=type=ssh \
+    --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
+    --mount=type=bind,from=build_te,source=/opt/te_wheel,target=/tmp/build_te,readonly \
+    <<"EOF" bash -exu
+# Adapt pyproject.toml in-place for this base image. These edits are done here (NOT in a source
+# patch) so they are line-number independent and cannot corrupt pyproject.toml as the source tree
+# drifts. Each sed is a no-op when the target value is already applied.
+# Target the base image's Python 3.12 interpreter (must precede `uv venv` below). Every workspace
+# pyproject that pins Python (root, Gym, Flow-GRPO, template project) is edited here rather than
+# in a source patch, to keep all base-image compatibility changes together.
+sed -i -E 's/^(requires-python[[:space:]]*=[[:space:]]*)"[^"]*"/\1">=3.12,<3.13"/' \
+    pyproject.toml \
+    3rdparty/Gym-workspace/Gym/pyproject.toml \
+    research/flow_grpo/pyproject.toml \
+    research/template_project/pyproject.toml
+# Resolve for Python 3.12 environments.
+sed -i "s/python_version == '3.13' and sys_platform/python_version == '3.12' and sys_platform/g" pyproject.toml
+# Use the cp312 flash-attn wheels (the pinned direct-URL wheels are cp313 for Python 3.13).
+sed -i 's/cp313-cp313/cp312-cp312/g' pyproject.toml
+# Gate the trtllm extra behind Python >=3.13 so the 3.12 resolution drops tensorrt-llm (which
+# requires >=3.13 and would otherwise make the lock unsatisfiable). Preserve the source pin
+# instead of matching a specific release, so upstream version bumps keep this gate.
+sed -i -E "s/\"(tensorrt-llm==[^\";]+)\"/\"\1; python_version >= '3.13'\"/" pyproject.toml
+# The base image ships its own torch in the system site-packages, which we keep via
+# --system-site-packages and --no-install-package torch (see UV_NO_INSTALL_PACKAGES).
+# The torch build dependencies in [tool.uv.extra-build-dependencies] use `match-runtime = true`,
+# which requires torch to be present in uv's resolution graph; excluding torch from install
+# removes it from the resolution and makes that assertion fail. Since every package that
+# declares it (flash-attn, deep_ep, deep_gemm, transformer-engine(-torch), mamba-ssm,
+# causal-conv1d, fast-hadamard-transform, nv-grouped-gemm) is also in no-build-isolation-package,
+# each builds inside this venv where the system torch is already importable. Drop the
+# match-runtime pin so those extensions compile against the base image's torch.
+# The deletion is SCOPED to the [tool.uv.extra-build-dependencies] table (from its header to the
+# next top-level [section]/[[array]] header) so it can never touch a [[tool.uv.dependency-metadata]]
+# block, regardless of how pyproject.toml is formatted upstream.
+sed -i '\#^\[tool\.uv\.extra-build-dependencies\]#,\#^\[#{/match-runtime[[:space:]]*=[[:space:]]*true/d}' pyproject.toml
+
+# Fail fast (with the offending region) if the in-place edits produced invalid TOML, instead of
+# letting uv silently drop [tool.uv] settings (which then breaks the no-build-isolation builds).
+python3 - <<'PYEOF' || exit 1
+import re, sys, tomllib
+try:
+    tomllib.load(open("pyproject.toml", "rb"))
+except tomllib.TOMLDecodeError as e:
+    print(f"[ERROR] pyproject.toml is invalid TOML after in-place edits: {e}", file=sys.stderr)
+    lines = open("pyproject.toml").read().splitlines()
+    m = re.search(r"line (\d+)", str(e))
+    if m:
+        n = int(m.group(1)); lo = max(0, n - 8); hi = min(len(lines), n + 4)
+        for i in range(lo, hi):
+            print(f"{i + 1:5}: {lines[i]}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+uv venv --seed --system-site-packages --python python3
+export VIRTUAL_ENV=/opt/nemo_rl_venv
+
+# Optionally regenerate the lockfile in-container (see ARG UV_RELOCK). When the committed
+# uv.lock already matches pyproject.toml this is unnecessary and the --locked syncs below
+# suffice; re-locking makes the subsequent --locked assertions pass when it doesn't.
+if [[ -n "${UV_RELOCK:-}" ]]; then
+    uv lock
+fi
+
+if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
+fi
+
+# Install vllm built from source
+if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
+    uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+fi
+
+# Install the Transformer Engine wheel built in the build_te stage BEFORE the syncs. --no-config is
+# critical: pyproject's [tool.uv] override-dependencies pins `transformer-engine @ git+...@release_v2.15`
+# globally (to keep TE consistent across extras), and uv applies that override even to `uv pip install
+# <our-wheel>` -- so without --no-config uv ignores the local file, resolves the git override, and
+# rebuilds public TE from a checkout (which then fails on the cuDNN engines_precompiled gap the
+# hermetic stage doesn't patch). --no-config makes uv ignore the whole [tool.uv] block for this one
+# install; since it's a local file with --no-deps, the dropped config (overrides/sources/indexes) is
+# irrelevant, and VIRTUAL_ENV (an env var, unaffected) still targets /opt/nemo_rl_venv. --no-deps so
+# this does NOT pull torch (which would overwrite the base image's torch); TE's runtime deps (pydantic,
+# importlib-metadata, packaging) come from the syncs below, and the transformer-engine(-torch) entries
+# in UV_NO_INSTALL_PACKAGES keep those syncs from rebuilding it. No-op when TE_REPO_URL was unset.
+if compgen -G "/tmp/build_te/*.whl" > /dev/null; then
+    uv pip install --no-cache-dir --no-config --no-deps /tmp/build_te/*.whl
+fi
 
 # uv sync has a more reliable resolver than simple uv pip install which can fail
-# The venv is symlinked to avoid bloating the layer size
-uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
-uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+
+# Sync each training + inference backend one at a time (since they may conflict)
+# to warm the uv cache, then at the end just sync the default dependencies.
+# Do everything in one layer to prevent large layers.
+
 apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
+
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
@@ -128,29 +366,111 @@ uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-projec
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+
+# The base image's PyTorch headers require C++20, but several locked native dependencies force
+# C++17. Build those packages from their exact locked revisions with the docker/patches/*.patch
+# compatibility edits applied. Building them after the syncs also prevents a later sync from
+# replacing the patched wheels.
+# Ignore project uv configuration for these installs: local sources are already pinned above,
+# dependencies are installed, and overrides must not replace the patched checkouts.
+NATIVE_SRC=/opt/nemo-rl-native-src
+mkdir -p "$NATIVE_SRC"
+fetch_source() {
+    local name=$1 url=$2 ref=$3
+    git init "$NATIVE_SRC/$name"
+    git -C "$NATIVE_SRC/$name" remote add origin "$url"
+    git -C "$NATIVE_SRC/$name" fetch --depth 1 origin "$ref"
+    git -C "$NATIVE_SRC/$name" checkout --detach FETCH_HEAD
+}
+
+fetch_source causal-conv1d https://github.com/Dao-AILab/causal-conv1d.git "$CAUSAL_CONV1D_REF"
+patch -d "$NATIVE_SRC/causal-conv1d" -p1 < /tmp/native-extension-patches/causal_conv1d_cxx20_arch_list.patch
+CAUSAL_CONV1D_FORCE_BUILD=TRUE uv pip install --no-config --no-build-isolation --no-deps "$NATIVE_SRC/causal-conv1d"
+
+fetch_source mamba-ssm https://github.com/state-spaces/mamba.git "$MAMBA_SSM_REF"
+patch -d "$NATIVE_SRC/mamba-ssm" -p1 < /tmp/native-extension-patches/mamba_ssm_cxx20_arch_list.patch
+# Ignore the global mamba-ssm version override so uv builds this patched local checkout.
+MAMBA_FORCE_BUILD=TRUE uv pip install --no-config --no-build-isolation --no-deps "$NATIVE_SRC/mamba-ssm"
+
+fetch_source nv-grouped-gemm https://github.com/fanshiqing/grouped_gemm.git "$NV_GROUPED_GEMM_REF"
+git -C "$NATIVE_SRC/nv-grouped-gemm" submodule update --init --recursive --depth 1
+patch -d "$NATIVE_SRC/nv-grouped-gemm" -p1 < /tmp/native-extension-patches/nv_grouped_gemm_cxx20.patch
+GROUPED_GEMM_FORCE_BUILD=TRUE uv pip install --no-config --no-build-isolation --no-deps "$NATIVE_SRC/nv-grouped-gemm"
+
+fetch_source deep-gemm https://github.com/deepseek-ai/DeepGEMM.git "$DEEP_GEMM_REF"
+git -C "$NATIVE_SRC/deep-gemm" submodule update --init --recursive --depth 1
+patch -d "$NATIVE_SRC/deep-gemm" -p1 < /tmp/native-extension-patches/deep_gemm_cxx20.patch
+DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=0 uv pip install --no-config --no-build-isolation --no-deps "$NATIVE_SRC/deep-gemm"
+
+fetch_source deep-ep https://github.com/deepseek-ai/DeepEP.git "$DEEPEP_REF"
+git -C "$NATIVE_SRC/deep-ep" submodule update --init --recursive --depth 1
+patch -d "$NATIVE_SRC/deep-ep" -p1 < /tmp/native-extension-patches/deepep_inherit_torch_cxx_standard.patch
+# Bypass pyproject's global DeepEP override so uv installs this patched local checkout instead of
+# rebuilding the unpatched pinned Git source from its cache.
+uv pip install --no-cache-dir --no-config --no-build-isolation --no-deps "$NATIVE_SRC/deep-ep"
+
+rm -rf "$NATIVE_SRC"
 apt-get purge -y libnvidia-ml-dev
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# torchvision (the base's rubin build) links libnvjpeg.so.13 (nvJPEG), which the inference base trims.
+# Without it torchvision's image.so fails to load and the VLM data path (transformers fast image
+# processor -> torchvision.io.decode_image) dies with "Couldn't load the image extension". Copy the
+# exact CUDA 13 nvJPEG out of the devel image (same source as the cuDNN sublib) onto the loader path;
+# arch-agnostic dest + ldconfig so it's found on x86_64 and aarch64.
+RUN --mount=from=cuda_devel,target=/cuda-devel,readonly <<"EOF" bash -exu
+SRC=$(find /cuda-devel -name "libnvjpeg.so.13*" 2>/dev/null | head -1)
+if [[ -z "${SRC:-}" ]]; then
+    echo "WARN: libnvjpeg.so.13 not found in CUDA_DEVEL_IMAGE (=${CUDA_DEVEL_IMAGE:-unset}); torchvision image ops (VLM image decode) will be unavailable." >&2
+else
+    DEST="/usr/lib/$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-linux-gnu")"
+    echo "Copying nvJPEG from ${SRC} -> ${DEST}"
+    cp -av "$(dirname "$SRC")"/libnvjpeg.so.13* "$DEST"/
+    ldconfig
+fi
+EOF
+
+ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# Preload the small, universal TLS-bearing runtimes so their ELF TLS is registered at process start,
+# before Ray/torch spawn threads. On aarch64, dlopening a TLS-using lib late (tilelang's libtvm.so,
+# pulled in eagerly by `import mamba_ssm` -> Mamba3) after threads already exist trips a glibc DTV
+# slotinfo race -> "Inconsistency detected by ld.so: _dl_allocate_tls_init: Assertion `listp != NULL'
+# failed" (sourceware.org/pipermail/glibc-cvs/2021q1/071851.html). Preloading libstdc++/libgomp (which
+# would load anyway) registers their TLS first and avoids it. Bare sonames resolve per-arch via
+# ldconfig (x86_64 + aarch64); harmless on x86_64 where the race doesn't reproduce.
+ENV LD_PRELOAD="libstdc++.so.6:libgomp.so.1"
+
+# TileLang's libtvm.so requests libcudart_stub.so (its CUDA-runtime compatibility shim). Once TileLang
+# is imported, that stub can get bound under the "libcudart_stub.so" name so vLLM later selects it as
+# the CUDA runtime instead of the real libcudart -- and then fails to find symbols like cudaDeviceReset.
+# Expose the REAL runtime under the name libcudart_stub.so, early on LD_LIBRARY_PATH, so it wins. Plain
+# LD_LIBRARY_PATH=/usr/local/cuda/lib64 or LD_PRELOAD of libcudart do NOT fix it (vLLM still selects the
+# stub by that specific filename). Baked into the image so it exists before Ray starts on every node.
+RUN mkdir -p /opt/cudart-compat && \
+    ln -sf /usr/local/cuda/lib64/libcudart.so /opt/cudart-compat/libcudart_stub.so
+ENV LD_LIBRARY_PATH="/opt/cudart-compat:${LD_LIBRARY_PATH}"
 
 WORKDIR /opt/nemo-rl
 
 FROM hermetic AS release
 
+# Re-declare build args for this stage
+ARG SKIP_VLLM_BUILD=1
+ARG SKIP_SGLANG_BUILD=1
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
 ARG RC_DATE=00.00
 ARG TARGETARCH
-ENV UV_NO_SYNC=1
 ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
 ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
 ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
+ENV UV_NO_SYNC=1
 ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1
-# The 25.06 Pytorch container is not compatible with vllm standalone compile so we disable it
-ENV VLLM_USE_STANDALONE_COMPILE=0
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
@@ -168,12 +488,24 @@ RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
 ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
-COPY --from=nemo-rl . /opt/nemo-rl
+# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
+COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+# The nemo-rl source (default: the GitHub ADD stage) pins .python-version to 3.13.13, but this image
+# is built for the base's system Python 3.12 (UV_PYTHON_PREFERENCE=only-system, managed downloads off,
+# pyproject rewritten to requires-python >=3.12 in the hermetic stage). Without realigning, runtime
+# `uv run` reads 3.13.13, finds no matching interpreter, and fails (e.g. tests/check_metrics.py). Pin it
+# to the system interpreter so uv resolves it. Done here (not via the .python-version source hunk) so it
+# holds regardless of whether the nemo-rl context was patched.
+RUN printf '3.12.3\n' > /opt/nemo-rl/.python-version
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+
+# Generate container fingerprint for frozen environment support
+# Store outside /opt/nemo-rl to avoid being overwritten by user mounts
+RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt

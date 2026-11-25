@@ -1,0 +1,46 @@
+diff --git a/setup.py b/setup.py
+index f9c3320..b7190d3 100755
+--- a/setup.py
++++ b/setup.py
+@@ -175,27 +175,2 @@ if not SKIP_CUDA_BUILD:
+-        # If system CUDA and PyTorch CUDA have different major versions,
+-        # clear TORCH_CUDA_ARCH_LIST to prevent cpp_extension from erroring
+-        torch_cuda_version = parse(torch.version.cuda)
+-        if bare_metal_version.major != torch_cuda_version.major:
+-            os.environ["TORCH_CUDA_ARCH_LIST"] = ""
+-
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_75,code=sm_75")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_80,code=sm_80")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_87,code=sm_87")
+-        if bare_metal_version >= Version("11.8"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_90,code=sm_90")
+-        if bare_metal_version >= Version("12.8"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_100,code=sm_100")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_120,code=sm_120")
+-        if bare_metal_version >= Version("13.0"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_103,code=sm_103")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_110,code=sm_110")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_121,code=sm_121")
++        # Let torch.utils.cpp_extension translate TORCH_CUDA_ARCH_LIST instead
++        # of compiling every architecture known to this source revision.
+@@ -213 +188 @@ if not SKIP_CUDA_BUILD:
+-            "cxx": ["-O3", "-std=c++17"],
++            "cxx": ["-O3", "-std=c++20"],
+@@ -216 +191 @@ if not SKIP_CUDA_BUILD:
+-                "-std=c++17",
++                "-std=c++20",
+@@ -226 +201 @@ if not SKIP_CUDA_BUILD:
+-            "cxx": ["-O3", "-std=c++17"],
++            "cxx": ["-O3", "-std=c++20"],
+@@ -230 +205 @@ if not SKIP_CUDA_BUILD:
+-                    "-std=c++17",
++                    "-std=c++20",
