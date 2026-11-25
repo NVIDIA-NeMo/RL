@@ -55,6 +55,48 @@ def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, st
     return result
 
 
+def link_python_config(venv_path: str) -> None:
+    """Expose the venv interpreter's ``python3-config`` inside the venv.
+
+    ``uv venv`` only links ``python``/``python3`` into a venv's ``bin/``; the
+    companion ``python3-config`` stays next to the base interpreter. Megatron-LM's
+    dataset-helper Makefile (``megatron/core/datasets/Makefile``) shells out to
+    ``python3-config --extension-suffix`` during ``compile_helpers()``, so a
+    Megatron worker venv without it fails to build the C++ helpers and rank 0
+    exits before NCCL init (NVIDIA-NeMo/RL#3109). Link the base interpreter's
+    own ``python3-config`` in when it exists. The system ``python3-config`` is
+    not a substitute: it reports the system Python's extension suffix, which
+    does not match the venv interpreter. No-op when the base interpreter ships
+    no ``python3-config``; never fails venv creation.
+    """
+    venv_bin = Path(venv_path) / "bin"
+    try:
+        interpreter = (venv_bin / "python").resolve(strict=True)
+    except OSError:
+        logger.warning(
+            "No python executable in %s; skipping python3-config link", venv_path
+        )
+        return
+    python_config = interpreter.parent / "python3-config"
+    if not python_config.is_file():
+        logger.debug(
+            "Base interpreter %s ships no python3-config; skipping link",
+            interpreter,
+        )
+        return
+    link = venv_bin / "python3-config"
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(python_config)
+    except OSError:
+        logger.warning(
+            "Could not link %s into %s; Megatron dataset helpers may fail to compile",
+            python_config,
+            venv_bin,
+        )
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -115,6 +157,11 @@ def create_local_venv(
     # Create the virtual environment
     uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
+
+    # `uv venv` does not link python3-config into the venv, but Megatron-LM's
+    # dataset-helper build needs it (see link_python_config). Link it before
+    # the syncs below: a stray symlink in bin/ survives `uv sync` / `uv run`.
+    link_python_config(venv_path)
 
     # Execute the command with the virtual environment
     env = os.environ.copy()

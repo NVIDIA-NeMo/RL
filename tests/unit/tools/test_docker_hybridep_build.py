@@ -187,3 +187,37 @@ def test_uv_cache_mount_id_matches_build_container_workflow() -> None:
     wf_vars = set(re.findall(r"=\$\(resolve_arg (\w+)\)", step))
 
     assert df_vars == wf_vars, (df_vars, wf_vars)
+
+
+def test_dockerfile_links_python_config_into_venvs() -> None:
+    """docker/Dockerfile must expose python3-config inside every venv.
+
+    Megatron-LM's dataset-helper Makefile calls `python3-config
+    --extension-suffix` during compile_helpers(), but `uv venv` never links
+    python3-config into a venv's bin/ (NVIDIA-NeMo/RL#3109). Without the link
+    every Megatron worker fails the C++ helper build and rank 0 exits before
+    NCCL init. The link must cover the main venv (UV_PROJECT_ENVIRONMENT) and
+    every worker venv (NEMO_RL_VENV_DIR), and must resolve the config next to
+    the venv's own interpreter -- the system python3-config reports the wrong
+    extension suffix for the venv interpreter.
+    """
+    dockerfile = REPO_ROOT / "docker/Dockerfile"
+    lines = dockerfile.read_text().splitlines()
+    link_loop = (
+        'for venv_path in "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"/*; do'
+    )
+    assert link_loop in lines, (
+        f"{dockerfile} does not wire python3-config into the main and worker venvs"
+    )
+    config_resolution = (
+        '    python_config="$(dirname "$(readlink -f "${venv_path}/bin/python")")'
+        '/python3-config"'
+    )
+    assert config_resolution in lines, (
+        f"{dockerfile} does not resolve python3-config next to the venv interpreter"
+    )
+    link = '        ln -sf "${python_config}" "${venv_path}/bin/python3-config"'
+    assert link in lines, f"{dockerfile} does not link python3-config into the venv"
+    assert lines.index(link_loop) > lines.index("done < /opt/actor_venvs.tsv"), (
+        f"{dockerfile} links python3-config before the worker venvs exist"
+    )

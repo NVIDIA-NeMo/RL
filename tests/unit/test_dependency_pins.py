@@ -144,3 +144,30 @@ def test_torch_split_shims_are_still_needed() -> None:
         "(nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py) - drop the "
         "check outright; the pre-2.13 `names` comparison cannot be restored"
     )
+
+
+def test_pybind11_reaches_every_uv_synced_venv() -> None:
+    """Trip-wire: pybind11 must land in every uv-synced venv, including mcore workers.
+
+    Megatron-LM's dataset-helper build (``compile_helpers()``) imports pybind11
+    from the worker venv's interpreter; without it rank 0 dies before NCCL init
+    (NVIDIA-NeMo/RL#3109). pybind11 is not a direct dep of any extra -- it rides
+    in the ``build`` dependency group, which only reaches the venvs because it is
+    a default group. If either half moves, the mcore worker venvs silently lose
+    pybind11 again.
+    """
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    build_group = [
+        canonicalize_name(Requirement(req).name)
+        for req in pyproject["dependency-groups"]["build"]
+    ]
+    assert "pybind11" in build_group, (
+        "pybind11 left the `build` dependency group; the mcore worker venvs "
+        "no longer get it and Megatron dataset helpers fail to compile "
+        "(NVIDIA-NeMo/RL#3109)"
+    )
+    assert "build" in pyproject["tool"]["uv"]["default-groups"], (
+        "`build` is no longer a default group, so plain `uv sync` no longer "
+        "installs pybind11 into the worker venvs and Megatron dataset helpers "
+        "fail to compile (NVIDIA-NeMo/RL#3109)"
+    )
