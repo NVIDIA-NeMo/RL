@@ -14,6 +14,7 @@
 import asyncio
 import copy
 import errno
+import hashlib
 import json
 import math
 import os
@@ -32,6 +33,7 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
 
+import orjson
 import ray
 import torch
 from nemo.lens.resources.attributes import (
@@ -95,7 +97,9 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     normalize_media_in_examples,
 )
 from nemo_rl.environments.nemo_gym_shards import (
+    AGENT_POOL_CONFIG_KEY,
     DEFAULT_PLACEMENT_STRATEGY,
+    FAN_OUT_CONFIG_KEY,
     GYM_LOG_DIR_KEY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
@@ -106,7 +110,12 @@ from nemo_rl.environments.nemo_gym_shards import (
     apply_shard_overlay,
     build_environment_server_routes,
     build_route_shard_map,
+    parse_agent_pool,
+    parse_fan_out,
     parse_shard_plan,
+    validate_agent_pool_targets,
+    validate_agent_routing_modes,
+    validate_fan_out_targets,
 )
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
@@ -3078,6 +3087,40 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
+    # Expand before batching so every GRPO sibling group stays on one harness.
+    env_cfg = getattr(config, "env", None)
+    if env_cfg is None:
+        return
+    nemo_gym_cfg = env_cfg.setdefault("nemo_gym", {})
+    agent_pool = parse_agent_pool(nemo_gym_cfg.get(AGENT_POOL_CONFIG_KEY))
+    fan_out = parse_fan_out(nemo_gym_cfg.get(FAN_OUT_CONFIG_KEY))
+    validate_agent_routing_modes(agent_pool, fan_out)
+    if fan_out:
+        data_cfg = getattr(config, "data", None)
+        if data_cfg is None:
+            raise ShardConfigError(
+                "env.nemo_gym.fan_out requires a data config so NeMo RL can "
+                "expand prompt groups before batching"
+            )
+        default_cfg = data_cfg.get("default") or {}
+        for split_name in ("train", "validation"):
+            split_cfg = data_cfg.get(split_name)
+            if split_cfg is None:
+                continue
+            entries = split_cfg if isinstance(split_cfg, list) else [split_cfg]
+            for entry in entries:
+                dataset_name = entry.get(
+                    "dataset_name", default_cfg.get("dataset_name")
+                )
+                if dataset_name != "NemoGymDataset":
+                    continue
+                configured = parse_fan_out(entry.get(FAN_OUT_CONFIG_KEY))
+                if configured and configured != fan_out:
+                    raise ShardConfigError(
+                        f"data.{split_name}.fan_out conflicts with env.nemo_gym.fan_out"
+                    )
+                entry[FAN_OUT_CONFIG_KEY] = fan_out
+
 
 def build_nemo_gym_config(
     env_configs: dict[str, Any],
@@ -3334,6 +3377,96 @@ def _build_gym_actor_config(
     )
 
 
+NEMO_GYM_ENVIRONMENT_SERVER_KEY = "_ng_environment_server"
+NEMO_GYM_AGENT_POOL_INDEX_KEY = "_ng_agent_pool_index"
+NEMO_GYM_AGENT_POOL_ASSIGNMENT_KEY = "_ng_agent_pool_assignment"
+_NEMO_GYM_AGENT_POOL_FALLBACK_IGNORED_KEYS = frozenset(
+    {
+        "_rowidx",
+        "_ng_task_index",
+        "_ng_rollout_index",
+        "_ng_attempt_index",
+        "_ng_rollout_id",
+        "_ng_group_id",
+        "_ng_group_attempt",
+    }
+)
+
+
+def _fallback_agent_pool_index(row: Mapping[str, Any]) -> int:
+    """Match Gym's stable content-derived index for older collated data."""
+    stable_row = {
+        key: value
+        for key, value in row.items()
+        if key not in _NEMO_GYM_AGENT_POOL_FALLBACK_IGNORED_KEYS
+    }
+    digest = hashlib.sha256(
+        orjson.dumps(stable_row, option=orjson.OPT_SORT_KEYS)
+    ).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def apply_nemo_gym_agent_pool(
+    rows: list[dict[str, Any]], agent_pool: Mapping[str, list[str]]
+) -> None:
+    """Resolve Gym agent-pool rows before shard selection.
+
+    This mirrors ``RolloutCollectionHelper._apply_agent_pool`` in NeMo Gym.
+    Sharded jobs cannot wait for a Gym actor to choose the harness because the
+    chosen harness determines which actor must receive the prompt group.
+    """
+    for row in rows:
+        if NEMO_GYM_ENVIRONMENT_SERVER_KEY in row or is_nemo_gym_task(row):
+            continue
+
+        agent_ref = row.get("agent_ref")
+        agent_name = agent_ref.get("name") if isinstance(agent_ref, Mapping) else None
+        recorded_assignment = row.get(NEMO_GYM_AGENT_POOL_ASSIGNMENT_KEY)
+        if recorded_assignment is not None:
+            if not isinstance(recorded_assignment, str) or not recorded_assignment:
+                raise ValueError(
+                    f"{NEMO_GYM_AGENT_POOL_ASSIGNMENT_KEY} must be a non-empty "
+                    f"agent name; got {recorded_assignment!r}"
+                )
+            if agent_name != recorded_assignment:
+                raise ValueError(
+                    f"{NEMO_GYM_AGENT_POOL_ASSIGNMENT_KEY} records "
+                    f"{recorded_assignment!r}, but agent_ref.name is {agent_name!r}"
+                )
+            continue
+
+        task_source = row.get("task_source")
+        matched_route: str | None = None
+        for route in (agent_name, task_source):
+            if isinstance(route, str) and route in agent_pool:
+                matched_route = route
+                break
+        if matched_route is None:
+            continue
+
+        selection_index = row.get(NEMO_GYM_AGENT_POOL_INDEX_KEY)
+        if selection_index is None:
+            selection_index = row.get("_ng_task_index")
+        if selection_index is None:
+            selection_index = _fallback_agent_pool_index(row)
+        if (
+            not isinstance(selection_index, int)
+            or isinstance(selection_index, bool)
+            or selection_index < 0
+        ):
+            raise ValueError(
+                f"{NEMO_GYM_AGENT_POOL_INDEX_KEY} and _ng_task_index must be "
+                "non-negative integers when used for agent_pool selection; "
+                f"got {selection_index!r}"
+            )
+
+        pool = agent_pool[matched_route]
+        selected_agent = pool[selection_index % len(pool)]
+        if agent_name != selected_agent:
+            row["agent_ref"] = {"name": selected_agent}
+        row[NEMO_GYM_AGENT_POOL_ASSIGNMENT_KEY] = selected_agent
+
+
 def _get_materialized_taskset(row: Mapping[str, Any]) -> str:
     taskset = row["task_id"].get("taskset")
     if not isinstance(taskset, str) or not taskset:
@@ -3403,6 +3536,8 @@ class NemoGymShardSet:
             names, read from the actors' resolved Gym configuration.
         multi_harness: Each multi-harness taskset's servers, one chosen per
             prompt group, or None.
+        agent_pool: Flat source routes resolved to one agent before dispatch.
+        fan_out: Flat source routes expanded into one group per agent at load time.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
     """
@@ -3411,6 +3546,8 @@ class NemoGymShardSet:
     route_to_shard: Dict[str, str] = field(default_factory=dict)
     environment_server_routes: Dict[str, str] = field(default_factory=dict)
     multi_harness: Optional[MultiHarnessRoutes] = None
+    agent_pool: Dict[str, List[str]] = field(default_factory=dict)
+    fan_out: Dict[str, List[str]] = field(default_factory=dict)
     placement_group: Optional[PlacementGroup] = None
     _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
     _replica_lock: threading.Lock = field(
@@ -3496,6 +3633,7 @@ class NemoGymShardSet:
         A bare actor resolves tasksets from its own Gym config. The driver
         still validates row routing fields and rejects mixed-route groups.
         """
+        apply_nemo_gym_agent_pool(rows, self.agent_pool)
         resolve_in_actor = (
             len(self.all_handles) == 1
             and not self.environment_server_routes
@@ -3715,6 +3853,9 @@ def _build_single_gym_actor(
     multi_harness: MultiHarnessConfig | None = None,
 ) -> NemoGymShardSet:
     """Start one actor and read its resolved taskset routes."""
+    fan_out = parse_fan_out(nemo_gym_dict.pop(FAN_OUT_CONFIG_KEY, None))
+    agent_pool = parse_agent_pool(nemo_gym_dict.pop(AGENT_POOL_CONFIG_KEY, None))
+    validate_agent_routing_modes(agent_pool, fan_out)
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
         base_urls=base_urls,
@@ -3741,7 +3882,9 @@ def _build_single_gym_actor(
         )
 
     actor = NemoGym.options(**actor_options).remote(actor_config)
-    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
+    shard_set = NemoGymShardSet(
+        handles={DEFAULT_SHARD_NAME: [actor]}, agent_pool=agent_pool, fan_out=fan_out
+    )
     try:
         ray.get(actor._spinup.remote())
         _, routes = ray.get(
@@ -3752,10 +3895,12 @@ def _build_single_gym_actor(
         )
         if turn_checkpointing_enabled:
             ray.get(actor.initialize_checkpoint_adapter.remote())
-        if routes or multi_harness is not None:
+        if routes or multi_harness is not None or agent_pool or fan_out:
             entries_by_shard = {
                 DEFAULT_SHARD_NAME: ray.get(actor.list_entries.remote())
             }
+            validate_agent_pool_targets(entries_by_shard, agent_pool)
+            validate_fan_out_targets(entries_by_shard, fan_out)
             if routes:
                 shard_set.environment_server_routes = build_environment_server_routes(
                     {DEFAULT_SHARD_NAME: routes}, entries_by_shard
@@ -3790,6 +3935,9 @@ def _build_sharded_gym_actors(
     spinup_timeout: float,
     multi_harness: MultiHarnessConfig | None = None,
 ) -> NemoGymShardSet:
+    agent_pool = parse_agent_pool(nemo_gym_dict.pop(AGENT_POOL_CONFIG_KEY, None))
+    fan_out = parse_fan_out(nemo_gym_dict.pop(FAN_OUT_CONFIG_KEY, None))
+    validate_agent_routing_modes(agent_pool, fan_out)
     instances = _shard_instances(plan)
 
     # num_gpu_nodes normally pins the single actor to the driver node. Under
@@ -3856,7 +4004,9 @@ def _build_sharded_gym_actors(
             f"allocation may be too small or its nodes too busy."
         ) from error
 
-    shard_set = NemoGymShardSet(handles={}, placement_group=pg)
+    shard_set = NemoGymShardSet(
+        handles={}, placement_group=pg, agent_pool=agent_pool, fan_out=fan_out
+    )
     try:
         for bundle_index, (shard, replica) in enumerate(instances):
             instance_gym_dict = apply_shard_log_dir(
@@ -4031,11 +4181,14 @@ def _discover_shard_routes(
     environment_server_routes = build_environment_server_routes(
         routes_by_shard, entries_by_shard
     )
+    validate_agent_pool_targets(entries_by_shard, shard_set.agent_pool)
+    validate_fan_out_targets(entries_by_shard, shard_set.fan_out)
     route_to_shard = build_route_shard_map(
         entries_by_shard,
         plan.allowed_duplicate_entries,
         environment_server_routes=environment_server_routes,
         multi_harness_servers=multi_harness.servers if multi_harness else (),
+        pooled_routes=frozenset(shard_set.agent_pool) | frozenset(shard_set.fan_out),
     )
     multi_harness_routes = (
         _install_multi_harness_routes(
@@ -4236,6 +4389,7 @@ def validate_dataset_agent_coverage(
                 ),
             )
         )
+    hosted = hosted | frozenset(shard_set.agent_pool) | frozenset(shard_set.fan_out)
     for split, dataset in datasets.items():
         if agent_names is not None and split in agent_names:
             referenced = agent_names[split]
