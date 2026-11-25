@@ -29,18 +29,21 @@ import subprocess as _subprocess
 
 
 if not int(_os.getenv("NO_VCS_VERSION", "0")):
-    try:
-        _git = _subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            cwd=_os.path.dirname(_os.path.abspath(__file__)),
-            check=True,
-            universal_newlines=True,
-        )
-    except (_subprocess.CalledProcessError, OSError):
-        pass
-    else:
-        __version__ += f"+{_git.stdout.strip()}"
+    # Only attempt to get git version if .git directory exists
+    _package_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _os.path.isdir(_os.path.join(_package_dir, ".git")):
+        try:
+            _git = _subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                cwd=_package_dir,
+                check=True,
+                universal_newlines=True,
+            )
+        except (_subprocess.CalledProcessError, OSError):
+            pass
+        else:
+            __version__ += f"+{_git.stdout.strip()}"
 
 __package_name__ = "nemo_rl"
 __contact_names__ = "NVIDIA"
