@@ -795,6 +795,32 @@ def _mask_undrained_receipt(receipt: dict) -> dict:
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
 
 
+def _reject_queued_environment_servers(global_config: Mapping[str, Any]) -> None:
+    """Refuse turn recovery behind an environment server that queues episodes.
+
+    With ``max_concurrent_episodes`` set, a request beyond the limit waits for a
+    slot before it claims checkpoint state, so Gym's checkpoint does not report
+    it. A checkpoint parks the running episodes, which keep their slots, so the
+    queued request cannot start and every snapshot times out waiting for it.
+    """
+    queued = sorted(
+        f"{instance}={server_type}"
+        for instance, entry in global_config.items()
+        if isinstance(entry, Mapping)
+        for server_type, server_config in (
+            entry.get("environment_servers") or {}
+        ).items()
+        if isinstance(server_config, Mapping)
+        and server_config.get("max_concurrent_episodes") is not None
+    )
+    if queued:
+        raise ValueError(
+            "rollout_recovery.target_level='turn' or 'prefix' does not support "
+            f"environment servers with max_concurrent_episodes set: {queued}; "
+            "set it to null or use 'sibling'"
+        )
+
+
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
     """Map the setup-derived generation backend to Gym's capture backend."""
     generation_backend = token_capture.get("generation_backend")
@@ -1515,6 +1541,9 @@ Depending on your data shape, you may want to change these values."""
         if not self.cfg["turn_checkpointing_enabled"]:
             raise RuntimeError("Gym checkpoint coordination is not enabled")
         if self._checkpoint_adapter is None:
+            _reject_queued_environment_servers(
+                self._control_client().global_config_dict
+            )
             self._checkpoint_adapter = GymCheckpointAdapter(
                 instance=self.cfg["checkpoint_instance"],
                 client=self._control_client(),

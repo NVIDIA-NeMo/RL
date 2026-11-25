@@ -1539,6 +1539,51 @@ def test_checkpointing_leaves_the_callers_policy_model_untouched(detected_uv_dir
     assert env_configs == env_configs_before
 
 
+@pytest.mark.parametrize("as_omegaconf", [False, True])
+def test_turn_recovery_rejects_environment_servers_that_queue_episodes(as_omegaconf):
+    """A queued episode is invisible to Gym's checkpoint and cannot start while it is prepared."""
+    from omegaconf import OmegaConf
+
+    unlimited = {
+        "policy_model": {"responses_api_models": {"vllm_model": {}}},
+        "env": {
+            "environment_servers": {
+                "legacy_agent": {
+                    "entrypoint": "app.py",
+                    "max_concurrent_episodes": None,
+                }
+            }
+        },
+        "tool_env": {"environment_servers": {"single_agent_turn": {}}},
+    }
+    queued = {
+        **unlimited,
+        "tool_env": {
+            "environment_servers": {
+                "single_agent_turn": {
+                    "max_concurrent_episodes": 4,
+                    "queue_timeout_seconds": 60,
+                }
+            }
+        },
+    }
+    queued_relay = {
+        **unlimited,
+        "env": {
+            "environment_servers": {"legacy_agent": {"max_concurrent_episodes": 2}}
+        },
+    }
+
+    def as_config(config):
+        return OmegaConf.create(config) if as_omegaconf else config
+
+    nemo_gym_mod._reject_queued_environment_servers(as_config(unlimited))
+    with pytest.raises(ValueError, match="tool_env=single_agent_turn"):
+        nemo_gym_mod._reject_queued_environment_servers(as_config(queued))
+    with pytest.raises(ValueError, match="env=legacy_agent"):
+        nemo_gym_mod._reject_queued_environment_servers(as_config(queued_relay))
+
+
 def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
     detected_uv_dirs,
 ):
