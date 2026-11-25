@@ -2009,9 +2009,10 @@ def validate_grpo_chunk_cap_alignment(
     from an unaligned ``min_groups_for_streaming_train``, which no validator
     covers today.
 
-    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
-    producer pads each group to the policy execution row multiple, so the logical
-    group count is not the physical row count.
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt:
+    execution padding (per group, or per training batch under
+    ``token_capture.forest_padding_scope: step``) brings rows to the execution
+    row multiple, so the logical group count is not the physical row count.
 
     Args:
         master_config: The run configuration.

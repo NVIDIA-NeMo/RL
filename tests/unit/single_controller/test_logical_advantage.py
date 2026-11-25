@@ -133,7 +133,7 @@ def test_forest_selection_config(policy):
 
 
 def test_forest_padding_scope_requires_forest_training():
-    assert TokenCaptureConfig(forest_training=True, forest_padding_scope="step")
+    TokenCaptureConfig(forest_training=True, forest_padding_scope="step")
     with pytest.raises(ValueError, match="forest_padding_scope.*forest_training"):
         TokenCaptureConfig(forest_padding_scope="step")
 
@@ -1054,6 +1054,18 @@ def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
     torch.testing.assert_close(data["returns"], returns)
 
 
+class _UniqueIdRowStore(_RowStore):
+    """Rejects a data-plane call that repeats a sample ID, as the local backend does."""
+
+    def get_samples(self, *, sample_ids, **kwargs):
+        assert len(set(sample_ids)) == len(sample_ids), sample_ids
+        return super().get_samples(sample_ids=sample_ids, **kwargs)
+
+    def put_samples(self, *, sample_ids, **kwargs) -> None:
+        assert len(set(sample_ids)) == len(sample_ids), sample_ids
+        super().put_samples(sample_ids=sample_ids, **kwargs)
+
+
 def _step_padded(multiple: int = 4):
     """Five real rows in two groups, padded once for the whole batch."""
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
@@ -1061,7 +1073,7 @@ def _step_padded(multiple: int = 4):
     meta = KVBatchMeta(
         "train", "train", meta.sample_ids, fields=list(data.keys()), tags=meta.tags
     )
-    store = _RowStore(
+    store = _UniqueIdRowStore(
         {
             sid: {name: data[name][row].clone() for name in data.keys()}
             for row, sid in enumerate(meta.sample_ids)
@@ -1083,9 +1095,12 @@ def _step_padded(multiple: int = 4):
 
 def test_forest_step_padding_copies_rows_once_per_batch() -> None:
     meta, padded, pad_meta, store = _step_padded()
-    copied = [0, 0, 0]
+    copied = [4, 4, 4]
     assert padded.size == 8 and pad_meta.size == 3
     assert padded.sample_ids == meta.sample_ids + pad_meta.sample_ids
+    # Copies of the last row extend the last group, so each group stays contiguous
+    # and the advantage stage can still split the batch by group.
+    assert [tag["dispatch_group_id"] for tag in padded.tags] == ["a"] * 3 + ["b"] * 5
     for pad_id, row in zip(pad_meta.sample_ids, copied, strict=True):
         pad, real = store.rows[pad_id], store.rows[meta.sample_ids[row]]
         torch.testing.assert_close(pad["token_mask"], real["token_mask"])

@@ -30,6 +30,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import Advantage
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.schema import forest_step_padding_id
 from tests.unit.single_controller.test_logical_advantage import (
     _batch,
     _controller,
@@ -464,7 +465,7 @@ def test_full_batch_ppo_trains_every_forest_row_per_epoch(monkeypatch):
 @pytest.mark.parametrize("streaming", [False, True])
 def test_forest_step_padding_trains_and_clears_copies(monkeypatch, streaming):
     """Step padding: both models see the copies; step cleanup deletes them."""
-    ctrl, _, _ = _ppo_setup(monkeypatch, streaming=streaming, padding=False)
+    ctrl, metas, _ = _ppo_setup(monkeypatch, streaming=streaming, padding=False)
     ctrl._master_config.token_capture = TokenCaptureConfig(
         enabled=True, forest_training=True, forest_padding_scope="step"
     )
@@ -488,10 +489,16 @@ def test_forest_step_padding_trains_and_clears_copies(monkeypatch, streaming):
         call.args[0]
         for call in ctrl._trainer.train_microbatches_from_meta.call_args_list
     ]
-    assert any("_pad" in sid for meta in submitted for sid in meta.sample_ids)
-    assert all(meta.size % 3 == 0 for meta in submitted)
-    for call in _critic_calls(ctrl):
-        assert call.kwargs["gbs"] == sum(meta.size for meta in submitted)
+    # One copy of the last row: of the batch, or of the 5-row chunk when streaming.
+    a_ids, b_ids = metas[0].sample_ids, metas[1].sample_ids
+    pad = forest_step_padding_id(b_ids[-1], 0)
+    expected = [a_ids, b_ids + [pad]] if streaming else [a_ids + b_ids + [pad]]
+    assert [meta.sample_ids for meta in submitted] == expected
+    critic = _critic_calls(ctrl)
+    assert critic
+    for call in critic:
+        assert call.args[0].sample_ids == [sid for ids in expected for sid in ids]
+        assert call.kwargs["gbs"] == 9
     assert not ctrl._dp_client.list_sample_ids("train")
 
 

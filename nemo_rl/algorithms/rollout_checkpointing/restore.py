@@ -332,7 +332,7 @@ class RolloutRestorer(_UsesRolloutParts):
             expected_group_size=self._algo_cfg.num_generations_per_prompt,
             expected_manifest_digest=expected_manifest_digest_value,
         )
-        # Only a rollout snapshot may hold a streamed step's padding copies.
+        # Only a rollout snapshot taken mid-step may hold that step's padding copies.
         await validate_replay_inventory(
             buffer_state,
             dp_client=self._dp_client,
@@ -340,7 +340,7 @@ class RolloutRestorer(_UsesRolloutParts):
             step_padding=(
                 "clear"
                 if self._resume.from_rollout_snapshot
-                and self._master_config.token_capture.forest_padding_scope == "step"
+                and self._master_config.token_capture.forest_training
                 else "reject"
             ),
         )

@@ -3109,7 +3109,7 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
-                    if self._master_config.token_capture.forest_padding_scope == "step":
+                    if self._forest_step_row_multiple > 1:
                         with self._timer.time("data_processing"):
                             train_meta, pad_meta = await self._pad_forest_step_rows(
                                 train_meta
@@ -5368,28 +5368,29 @@ class SingleControllerActor:
         """Pad a Forest training batch once to the policy and critic row multiple.
 
         Used with ``token_capture.forest_padding_scope: step``. Pad rows copy
-        the first row under new sample IDs with ``sample_mask`` zeroed.
-        Returns the padded meta and the
+        the last row under new sample IDs with ``sample_mask`` zeroed, so they
+        extend the last group: the advantage stage splits a batch by group only
+        when each group's rows are contiguous. Returns the padded meta and the
         pad rows' meta for post-step cleanup, or ``(meta, None)``.
         """
         num_pad = -meta.size % self._forest_step_row_multiple
         if num_pad == 0:
             return meta, None
         assert meta.tags is not None
-        sources = [0] * num_pad
-        pad_ids = [
-            forest_step_padding_id(meta.sample_ids[source], index)
-            for index, source in enumerate(sources)
-        ]
+        source = meta.size - 1
+        source_id = meta.sample_ids[source]
+        pad_ids = [forest_step_padding_id(source_id, index) for index in range(num_pad)]
+        # Fetch the source once and write it once per copy, so no data-plane
+        # call repeats a sample ID.
         fields = await self._call_dp(
             "get_samples",
-            sample_ids=[meta.sample_ids[source] for source in sources],
+            sample_ids=[source_id],
             partition_id=meta.partition_id,
             select_fields=list(meta.fields or []),
         )
         fields["sample_mask"] = torch.zeros_like(fields["sample_mask"])
         # Ownerless padding of the source's dispatch group, as in per-group padding.
-        tags = [
+        tag = (
             dict(meta.tags[source])
             | {
                 "logical_rollout_id": None,
@@ -5400,27 +5401,27 @@ class SingleControllerActor:
                 "uses_borrowed_input": True,
             }
             | {key: 0 for key in VIOLATION_TAG_KEYS if key in meta.tags[source]}
-            for source in sources
-        ]
+        )
         async with self._data_plane_checkpoint_barrier.mutation("other"):
-            await self._call_dp(
-                "put_samples",
-                sample_ids=pad_ids,
-                partition_id=meta.partition_id,
-                fields=fields,
-                tags=tags,
-            )
+            for pad_id in pad_ids:
+                await self._call_dp(
+                    "put_samples",
+                    sample_ids=[pad_id],
+                    partition_id=meta.partition_id,
+                    fields=fields,
+                    tags=[dict(tag)],
+                )
         pad_meta = KVBatchMeta(
             partition_id=meta.partition_id,
             task_name=meta.task_name,
             sample_ids=pad_ids,
             fields=list(meta.fields or []),
             sequence_lengths=(
-                [meta.sequence_lengths[source] for source in sources]
+                [meta.sequence_lengths[source]] * num_pad
                 if meta.sequence_lengths is not None
                 else None
             ),
-            tags=tags,
+            tags=[dict(tag) for _ in pad_ids],
         )
         return meta.concat(pad_meta), pad_meta
 

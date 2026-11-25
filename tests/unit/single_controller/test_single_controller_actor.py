@@ -2663,6 +2663,8 @@ def _train_pump_controller(*, sampler) -> object:
         rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
+    # Only __init__ sets this; 1 means no step padding.
+    ctrl._forest_step_row_multiple = 1
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,

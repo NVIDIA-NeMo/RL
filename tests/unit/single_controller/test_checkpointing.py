@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -4653,6 +4654,9 @@ class TestDataPlaneCheckpoint:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        # Full checkpoints reject step copies even under scope=step. forest_training
+        # stays False (the validator rejects this pairing) so the fake pump needs no
+        # Forest tags.
         mc.token_capture.forest_padding_scope = "step"
         sample_ids = ["g0-0", "g0-1"]
         replay_metadata = {
@@ -4682,19 +4686,12 @@ class TestDataPlaneCheckpoint:
             ],
         }
 
-        async def _no_step_padding(train_meta):
-            return train_meta, None
-
         with pytest.raises(RuntimeError, match=error_fragment):
             _run_train_pump(
                 mc,
                 _make_actor_args(
                     dp_client=_FakeDPClient(sample_ids=actual_sample_ids),
                     tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
-                ),
-                # The fake batch has no Forest rows to pad.
-                seed=lambda actor: setattr(
-                    actor, "_pad_forest_step_rows", _no_step_padding
                 ),
             )
 
@@ -6138,6 +6135,9 @@ class TestReplayBufferPersistence:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        # A full checkpoint restore rejects step copies even under scope=step.
+        # forest_training stays False (the validator rejects this pairing) so the
+        # fake run needs no Forest tags.
         mc.token_capture.forest_padding_scope = "step"
         dp_client = _FakeDPClient(sample_ids=actual_sample_ids)
 
@@ -6153,6 +6153,64 @@ class TestReplayBufferPersistence:
             )
         # A full checkpoint never deletes rows it does not expect.
         assert dp_client.clear_calls == []
+
+    def test_snapshot_restore_clears_step_padding_copies(self, tmp_path):
+        """A Forest resume from a rollout snapshot deletes mid-step padding copies."""
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        envelope = {
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name=None,
+                        sample_ids=["g0-0", "g0-1"],
+                        sequence_lengths=[16, 16],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
+                    ),
+                    "start_weight": 0,
+                    "end_weight": 0,
+                    "target_step": 0,
+                    "group_id": "g0",
+                }
+            ]
+        }
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        tq_metadata = _data_plane_checkpoint_metadata(group_count=1) | {
+            "forest_training": True,
+            "forest_execution_row_multiple": 1,
+        }
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        mc.token_capture.forest_training = True
+        copy = forest_step_padding_id("g0-0", 0)
+        dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", copy])
+        args = dataclasses.replace(
+            _make_actor_args(
+                tq_buffer=_FakeTQBuffer(load_return=1),
+                dp_client=dp_client,
+                last_checkpoint_path=str(ckpt_dir),
+                data_plane_checkpoint_metadata=tq_metadata,
+            ),
+            restored_from_rollout_snapshot=True,
+        )
+
+        async def _restore() -> int:
+            actor = _ACTOR_CLS(mc, args, SetupTimingMetrics())
+            try:
+                return await actor._rollout_restorer._restore_replay_buffer()
+            finally:
+                actor._checkpointer.shutdown()
+
+        assert asyncio.run(_restore()) == 1
+        assert dp_client.clear_calls == [([copy], _PARTITION_ID)]
 
     def test_native_replay_metadata_requires_setup_side_tq_restore(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
