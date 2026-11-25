@@ -153,7 +153,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A `replacement_reserve.pt` sidecar containing a dictionary with independent `replacement` (fault tolerance) and `filtered` (dynamic sampling) prompt pools, including empty lists for empty pools. The reader also accepts the legacy single-list format; schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
-The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
+The TQ snapshot and replay index are captured under the same checkpoint barrier. Completed-group commits and destructive TQ clears wait while the barrier is held. With `data_plane.simple.async_checkpoint: true`, the barrier covers only the capture, and the snapshot files are written after commits resume. This ensures that the TQ snapshot and replay index describe the same set of groups.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
@@ -349,7 +349,7 @@ The sampler's `uses_pooled_replacements` flag declares whether it uses pool-base
 
 Expect fewer training steps than `grpo.max_num_steps`. `in_order` and `ready_first` draw replacements from dataloader batches diverted into a filtering pool; `windowed` consumes later ordinary dispatches. `max_num_steps` is clamped to `grpo.max_num_epochs * len(dataloader)`. Each committed group costs `1 / (1 - p)` prompts at drop rate `p`, so a single epoch yields about `(1 - p)` of the steps it otherwise would. The run then ends cleanly either way: a step left short because the data ran out is trained or skipped according to `min_step_batch_fraction`. Raise `grpo.max_num_epochs` to absorb the shorter epoch if the run needs its full step budget, or set it to `null` for no epoch limit at all, in which case nothing clamps `max_num_steps` and the loader wraps.
 
-`grpo.batch_multiplier` is rejected outright, filter or no filter, because the SC dataloader batches `num_prompts_per_step` directly and a run sized around an over-generating multiplier would quietly train on a fraction of the batch it asked for. Filtered groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)).
+`grpo.batch_multiplier` is rejected outright, filter or no filter, because the SC dataloader batches `num_prompts_per_step` directly and a run sized around an over-generating multiplier would quietly train on a fraction of the batch it asked for. Filtered groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: SC rejects `ppo.use_dynamic_sampling` on every PPO run, Forest included, because zero within-group reward variance does not imply zero PPO advantage.
 
 `reward` stays the mean over the trained rows, which only hold groups with reward spread, so it can stay flat while the policy still improves. Watch `unfiltered_reward` (or `first_attempt_reward`) for the pre-filter progress signal instead. These per-step metrics are also reported. A group from a sampler that stamps no step is counted under the step being assembled when it finishes:
 
@@ -366,6 +366,19 @@ The reward totals are kept in memory only, so after a checkpoint resume the in-f
 ```{warning}
 `train/reward` means different things on the two paths, so the curves are not comparable. With dynamic sampling on, v1 reports the **pre-filter** mean as `reward` and the kept rows as `filtered_reward`; SC keeps `reward` as the **trained-rows** mean and reports the pre-filter mean as `unfiltered_reward`. Comparing a v1 run against an SC run means lining up v1's `reward` with SC's `unfiltered_reward`, and v1's `filtered_reward` with SC's `reward`. SC's naming is the one to keep: every other metric on both paths describes the data actually trained on, and only v1's dynamic-sampling branch redefines `reward` to mean something else. Aligning v1 to this naming is tracked in [#5039](https://github.com/NVIDIA-NeMo/RL/issues/5039); it changes a metric existing dashboards already consume, so it lands on its own.
 ```
+
+## Opt-In Startup Optimizations
+
+These settings shorten the time from job start to the end of the first training step. All are off by default. Set the `NRL_MEGATRON_*` variables in the driver's environment, which `init_ray` passes to every Ray actor.
+
+| Setting | Effect | Needs |
+| ------- | ------ | ----- |
+| `NRL_MEGATRON_TRITON_CACHE_AUTOTUNING=1`, `NRL_MEGATRON_TORCH_COMPILE_JOB_ID=<id>` | Keep Triton autotune results and torch.compile shape profiles in the Megatron compile cache between jobs. The trainer saves all ranks' shape profiles as one set after steps 1, 2, 4, 8 and so on when one changed, and a job loads the newest set for its job id, user, model, parallel layout, world size and torch version, or none. `NRL_MEGATRON_TRITON_PRINT_AUTOTUNING=1` logs each benchmark. | The [persistent JIT compile caches](persistent-jit-caches.md), and the same job id in every run. |
+| `async_rl.early_trainer_build: true` | Builds the trainer while setup reserves the vLLM workers, not after. Creating both sets of actors at once adds load on the Ray GCS. | NeMo-Gym, non-colocated vLLM, `cluster.segment_size` and no resume. |
+| `async_rl.trainer_warmup.enabled: true` | Runs a synthetic first training pass while the trainer waits for generation or the first rollouts. | A Megatron trainer and non-colocated generation. Setups it does not cover, such as PPO, router replay or CUDA graphs, skip it and log why. |
+| `async_rl.trainer_warmup.seqlens: [<a>, <b>, ...]` | Sets the warm-up's sequence lengths. The default, `null`, fills two microbatches near the microbatch token budget. | `async_rl.trainer_warmup.enabled: true`. |
+
+With cached autotune results, a kernel runs the config of whichever job tuned it first, which a job without the cache may not pick; the trainer warns about this when `zero_train_gen_mismatch` or `batch_invariant_mode` is on. On Mamba-hybrid models the backward SSD kernels are still benchmarked in every job.
 
 ## Implementation Structure
 
@@ -477,13 +490,18 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM, Megatron and SGLang generation are supported.
+  - vLLM: non-colocated only. It can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md).
+  - Megatron: both non-colocated and colocated modes.
+  - SGLang: non-colocated, native rollout path only. Setup requires `sglang_fault_tolerance_config.use_fault_tolerance: false`, `async_rl.generation_fleet_health.enabled: false` and `async_rl.generation_fleet_health.refit_timeout_s: null`; see [grpo_math_1B_sglang_single_controller.yaml](../../examples/configs/grpo_math_1B_sglang_single_controller.yaml).
+  - TRT-LLM has not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
-- (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
+- (PPO without `token_capture.forest_training`) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. A Forest PPO critic trains on the step's actual row count, so a non-zero budget is accepted there. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
   - `reward_scaling` — supported. The advantage stage applies it ahead of the baseline and the logged `reward`, as v1 does. Configuration rejects non-finite bounds and requires `source_min < source_max`.
   - `reward_shaping` — supported, both the DAPO overlong penalty and the `stop_properly_penalty_coef` truncation penalty. Applied after `reward_scaling`, as v1 orders them: the overlong penalty is subtracted from the reward, so its magnitude is only meaningful against the scaled range. Response length comes from `token_mask`, which the stage already fetches, so nothing is added to the rollout schema. Setup rejects an enabled DAPO block missing any of `overlong_buffer_length` / `overlong_buffer_penalty` / `max_response_length`, one whose `overlong_buffer_length` is not positive, or one whose `overlong_buffer_penalty` is negative or non-finite; `stop_properly_penalty_coef` needs none of them and must be in `[0, 1]`. Setup warns when `max_response_length <= overlong_buffer_length`. Not supported under `token_capture.forest_training`, which rejects it at setup.
   - `overlong_filtering` — supported. Truncated completions are excluded from the loss through `sample_mask`.
+  - `grpo.agent_overrides` — supported with token capture: per-environment `overlong_filtering` and `adv_estimator.normalize_rewards`. See [Per-Environment Settings](grpo.md#per-environment-settings).
   - Environment-flagged sample masking — supported. A step in which every completion is filtered is rejected rather than skipped.
   - `use_dynamic_sampling` — supported for GRPO under the constraints in [Dynamic sampling](#dynamic-sampling).
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.

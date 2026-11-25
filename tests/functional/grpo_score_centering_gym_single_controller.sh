@@ -68,7 +68,7 @@ for IS_MODE in ${SC_IS_MODES:-off is tis icepop adaptive-ppo-clip}; do
         ++policy.generation.top_logprobs=16 \
         ++loss_fn.score_centering=true \
         loss_fn.sequence_level_importance_ratios=false \
-        loss_fn.token_level_loss=true \
+        loss_fn.normalization=global_token_mean \
         ++loss_fn.force_on_policy_ratio=$FORCE_ON_POLICY \
         loss_fn.reference_policy_kl_penalty=0 \
         grpo.skip_reference_policy_logprobs_calculation=true \

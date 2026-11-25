@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[3] / "nemo_rl/utils/cache_sync.sh"
+PROFILE = "inductor/dynamo/code_state_job_0_.pkl"
 
 
 def _run(*args: object, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -33,6 +34,13 @@ def _run(*args: object, env: dict | None = None) -> subprocess.CompletedProcess:
 def _set_age(path: Path, minutes: float) -> None:
     t = time.time() - minutes * 60
     os.utime(path, (t, t))
+
+
+def _put(path: Path, text: str, minutes: float = 0.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if minutes:
+        _set_age(path, minutes)
 
 
 def _fake_rsync(tmp_path: Path, body: str) -> dict:
@@ -70,6 +78,18 @@ def test_writeback_publishes_new_settled_files_once(tmp_path: Path):
     _run("writeback", local, persistent, env={"NRL_COMPILE_CACHE_MIN_AGE_MIN": "0"})
     assert not (persistent / "a/new").exists()
     assert (persistent / "a/busy").read_text() == "being written"
+
+
+def test_writeback_leaves_shape_profiles_to_the_workers(tmp_path: Path):
+    persistent, local = tmp_path / "persistent/megatron", tmp_path / "local/megatron"
+    _put(Path(f"{local}.seeded"), "", minutes=30)
+    for rel in (PROFILE, f"{PROFILE}.lock", "triton/kernel.cubin"):
+        _put(local / rel, "compiled", minutes=10)
+
+    _run("writeback", local, persistent)
+
+    assert (persistent / "triton/kernel.cubin").read_text() == "compiled"
+    assert not (persistent / "inductor").exists()
 
 
 def test_seed_marks_the_start_of_the_copy(tmp_path: Path):

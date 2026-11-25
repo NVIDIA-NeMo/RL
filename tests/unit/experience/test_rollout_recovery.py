@@ -864,6 +864,36 @@ def test_checkpoint_parser_defaults_optional_controller_fields() -> None:
     assert parsed.sampler_stamps_target_steps is None
 
 
+def test_sidecar_records_the_multi_harness_routes_it_ran_with() -> None:
+    routes = {
+        "selection": "nemo-rl-multi-harness-v1",
+        "candidates": [
+            [
+                "swe",
+                [["opencode_agent", "swe_opencode", 2.0], ["pi_agent", "swe_pi", 1.0]],
+            ]
+        ],
+    }
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        steps_allowed_short=set(),
+        sampler_stamps_target_steps=True,
+        multi_harness_routes=routes,
+    )
+
+    assert parse_rollout_recovery_state(state).multi_harness_routes == routes
+    # A sidecar saved before routes were recorded reads as saved without them.
+    old = parse_rollout_recovery_state(_sidecar_state(RolloutRecoveryLedger()))
+    assert old.multi_harness_routes is None
+    state["multi_harness_routes"] = {
+        "selection": "nemo-rl-multi-harness-v1",
+        "candidates": [["swe", [["opencode_agent", 2.0]]]],
+    }
+    with pytest.raises(TypeError, match="multi_harness_routes"):
+        parse_rollout_recovery_state(state)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error_type"),
     [

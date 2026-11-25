@@ -67,7 +67,7 @@ if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
         policy.logprob_batch_size=1
         policy.max_total_sequence_length=16384
         grpo.calculate_advantages_on_gpu=false
-        loss_fn.token_level_loss=true
+        loss_fn.normalization=global_token_mean
         loss_fn.sequence_level_importance_ratios=false
         ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
         env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true
@@ -151,6 +151,10 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
             # Every captured row carries routed experts for the policy to replay.
             EXTRA_CHECKS+=('min(data["train/finalize/routed_experts_row_coverage"]) == 1')
         fi
+    fi
+    if [[ "$*" == *trainer_warmup.enabled=true* ]]; then
+        grep "Trainer warm-up (rank 0):" "$RUN_LOG" | grep -vq "'skipped'" \
+            || { echo "trainer warm-up did not run"; exit 1; }
     fi
 
     if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then

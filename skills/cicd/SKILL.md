@@ -1,7 +1,7 @@
 ---
 name: cicd
-description: CI/CD reference for NeMo-RL. Covers GitHub Actions pipeline structure, CI triggering via /ok to test, and CI failure investigation.
-when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; re-running CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot', 're-run', 'rerun', 'retry CI', 'flaky test'.
+description: CI/CD reference for NeMo-RL. Covers GitHub Actions pipeline structure, CI triggering via /ok to test and /internal-ci, and CI failure investigation.
+when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; re-running CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'internal CI', '/internal-ci', 'nemo-ci', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot', 're-run', 'rerun', 'retry CI', 'flaky test'.
 ---
 
 # CI/CD Guide
@@ -31,15 +31,21 @@ Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
 > **Re-triggering after new commits**: each `/ok to test <sha>` is specific to that SHA. After pushing additional commits, post a new comment with the updated SHA.
 
+### Internal CI with `/internal-ci`
+
+Members of the `automation` or `rl_autobot_approvers` GitHub teams can comment `/internal-ci test-case=<job>` to launch NVIDIA's internal nemo-ci pipeline and build the RL image from the PR head. Fork PRs first need `/ok to test <full-sha>` vetting and a copy-pr-bot mirror matching that head.
+
+With `run_as: requester`, the pipeline runs as the commenter's own GitLab account. NVIDIA employees must follow ["Enroll once" in the `trigger-gitlab-ci` README](https://github.com/NVIDIA-NeMo/CI-Events-Workflows/blob/main/apps/workflows/capability/shared/trigger-gitlab-ci/README.md#enroll-once) (NVIDIA-internal); unenrolled requests receive a neutral check. See [the CI/CD guide](../../docs/ci-cd.md#internal-ci-with-internal-ci) for settings and the `Autobot internal CI` check. A new push supersedes the run without cancelling the GitLab pipeline.
+
 ---
 
 ## CI Labels
 
-Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. Labels control which test tier runs and whether a new container image is built.
+Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. A bot sets it (see below). Labels control which test tier runs and whether a new container image is built.
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
-| `CI:docs` | Doc tests only | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, same as `CI:Lfast`) |
+| `CI:docs` | Lint + Sphinx docs build only | None (no GPU) |
 | `CI:Lfast` | Fast test subset | Reuses main container (PRs to a release branch such as `r0.8.0` reuse that branch's container, published only by pushes to that branch after merges) |
 | `CI:L0` | Unit tests + docs + lint | Builds new image |
 | `CI:L1` | L0 + functional tests | Builds new image |
@@ -48,15 +54,17 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 **Default on merge group / push to main**: L1.
 
-**Which label to attach when opening a PR:**
+**The label is set automatically.** The `Set CI label` workflow (`.github/scripts/ci_label.py`) picks it from the changed files on every push, first match wins:
 
-| Changed paths / nature of change | Label |
-|----------------------------------|-------|
-| Docs only (`docs/`, `*.md`, docstrings) | `CI:docs` |
-| Default, including new features and bug fixes | `CI:Lfast` |
-| (Rarely needed) | `CI:L0` |
-| Large refactor, broad changes to core code, or dependency changes | `CI:L1` |
-| (Not needed: it runs the same jobs as `CI:L1` today) | `CI:L2` |
+| Changed files | Label |
+|---------------|-------|
+| Any `pyproject.toml`, `uv.lock`, `Dockerfile*`, `docker/**.sh`, `docker/**.py` or `3rdparty/**` | `CI:L1` |
+| Only `*.md`, `docs/**`, `skills/**`, or `.github/**` files the main CI run doesn't read | `CI:docs` |
+| Anything else | `CI:Lfast` |
+
+These `.github/` files feed the main CI run, so they still mean `CI:Lfast`: `workflows/cicd-main.yml`, `workflows/_build_container.yml`, `actions/test-template/*`, `scripts/plan-tests.sh`, `scripts/checkout-megatron-lm-commit.sh`, `scripts/install-megatron-lock-artifact.sh` and `scripts/known-flake-patterns.txt`.
+
+Only repo maintainers (admin or maintain role) can change it, for example to `CI:L1` for a broad core change, or add `Skip CICD`. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels on PRs to `main`. Release branches have no label bot, so `cp-to-release` still copies the original PR's label.
 
 ---
 

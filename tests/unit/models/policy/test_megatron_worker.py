@@ -3602,7 +3602,12 @@ def test_worker_initialization_preserves_only_restored_rng(
         setup_model_and_optimizer=MagicMock(return_value=components),
         setup_reference_model_state=MagicMock(side_effect=reference),
         finalize_megatron_setup=MagicMock(side_effect=finalize),
-        compile_cache=SimpleNamespace(seed=MagicMock()),
+        compile_cache=SimpleNamespace(
+            seed=MagicMock(),
+            ShapeProfiles=SimpleNamespace(load=MagicMock(return_value=None)),
+            warn_if_autotuning_is_shared=MagicMock(),
+        ),
+        _SHAPE_PROFILE_LAYOUT=(),
     )
     exec(
         compile(
@@ -3629,7 +3634,11 @@ def test_worker_initialization_preserves_only_restored_rng(
         torch.set_rng_state(before)
         namespace["__init__"](
             worker,
-            {"megatron_cfg": {}, "sequence_packing": {"enabled": False}},
+            {
+                "model_name": "model",
+                "megatron_cfg": {},
+                "sequence_packing": {"enabled": False},
+            },
             SimpleNamespace(pad_token="pad"),
             weights_path="weights" if load_rng else None,
             optimizer_path=optimizer_path,
@@ -6843,3 +6852,146 @@ def test_reshard_group_rebuild_replaces_only_requested_layout(
     assert worker.pp_comm_group == {0: new_prefill, 1: decode}
     assert old_map == {0: old_prefill, 1: decode}
     assert events == ["init", "release"]
+
+
+class _GeneratorRngTracker:
+    """Holds torch.Generator states and, like TE's tracker, hands out a new dict."""
+
+    def __init__(self, states: dict[str, torch.Generator]):
+        self.states = states
+
+    def get_states(self) -> dict[str, torch.Generator]:
+        return dict(self.states)
+
+    def set_states(self, states: dict[str, torch.Generator]) -> None:
+        self.states = states
+
+
+class TestWarmupFirstPass:
+    """warmup_first_pass on a bare worker whose train step is mocked."""
+
+    def test_generator_rng_states_are_restored_in_place(self, monkeypatch):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        generators = {
+            "model-parallel-rng": torch.Generator().manual_seed(1),
+            "expert-parallel-rng": torch.Generator().manual_seed(2),
+        }
+        saved = {name: g.get_state() for name, g in generators.items()}
+        tracker = _GeneratorRngTracker(dict(generators))
+
+        def train_microbatch(data):
+            for g in generators.values():
+                torch.rand(4, generator=g)
+
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {
+            "max_total_sequence_length": 32,
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {"empty_unused_memory_level": 0},
+        }
+        worker.model = MagicMock(name="model")
+        worker.timer = MagicMock(name="step_timer")
+        worker._trainer_warmup_skip_reason = lambda: None
+        worker._apply_packing_prep = lambda data: data
+        worker.prepare_for_training = MagicMock()
+        worker.begin_train_step = MagicMock()
+        worker.train_microbatch = MagicMock(side_effect=train_microbatch)
+        worker.abort_train_step = MagicMock()
+        monkeypatch.setattr(worker_module, "get_cuda_rng_tracker", lambda: tracker)
+        monkeypatch.setattr(worker_module, "get_model_config", MagicMock())
+        monkeypatch.setattr(worker_module, "reset_model_temporary_tensors", MagicMock())
+        monkeypatch.setattr(worker_module, "clear_aux_losses_tracker", MagicMock())
+        monkeypatch.setattr(worker_module, "MTPLossLoggingHelper", MagicMock())
+        monkeypatch.setattr(
+            torch.cuda, "get_rng_state", lambda: torch.zeros(8, dtype=torch.uint8)
+        )
+        monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"),
+            train_fields=("input_ids", "input_lengths", "sample_mask"),
+            run_logprobs=False,
+            seqlens=[16],
+        )
+
+        assert summary["seqlens"] == [16]
+        worker.train_microbatch.assert_called_once()
+        for name, g in generators.items():
+            # The same objects: CUDA graphs captured on them stay valid.
+            assert tracker.states[name] is g
+            assert torch.equal(g.get_state(), saved[name])
+
+    @pytest.mark.parametrize(
+        ("attrs", "reason"),
+        [
+            ({"optimizer": None}, "no optimizer"),
+            (
+                {"model": SimpleNamespace(cuda_graph_impl="local")},
+                "CUDA graphs would be captured on the synthetic batch's shapes",
+            ),
+            (
+                {"_router_replay_enabled": True},
+                "router replay needs the routes recorded during generation",
+            ),
+            (
+                {"fp8_cfg": {"enabled": True, "fp8_recipe": "delayed"}},
+                "FP8 delayed scaling would keep the synthetic batch's amax history",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {"fp4_cfg": {"enabled": True}}}},
+                "FP4 and per-module precision recipes are not covered",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {"te_precision_config_file": "te.yaml"}}},
+                "FP4 and per-module precision recipes are not covered",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {}, "draft": SimpleNamespace(enabled=True)}},
+                "draft-model training is not covered",
+            ),
+            (
+                {"delegate_pack_to_model": True},
+                "models that pack their own inputs are not covered",
+            ),
+            (
+                {"media_placeholder_token_id": 200},
+                "the synthetic batch could hold the media placeholder token",
+            ),
+        ],
+        ids=[
+            "no-optimizer",
+            "cuda-graphs",
+            "router-replay",
+            "fp8-delayed",
+            "fp4",
+            "te-precision-file",
+            "draft-model",
+            "model-packs-inputs",
+            "media-placeholder",
+        ],
+    )
+    def test_skipped_where_it_would_leave_state_behind(
+        self, monkeypatch, attrs, reason
+    ):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {"megatron_cfg": {}}
+        worker.fp8_cfg = None
+        worker.optimizer = MagicMock(name="optimizer")
+        worker.model = SimpleNamespace(cuda_graph_impl="none")
+        worker._router_replay_enabled = False
+        worker.delegate_pack_to_model = False
+        worker.media_placeholder_token_id = None
+        monkeypatch.setattr(worker_module, "get_model_config", lambda model: model)
+        assert worker._trainer_warmup_skip_reason() is None
+
+        for name, value in attrs.items():
+            setattr(worker, name, value)
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"), train_fields=(), run_logprobs=False, seqlens=None
+        )
+
+        assert summary == {"skipped": reason}

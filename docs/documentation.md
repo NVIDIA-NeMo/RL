@@ -50,7 +50,7 @@ Open a web browser and go to `http://${HOST_WHERE_SPHINX_COMMAND_RUN}:12345` to 
 
 ## Run Tests in Python Docstrings
 
-We also run tests in our Python docstrings. You can run them with:
+You can test the examples in our Python docstrings (CI does not run these; run them locally when you change an example):
 
 ```sh
 cd docs/

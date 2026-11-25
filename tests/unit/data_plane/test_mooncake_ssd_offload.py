@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import atexit
 import functools
 import http.client
 import http.server
@@ -42,7 +41,7 @@ def _cfg(**mooncake_cpu) -> MooncakeCpuConfig:
 
 
 def test_master_args_are_empty_when_offload_is_off() -> None:
-    assert offload.master_args(_cfg()) == ()
+    assert offload.master_args(_cfg(ssd_offload={"enabled": False})) == ()
 
 
 def test_master_args_turn_eviction_into_offload() -> None:
@@ -71,52 +70,14 @@ def test_owned_segment_size(unit_segment_size, segment_size, owned) -> None:
     assert cfg.owned_segment_size(segment_size) == owned
 
 
-@pytest.fixture
-def fake_store(monkeypatch, tmp_path):
-    """A fake mooncake store class, fresh offload state, and a clean env."""
-    import ray
-    from transfer_queue.storage.clients import mooncake_client
-
-    calls = []
-
-    class FakeStore:
-        def setup(self, *args, **kwargs):
-            calls.append((args, kwargs))
-            return 0
-
-    FakeClient = _client_cls([])
-    monkeypatch.setattr(mooncake_client, "MooncakeDistributedStore", FakeStore)
-    monkeypatch.setattr(mooncake_client, "MooncakeStoreClient", FakeClient)
-    monkeypatch.setattr(
-        ray,
-        "get_runtime_context",
-        lambda: SimpleNamespace(get_job_id=lambda: "05000000"),
-    )
-    for var in offload.REQUIRED_ENV:
-        # setenv first so monkeypatch restores the var even if it was unset.
-        monkeypatch.setenv(var, "")
-        monkeypatch.delenv(var)
-    monkeypatch.setattr(offload, "_dir", None)
-    monkeypatch.setattr(offload, "_lock_fd", None)
-    monkeypatch.setattr(offload, "_offloading_store_set_up", False)
-    monkeypatch.setattr(offload, "_sweep_stop", None)
-    exit_hooks = []
-    monkeypatch.setattr(atexit, "register", exit_hooks.append)
-    yield SimpleNamespace(
-        module=mooncake_client,
-        cls=FakeStore,
-        client_cls=FakeClient,
-        calls=calls,
-        exit_hooks=exit_hooks,
-    )
-    if offload._sweep_stop is not None:
-        offload._sweep_stop.set()  # a fake store has nothing to sweep
+# ``fake_store`` (conftest.py): a recording fake Mooncake store class, fresh
+# offload module state, and a clean environment.
 
 
 @pytest.mark.parametrize(
     ("mooncake_cpu", "segment_size"),
     [
-        ({}, None),  # offload off
+        ({"ssd_offload": {"enabled": False}}, None),  # offload off
         ({"ssd_offload": _SSD, "storage_unit_segment_size": UNIT}, None),  # client
         ({"ssd_offload": _SSD}, 0),  # generation worker
     ],
@@ -129,7 +90,7 @@ def test_install_is_a_noop_unless_this_process_owns_memory(
     assert fake_store.exit_hooks == []
     # Every client writes, so every client waits for memory when offload is on.
     waits = getattr(fake_store.client_cls, "_nrl_waits_for_memory", False)
-    assert waits == ("ssd_offload" in mooncake_cpu)
+    assert waits == mooncake_cpu["ssd_offload"]["enabled"]
 
 
 def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
@@ -308,6 +269,47 @@ def test_disk_evictions_reads_the_master_counter(text, count) -> None:
     assert offload.disk_evictions(text) == count
 
 
+_MASTER = """\
+master_allocated_bytes 1073741824
+master_total_capacity_bytes 4294967296
+master_key_count 10
+master_successful_evictions_mem {rounds}
+master_evicted_key_count_mem 5
+master_evicted_size_bytes_mem 2097152
+master_evict_disk_replica_requests_total 0
+"""
+
+
+def test_master_metrics_are_in_mib_with_a_memory_ratio() -> None:
+    assert offload.master_metrics(_MASTER.format(rounds=3)) == {
+        "mem_used_mb": 1024.0,
+        "mem_capacity_mb": 4096.0,
+        "keys": 10.0,
+        "offload_rounds_total": 3.0,
+        "mem_evicted_keys_total": 5.0,
+        "mem_evicted_mb_total": 2.0,
+        "disk_evictions_total": 0.0,
+        "mem_used_ratio": 0.25,
+    }
+    assert offload.master_metrics("")["mem_used_ratio"] == 0.0  # no capacity yet
+
+
+def test_the_first_offload_round_warns_once(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        for rounds in (0, 3, 9):
+            offload._warn_on_first_offload(
+                offload.master_metrics(_MASTER.format(rounds=rounds))
+            )
+    (msg,) = [r.getMessage() for r in caplog.records]
+    assert "3 SSD offload round(s)" in msg and "25% of 4.0 GiB" in msg
+    assert "5 object(s), 2.0 MiB" in msg and "offload_threshold" in msg
+
+
+def test_step_metrics_without_a_mooncake_client_is_empty() -> None:
+    assert offload.step_metrics() == {}  # this process has no TQ client
+
+
 def _watch(reads, **kwargs):
     """Run the watcher over scripted counter reads until it stops."""
     script = iter(reads)
@@ -417,6 +419,21 @@ def test_watch_master_disk_evictions_reads_the_real_endpoint(
     assert fired.wait(5)
 
 
+def test_step_metrics_read_the_real_endpoint_and_warn_once(
+    monkeypatch, caplog, metrics_server
+) -> None:
+    url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
+    monkeypatch.setattr(offload, "_master_metrics_url", lambda: url)
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    metrics_server.body = _MASTER.format(rounds=0)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        assert offload.step_metrics()["offload_rounds_total"] == 0
+        metrics_server.body = _MASTER.format(rounds=7)
+        assert offload.step_metrics()["offload_rounds_total"] == 7
+        assert offload.step_metrics()["mem_used_ratio"] == 0.25
+    assert len(caplog.records) == 1
+
+
 def test_a_reinit_replaces_the_old_watcher(monkeypatch) -> None:
     started = []
     monkeypatch.setattr(offload, "_watch_stop", None)
@@ -499,7 +516,8 @@ def test_copied_mooncake_names_exist_in_the_installed_mooncake() -> None:
         assert name.encode() in store, name
     backend = offload.REQUIRED_ENV["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"]
     assert backend.encode() in store, backend
-    assert offload.EVICTION_COUNTER.encode() in master, offload.EVICTION_COUNTER
+    for metric in offload.MASTER_METRICS:  # includes EVICTION_COUNTER
+        assert metric.encode() in master, metric
     for arg in offload.master_args(_cfg(ssd_offload=_SSD)):
         flag = arg.removeprefix("--").split("=", 1)[0]
         assert flag.encode() in master, flag
@@ -555,11 +573,11 @@ def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
     (tmp_path / "foreign").write_bytes(b"not mooncake's")
     answers = {"1@x": 1, "2@x": 0, "3@x": -1}  # exists, absent, RPC error
 
-    removed = offload.sweep_cleared_files(
+    sweep = offload.sweep_cleared_files(
         str(tmp_path), lambda keys: [answers[k] for k in keys]
     )
 
-    assert removed == 1
+    assert sweep == 1
     assert not cleared.exists()
     assert live.exists() and unknown.exists()
     assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()
