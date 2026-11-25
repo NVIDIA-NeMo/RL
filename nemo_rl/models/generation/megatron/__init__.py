@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from typing import TYPE_CHECKING
+
+from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
     MCoreGenerationSpecificArgs,
@@ -22,8 +24,15 @@ from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,
 )
 
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.megatron.dynamo_generation import (
+        MegatronDynamoGeneration,
+    )
 
-def megatron_generation_cls(generation_config: dict) -> type[GenerationInterface]:
+
+def megatron_generation_cls(
+    generation_config: GenerationConfig,
+) -> type[MegatronGeneration] | type["MegatronDynamoGeneration"]:
     """``MegatronGeneration``, or the class that serves prefill/decode engines through Dynamo.
 
     ``policy.generation.dynamo=true`` picks ``MegatronDynamoGeneration``, which
