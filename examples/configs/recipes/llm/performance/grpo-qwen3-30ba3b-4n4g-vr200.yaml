@@ -1,6 +1,18 @@
 defaults: ./grpo-qwen3-30ba3b-4n4g.yaml
 policy:
   logprob_batch_size: 16
+  generation:
+    vllm_cfg:
+      # Reserve the K3 lookahead while keeping the 4,096-token rollout cap.
+      max_model_len: 4100
+    vllm_kwargs:
+      speculative_config:
+        method: eagle3
+        model: RedHatAI/Qwen3-30B-A3B-speculator.eagle3
+        revision: 6afc5aa2477b923467fb9a8d906782b984a9a6ba  # pragma: allowlist secret
+        num_speculative_tokens: 3
+        draft_load_config:
+          load_format: safetensors
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-vr200
 logger:
