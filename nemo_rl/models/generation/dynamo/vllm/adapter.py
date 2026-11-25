@@ -24,19 +24,19 @@ NeMo-Gym's chat calls, whose prompt NeMo RL's chat engine in the frontend
 rendered, prepared and routed (``chat_engine``). For those the adapter runs the
 native server's steps after that (``prompt_and_capture``): ``start_capture``, the
 generation with the SamplingParams the native server would build, and
-``save_capture``'s one TQ write.
+``save_capture``'s one TQ write. A call with media is rendered again here first:
+the frontend sends its request, not pixels, and the engine processes the media.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import dataclasses
+import functools
 import json
 import logging
 import math
 import os
-import pickle
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -67,6 +67,7 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
     GYM_CALL_ANNOTATION,
     RUNTIME_DATA_KEY,
     ForwardedCall,
+    ForwardedMedia,
     GymEngineReply,
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
@@ -98,6 +99,7 @@ from nemo_rl.models.generation.vllm.utils import (
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from nemo_rl.models.generation.vllm.chat_server import EngineMediaRenderer
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
@@ -336,13 +338,61 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         if chunk is not None:
             yield chunk
 
+    @functools.cached_property
+    def _media_renderer(self) -> "EngineMediaRenderer":
+        """The renderer media calls are processed with, built on the first one."""
+        # Deferred: chat_server imports vLLM's OpenAI server stack.
+        from nemo_rl.models.generation.vllm.chat_server import (
+            build_engine_media_renderer,
+        )
+
+        return build_engine_media_renderer(
+            model_config=self._llm.model_config,
+            renderer=self._llm.renderer,
+            cfg=self._host.cfg,
+        )
+
+    async def _render_media(self, chat: Any, media: ForwardedMedia) -> dict[str, Any]:
+        """Process a media call's media on this engine, as the native server does.
+
+        Renders the request the frontend rendered with the engine's own
+        renderer, and returns the engine input, in the template's coordinates.
+        """
+        # Deferred: chat_server imports vLLM's OpenAI server stack.
+        from nemo_rl.models.generation.vllm.chat_server import (
+            NeMoRLChatCompletionRequest,
+        )
+
+        host = self._host
+        request = NeMoRLChatCompletionRequest.model_validate(media["body"])
+        # The frontend planned the splice from the request's own prefix; left
+        # set, this render would process the history's media a second time.
+        request.required_prefix_token_ids = None
+        engine_prompt = await self._media_renderer.render_media(
+            request,
+            # As the native server (#4124): capture reads a captured call's
+            # media from the engine input, so it must hold concrete pixels.
+            skip_mm_cache=host._capture_media
+            and host._capture_admission(chat) is not None,
+        )
+        if engine_prompt["prompt_token_ids"] != media["template_token_ids"]:
+            raise RuntimeError(
+                "The engine's render of a media call "
+                f"({len(engine_prompt['prompt_token_ids'])} prompt tokens) differs "
+                f"from the frontend's ({len(media['template_token_ids'])}). The "
+                "frontend routed and spliced the call on its own render, so both "
+                "must render alike."
+            )
+        return engine_prompt
+
     async def _serve_gym_call(
         self, chat: Any, plan: PreparedPrompt, wire: ForwardedCall, context: Context
     ) -> Optional[GenerateChunk]:
         """One NeMo-Gym chat call, after the frontend prepared its prompt.
 
         The native server's steps after the plan, in its order: the queue
-        check vLLM's serving runs first, :func:`start_capture` (a restore
+        check vLLM's serving runs first, a media call's processing
+        (:meth:`_render_media`), :func:`start_capture` (a restore
         from a checkpoint cut, and ``begin_call``, which stamps the weight
         version), the generation, and :func:`save_capture`'s one TQ write.
         Returns one chunk whose ``engine_data`` carries the output the
@@ -357,11 +407,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         engine_prompt: dict[str, Any]
         media = wire["multimodal"]
         if media is not None:
-            # The processed media, in the template's coordinates.
-            engine_prompt = {
-                **pickle.loads(base64.b64decode(media["inputs"])),
-                "prompt_token_ids": list(media["template_token_ids"]),
-            }
+            engine_prompt = await self._render_media(chat, media)
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
             if chat.cache_salt is not None:

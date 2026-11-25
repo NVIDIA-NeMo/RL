@@ -19,8 +19,6 @@ Gym's capture core, and in the media tests the worker's media snapshot, are
 faked.
 """
 
-import base64
-import pickle
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -84,6 +82,7 @@ from tests.unit.models.generation.test_dynamo_vllm_adapter import (  # noqa: E40
     EOS,
     IMAGE_TOKEN,
     IMAGE_TOKENS,
+    MEDIA_BODY,
     _chat,
     _collect,
     _completion,
@@ -92,6 +91,7 @@ from tests.unit.models.generation.test_dynamo_vllm_adapter import (  # noqa: E40
     _gym_call,
     _host,
     _logprob,
+    _media_adapter,
     _output,
 )
 from tests.unit.models.generation.test_vllm_token_capture_hosting import (  # noqa: E402
@@ -329,15 +329,14 @@ def test_a_call_that_does_not_finish_cleanly_fails_its_capture(
     assert len(host._capture_registry) == 0
 
 
-def _multimodal(placeholders: list[PlaceholderRange]) -> str:
-    """The rendered engine input's media, as the chat engine ships it."""
-    multimodal = {
+def _multimodal(placeholders: list[PlaceholderRange]) -> dict:
+    """The media of the engine input the engine's own render gives."""
+    return {
         "type": "multimodal",
         "mm_kwargs": {"image": [f"pixels-{i}" for i in range(len(placeholders))]},
         "mm_hashes": {"image": [f"hash-{i}" for i in range(len(placeholders))]},
         "mm_placeholders": {"image": placeholders},
     }
-    return base64.b64encode(pickle.dumps(multimodal)).decode()
 
 
 def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
@@ -359,7 +358,9 @@ def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
         return CapturedMedia((), None)
 
     host._capture_request_media = capture_request_media
-    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+    engine = _media_adapter(
+        host, _multimodal([PlaceholderRange(3, IMAGE_TOKENS)]), template
+    )
 
     _collect(
         engine,
@@ -369,7 +370,7 @@ def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
             prefix_len=len(PREFIX),
             template_token_ids=template,
             splice=SPLICE,
-            multimodal=_multimodal([PlaceholderRange(3, IMAGE_TOKENS)]),
+            multimodal=MEDIA_BODY,
             verify_retained_media=True,
         ),
     )
@@ -400,17 +401,15 @@ def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
         return CapturedMedia((), None)
 
     host._capture_request_media = capture_request_media
-    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
-
-    (chunk,) = _collect(
-        engine,
-        _captured_call(
-            processed,
-            TEXT,
-            multimodal=_multimodal([PlaceholderRange(1, IMAGE_TOKENS)]),
-        ),
+    engine = _media_adapter(
+        host, _multimodal([PlaceholderRange(1, IMAGE_TOKENS)]), processed
     )
 
+    (chunk,) = _collect(engine, _captured_call(processed, TEXT, multimodal=MEDIA_BODY))
+
+    # Capture reads the pixels, so the engine processed them past vLLM's cache.
+    ((_, skip_mm_cache),) = engine._media_renderer.calls
+    assert skip_mm_cache
     # Media is snapshotted from the processed prompt the engine runs.
     assert snapshots == [(processed, TEXT, None)]
     (payload,) = host.token_capture.staged
@@ -548,10 +547,8 @@ def test_a_restored_media_call_is_checked_against_its_cuts_tensor_digests(
     )
 
     (chunk,) = _collect(
-        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
-        _captured_call(
-            image, admission, multimodal=_multimodal([PlaceholderRange(0, 2)])
-        ),
+        _media_adapter(host, _multimodal([PlaceholderRange(0, 2)]), image),
+        _captured_call(image, admission, multimodal=MEDIA_BODY),
     )
 
     if changed:

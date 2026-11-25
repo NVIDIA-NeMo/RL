@@ -19,10 +19,8 @@ constructor, so rollouts and NeMo-Gym calls run the native worker's own helpers.
 
 import ast
 import asyncio
-import base64
 import importlib.util
 import json
-import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -495,11 +493,8 @@ def _gym_call(token_ids: list[int], **fields) -> dict:
     }
     # A media call's template ids are its own prompt's unless it was spliced.
     template_token_ids = fields.pop("template_token_ids", token_ids)
-    if (inputs := fields.pop("multimodal", None)) is not None:
-        wire["multimodal"] = {
-            "inputs": inputs,
-            "template_token_ids": template_token_ids,
-        }
+    if (body := fields.pop("multimodal", None)) is not None:
+        wire["multimodal"] = {"body": body, "template_token_ids": template_token_ids}
     for name, value in fields.items():
         if name in plan:
             plan[name] = value
@@ -511,6 +506,40 @@ def _gym_call(token_ids: list[int], **fields) -> dict:
         "annotations": [GYM_CALL_ANNOTATION],
         "extra_args": {CALL_KEY: wire},
     }
+
+
+# A media call's request as the frontend rendered it, with Gym's echoed prefix.
+MEDIA_BODY = {
+    **_chat(),
+    "messages": [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "file:///a.png"}}],
+        }
+    ],
+    "required_prefix_token_ids": [1, 5],
+}
+
+
+class _FakeMediaRenderer:
+    """The engine's render of a media call: a scripted engine input."""
+
+    def __init__(self, media: dict, template_token_ids: list[int]) -> None:
+        self._engine_prompt = {**media, "prompt_token_ids": template_token_ids}
+        self.calls = []
+
+    async def render_media(self, request, *, skip_mm_cache: bool) -> dict:
+        self.calls.append((request, skip_mm_cache))
+        return dict(self._engine_prompt)
+
+
+def _media_adapter(
+    host: VllmAsyncGenerationWorkerImpl, media: dict, template_token_ids: list[int]
+) -> vllm_adapter.DynamoVllmAdapter:
+    """An adapter whose render of a media call gives ``media`` on those ids."""
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+    engine._media_renderer = _FakeMediaRenderer(media, template_token_ids)
+    return engine
 
 
 @pytest.mark.parametrize(
@@ -685,7 +714,7 @@ def test_a_spliced_media_call_keeps_placeholders_on_their_tokens() -> None:
         },
     }
     llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
-    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+    engine = _media_adapter(_host(llm), multimodal, template)
 
     _collect(
         engine,
@@ -694,10 +723,18 @@ def test_a_spliced_media_call_keeps_placeholders_on_their_tokens() -> None:
             template_token_ids=template,
             # Each side cut at its turn end: prefix[:7] + template[6:].
             splice=[7, 6],
-            multimodal=base64.b64encode(pickle.dumps(multimodal)).decode(),
+            multimodal=MEDIA_BODY,
         ),
     )
 
+    # The engine processed the media itself, from the request the frontend
+    # rendered. The frontend spliced already, so no prefix is rendered again,
+    # and an uncaptured call may read vLLM's processor cache.
+    ((request, skip_mm_cache),) = engine._media_renderer.calls
+    assert [part["image_url"]["url"] for part in request.messages[0]["content"]] == [
+        "file:///a.png"
+    ]
+    assert (request.required_prefix_token_ids, skip_mm_cache) == (None, False)
     ((engine_input, params, _, _),) = llm.calls
     assert engine_input["prompt_token_ids"] == spliced
     assert engine_input["mm_kwargs"] == multimodal["mm_kwargs"]
@@ -707,6 +744,19 @@ def test_a_spliced_media_call_keeps_placeholders_on_their_tokens() -> None:
         (span.offset, span.length) for span in engine_input["mm_placeholders"]["image"]
     ] == [(1, IMAGE_TOKENS), (len(prefix), IMAGE_TOKENS)]
     assert params.max_tokens == MAX_MODEL_LEN - len(spliced)
+
+
+def test_a_media_call_the_engine_lays_out_differently_is_failed() -> None:
+    # The frontend routed and spliced on its render: three placeholder tokens.
+    template = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 4]
+    llm = _FakeLLM([_output(template, _completion([10], "stop"))])
+    engine = _media_adapter(_host(llm), {"type": "multimodal"}, [1, IMAGE_TOKEN, 4])
+
+    # As any engine failure: the cause reaches the chat engine, which answers 500.
+    with pytest.raises(InvalidArgument, match="both must render alike"):
+        _collect(engine, _gym_call(template, multimodal=MEDIA_BODY))
+
+    assert llm.calls == []
 
 
 @pytest.mark.parametrize(

@@ -23,7 +23,9 @@ where vLLM is installed.
 
 import asyncio
 import copy
+import functools
 import logging
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from logging import Filter as LoggingFilter
@@ -439,9 +441,9 @@ class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
     """The render step for NeMo RL's chat engine in Dynamo's frontend.
 
     Runs only the shared step (:meth:`_render_chat_call`): the frontend reads
-    the TQ prefix and splices, and the engine captures. Media is always
-    processed here, never served from a processor cache, since the engine runs
-    on the pixels the frontend sends.
+    the TQ prefix and splices, and the engine captures. Media is processed
+    here on every call, for the prompt's token layout only: the engine
+    processes it again for the pixels (:class:`EngineMediaRenderer`).
     """
 
     # The render the overridden preprocess_chat is asked for, and its result.
@@ -489,6 +491,59 @@ class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
             admission=self._admission,
         )
         return self._rendered.conversation, [self._rendered.engine_prompt]
+
+
+class EngineMediaRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
+    """The engine's render of a media call that Dynamo's frontend prepared.
+
+    Runs only the shared step (:meth:`_render_chat_call`), as
+    :class:`FrontendRenderer` did for the same request, so the engine processes
+    the call's media itself and lays the prompt out as the frontend did. The
+    frontend decided the capture and planned the splice; neither runs here.
+    Keeps nothing of a call, so an engine's calls may overlap.
+    """
+
+    async def render_media(self, request, *, skip_mm_cache: bool) -> dict[str, Any]:
+        """Render ``request`` and return its engine input, media processed.
+
+        Args:
+            request: The chat request the frontend rendered, without a prefix
+                of its own.
+            skip_mm_cache: Process the media instead of reading vLLM's
+                processor cache.
+        """
+        result = await self.render_chat(request, skip_mm_cache=skip_mm_cache)
+        if not isinstance(result, tuple):
+            raise ValueError(result.error.message)
+        _, (engine_prompt,) = result
+        return engine_prompt
+
+    async def preprocess_chat(
+        self,
+        request,
+        messages,
+        default_template,
+        default_template_content_format,
+        default_template_kwargs,
+        tool_dicts=None,
+        parser=None,
+        *,
+        skip_mm_cache: bool = False,
+    ):
+        rendered = await self._render_chat_call(
+            request,
+            messages,
+            dict(
+                default_template=default_template,
+                default_template_content_format=default_template_content_format,
+                default_template_kwargs=default_template_kwargs,
+                tool_dicts=tool_dicts,
+                parser=parser,
+                skip_mm_cache=skip_mm_cache,
+            ),
+            admission=None,
+        )
+        return rendered.conversation, [rendered.engine_prompt]
 
 
 _FULL_GENERATOR_SIGNATURE = _full_generator_signature(
@@ -695,18 +750,34 @@ class ChatServer:
     serving_tokenization: NeMoRLServingTokenization
 
 
-def register_parser_plugins(cfg: dict[str, Any]) -> None:
-    """Import the tool and reasoning parser plugins ``policy.generation`` names."""
+@functools.cache
+def _import_tool_parser_plugin(path: str) -> None:
+    ToolParserManager.import_tool_parser(path)
+
+
+@functools.cache
+def _import_reasoning_parser_plugin(path: str) -> None:
+    ReasoningParserManager.import_reasoning_parser(path)
+
+
+def register_parser_plugins(cfg: Mapping[str, Any]) -> None:
+    """Import the tool and reasoning parser plugins ``policy.generation`` names.
+
+    A plugin file is imported once per process: an engine served through
+    Dynamo may build both the chat server and :class:`EngineMediaRenderer`.
+    """
     maybe_tool_parser_plugin = cfg["vllm_cfg"].get("tool_parser_plugin")
     if maybe_tool_parser_plugin:
-        ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+        _import_tool_parser_plugin(maybe_tool_parser_plugin)
 
     maybe_reasoning_parser_plugin = cfg["vllm_cfg"].get("reasoning_parser_plugin")
     if maybe_reasoning_parser_plugin:
-        ReasoningParserManager.import_reasoning_parser(maybe_reasoning_parser_plugin)
+        _import_reasoning_parser_plugin(maybe_reasoning_parser_plugin)
 
 
-def serving_chat_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def serving_chat_settings(
+    cfg: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """The chat serving's settings and default chat-template kwargs.
 
     One copy for every host of the chat path, so each renders and parses
@@ -753,6 +824,46 @@ def serving_chat_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         serving_chat_kwargs["default_chat_template_kwargs"] or {}
     )
     return serving_chat_kwargs, default_chat_template_kwargs
+
+
+def dynamo_renderer_settings(
+    serving_chat_kwargs: dict[str, Any], default_chat_template_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """The renderer kwargs both Dynamo hosts of the chat path render with.
+
+    Built from :func:`serving_chat_settings`'s two results. The frontend's
+    render workers and the engine share them, so both lay a prompt out alike.
+    """
+    return {
+        "request_logger": None,
+        "chat_template": serving_chat_kwargs["chat_template"],
+        "chat_template_content_format": serving_chat_kwargs[
+            "chat_template_content_format"
+        ],
+        "enable_auto_tools": serving_chat_kwargs["enable_auto_tools"],
+        "tool_parser": serving_chat_kwargs.get("tool_parser"),
+        "reasoning_parser": serving_chat_kwargs.get("reasoning_parser"),
+        "default_chat_template_kwargs": default_chat_template_kwargs,
+    }
+
+
+def build_engine_media_renderer(
+    *, model_config: Any, renderer: Any, cfg: Mapping[str, Any]
+) -> EngineMediaRenderer:
+    """Build the renderer an engine served through Dynamo processes media with.
+
+    Args:
+        model_config: The engine's vLLM ``ModelConfig``.
+        renderer: The engine's own vLLM renderer. Its processor cache is the
+            one the engine core mirrors, as for the native chat server.
+        cfg: ``policy.generation``.
+    """
+    register_parser_plugins(cfg)
+    return EngineMediaRenderer(
+        model_config=model_config,
+        renderer=renderer,
+        **dynamo_renderer_settings(*serving_chat_settings(cfg)),
+    )
 
 
 def build_chat_server(
