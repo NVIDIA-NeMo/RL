@@ -1,0 +1,25 @@
+# Inherit the native GRPO loss, reward verifier, data loader and rollout engine.
+defaults: ../../../examples/configs/grpo_math_1B.yaml
+logra:
+  enabled: true
+  rank: 256
+  optimizer: row_adam
+  refresh: true
+  distribution: rademacher
+  freeze_non_target: false
+policy:
+  model_name: Qwen/Qwen2.5-Math-7B
+  tokenizer:
+    name: ${policy.model_name}
+  dtensor_cfg:
+    automodel_kwargs:
+      force_hf: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-6
+data:
+  default:
+    prompt_file: ../../examples/prompts/cot.txt
