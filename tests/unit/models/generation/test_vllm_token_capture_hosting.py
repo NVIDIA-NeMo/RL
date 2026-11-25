@@ -110,6 +110,10 @@ from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRIT
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    durable_prefixes,
+    merge_cut_receipts,
+)
 from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402
     VllmProgressReader,
 )
@@ -483,9 +487,13 @@ def test_obsolete_generation_cut_row_flush_fans_out(monkeypatch):
 def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     gen = _generation_with_mock_group()
     gen.worker_group.workers = [object(), object()]
+    # The second worker runs two HTTP frontends.
     gen.worker_group.run_all_workers_single_data.return_value = [
-        {"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1},
-        {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+        [{"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1}],
+        [
+            {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+            {"restored_calls": 4, "restored_prefix_tokens": 9, "progress_reads": 2},
+        ],
     ]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
@@ -493,12 +501,12 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     )
 
     assert gen.get_generation_prefix_counts() == {
-        "restored_calls": 3,
-        "restored_prefix_tokens": 57,
-        "progress_reads": 1,
+        "restored_calls": 7,
+        "restored_prefix_tokens": 66,
+        "progress_reads": 3,
     }
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "get_generation_prefix_counts",
+        "get_generation_prefix_counts_per_frontend",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -1732,6 +1740,45 @@ def _active_call_inventory(
         active_prefixes=prefixes,
     )
     return inventory, states
+
+
+def test_frontends_cut_their_own_calls_into_one_receipt():
+    # Each HTTP frontend holds the calls whose requests it accepted.
+    sinks = [_MemorySink(), _MemorySink()]
+    owner, child = (_worker_with_capture(sink) for sink in sinks)
+    _active_call_inventory(owner, ("c1", [11, 12]))
+    _active_call_inventory(child, ("c2", [13, 14]))
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{model_call_id}",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+            for model_call_id in ("c1", "c2", "not-arrived")
+        ],
+    )
+
+    receipt = merge_cut_receipts(
+        inventory,
+        [
+            durable_prefixes(_cuts(frontend).checkpoint_cut(inventory))
+            for frontend in (owner, child)
+        ],
+    )
+
+    receipt.validate_for(inventory)
+    assert {ack.ticket_id: ack.disposition for ack in receipt.prefixes} == {
+        "ticket-c1": "durable_prefix",
+        "ticket-c2": "durable_prefix",
+        "ticket-not-arrived": "durable_failure",
+    }
+    # Each frontend staged only its own call's row.
+    assert [len(sink.generation_prefix_records) for sink in sinks] == [1, 1]
 
 
 def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
