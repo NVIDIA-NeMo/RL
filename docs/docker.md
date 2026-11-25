@@ -76,6 +76,36 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
 
+## Overriding Packages in the vLLM Worker Venvs
+
+`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to run a newer vLLM than the one `uv.lock` pins, on a torch built for a newer CUDA toolkit, which the lock cannot express for a single extra:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+The value is a comma-separated list of requirements, normally exact pins. Override torch together with its companion packages (torchvision, torchaudio): torchaudio refuses to import next to a torch built for a different CUDA version. Packages come from PyPI and from `VLLM_VENV_PACKAGE_OVERRIDES_INDEX`, a comma-separated list of extra indexes (default: the PyTorch cu134 index).
+
+The list may include `vllm` itself and nightly wheels. The listed requirements also override what the installed packages ask for, so a vLLM wheel that pins an older torch still installs next to the torch you list. A requirement that names a pre-release allows one for that package:
+
+```sh
+--build-arg VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/nightly/cu135,https://download.pytorch.org/whl/nightly/cu134,https://wheels.vllm.ai/4f0ecfff6be6f4d28ba91ad4d44b43b4100d4f2d \
+--build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0rc1.dev1193,torch==2.16.0.dev20261116+cu135,torchvision==0.30.0.dev20261116+cu134,torchaudio==2.11.0.dev20261116+cu134
+```
+
+When the overridden venv has a Triton wheel with its own `ptxas-blackwell`, the build also sets `TRITON_PTXAS_BLACKWELL_PATH` to it for that venv (through a `.pth` file, unless the variable is already set). Otherwise flashinfer points Triton at the base image's `ptxas`, which can be too old for the GPU the overridden torch targets.
+
+`MCORE_VENV_PACKAGE_OVERRIDES` does the same for the worker venvs that carry the `mcore` extra, with the same index list. It is also empty by default. The compiled training extensions are built against the locked torch, so use it for packages that do not link to torch, such as a Triton whose compiler knows a newer GPU:
+
+```sh
+--build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
+```
+
+The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.
+
 ## Stripping the uv Cache
 
 By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.

@@ -27,6 +27,8 @@
 #   --build-arg BUILD_DYNAMO=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
+# Optional: install packages over the locked ones in the worker venvs that carry the vllm extra:
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
@@ -745,6 +747,28 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+# Opt-in, off by default: packages to install over the locked ones in every worker venv
+# that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
+# toolkit than the one uv.lock pins:
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
+# Comma-separated requirements, so the value survives build systems that pass it unquoted.
+# VLLM_VENV_PACKAGE_OVERRIDES_INDEX is a comma-separated list of extra indexes. Nightly
+# wheels work too: a requirement that names a pre-release (torch==2.16.0.dev20261116+cu135,
+# vllm==0.34.0rc1.dev1193) lets uv pick one.
+# uv.lock cannot express this per extra: the base project also requires torch, so a second
+# torch index for the vllm extra conflicts with it in the same resolution fork. The venvs
+# then no longer match uv.lock: anything that rebuilds them from the lock (a `uv sync`,
+# `uv run --extra vllm`, NRL_FORCE_REBUILD_VENVS=true, or a different NEMO_RL_VENV_DIR)
+# gets the locked packages back. Every venv with the vllm extra is changed, not only the
+# vLLM engines (see nemo_rl/distributed/actor_environments.py).
+# Override every torch companion package together: torchaudio refuses to import next to
+# a torch built for a different CUDA version, and the workers import it through transformers.
+ARG VLLM_VENV_PACKAGE_OVERRIDES=
+# The same for the worker venvs that carry the mcore extra (same index list), e.g. a Triton
+# whose compiler knows a GPU newer than the one the locked torch's Triton targets:
+#   --build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
+ARG MCORE_VENV_PACKAGE_OVERRIDES=
+ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install and
@@ -779,6 +803,54 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
 # and a full FQN matches only itself.
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
+# override_venv_packages <extra> <comma-separated requirements> <extra modules to import>
+# Installs the requirements over the locked packages in every worker venv with that extra.
+override_venv_packages() {
+    local extra="$1" requirements="$2" check_imports="$3"
+    if [[ -z "${requirements}" ]]; then
+        return 0
+    fi
+    # --no-config: pyproject.toml's override-dependencies would pin these back.
+    # unsafe-best-match: the override index mirrors only some NVIDIA wheels, so each
+    # package must be free to come from whichever index has the requested version.
+    local overrides override_indexes index_url index_args=() overrides_file
+    IFS=, read -ra overrides <<< "${requirements}"
+    IFS=, read -ra override_indexes <<< "${VLLM_VENV_PACKAGE_OVERRIDES_INDEX}"
+    for index_url in "${override_indexes[@]}"; do
+        index_args+=(--index "${index_url}")
+    done
+    # Also pass the list as uv overrides: an overridden vllm wheel pins its own torch,
+    # and the torch requested here must win over that pin.
+    overrides_file="$(mktemp)"
+    printf '%s\n' "${overrides[@]}" > "${overrides_file}"
+    local venv_name stage extras venv_python venv_site venv_ptxas
+    while IFS=$'\t' read -r venv_name stage extras; do
+        if [[ " $extras " != *" ${extra} "* ]]; then
+            continue
+        fi
+        venv_python="${NEMO_RL_VENV_DIR}/${venv_name}/bin/python"
+        UV_LINK_MODE=hardlink uv pip install --no-config \
+            --python "${venv_python}" \
+            --default-index https://pypi.org/simple \
+            "${index_args[@]}" \
+            --index-strategy unsafe-best-match \
+            --overrides "${overrides_file}" \
+            "${overrides[@]}"
+        # flashinfer points Triton at the ptxas on PATH (the base image's CUDA toolkit)
+        # unless TRITON_PTXAS_BLACKWELL_PATH is already set. That ptxas can be older than
+        # the overridden packages need, so keep Triton on the ptxas its own wheel ships.
+        venv_site="$("${venv_python}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        venv_ptxas="${venv_site}/triton/backends/nvidia/bin/ptxas-blackwell"
+        if [[ -x "${venv_ptxas}" ]]; then
+            echo "import os; os.environ.setdefault('TRITON_PTXAS_BLACKWELL_PATH', '${venv_ptxas}')" \
+                > "${venv_site}/nemo_rl_venv_override.pth"
+        fi
+        "${venv_python}" -c \
+            "import os, torch, triton${check_imports}; print('venv override [${extra}]:', torch.__version__, torch.version.cuda, triton.__version__, os.environ.get('TRITON_PTXAS_BLACKWELL_PATH'))"
+    done < /opt/actor_venvs.tsv
+}
+override_venv_packages vllm "${VLLM_VENV_PACKAGE_OVERRIDES:-}" ", vllm, transformers.audio_utils"
+override_venv_packages mcore "${MCORE_VENV_PACKAGE_OVERRIDES:-}" ""
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
 # this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
 # unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
