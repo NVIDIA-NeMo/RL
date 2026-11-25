@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
 )
 from nemo_rl.environments.checkpointing import build_environment_checkpoint
+from nemo_rl.environments.checkpointing import nemo_gym as gym_checkpointing
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.checkpointing.nemo_gym import (
     GymEnvironmentCheckpoint,
@@ -1222,6 +1225,51 @@ def test_a_failed_release_warns_and_never_raises(tmp_path: Path, failure: str) -
             await gym.release([tmp_path / "save-1"])
 
     asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+
+def test_release_reads_each_snapshots_gym_manifest_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that keeps many checkpoints must not re-read every manifest at every release."""
+    actor = FakeGymActor(exported_episodes=())
+    gym = gym_environment_checkpoint(gym_coordinator(actor))
+    read: list[str] = []
+    load = gym_checkpointing.load_gym_checkpoint_manifest
+
+    def recording_load(snapshot_dir: Path) -> Any:
+        read.append(snapshot_dir.name)
+        return load(snapshot_dir)
+
+    monkeypatch.setattr(
+        gym_checkpointing, "load_gym_checkpoint_manifest", recording_load
+    )
+    first, second, third = (tmp_path / name for name in ("first", "second", "third"))
+
+    async def exercise() -> list[tuple[str, ...]]:
+        await _commit_gym_snapshot(gym, first, "save-1")
+        await _commit_gym_snapshot(gym, second, "save-2")
+        await gym.release([first, second])
+        await _commit_gym_snapshot(gym, third, "save-3")
+        # The first snapshot was pruned.
+        await gym.release([second, third])
+        # The second snapshot's directory now holds another checkpoint.
+        manifest = second / GYM_CHECKPOINT_MANIFEST_FILENAME
+        mtime_ns = manifest.stat().st_mtime_ns
+        shutil.rmtree(second)
+        await _commit_gym_snapshot(gym, second, "save-4")
+        # Coarse file timestamps can repeat within a test; a later write's do not.
+        os.utime(manifest, ns=(mtime_ns + 10**9, mtime_ns + 10**9))
+        await gym.release([second, third])
+        return [call[1][1] for call in actor.calls if call[0] == "release"]
+
+    kept = asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+    assert kept == [
+        ("save-1", "save-2"),
+        ("save-2", "save-3"),
+        ("save-3", "save-4"),
+    ]
+    assert read == ["first", "second", "third", "second"]
 
 
 class _GateRecordingManager:

@@ -291,6 +291,9 @@ class GymEnvironmentCheckpoint:
         # Separate from the data-plane barrier: it pauses only Gym /run
         # submissions while a Gym checkpoint is prepared.
         self.admission_gate = DataPlaneCheckpointBarrier()
+        # The Gym checkpoint ID of each snapshot the last release kept, with
+        # the inode and mtime of the manifest it was read from.
+        self._kept_checkpoint_ids: dict[Path, tuple[tuple[int, int], str]] = {}
 
     @property
     def holds_rollout_state(self) -> bool:
@@ -613,7 +616,9 @@ class GymEnvironmentCheckpoint:
         still restore.
         """
         try:
-            kept = await asyncio.to_thread(_gym_checkpoint_ids, list(snapshot_dirs))
+            kept = await asyncio.to_thread(
+                self._gym_checkpoint_ids, list(snapshot_dirs)
+            )
         except (OSError, ValueError, KeyError, TypeError) as error:
             warnings.warn(
                 "Skipping the Gym checkpoint release: a rollout snapshot's Gym "
@@ -632,11 +637,31 @@ class GymEnvironmentCheckpoint:
                 stacklevel=2,
             )
 
+    def _gym_checkpoint_ids(self, snapshot_dirs: list[Path]) -> frozenset[str]:
+        """Return the Gym checkpoint ID each snapshot directory's Gym manifest names.
 
-def _gym_checkpoint_ids(snapshot_dirs: list[Path]) -> frozenset[str]:
-    """Return the Gym checkpoint ID each snapshot directory's Gym manifest names."""
-    return frozenset(
-        load_gym_checkpoint_manifest(snapshot_dir).checkpoint_id
-        for snapshot_dir in snapshot_dirs
-        if (snapshot_dir / GYM_CHECKPOINT_MANIFEST_FILENAME).is_file()
-    )
+        A published snapshot never changes, so each manifest is read once and
+        its ID reused while the snapshot stays on disk: a long run would
+        otherwise re-read every retained manifest at every release. Snapshots
+        missing from ``snapshot_dirs`` are forgotten, and a manifest whose
+        inode or mtime changed is read again.
+        """
+        checkpoint_ids: dict[Path, tuple[tuple[int, int], str]] = {}
+        for snapshot_dir in snapshot_dirs:
+            try:
+                manifest = (snapshot_dir / GYM_CHECKPOINT_MANIFEST_FILENAME).stat()
+            except FileNotFoundError:
+                # Taken while Gym held nothing to save.
+                continue
+            identity = (manifest.st_ino, manifest.st_mtime_ns)
+            known = self._kept_checkpoint_ids.get(snapshot_dir)
+            checkpoint_ids[snapshot_dir] = (
+                known
+                if known is not None and known[0] == identity
+                else (
+                    identity,
+                    load_gym_checkpoint_manifest(snapshot_dir).checkpoint_id,
+                )
+            )
+        self._kept_checkpoint_ids = checkpoint_ids
+        return frozenset(checkpoint_id for _, checkpoint_id in checkpoint_ids.values())
