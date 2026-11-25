@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -161,8 +162,9 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
             installed_sources.append((client, staging_partition, capture_media))
 
     class _Preparer:
-        def __init__(self, source):
+        def __init__(self, source, *, bridge):
             self.source = source
+            self.bridge = bridge
 
     class _Stager:
         def __init__(self, sink, *, require_routed_experts, expected_route_dims):
@@ -214,8 +216,10 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     worker._router_replay_enabled = router_replay_enabled
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
+    worker.cfg = _generation_cfg(tito_interface=False)
 
     assert worker.setup_token_capture({}, "rollout_staging") is None  # text-only
+    assert worker._request_prompt_preparer.bridge is False
     assert (
         worker.dynamic_inference_engine.payload_stager is worker._request_payload_stager
     )
@@ -257,6 +261,64 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     assert installed_sources == [("dp", "rollout_staging", False)]
 
 
+def _generation_cfg(*, tito_interface: bool) -> dict:
+    return {
+        "generation": {
+            "mcore_generation_config": {"tito_interface": tito_interface},
+            "stop_token_ids": [7],
+        }
+    }
+
+
+def _stub_capture_storage(monkeypatch) -> None:
+    """Replace the data-plane client, sink, source and stager with mocks."""
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
+    )
+    for name in (
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSource",
+        "nemo_rl.models.generation.megatron.token_capture.TQMegatronTokenStager",
+    ):
+        monkeypatch.setattr(name, MagicMock())
+
+
+def test_worker_qualifies_the_chat_template_before_bridging(monkeypatch):
+    """The bridge replaces the splice only for a template it can continue."""
+    _stub_capture_storage(monkeypatch)
+    qualified = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.qualify_bridge",
+        lambda **kwargs: qualified.append(kwargs),
+    )
+    worker = _capture_ready_worker()
+    worker.cfg = _generation_cfg(tito_interface=True)
+    worker.tokenizer = SimpleNamespace(eos_token_id=2)
+
+    worker.setup_token_capture({}, "rollout_staging")
+
+    assert qualified[0]["turn_close_token_ids"] == {2, 7}
+    assert worker._request_prompt_preparer._bridge is True
+
+
+def test_worker_refuses_to_bridge_an_unqualified_chat_template(monkeypatch):
+    _stub_capture_storage(monkeypatch)
+
+    def reject(**kwargs):
+        raise ValueError("The chat template cannot be bridged")
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.qualify_bridge", reject
+    )
+    worker = _capture_ready_worker()
+    worker.cfg = _generation_cfg(tito_interface=True)
+    worker.tokenizer = SimpleNamespace(eos_token_id=2)
+
+    with pytest.raises(ValueError, match="cannot be bridged"):
+        worker.setup_token_capture({}, "rollout_staging")
+    assert worker._request_prompt_preparer is None
+
+
 def _capture_ready_worker() -> MegatronGenerationMixin:
     """A coordinator worker whose engine already exposes the MInf capture hooks."""
     worker = object.__new__(MegatronGenerationMixin)
@@ -269,6 +331,7 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
     worker._router_replay_enabled = False
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
+    worker.cfg = _generation_cfg(tito_interface=False)
     return worker
 
 

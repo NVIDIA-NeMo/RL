@@ -408,8 +408,8 @@ The Megatron chat route uses the shared bridge instead of the splice when `mcore
 
 Limits on this backend:
 
-- Verified with three tests against a Megatron inference server with Qwen3-0.6B, and not on a Gym recipe.
-- The bridge on this backend is not qualified at startup; the template is the same one the vLLM backend qualifies.
+- Verified with three tests against a Megatron inference server with Qwen3-0.6B, and not on a Gym recipe. The SWE smoke cannot run on this backend with this model: the pinned Megatron-LM has tool-call parsers for the Qwen3-Coder and Nemotron formats only, so Qwen3-0.6B's tool calls are not parsed and a rollout has no second turn.
+- The chat template is qualified when token capture is set up, with the tokenizer's EOS and the configured stop tokens as turn closes. The endpoint sends its own EOS set with each request, which is not compared with the qualified one.
 - The sampling-profile check and `tito_reject_root_reasons` are not applied to this backend.
 
 What the first implementation leaves out:
