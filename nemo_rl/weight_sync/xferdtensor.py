@@ -16,11 +16,11 @@
 
 import logging
 import os
-from collections.abc import Sequence
 from contextlib import nullcontext
+from typing import Literal
 
 import torch
-from torch.distributed._tensor import Placement, Shard
+from torch.distributed._tensor import Shard
 
 try:
     from nccl.m2n import (  # pyrefly: ignore[missing-import]
@@ -35,9 +35,9 @@ except ImportError:
 
 # Log the selected reshard path once per process (real op / python / golden).
 _XFERDTENSOR_PATH_LOGGED = False
-
-# nccl-extensions 0.1.0's hierarchical planner has fixed-size source arrays.
-_NATIVE_MAX_SOURCES = 16
+_XFERDTENSOR_DEFAULT_SELECTION: Literal[
+    "NCCL_EXTENSION", "NEMO_RL_PYTHON", "NEMO_RL_GOLDEN"
+] = "NEMO_RL_PYTHON"  # Until NCCL_EXTENSION is fully verified.
 
 
 class DTensorRef:
@@ -75,33 +75,22 @@ class DTensorRef:
 # ===========================================================
 
 
-def _use_golden_api() -> bool:
-    """Whether ``NRL_XFERDTENSOR_GOLDEN`` forces the golden reshard path."""
-    return os.environ.get("NRL_XFERDTENSOR_GOLDEN", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _use_python_api() -> bool:
-    """Use Python only implementation in for the xferdtensor.
-
-    ``xferdtensor_python_impl`` is the backup implementation when the
-    nccl.m2n.reshard is not available.
-    """
-    return os.environ.get("NRL_XFERDTENSOR_PYTHON", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+def _get_xferdtensor_selection() -> str:
+    """Apply environment overrides to the default implementation selection."""
+    for selection in ("GOLDEN", "PYTHON"):
+        if os.environ.get(f"NRL_XFERDTENSOR_{selection}", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return f"NEMO_RL_{selection}"
+    return _XFERDTENSOR_DEFAULT_SELECTION
 
 
 def uses_real_reshard_op() -> bool:
     """Whether this process transfers with ``nccl.m2n.reshard``."""
-    return _reshard is not None and not _use_golden_api() and not _use_python_api()
+    return _reshard is not None and _get_xferdtensor_selection() == "NCCL_EXTENSION"
 
 
 def follow_source_reshard_path(source_uses_real_op: bool) -> None:
@@ -116,43 +105,10 @@ def follow_source_reshard_path(source_uses_real_op: bool) -> None:
     elif not uses_real_reshard_op():
         raise RuntimeError(
             "The refit source transfers with nccl.m2n.reshard, but this destination "
-            "cannot: install nccl-extensions in its venv and unset "
-            "NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
+            "cannot: select NCCL_EXTENSION, install nccl-extensions in its venv, "
+            "and unset NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
             "NRL_XFERDTENSOR_PYTHON=1 for the source."
         )
-
-
-def _max_reshard_sources(
-    *,
-    src_mesh_shape: Sequence[int],
-    src_placement: Sequence[Placement],
-    dst_mesh_shape: Sequence[int],
-    dst_placement: Sequence[Placement],
-) -> int:
-    """Count maximum source overlaps for native's uniform single-axis layouts."""
-    src_shards = [
-        (p.dim, src_mesh_shape[axis])
-        for axis, p in enumerate(src_placement)
-        if isinstance(p, Shard)
-    ]
-    dst_shards = [
-        (p.dim, dst_mesh_shape[axis])
-        for axis, p in enumerate(dst_placement)
-        if isinstance(p, Shard)
-    ]
-    if not src_shards:
-        return 1
-    src_dim, num_src_shards = src_shards[0]
-    if not dst_shards or src_dim != dst_shards[0][0]:
-        return num_src_shards
-    num_dst_shards = dst_shards[0][1]
-    # Count source intervals intersecting each destination interval; a
-    # non-aligned boundary can add a source beyond ceil(src_count / dst_count).
-    return max(
-        ((dst + 1) * num_src_shards + num_dst_shards - 1) // num_dst_shards
-        - (dst * num_src_shards) // num_dst_shards
-        for dst in range(num_dst_shards)
-    )
 
 
 def xferdtensor(
@@ -167,24 +123,17 @@ def xferdtensor(
 ):
     """Public XferDTensor entry point used by all external callers."""
     global _XFERDTENSOR_PATH_LOGGED
-    use_golden = _use_golden_api()
-    force_python = _use_python_api()
-    # nccl-extensions 0.1.0 limits mesh axes, shard axes, and source fan-in.
+    selection = _get_xferdtensor_selection()
+    use_golden = selection == "NEMO_RL_GOLDEN"
+    # nccl-extensions 0.1.0 supports at most two mesh axes and one shard axis.
     # Both endpoints select from the same global layout before transfer starts.
     use_python = (
-        force_python
+        selection == "NEMO_RL_PYTHON"
         or _reshard is None
         or src_mesh.mesh.ndim > 2
         or dst_mesh.mesh.ndim > 2
         or sum(isinstance(p, Shard) for p in src_placement) > 1
         or sum(isinstance(p, Shard) for p in dst_placement) > 1
-        or _max_reshard_sources(
-            src_mesh_shape=src_mesh.mesh.shape,
-            src_placement=src_placement,
-            dst_mesh_shape=dst_mesh.mesh.shape,
-            dst_placement=dst_placement,
-        )
-        > _NATIVE_MAX_SOURCES
     )
     if not _XFERDTENSOR_PATH_LOGGED:
         if use_golden:
@@ -196,7 +145,7 @@ def xferdtensor(
         print(
             f"[xferdtensor] reshard path: {path} "
             f"(real_op_available={_reshard is not None}, "
-            f"force_golden={use_golden}, force_python={force_python})",
+            f"selection={selection})",
             flush=True,
         )
         _XFERDTENSOR_PATH_LOGGED = True
