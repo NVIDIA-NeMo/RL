@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 from copy import deepcopy
 from types import SimpleNamespace
@@ -1358,6 +1359,221 @@ def test_megatron_generation_colocated(
             policy.shutdown()
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@contextlib.contextmanager
+def _captured_megatron_http_server(cluster, tokenizer, *, tito_interface: bool):
+    """Serve Megatron inference over HTTP with token capture staging to TQ.
+
+    Yields:
+        A function that posts a JSON body to a route and returns the reply, and
+        the source that reads staged calls.
+    """
+    import requests
+
+    from nemo_rl.data_plane import build_data_plane_client
+    from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS, TQTokenSource
+
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = True
+    generation_config = config["generation"]["mcore_generation_config"]
+    generation_config["expose_http_server"] = True
+    generation_config["tito_interface"] = tito_interface
+    config["megatron_cfg"]["transformer_impl"] = "transformer_engine"
+    generation_config["transformer_impl"] = "transformer_engine"
+    dp_cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "simple",
+        "claim_meta_poll_interval_s": 0.5,
+        "simple": {"storage_capacity": 1024, "num_storage_units": 1},
+    }
+    staging_partition = "tito_staging"
+    policy = None
+    dp_client = None
+    try:
+        policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+        generation = MegatronGeneration(
+            policy=policy, config=config, tokenizer=tokenizer
+        )
+        dp_client = build_data_plane_client(dp_cfg)
+        dp_client.register_partition(
+            partition_id=staging_partition,
+            fields=list(STAGING_FIELDS),
+            num_samples=16,
+            consumer_tasks=["finalize"],
+        )
+        generation.setup_token_capture(dp_cfg, staging_partition)
+        # Capture stamps each call with the policy epoch it was admitted under.
+        generation.set_rollout_weight_version(0)
+        base_url = generation.dp_openai_server_base_urls[0]
+
+        def post(route: str, body: dict) -> dict:
+            response = requests.post(
+                f"{base_url}/{route}",
+                json={
+                    "max_tokens": 8,
+                    "temperature": config["generation"]["temperature"],
+                    "top_p": config["generation"]["top_p"],
+                    "logprobs": 0,
+                    **body,
+                },
+                timeout=300,
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        yield post, TQTokenSource(dp_client, staging_partition=staging_partition)
+    finally:
+        if dp_client is not None:
+            dp_client.close()
+        if policy is not None:
+            policy.shutdown()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _staged_call(source, reply: dict):
+    """Return the commit coordinates of a captured reply and its staged record."""
+    coords = reply["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    (record,) = source.fetch([coords["staging_key"]])
+    return coords, record
+
+
+_TITO_APPENDED_TURN = (
+    "<|im_end|>\n<|im_start|>user\nnow count to 10<|im_end|>\n<|im_start|>assistant\n"
+)
+
+
+@pytest.mark.mcore
+@pytest.mark.timeout(900)
+def test_megatron_http_server_token_in_token_out_continuation(cluster, tokenizer):
+    """The inference server continues a captured parent from appended tokens only."""
+    pytest.importorskip("nemo_gym.token_id_capture.staging")
+    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+    with _captured_megatron_http_server(cluster, tokenizer, tito_interface=False) as (
+        post,
+        source,
+    ):
+        prompt = tokenizer.encode(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "count to 5"}],
+                add_generation_prompt=True,
+                tokenize=False,
+            ),
+            add_special_tokens=False,
+        )
+        root = post(
+            "completions",
+            {
+                "prompt": prompt,
+                "offload_params": {
+                    "ng_capture": CaptureAdmission(
+                        capture_key="tito-rollout", model_call_id="first", mode="text"
+                    ).model_dump(mode="json")
+                },
+            },
+        )
+        # Capture stages the tokens and drops them from the reply.
+        root_coords, root_record = _staged_call(source, root)
+        parent = root_record.token_ids_delta
+        assert parent[: len(prompt)] == prompt
+        assert len(parent) > len(prompt)
+
+        appended = tokenizer.encode(_TITO_APPENDED_TURN, add_special_tokens=False)
+        continuation = post(
+            "completions",
+            {
+                "prompt": appended,
+                "offload_params": {
+                    "ng_capture": CaptureAdmission(
+                        capture_key="tito-rollout",
+                        model_call_id="second",
+                        mode="token_in",
+                        parent_call_id="first",
+                        prev_len=len(parent),
+                        parent_chain_hash=root_coords["chain_hash"],
+                        staging_chain=[root_coords["staging_key"]],
+                    ).model_dump(mode="json"),
+                    "ng_tito_append": True,
+                },
+            },
+        )
+
+        # Staging verifies the engine prompt against the parent, so the staged
+        # delta is exactly what the engine consumed after it.
+        _, record = _staged_call(source, continuation)
+        assert record.prev_len == len(parent)
+        assert record.token_ids_delta[: len(appended)] == appended
+        assert len(record.token_ids_delta) > len(appended)
+
+
+@pytest.mark.mcore
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("tito_interface", [False, True], ids=["splice", "bridge"])
+def test_megatron_http_server_chat_continuation_keeps_parent_tokens(
+    cluster, tokenizer, tito_interface
+):
+    """The splice and the bridge feed the engine the same tokens after a parent."""
+    pytest.importorskip("nemo_gym.token_id_capture.staging")
+    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+    with _captured_megatron_http_server(
+        cluster, tokenizer, tito_interface=tito_interface
+    ) as (post, source):
+        history = [{"role": "user", "content": "count to 5"}]
+        root = post(
+            "chat/completions",
+            {
+                "messages": history,
+                # The chat route takes a flag where completions take a count.
+                "logprobs": True,
+                "offload_params": {
+                    "ng_capture": CaptureAdmission(
+                        capture_key="tito-chat", model_call_id="first", mode="text"
+                    ).model_dump(mode="json")
+                },
+            },
+        )
+        root_coords, root_record = _staged_call(source, root)
+        parent = root_record.token_ids_delta
+
+        history += [
+            {
+                "role": "assistant",
+                "content": root["choices"][0]["message"]["content"] or "",
+            },
+            {"role": "user", "content": "now count to 10"},
+        ]
+        continuation = post(
+            "chat/completions",
+            {
+                "messages": history,
+                # The chat route takes a flag where completions take a count.
+                "logprobs": True,
+                "offload_params": {
+                    "ng_capture": CaptureAdmission(
+                        capture_key="tito-chat",
+                        model_call_id="second",
+                        mode="token_in",
+                        parent_call_id="first",
+                        prev_len=len(parent),
+                        parent_chain_hash=root_coords["chain_hash"],
+                        staging_chain=[root_coords["staging_key"]],
+                    ).model_dump(mode="json")
+                },
+            },
+        )
+
+        _, record = _staged_call(source, continuation)
+        assert record.prev_len == len(parent)
+        # The eight-token reply may or may not have closed its turn.
+        appended = tokenizer.encode(_TITO_APPENDED_TURN, add_special_tokens=False)
+        if parent[-1] == appended[0]:
+            appended = appended[1:]
+        assert record.token_ids_delta[: len(appended)] == appended
 
 
 @pytest.mark.mcore

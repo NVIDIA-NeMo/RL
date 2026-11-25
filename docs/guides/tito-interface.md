@@ -106,7 +106,13 @@ The Megatron inference server's `POST /v1/completions` accepts `prompt` as a lis
 | `offload_params.ng_capture` | The `token_in` capture admission. |
 | `offload_params.ng_tito_append` | `true`. |
 
-The worker prepends the parent's tokens. A request with `ng_tito_append` that also carries chat splice metadata is rejected. This path is covered by unit tests and has not been run against a Megatron inference server.
+The worker prepends the parent's tokens. A request with `ng_tito_append` that also carries chat splice metadata is rejected.
+
+| Key | Values | Behavior |
+| --- | --- | --- |
+| `policy.generation.mcore_generation_config.tito_interface` | `false` (default), `true` | Continue a captured chat request with the shared bridge instead of the prefix splice. |
+
+Both were checked against a Megatron inference server with Qwen3-0.6B, not on a Gym recipe.
 
 ## Measuring roots
 

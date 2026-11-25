@@ -48,7 +48,7 @@ from nemo_rl.experience.route_assembly import (
     boundary_route_rows,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
-from nemo_rl.models.generation.tito import TITO_APPEND_FIELD
+from nemo_rl.models.generation.tito import TITO_APPEND_FIELD, bridge_suffix
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 if TYPE_CHECKING:
@@ -133,9 +133,17 @@ class TQMegatronPromptPreparer:
     ``offload_params``.
     """
 
-    def __init__(self, source: TQTokenSource) -> None:
+    def __init__(self, source: TQTokenSource, *, bridge: bool) -> None:
+        """Resolve prefixes from ``source``.
+
+        Args:
+            source: Reads staged calls.
+            bridge: Continue a chat request with ``bridge_suffix`` instead of
+                ``replace_prefix_tokens``.
+        """
         # Same cached chain resolution as the vLLM worker (see ChainPrefixCache).
         self._chain_prefix = ChainPrefixCache(source)
+        self._bridge = bridge
 
     def prepare_prompt(
         self,
@@ -273,13 +281,22 @@ class TQMegatronPromptPreparer:
                 or any(type(token_id) is not int for token_id in eos_token_ids)
             ):
                 raise ValueError("MInf capture request carries no valid EOS token ids")
-            prompt = replace_prefix_tokens(
-                tokenizer=None,
-                model_prefix_token_ids=prefix_token_ids,
-                template_prefix_token_ids=template_prefix_token_ids,
-                template_token_ids=prompt,
-                eos_token_id=eos_token_ids,
-            )
+            if self._bridge:
+                prompt = prefix_token_ids + bridge_suffix(
+                    parent_token_ids=prefix_token_ids,
+                    rendered_token_ids=prompt,
+                    turn_close_token_ids=(
+                        [eos_token_ids] if type(eos_token_ids) is int else eos_token_ids
+                    ),
+                )
+            else:
+                prompt = replace_prefix_tokens(
+                    tokenizer=None,
+                    model_prefix_token_ids=prefix_token_ids,
+                    template_prefix_token_ids=template_prefix_token_ids,
+                    template_token_ids=prompt,
+                    eos_token_id=eos_token_ids,
+                )
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"

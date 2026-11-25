@@ -1154,7 +1154,10 @@ class MegatronGenerationMixin:
                 dp_client,
                 staging_partition=staging_partition,
                 capture_media=capture_media,
-            )
+            ),
+            bridge=bool(
+                self.cfg["generation"]["mcore_generation_config"].get("tito_interface")
+            ),
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer

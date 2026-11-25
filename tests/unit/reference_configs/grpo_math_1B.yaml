@@ -510,6 +510,7 @@ policy:
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
+      tito_interface: false
     vllm_cfg:
       tito_model: null
       tito_interface: false

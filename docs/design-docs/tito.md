@@ -278,6 +278,25 @@ PR #5128 adds an incremental renderer for Qwen3 inside the existing chat handler
 
 ## What changes and what does not
 
+```mermaid
+flowchart TB
+    subgraph OLD["Today"]
+        direction LR
+        H1[Harness] -- messages --> G1["Gym model server<br/>ledger selects parent"]
+        G1 -- "messages + parent reference" --> W1["Chat handler<br/>render twice, splice parent tokens,<br/>generate, parse, record"]
+    end
+    subgraph NEW["With the TITO interface"]
+        direction LR
+        H2[Harness] -- messages --> G2["Gym model server<br/>ledger selects parent"]
+        G2 -- "messages + parent reference" --> A2["Chat adapter<br/>render once, keep tokens after the parent,<br/>parse"]
+        A2 -- "parent reference + new tokens" --> C2["TITO core<br/>generate, record"]
+        C2 -- "sampled tokens" --> A2
+        T2[Token-owning client] -- tokens --> C2
+    end
+```
+
+The harness and Gym are the same in both. The one chat handler becomes an adapter and a core, and a client that already holds tokens can call the core directly.
+
 | Aspect | Today | This design |
 | --- | --- | --- |
 | Public interface | `/v1/chat/completions` only | A token-only core endpoint is added; the chat endpoint stays |
@@ -323,7 +342,7 @@ The value of the design is therefore: a contract where there was a side effect, 
 | 1 | TITO core endpoint on the vLLM backend; capture reads from it | A client submitting tokens directly reproduces the same training rows as the chat path on a fixed rollout. | Implemented. Checked on one two-turn conversation and by training rows built from the route in a unit test. |
 | 2 | Chat adapter with render, bridge, parse, and startup qualification for Qwen3 | Token-identical prompts to the existing splice path on the SWE recipe; existing path still passes. | Implemented. Token-identical on test conversations. The SWE smoke ran two steps with identical root statistics in the first step; prompts were not compared token by token there. |
 | 3 | Root policy changes chosen from Phase 0 data; rejection mode; more model families | Agreed root-rate threshold met. | Rejection mode implemented (`vllm_cfg.tito_reject_root_reasons`). No matching-rule change made: in 299 measured calls no root had a reason that a rule change would recover. The rules live in Gym. |
-| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Core contract implemented in the prompt preparer on top of the existing `/v1/completions` route; unit-tested, not run against a Megatron inference server. See [Megatron backend](#megatron-backend). |
+| 4 | Megatron inference backend implements the core contract | Same metrics and thresholds. | Implemented: the core contract on the existing `/v1/completions` route and the bridge on the chat route. Checked against a Megatron inference server, not on a Gym recipe. See [Megatron backend](#megatron-backend). |
 
 ## Implementation status
 
@@ -345,6 +364,8 @@ What has been verified:
 | Same server: the second prompt submitted to the core route returns the same tokens and log probabilities as the chat route | Passed |
 | Same server: the existing merged-prefix test with the interface on and off | Same expected tokens on both paths |
 | Core route with Gym's capture: a root call and its continuation linearize into one training row | Tokens, loss mask, and log probabilities as expected |
+| Megatron inference server, two H100 GPUs, Qwen3-0.6B: a completions call that sends only the tokens after its parent, with the parent named by its staged record | The staged record shows the engine consumed the parent followed by the submitted tokens |
+| Same server: a two-turn chat with the splice and with the bridge | Both stage the same tokens after the parent |
 | Prompt construction on CPU, Qwen3-0.6B tokenizer, prefixes of 677, 5157, and 20517 tokens, 30 alternating measurements each | The bridge is 1.9 times as fast as the splice at every length, with identical tokens. Rollout throughput is not measured. |
 
 ### SWE smoke
@@ -380,11 +401,13 @@ The Megatron-LM text generation server already takes token prompts: `POST /v1/co
 
 For a continuation, `TQMegatronPromptPreparer.prepare_prompt` resolves the parent's tokens and prepends them. Recording through `TQMegatronTokenStager` is unchanged.
 
+The Megatron chat route uses the shared bridge instead of the splice when `mcore_generation_config.tito_interface` is true. It is off by default.
+
 Limits on this backend:
 
-- Covered by unit tests of the prompt preparer only. It has not been run against a Megatron inference server.
-- The Megatron chat route still uses the splice. Replacing it with the shared bridge is not done.
-- The sampling-profile check and `tito_reject_root_reasons` are not applied to this route.
+- Verified with three tests against a Megatron inference server with Qwen3-0.6B, and not on a Gym recipe.
+- The bridge on this backend is not qualified at startup; the template is the same one the vLLM backend qualifies.
+- The sampling-profile check and `tito_reject_root_reasons` are not applied to this backend.
 
 What the first implementation leaves out:
 

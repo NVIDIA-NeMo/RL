@@ -1490,7 +1490,8 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
     preparer = TQMegatronPromptPreparer(
         TQTokenSource(
             tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
-        )
+        ),
+        bridge=False,
     )
 
     def stage(call_id, prompt, generated, media_tensors, offload_params):
