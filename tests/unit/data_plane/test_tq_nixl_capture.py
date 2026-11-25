@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.data_plane.adapters import tq_nixl_checkpoint as ckpt
+from nemo_rl.data_plane.checkpoint import CheckpointReleaseError
 from tests.unit.data_plane._nixl_helpers import bare_unit, gidx_of, key_of, write_blob
 
 
@@ -52,12 +53,22 @@ class _Controller:
         self.nrl_release_snapshot = _Remote(lambda t: self.views.pop(t, None))
 
 
-def _actor(unit):
-    return SimpleNamespace(
-        capture_shard=_Remote(unit.capture_shard),
-        persist_shard=_Remote(unit.persist_shard),
-        release_shard=_Remote(unit.release_shard),
-    )
+def _fake_get(ref, timeout=None):
+    """ray.get on a fake future; a wait that expires raises Ray's own error."""
+    try:
+        return ref.result(timeout)
+    except concurrent.futures.TimeoutError as error:
+        raise ckpt.ray.exceptions.GetTimeoutError("fake wait expired") from error
+
+
+def _actor(unit, **overrides):
+    """A fake unit actor; `overrides` replace single RPCs (for failure cases)."""
+    rpcs = {
+        "capture_shard": _Remote(unit.capture_shard),
+        "persist_shard": _Remote(unit.persist_shard),
+        "release_shard": _Remote(unit.release_shard),
+    }
+    return SimpleNamespace(**{**rpcs, **overrides})
 
 
 def _put(u, blob_id, fill):
@@ -71,7 +82,7 @@ def cluster(monkeypatch):
     units = [bare_unit(1 << 16), bare_unit(1 << 16)]
     units[1].unit_id = 1
     actors = {0: _actor(units[0]), 1: _actor(units[1])}
-    monkeypatch.setattr(ckpt.ray, "get", lambda ref, timeout=None: ref.result(timeout))
+    monkeypatch.setattr(ckpt.ray, "get", _fake_get)
     monkeypatch.setattr(ckpt, "_unit_actor", lambda store, u: actors[u])
     monkeypatch.setattr(ckpt, "_active_units", lambda store: [0, 1])
     storage = SimpleNamespace(store=object(), unit_ids=[0, 1])
@@ -146,3 +157,43 @@ def test_persist_is_single_attempt_and_release_is_idempotent(cluster, tmp_path):
     cap.release()  # a second release is a no-op
     with pytest.raises(RuntimeError, match="released"):
         cap.persist()
+
+
+class _NeverDone:
+    """An RPC whose reply never arrives, as with a frozen actor."""
+
+    def remote(self, *args):
+        return concurrent.futures.Future()
+
+
+def test_frozen_unit_times_out_the_capture_and_releases_the_rest(
+    cluster, tmp_path, monkeypatch
+):
+    units, client = cluster
+    actors = {
+        0: _actor(units[0]),
+        1: _actor(units[1], capture_shard=_NeverDone()),
+    }
+    monkeypatch.setattr(ckpt, "_unit_actor", lambda store, u: actors[u])
+    with pytest.raises(TimeoutError, match="timed out"):
+        ckpt.capture_nixl_checkpoint(
+            client, tmp_path / "dp", metadata=None, timeout_s=0.2
+        )
+    assert not units[0]._captures  # unit 0 captured, then was released
+    assert not client.controller.views  # the controller bytes were released too
+
+
+def test_capture_that_cannot_release_raises_checkpoint_release_error(
+    cluster, tmp_path, monkeypatch
+):
+    units, client = cluster
+    units[1].capture_shard("prior")  # unit 1 refuses a second capture
+    boom = _Remote(lambda token: (_ for _ in ()).throw(RuntimeError("release boom")))
+    actors = {0: _actor(units[0], release_shard=boom), 1: _actor(units[1])}
+    monkeypatch.setattr(ckpt, "_unit_actor", lambda store, u: actors[u])
+    with pytest.raises(CheckpointReleaseError, match="stop checkpointing") as info:
+        ckpt.capture_nixl_checkpoint(
+            client, tmp_path / "dp", metadata=None, timeout_s=30.0
+        )
+    assert isinstance(info.value.__cause__, RuntimeError)
+    assert "release boom" in str(info.value.__cause__)
