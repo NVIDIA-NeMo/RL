@@ -64,6 +64,14 @@ TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 # later, so require a recoverable prefix in every Workplace prompt group rather
 # than in every sibling at once.
 MIN_PREFIX_CUT_GROUPS=${#LIST_LENGTHS[@]}
+SELECT_FLAGS=(--min-cut-groups "$MIN_PREFIX_CUT_GROUPS")
+# With several HTTP frontends, restore a call that a frontend other than the one
+# Gym's cut reached cut, so the cut's fan-out is what the restore checks.
+for override in "$@"; do
+    if [[ "$override" =~ vllm_cfg\.http_api_server_count=([0-9]+)$ ]] && [[ "${BASH_REMATCH[1]}" -gt 1 ]]; then
+        SELECT_FLAGS+=(--require-peer-frontend-cut)
+    fi
+done
 POLICY_MAX_NEW_TOKENS=0
 for list_length in "${LIST_LENGTHS[@]}"; do
     list_budget=$((list_length * LIST_TOKENS_PER_ITEM + LIST_OUTPUT_SLACK_TOKENS))
@@ -217,7 +225,7 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$SNAPSHOT_TIMEOUT_S" \
     "$SELECTED_BACKUP" \
     "$SENTINEL_EVENT" \
-    --min-cut-groups "$MIN_PREFIX_CUT_GROUPS"
+    "${SELECT_FLAGS[@]}"
 
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
