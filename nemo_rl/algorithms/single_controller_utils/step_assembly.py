@@ -170,9 +170,17 @@ class StepAssembler:
         self._runtime.shortfall_reconciliation_pending = False
 
     def credit_shortfall(
-        self, target_step: Optional[int], *, allow_short: bool = False
+        self,
+        target_step: Optional[int],
+        *,
+        allow_short: bool = False,
+        prompt_idx: Optional[int] = None,
     ) -> None:
-        """Record that a step will never receive a group it is waiting for."""
+        """Record that a step will never receive a group it is waiting for.
+
+        ``prompt_idx`` is the dataset index of the lost prompt, when known; it is
+        logged so repeated losses can be traced to the prompts they cluster on.
+        """
         self.advance_assembling_version()
         charged_step = self._charge_step_for_lost_group(target_step)
         if charged_step is None:
@@ -193,8 +201,9 @@ class StepAssembler:
             )
             self._runtime.shortfall_reconciliation_pending = True
         self.advance_assembling_version()
+        lost = "" if prompt_idx is None else f" (lost prompt idx={prompt_idx})"
         print(
-            f"  target_step={charged_step} is one group short "
+            f"  target_step={charged_step} is one group short{lost} "
             f"({self._runtime.batch_shortfall[charged_step]} total); the train pump "
             "will close that step early",
             flush=True,

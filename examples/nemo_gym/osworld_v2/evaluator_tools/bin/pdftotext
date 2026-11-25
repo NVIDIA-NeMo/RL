@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${OSWORLD_EVALUATOR_TOOLS_ROOT:?}"
+test -x "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/pdftotext"
+test -d "$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+
+evaluator_ld_library_path="$OSWORLD_EVALUATOR_TOOLS_ROOT/runtime-libs"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  evaluator_ld_library_path="$evaluator_ld_library_path:$LD_LIBRARY_PATH"
+fi
+
+exec env \
+  LD_LIBRARY_PATH="$evaluator_ld_library_path" \
+  "$OSWORLD_EVALUATOR_TOOLS_ROOT/usr/bin/pdftotext" \
+  "$@"

@@ -1,0 +1,123 @@
+# FlashREINFORCE for Nemotron Omni on AgentENV microVMs.
+#
+# B=32 prompts x N=4 same-state forks = 128 trajectories per optimizer step.
+# Gym runs each prompt group's task setup once and forks one guest per rollout
+# (osworld_nemo_rl_agentenv_flashreinforce.yaml), drives the policy with the
+# pinned canonical harness, and judges RLVR snapshot tasks with their frozen
+# evaluators. The objective is Dr.GRPO (group-mean baseline, no std
+# normalization) with token-level IS correction and a per-segment binary-KL gate.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8_checkpoint.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 4
+  max_num_epochs: 200
+  max_num_steps: 100
+  seed: 43
+  adv_estimator:
+    name: grpo
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_kl_in_reward: false
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: true
+  actor_importance_sampling_ratio_min: 0.0
+  actor_importance_sampling_ratio_max: 1.0e9
+  truncated_importance_sampling_type: seq-mask-tis
+  # Mask a whole segment when its mean sampled-token Bernoulli KL between the
+  # rollout and trainer policies exceeds truncated_importance_sampling_ratio.
+  is_correction_gating: binary_kl
+  truncated_importance_sampling_ratio_min: 0.0
+  truncated_importance_sampling_ratio: 0.01
+  force_on_policy_ratio: true
+  disable_ppo_ratio: false
+  use_cispo: false
+  use_on_policy_kl_approximation: false
+  positive_example_nll_weight: 0.0
+
+policy:
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # Bounded fp32 logits conversion: 1024 can OOM once optimizer state and
+  # activations are resident on 80GB H100s.
+  logprob_chunk_size: 256
+  max_total_sequence_length: 49152
+  max_grad_norm: 1.0
+  megatron_cfg:
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+      weight_decay: 0.0
+      adam_eps: 1.0e-8
+      clip_grad: 1.0
+      optimizer_cpu_offload: true
+      # Keep 40% of distributed optimizer state on GPU. Higher CPU offload
+      # exceeds the policy node's host-RAM limit at first-microbatch broadcast.
+      optimizer_offload_fraction: 0.6
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 5.0e-6
+      lr_decay_iters: 1000
+      lr_decay_style: constant
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      weight_decay_incr_style: constant
+  generation:
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      max_model_len: 49152
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 11}
+      max_num_batched_tokens: 49152
+
+env:
+  nemo_gym:
+    config_paths:
+      - benchmarks/osworld/configs/osworld_nemo_rl_agentenv_flashreinforce.yaml
+
+async_rl:
+  sampler:
+    # Generate only with the current policy version while admitting all 32
+    # prompt groups at once.
+    name: in_order
+    max_lookahead_versions: 0
+    warmup_lookahead_versions: null
+  # The Dr.GRPO baseline is local to each complete N=4 group, so groups stream
+  # into the open gradient-accumulation step one at a time; fetching the full
+  # 128-trajectory window at once exceeds the policy node's host RAM.
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 32
+  rollout_failure:
+    max_infra_attempts_per_prompt: 8
+    max_data_attempts_per_prompt: 1
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    # A group the finalizer drops (every rollout lost its token capture) gets no
+    # replacement; train that step on 31 of 32 groups instead of failing the run.
+    min_step_batch_fraction: 0.96875
+    # Keep the B=32 gradient estimate when a structurally empty group (for
+    # example, every logical row masked) cannot be trained.
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    nemo_gym:
+      max_row_attempts: 8
+
+checkpointing:
+  save_period: 2
+  keep_top_k: 1
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-v2-flashreinforce-b32n4}
+  wandb:
+    project: nemo-rl-osworld
+    name: osworld-v2-flashreinforce-b32n4
