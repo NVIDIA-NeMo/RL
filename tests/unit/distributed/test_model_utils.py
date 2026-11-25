@@ -2758,6 +2758,33 @@ def test_sampling_filter_chunk_equivalence_gloo(tmp_path, tp_size):
     )
 
 
+@pytest.mark.parametrize("top_k,top_p", [(8, 1.0), (None, 0.9), (8, 0.9)])
+def test_chunked_sampling_logprob_matches_autograd_on_the_filtered_logits(
+    single_rank_gloo_group, top_k, top_p
+):
+    """The chunked top-k/top-p logprobs and their gradient match autograd on the filtered logits."""
+    torch.manual_seed(11)
+    vocab = 32
+    logits = torch.randn(2, 7, vocab, requires_grad=True)
+    target = torch.randint(0, vocab, (2, 7))
+    # Every other target is the most likely token, which every filter keeps.
+    target[:, ::2] = logits[:, ::2].argmax(-1)
+    weights = torch.randn(2, 7)
+
+    filtered, _ = apply_top_k_top_p(logits, top_k=top_k, top_p=top_p)
+    expected = filtered.log_softmax(-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+
+    # 2 batch rows times a chunk size of 3: the 14 logit rows form chunks of 6, 6 and 2.
+    actual = ChunkedDistributedLogprobWithSampling.apply(
+        logits, target, single_rank_gloo_group, top_k, top_p, 3, False
+    )
+    torch.testing.assert_close(actual, expected)
+
+    (actual_grad,) = torch.autograd.grad(actual, logits, grad_outputs=weights)
+    (expected_grad,) = torch.autograd.grad(expected, logits, grad_outputs=weights)
+    torch.testing.assert_close(actual_grad, expected_grad)
+
+
 def test_replay_reference_kl_chunks_the_packed_logits_in_their_dtype(
     single_rank_gloo_group,
 ):
