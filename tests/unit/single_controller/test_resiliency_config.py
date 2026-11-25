@@ -295,6 +295,11 @@ class TestStreamingChunkBounds:
         """None is the pre-existing unbounded behaviour, and stays the default."""
         assert AsyncRLConfig().max_groups_for_streaming_train is None
 
+    @pytest.mark.parametrize("floor", [0, -1])
+    def test_a_non_positive_floor_is_rejected_without_a_chunk_cap(self, floor):
+        with pytest.raises(ValidationError, match="min_groups_for_streaming_train"):
+            AsyncRLConfig(min_groups_for_streaming_train=floor)
+
     def test_a_cap_at_or_above_the_floor_is_accepted(self):
         cfg = AsyncRLConfig(
             min_groups_for_streaming_train=8, max_groups_for_streaming_train=8
