@@ -36,6 +36,10 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
                        you may want to return a list of stop strings
                        that are valid actions for the next turn or
                        similar. This field lets you control this per turn.
+                       It only applies from the second turn onward: the
+                       first turn uses the `stop_strings` set on each
+                       DatumSpec by the data processor (plus any in
+                       `policy.generation.stop_strings`).
     rewards: the rewards for this turn.
     terminateds: whether the episode ended this turn.
     answers: the answers for this turn.
