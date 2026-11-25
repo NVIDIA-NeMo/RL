@@ -1155,7 +1155,6 @@ def _distillation_train_impl(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=student_policy.finalize_async_save,
-                            is_final_checkpoint=is_last_step,
                         )
 
             # Logging

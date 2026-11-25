@@ -102,7 +102,7 @@ def test_publish_hooks_receive_the_msc_uri(manager):
     manager._publish_hooks = [published.append]
     checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
 
-    manager.finalize_checkpoint(checkpoint, is_final_checkpoint=True)
+    manager.finalize_checkpoint(checkpoint)
 
     assert checkpoint.startswith("msc://")
     assert published == [PublishedCheckpoint(1, checkpoint, True)]

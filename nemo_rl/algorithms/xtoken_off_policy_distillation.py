@@ -832,7 +832,6 @@ def xtoken_off_policy_distillation_train(
                         checkpointer.begin_finalization(
                             ckpt_path,
                             wait_fn=student_policy.finalize_async_save,
-                            is_final_checkpoint=is_last_step,
                         )
 
             # ===== Logging =====

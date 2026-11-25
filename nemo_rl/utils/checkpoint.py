@@ -280,13 +280,15 @@ class PublishedCheckpoint:
         step (int): Training step the checkpoint was saved at.
         path (str): Published ``step_N`` directory; may be a URI such as
             ``msc://profile/run/step_N``.
-        is_final_checkpoint (bool): Whether the run saved it after its last
-            step, as passed to the policy's ``save_checkpoint``.
+        is_periodic (bool): Whether ``step`` is a multiple of ``save_period``.
+            Retention keeps periodic checkpoints (limited by ``keep_top_k`` if
+            set); others, such as fault-tolerance saves, are kept only while
+            among the latest ``ft_keep_latest_k`` when that is set.
     """
 
     step: int
     path: str
-    is_final_checkpoint: bool
+    is_periodic: bool
 
 
 class CheckpointManager:
@@ -467,9 +469,7 @@ class CheckpointManager:
 
         return save_dir
 
-    def finalize_checkpoint(
-        self, checkpoint_path: PathLike, *, is_final_checkpoint: bool = False
-    ) -> None:
+    def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Complete a checkpoint synchronously (rename + delete old).
 
         This is the original synchronous API, preserved for backward
@@ -478,18 +478,15 @@ class CheckpointManager:
 
         Args:
             checkpoint_path (PathLike): Path to the temporary checkpoint directory.
-            is_final_checkpoint (bool): Whether the run saved it after its last step.
         """
-        self._run_publish_hooks(
-            self._storage.publish(checkpoint_path), is_final_checkpoint
-        )
+        self._run_publish_hooks(self._storage.publish(checkpoint_path))
         self.remove_old_checkpoints()
 
-    def _run_publish_hooks(self, published: str, is_final_checkpoint: bool) -> None:
+    def _run_publish_hooks(self, published: str) -> None:
         step = _parse_step(Path(published).name)
         if step is None:
             return
-        checkpoint = PublishedCheckpoint(step, published, is_final_checkpoint)
+        checkpoint = PublishedCheckpoint(step, published, step % self.save_period == 0)
         for hook in self._publish_hooks:
             try:
                 hook(checkpoint)
@@ -503,8 +500,6 @@ class CheckpointManager:
         self,
         checkpoint_path: PathLike,
         wait_fn: Optional[Callable[[], None]] = None,
-        *,
-        is_final_checkpoint: bool = False,
     ) -> None:
         """Start background finalization of a checkpoint.
 
@@ -519,7 +514,6 @@ class CheckpointManager:
             wait_fn: Callable that blocks until all async writes are complete.
                 For Megatron async save: policy.finalize_async_save.
                 For sync saves: None (rename immediately).
-            is_final_checkpoint: Whether the run saved it after its last step.
         """
         self.finalize_pending()
         self._pending_checkpoint_path = as_path(checkpoint_path)
@@ -544,7 +538,7 @@ class CheckpointManager:
                     if wait_fn is not None:
                         wait_fn()
                     published = self._storage.publish(checkpoint_path)
-                    self._run_publish_hooks(published, is_final_checkpoint)
+                    self._run_publish_hooks(published)
                     # Prune old checkpoints off the critical path. Surface any
                     # failure via a done-callback so a broken delete is not
                     # silently swallowed (the discarded Future would otherwise

@@ -1478,14 +1478,13 @@ def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
         f"{__name__}._failing_publish",
         f"{__name__}._record_publish",
     ]
+    checkpoint_config.save_period = 2
     manager = CheckpointManager(checkpoint_config)
 
     with pytest.warns(UserWarning, match="failed for step 1: .*event API down"):
         manager.finalize_checkpoint(manager.init_tmp_checkpoint(1, {}))
     with pytest.warns(UserWarning, match="failed for step 2: .*event API down"):
-        manager.begin_finalization(
-            manager.init_tmp_checkpoint(2, {}), is_final_checkpoint=True
-        )
+        manager.begin_finalization(manager.init_tmp_checkpoint(2, {}))
         manager.shutdown()
 
     assert published_by_hook == [

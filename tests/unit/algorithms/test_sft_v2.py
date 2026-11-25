@@ -284,11 +284,6 @@ def test_save_checkpoint_uses_policy_signature_and_terminal_step(
         tokenizer_path=str(tmp_path / "policy" / "tokenizer"),
         is_final_checkpoint=is_final,
     )
-    controller._checkpointer.begin_finalization.assert_called_once_with(
-        str(tmp_path),
-        wait_fn=controller._trainer.finalize_async_save,
-        is_final_checkpoint=is_final,
-    )
 
 
 def _deferred_save_controller(tmp_path: Path) -> object:
@@ -311,16 +306,13 @@ def test_save_checkpoint_finalizes_in_background_by_default(tmp_path: Path) -> N
     controller._save_checkpoint({})
 
     controller._checkpointer.begin_finalization.assert_called_once_with(
-        str(tmp_path),
-        wait_fn=controller._trainer.finalize_async_save,
-        is_final_checkpoint=False,
+        str(tmp_path), wait_fn=controller._trainer.finalize_async_save
     )
     assert controller._pending_checkpoint_path is None
 
 
 def test_deferred_save_leaves_the_checkpoint_pending(tmp_path: Path) -> None:
     controller = _deferred_save_controller(tmp_path)
-    controller._save_state.total_steps = 25
 
     controller._save_checkpoint({})
 
@@ -328,7 +320,6 @@ def test_deferred_save_leaves_the_checkpoint_pending(tmp_path: Path) -> None:
     controller._trainer.finalize_async_save.assert_not_called()
     controller._checkpointer.begin_finalization.assert_not_called()
     assert controller._pending_checkpoint_path == str(tmp_path)
-    assert controller._pending_is_final_checkpoint is True
 
 
 def test_pending_save_publishes_only_after_a_successful_poll(tmp_path: Path) -> None:
@@ -342,9 +333,7 @@ def test_pending_save_publishes_only_after_a_successful_poll(tmp_path: Path) -> 
     assert controller._pending_checkpoint_path == str(tmp_path)
 
     controller._finish_pending_save(blocking=False)
-    controller._checkpointer.begin_finalization.assert_called_once_with(
-        str(tmp_path), is_final_checkpoint=False
-    )
+    controller._checkpointer.begin_finalization.assert_called_once_with(str(tmp_path))
     assert controller._pending_checkpoint_path is None
     controller._trainer.finalize_async_save.assert_not_called()
 
@@ -356,17 +345,13 @@ def test_pending_save_publishes_only_after_a_successful_poll(tmp_path: Path) -> 
 def test_blocking_finish_waits_for_the_write_then_publishes(tmp_path: Path) -> None:
     controller = _deferred_save_controller(tmp_path)
     controller._pending_checkpoint_path = str(tmp_path)
-    controller._pending_is_final_checkpoint = True
     order = MagicMock()
     order.attach_mock(controller._trainer.finalize_async_save, "finalize")
     order.attach_mock(controller._checkpointer.begin_finalization, "publish")
 
     controller._finish_pending_save(blocking=True)
 
-    assert order.mock_calls == [
-        call.finalize(),
-        call.publish(str(tmp_path), is_final_checkpoint=True),
-    ]
+    assert order.mock_calls == [call.finalize(), call.publish(str(tmp_path))]
     controller._trainer.poll_async_save.assert_not_called()
     assert controller._pending_checkpoint_path is None
 
@@ -383,7 +368,7 @@ def test_next_save_publishes_the_pending_one_first(tmp_path: Path) -> None:
     controller._save_checkpoint({})
 
     assert [c[0] for c in order.mock_calls] == ["finalize", "publish", "save"]
-    assert order.mock_calls[1] == call.publish(previous, is_final_checkpoint=False)
+    assert order.mock_calls[1] == call.publish(previous)
     assert controller._pending_checkpoint_path == str(tmp_path)
 
 
@@ -455,7 +440,7 @@ def test_run_failure_still_publishes_the_pending_save(tmp_path: Path) -> None:
     # Published before checkpoint close, which joins the rename.
     assert order.mock_calls == [
         call.finalize(),
-        call.publish(str(tmp_path), is_final_checkpoint=False),
+        call.publish(str(tmp_path)),
         call.close(),
     ]
     assert controller._pending_checkpoint_path is None

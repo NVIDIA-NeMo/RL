@@ -209,11 +209,10 @@ def _max_train_steps(master_config: MasterConfig) -> int:
 class SFTSingleControllerActor:
     """Drive colocated loaders and the existing TQPolicy from one actor."""
 
-    # sft.defer_async_checkpoint_finalize, and the tmp_step_N path and final flag of
-    # an async save that has been written but not yet finalized and published.
+    # sft.defer_async_checkpoint_finalize, and the tmp_step_N path of an async save
+    # that has been written but not yet finalized and published.
     _defer_checkpoint_finalize: bool = False
     _pending_checkpoint_path: Optional[str] = None
-    _pending_is_final_checkpoint: bool = False
 
     def __init__(
         self,
@@ -511,7 +510,6 @@ class SFTSingleControllerActor:
             checkpoint_path = self._checkpointer.init_tmp_checkpoint(
                 step, training_info, self._master_config
             )
-            is_final_checkpoint = step == self._max_steps
             self._trainer.save_checkpoint(
                 weights_path=os.path.join(checkpoint_path, "policy", "weights"),
                 optimizer_path=(
@@ -520,7 +518,7 @@ class SFTSingleControllerActor:
                     else None
                 ),
                 tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-                is_final_checkpoint=is_final_checkpoint,
+                is_final_checkpoint=step == self._max_steps,
             )
             save_checkpoint_object(
                 loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
@@ -529,12 +527,9 @@ class SFTSingleControllerActor:
             # write, so a later write into checkpoint_path races it.
             if self._defer_checkpoint_finalize:
                 self._pending_checkpoint_path = checkpoint_path
-                self._pending_is_final_checkpoint = is_final_checkpoint
             else:
                 self._checkpointer.begin_finalization(
-                    checkpoint_path,
-                    wait_fn=self._trainer.finalize_async_save,
-                    is_final_checkpoint=is_final_checkpoint,
+                    checkpoint_path, wait_fn=self._trainer.finalize_async_save
                 )
 
     def _finish_pending_save(self, *, blocking: bool) -> None:
@@ -554,10 +549,7 @@ class SFTSingleControllerActor:
             self._trainer.finalize_async_save()
         elif not self._trainer.poll_async_save():
             return
-        self._checkpointer.begin_finalization(
-            self._pending_checkpoint_path,
-            is_final_checkpoint=self._pending_is_final_checkpoint,
-        )
+        self._checkpointer.begin_finalization(self._pending_checkpoint_path)
         self._pending_checkpoint_path = None
 
     def _close_loaders(self) -> None:

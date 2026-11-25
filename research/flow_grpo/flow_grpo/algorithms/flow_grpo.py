@@ -446,9 +446,7 @@ def flow_grpo_train(
                 os.path.join(tmp_path, "policy"),
                 save_optimizer=checkpointer.save_optimizer,
             )
-            checkpointer.finalize_checkpoint(
-                tmp_path, is_final_checkpoint=step + 1 == max_steps
-            )
+            checkpointer.finalize_checkpoint(tmp_path)
 
         if val_dataloader is not None:
             val_period = algo_cfg.val_period

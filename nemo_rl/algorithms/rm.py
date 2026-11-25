@@ -707,7 +707,6 @@ def rm_train(
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
-                            is_final_checkpoint=is_last_step,
                         )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")

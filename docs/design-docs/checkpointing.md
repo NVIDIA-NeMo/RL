@@ -131,8 +131,8 @@ def checkpoint_ready(checkpoint: PublishedCheckpoint) -> None:
     ...
 ```
 
-`PublishedCheckpoint` has `step`, `path` and `is_final_checkpoint`; new fields may be added, so hooks keep working as it grows.
+`PublishedCheckpoint` has `step`, `path` and `is_periodic`; new fields may be added, so hooks keep working as it grows.
 
-- **When:** after `step_N` is published (renamed locally, or `_SUCCESS` written on `msc://`), never for a failed write or publication. `path` is the published directory and may be an `msc://` URI. `is_final_checkpoint` is the flag the algorithm passes to the policy's `save_checkpoint`: true for the save after the run's last step.
+- **When:** after `step_N` is published (renamed locally, or `_SUCCESS` written on `msc://`), never for a failed write or publication. `path` is the published directory and may be an `msc://` URI. `is_periodic` says whether the step is a multiple of `save_period`: retention keeps those (limited by `keep_top_k` if set), while other saves, such as fault-tolerance ones, are kept only while among the latest `ft_keep_latest_k` when that is set.
 - **Where:** in config order, on the thread that publishes the checkpoint. Every built-in training loop publishes on the background finalization thread (inside the controller actor under SingleController and SFT v2), which the next save and training exit wait for. Keep hooks bounded (use timeouts) so they cannot stall training.
 - **Failures:** an exception is reported as a warning and the checkpoint stays published. Calls are not retried or replayed, and retention (`keep_top_k`) may later delete a step a hook was told about.
