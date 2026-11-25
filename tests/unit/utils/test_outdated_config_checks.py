@@ -37,6 +37,29 @@ def test_forest_config_has_no_obsolete_switch(config):
     check_outdated_config(config)
 
 
+@pytest.mark.parametrize("legacy", [True, False, None])
+def test_token_level_loss_requires_explicit_migration(legacy: bool | None) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"loss_fn\.token_level_loss was removed.*global_token_mean.*sequence_mean",
+    ):
+        check_outdated_config(
+            {
+                "loss_fn": {
+                    "token_level_loss": legacy,
+                    "normalization": "global_token_mean",
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "normalization", [None, "global_token_mean", "sequence_mean", "group_token_mean"]
+)
+def test_current_loss_normalization_is_accepted(normalization: str | None) -> None:
+    check_outdated_config({"loss_fn": {"normalization": normalization}})
+
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports

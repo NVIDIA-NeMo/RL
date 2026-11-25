@@ -874,9 +874,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     if backend == "trtllm":
         # TRT-LLM's loader needs full EP-local experts; validate every engine role.
         # Dense MLP layers are rejected later (check_trtllm_nccl_reshard_bulk_params).
+        from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
         from nemo_rl.models.generation.trtllm.config import (
             TrtllmConfig,
-            resolve_disagg_layout,
             resolve_role_overrides,
             role_engine_config,
         )
