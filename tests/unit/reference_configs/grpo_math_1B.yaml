@@ -503,6 +503,7 @@ policy:
       async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
       materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
       num_speculative_tokens: 0
+      mamba_memory_ratio: null  # Hybrid cache fraction for recurrent states. Null uses the speculative-decoding default.
       # Hybrid models only; null keeps the model dtype. Commonly set to `float32`.
       mamba_inference_ssm_states_dtype: null
       mamba_inference_conv_states_dtype: null
