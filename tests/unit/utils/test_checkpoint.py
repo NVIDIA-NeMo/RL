@@ -304,6 +304,63 @@ def test_get_best_checkpoint_path_bias_recent_if_equal(
     assert Path(best_path).name == "step_10"
 
 
+@pytest.mark.parametrize(
+    "higher_is_better,values,expected_best,expected_remaining",
+    [
+        # Step 2 diverged to NaN and step 3 holds the best real value. Without NaN
+        # handling the sort leaves step 1 first and step 2 second, so step 3 is deleted.
+        (False, [0.3, float("nan"), 0.1, 0.5, 0.7], 3, [1, 3, 5]),
+        (True, [0.1, float("nan"), 0.7, 0.5, 0.3], 3, [3, 4, 5]),
+    ],
+)
+def test_nan_metric_ranks_worst(
+    tmp_path, monkeypatch, higher_is_better, values, expected_best, expected_remaining
+):
+    # A diverged run writes NaN into training_info.json and json.load reads it back
+    # as float("nan"). NaN must not take a top-k slot or win get_best_checkpoint_path.
+    checkpoint_dir = tmp_path.resolve() / "checkpoints"
+    config = {
+        "enabled": True,
+        "checkpoint_dir": checkpoint_dir,
+        "metric_name": "val:loss",
+        "higher_is_better": higher_is_better,
+        "save_period": 1,
+        "keep_top_k": None,  # save everything first, prune explicitly below
+        "save_optimizer": True,
+    }
+    saver = CheckpointManager(config)
+    steps = [1, 2, 3, 4, 5]
+    for step, value in zip(steps, values):
+        tmp_dir = saver.init_tmp_checkpoint(step, {"val:loss": value})
+        saver.finalize_checkpoint(tmp_dir)
+
+    # Pin the checkpoint history to step order so the result does not depend on
+    # the filesystem's glob ordering.
+    orig_glob = checkpoint_module.glob.glob
+    monkeypatch.setattr(
+        checkpoint_module.glob,
+        "glob",
+        lambda pattern: sorted(
+            orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
+        ),
+    )
+
+    manager = CheckpointManager({**config, "keep_top_k": 2})
+
+    with pytest.warns(
+        UserWarning, match=r"Ignoring 1 checkpoint\(s\) at step\(s\) \[2\]"
+    ):
+        best_path = manager.get_best_checkpoint_path()
+    assert Path(best_path).name == f"step_{expected_best}"
+
+    manager.remove_old_checkpoints()
+    remaining_steps = sorted(
+        int(p.name.split("_")[1]) for p in checkpoint_dir.glob("step_*")
+    )
+    # The two best real values plus the latest step, which is always kept.
+    assert remaining_steps == expected_remaining
+
+
 def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Create multiple checkpoints
     steps = [1, 2, 3]
