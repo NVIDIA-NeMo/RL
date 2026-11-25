@@ -151,8 +151,10 @@ def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
             self.tokenizer = MagicMock()
             self.tokenizer.model_input_names = ["input_ids"]
             self.captured_call_text = None
+            self.captured_chat_messages = None
 
         def apply_chat_template(self, messages, **kwargs):
+            self.captured_chat_messages = messages
             parts = []
             for msg in messages:
                 content = msg.get("content", "")
@@ -199,7 +201,7 @@ _TEST_PROMPT_TEMPLATE = (
 )
 
 
-def _run_processor(tiny_image_path, processor=None):
+def _run_processor(tiny_image_path, processor=None, system_prompt=None):
     """Helper: run vlm_hf_data_processor on an MMPR sample and return
     (result DatumSpec, stub processor with captured_call_text)."""
     from nemo_rl.data.interfaces import TaskDataSpec
@@ -207,6 +209,7 @@ def _run_processor(tiny_image_path, processor=None):
 
     task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
     task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+    task_data_spec.system_prompt = system_prompt
     processor = processor or _make_stub_nemotron_processor()
     sample = {
         "images": [tiny_image_path],
@@ -248,6 +251,29 @@ class TestVLMProcessorMMPRTiny:
         assert user_message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
 
+    def test_system_prompt_is_rendered_before_the_user_turn(self, tiny_image_path):
+        """data.*.system_prompt_file has to reach the model on the VLM path too.
+
+        The conversation is rendered in one apply_chat_template call, so a
+        one-element list silently dropped task_data_spec.system_prompt. The
+        system turn also has to be a plain string, both for the processors that
+        take an OpenAI-style content list and for the <image>-placeholder path.
+        """
+        system_prompt = "You are a careful geometry tutor."
+        result, processor = _run_processor(tiny_image_path, system_prompt=system_prompt)
+
+        conversation = processor.captured_chat_messages
+        assert [message["role"] for message in conversation] == ["system", "user"]
+        assert conversation[0]["content"] == system_prompt
+        assert result["vllm_content"].startswith(system_prompt)
+
+    def test_no_system_prompt_leaves_the_conversation_alone(self, tiny_image_path):
+        result, processor = _run_processor(tiny_image_path)
+
+        conversation = processor.captured_chat_messages
+        assert [message["role"] for message in conversation] == ["user"]
+        assert not result["vllm_content"].startswith("You are")
+
     def test_vllm_receives_raw_prompt_and_learner_keeps_processed_ids(
         self, tiny_image_path
     ):
@@ -269,13 +295,22 @@ class TestVLMProcessorMMPRTiny:
         )
         assert torch.equal(batch["input_ids"][0], learner_ids)
 
-    def test_text_only_row_preserves_formatted_vllm_content(self):
+    # prompt_file ships as null in five VLM recipes, and the list branch of the
+    # same dispatch already guards for it; the text-only branch did not.
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            pytest.param("Answer: {}", "Answer: What is 2 + 2?", id="with-template"),
+            pytest.param(None, "What is 2 + 2?", id="null-prompt-file"),
+        ],
+    )
+    def test_text_only_row_preserves_formatted_vllm_content(self, prompt, expected):
         from nemo_rl.data.interfaces import TaskDataSpec
         from nemo_rl.data.processors import vlm_hf_data_processor
 
         processor = _make_stub_nemotron_processor()
         task_data_spec = TaskDataSpec(task_name="text-only")
-        task_data_spec.prompt = "Answer: {}"
+        task_data_spec.prompt = prompt
 
         result = vlm_hf_data_processor(
             datum_dict={
@@ -291,7 +326,7 @@ class TestVLMProcessorMMPRTiny:
             idx=0,
         )
 
-        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_content"] == expected
         assert result["vllm_multi_modal_data"] == {}
 
     def test_vllm_multi_modal_data_collapses_single_item_and_keeps_lists(
