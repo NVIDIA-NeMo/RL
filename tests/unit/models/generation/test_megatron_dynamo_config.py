@@ -417,8 +417,20 @@ def _master_config(generation: dict) -> SimpleNamespace:
     )
 
 
-def test_megatron_generation_refuses_the_switch_until_rollouts_are_served() -> None:
-    generation = _megatron_config()
+@pytest.mark.parametrize(
+    "role_layouts",
+    [
+        pytest.param({}, id="shared_layout"),
+        pytest.param(
+            {"prefill_engine": {"tensor_model_parallel_size": 4}},
+            id="role_layouts",
+        ),
+    ],
+)
+def test_megatron_generation_refuses_the_switch_until_rollouts_are_served(
+    role_layouts,
+) -> None:
+    generation = _megatron_config(**role_layouts)
     with pytest.raises(NotImplementedError, match="not served by MegatronGeneration"):
         resolve_generation_class(generation).validate_settings(
             _master_config(generation)

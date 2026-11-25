@@ -268,19 +268,17 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
-        if not dynamo_enabled(policy_config["generation"]) and (
-            resolve_disagg_layout(policy_config["generation"]).enabled
-        ):
-            # Only MegatronDynamoGeneration reads the disaggregation block;
-            # without Dynamo the run would train plain aggregated engines.
-            raise ValueError(
-                "policy.generation.disaggregation.enabled=true with "
-                "policy.generation.backend='megatron' requires "
-                "policy.generation.dynamo=true: Megatron prefill/decode engines are "
-                "served only behind Dynamo. Set dynamo to true, or set "
-                "disaggregation.enabled to false."
-            )
-        else:
+        if not dynamo_enabled(policy_config["generation"]):
+            if resolve_disagg_layout(policy_config["generation"]).enabled:
+                # Only MegatronDynamoGeneration reads the disaggregation block;
+                # without Dynamo the run would train plain aggregated engines.
+                raise ValueError(
+                    "policy.generation.disaggregation.enabled=true with "
+                    "policy.generation.backend='megatron' requires "
+                    "policy.generation.dynamo=true: Megatron prefill/decode engines "
+                    "are served only behind Dynamo. Set dynamo to true, or set "
+                    "disaggregation.enabled to false."
+                )
             reject_role_layouts_without_dynamo(policy_config["generation"])
 
     @classmethod
