@@ -40,6 +40,7 @@ from nemo_rl.models.generation.megatron.config import (
 )
 from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_widths,
+    reject_role_layouts_without_dynamo,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -279,6 +280,8 @@ class MegatronGeneration(GenerationInterface):
                 "served only behind Dynamo. Set dynamo to true, or set "
                 "disaggregation.enabled to false."
             )
+        else:
+            reject_role_layouts_without_dynamo(policy_config["generation"])
 
     @classmethod
     def verify_served_addresses(

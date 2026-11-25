@@ -29,11 +29,11 @@ from nemo_rl.models.generation.disagg_layout import (
     ROLES,
     Role,
     plan_engines,
-    replica_width_from,
     resolve_disagg_layout,
 )
 from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.megatron.config import (
+    ENGINE_ROLE_KEYS,
     EngineLayoutOverrides,
     merged_inference_megatron_cfg,
 )
@@ -118,20 +118,48 @@ def engine_widths(policy_config: Mapping[str, Any]) -> dict[Role, int]:
     }
 
 
-def replica_width(policy_config: Mapping[str, Any]) -> int:
-    """GPUs one prefill/decode replica of Megatron engines spans.
+def reject_megatron_dynamo_outside_single_controller(
+    generation_config: Mapping[str, Any],
+) -> None:
+    """Refuse Megatron-behind-Dynamo keys on an entrypoint that cannot serve them.
 
-    The Dynamo frontend routes across the whole fleet, so a replica only fixes
-    the P:D ratio and keeps each group's engines next to each other. It is not
-    an NVLink unit: ``MegatronGeneration.nvlink_domain_span`` is the widest
-    engine.
+    Only the SingleController builds Megatron engines behind Dynamo and runs
+    ``MegatronGeneration.validate_settings``; on the other entrypoints these keys
+    would be ignored and the run would train plain Megatron generation.
+
+    Raises:
+        NotImplementedError: ``backend: megatron`` with ``dynamo: true``.
+        ValueError: ``mcore_generation_config.prefill_engine`` / ``decode_engine``
+            with ``dynamo`` off.
     """
-    widths = engine_widths(policy_config)
-    return replica_width_from(
-        resolve_disagg_layout(policy_config["generation"]),
-        prefill_width=widths["prefill"],
-        decode_width=widths["decode"],
-    )
+    if generation_config["backend"] != "megatron":
+        return
+    if dynamo_enabled(generation_config):
+        raise NotImplementedError(
+            "policy.generation.dynamo=true with backend=megatron runs only under "
+            "the SingleController (examples/run_grpo_single_controller.py); use "
+            "that entrypoint or remove policy.generation.dynamo"
+        )
+    reject_role_layouts_without_dynamo(generation_config)
+
+
+def reject_role_layouts_without_dynamo(generation_config: Mapping[str, Any]) -> None:
+    """Refuse per-role engine layouts on a Megatron config with ``dynamo`` off.
+
+    Only Megatron engines behind Dynamo read them; without it they are dropped
+    from the inference layout without a word.
+
+    Raises:
+        ValueError: ``mcore_generation_config.prefill_engine`` / ``decode_engine``
+            is set.
+    """
+    mcore_generation_config = generation_config.get("mcore_generation_config") or {}
+    if any(key in mcore_generation_config for key in ENGINE_ROLE_KEYS):
+        raise ValueError(
+            "policy.generation.mcore_generation_config.prefill_engine / "
+            "decode_engine size Megatron engines behind Dynamo and are ignored "
+            "without it. Set policy.generation.dynamo=true, or remove them."
+        )
 
 
 def plan_megatron_engines(

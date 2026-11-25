@@ -36,8 +36,6 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 
 Role = Literal["prefill", "decode"]
 ROLES: tuple[Role, Role] = ("prefill", "decode")
-# Backends whose generation class reads ``generation.disaggregation``.
-DISAGG_BACKENDS: tuple[str, ...] = ("megatron", "trtllm")
 
 
 def as_dict(raw: Any) -> dict[str, Any]:
@@ -117,6 +115,11 @@ def plan_engines(
 
     num_prefill = layout.num_prefill_engines
     num_decode = layout.num_decode_engines
+    if num_prefill < 1 or num_decode < 1:
+        raise ValueError(
+            "a replica needs at least one engine of each role, got "
+            f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
+        )
     width = replica_width_from(
         layout, prefill_width=prefill_width, decode_width=decode_width
     )
