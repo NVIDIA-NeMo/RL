@@ -20,7 +20,7 @@ on:
 
 jobs:
   cherry-pick:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@b7c7f7d585ad8f529a111e69afcbf14f0279663e # v1.12.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@65774f05d7d2fc5c2c930a0c14a34e9ed0b786e5 # v1.13.0
     with:
       target-branch: main
       trigger-label: cherry-pick-to-main
@@ -35,3 +35,6 @@ jobs:
       PAT: ${{ secrets.PAT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      # Resolve the PR author and merger to Slack users so the failure alert pings them.
+      NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+      NEMO_FW_ALERT_MANAGER_SLACK_BOT_TOKEN: ${{ secrets.NEMO_FW_ALERT_MANAGER_SLACK_BOT_TOKEN }}
