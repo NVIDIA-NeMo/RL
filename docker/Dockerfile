@@ -101,6 +101,7 @@ apt-get install -y --no-install-recommends \
     less \
     vim \
     ccache \
+    pkg-config \
     protobuf-compiler \
     libzmq3-dev \
 
