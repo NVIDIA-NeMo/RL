@@ -1588,12 +1588,22 @@ class AsyncNemoGymRolloutImpl:
                     task.cancel()
                 await asyncio.gather(*streams, return_exceptions=True)
             finally:
-                # The mutually recursive closures otherwise retain receipt results
-                # and the completion callback until cyclic GC runs.
+                # The mutually recursive closures, and a failed task's traceback,
+                # otherwise retain receipt results until cyclic GC runs.
                 consume_stream = None
+                streams.clear()
+                while not finished.empty():
+                    finished.get_nowait()
+                task = None
 
         if row_failure is not None:
-            raise row_failure
+            # The closure cell would otherwise hold the raised error, whose
+            # traceback holds this frame.
+            failure, row_failure = row_failure, None
+            try:
+                raise failure
+            finally:
+                failure = None
         return env_timing_metrics
 
     async def _replace_unreturned_rows(
