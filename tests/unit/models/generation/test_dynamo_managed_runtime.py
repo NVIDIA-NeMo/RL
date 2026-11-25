@@ -406,12 +406,12 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     runtime = _runtime(
         True,
         num_frontends=3,
-        extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"},
+        extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192", "POD_NAME": "extra-env-pod"},
     )
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
     # What the driver sets after init_ray() is only in its own environment.
     monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
-    # A name the driver must not forward stays out of the frontends' environment.
+    # An excluded name stays out of the frontends' environment, even from extra_env.
     monkeypatch.setenv("POD_NAME", "driver-pod")
     monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", "POD_NAME")
 
