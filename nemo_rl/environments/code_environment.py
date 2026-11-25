@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -33,7 +34,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentRet
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
-class CodeEnvConfig(TypedDict):
+class CodeEnvConfig(BaseModel, extra="allow"):
     num_workers: int
     # whether to terminate the execution after expression evaluation
     # if you want to execute multiple rounds of code, set this to False
@@ -191,10 +192,11 @@ class CodeExecutionWorker:
 class CodeEnvironment(EnvironmentInterface):
     """Code execution environment that maintains state between steps."""
 
-    def __init__(self, cfg: CodeEnvConfig):
-        self.cfg = cfg
-        self.num_workers = cfg["num_workers"]
-        self.terminate_on_evaluation = cfg["terminate_on_evaluation"]
+    def __init__(self, cfg: CodeEnvConfig | dict[str, Any]):
+        # MasterConfig.env is a plain dict, so validate where it is consumed.
+        self.cfg = CodeEnvConfig.model_validate(cfg)
+        self.num_workers = self.cfg.num_workers
+        self.terminate_on_evaluation = self.cfg.terminate_on_evaluation
         self.workers = [
             CodeExecutionWorker.options(
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}

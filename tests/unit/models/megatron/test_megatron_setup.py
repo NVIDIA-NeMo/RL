@@ -225,6 +225,34 @@ class TestValidateModelPaths:
         assert "model_" in pretrained_path
         assert pt_checkpoint_exists is False
 
+    def test_local_path_aliases_share_one_conversion(self, tmp_path):
+        """A symlink and its target key the same conversion cache directory.
+
+        MOPD names teachers that share one checkpoint through distinct links,
+        so keying by the path as written would convert it once per alias.
+        """
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        target = tmp_path / "sft_ckpt"
+        target.mkdir()
+        alias = tmp_path / "teachers" / "rlhf"
+        alias.parent.mkdir()
+        alias.symlink_to(target)
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path / "checkpoints"),
+        ):
+            alias_name, alias_path, _ = validate_model_paths({"model_name": str(alias)})
+            _, target_path, _ = validate_model_paths({"model_name": str(target)})
+
+        # The configured name is untouched; only the cache key is resolved.
+        assert alias_name == str(alias)
+        assert alias_path == target_path
+        assert target_path == (
+            f"{tmp_path}/checkpoints/model_{str(target.resolve()).replace('/', '_')}"
+        )
+
     @pytest.mark.parametrize("complete", [True, False])
     def test_checkpoint_exists(self, tmp_path, complete):
         """Only a completed conversion counts; a bare iter_0000000/ (interrupted) must not."""
@@ -968,6 +996,32 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
+
+    def test_moe_router_enable_expert_bias_is_applied_only_when_configured(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        # An omitted key keeps the checkpoint's value, whatever it is.
+        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=True)
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
+
+        _apply_moe_config(model_cfg, config)
+        assert model_cfg.moe_router_enable_expert_bias is True
+
+        config["megatron_cfg"]["moe_router_enable_expert_bias"] = False
+        _apply_moe_config(model_cfg, config)
+        assert model_cfg.moe_router_enable_expert_bias is False
+
+    def test_moe_router_enable_expert_bias_skips_teachers_without_allowlist(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(moe_router_enable_expert_bias=True)
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_router_enable_expert_bias"] = False
+        megatron_cfg["_provider_override_allowlist"] = []
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_router_enable_expert_bias is True
 
     def test_moe_grouped_gemm_absent_keeps_default(self):
         """Absent key leaves the attr unset on the model cfg."""

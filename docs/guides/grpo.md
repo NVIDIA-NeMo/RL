@@ -452,14 +452,27 @@ where:
 - c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
 - $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
 
-### Loss Normalization (`token_level_loss`)
+### Loss Normalization
 
-The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `token_level_loss` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
+The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `loss_fn.normalization` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
 
-There are two choices:
+There are three choices:
 
-- **`token_level_loss: true`** — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
-- **`token_level_loss: false`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
+- **`normalization: global_token_mean`** (default) — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
+- **`normalization: sequence_mean`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
+- **`normalization: group_token_mean`** — average all valid response tokens within each prompt group, then average groups equally. See [Equal prompt-group token means](#equal-prompt-group-token-means) for supported training paths.
+
+By default, the loss uses `global_token_mean`.
+Child recipes inherit their parent's `normalization` setting; set another value to override it, or `null` to restore global token averaging.
+
+```yaml
+loss_fn:
+  normalization: sequence_mean
+```
+
+> **Upgrading an interrupted run:** If your run has a bootstrap rollout snapshot but no trainer checkpoint, resume with the original NeMo-RL version and config.
+> Save a trainer checkpoint, then upgrade NeMo-RL and migrate the config.
+> Removing `token_level_loss` can make the new version reject an older bootstrap snapshot.
 
 Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 
@@ -473,25 +486,64 @@ Both denominators — $\sum_i |o_i|$ and $N$ — are counts over the whole globa
 
 The same choice also normalizes the KL penalty term, so `reference_policy_kl_penalty` is applied on whichever scale you select.
 
+#### Equal prompt-group token means
+
+`loss_fn.normalization: group_token_mean` opts into a token mean within each
+complete rollout prompt group, followed by an equal mean over groups with
+positive valid token mass. The default `global_token_mean` gives every valid
+token equal weight; `sequence_mean` gives every response equal weight.
+
+| Reduction | Weighting |
+| --- | --- |
+| Global token mean | Every valid token has equal weight across the batch. |
+| Sequence mean | Every response has equal weight; its tokens share that weight. |
+| Group token mean | Every prompt group has equal weight; all valid tokens across its responses share that weight. |
+
+SingleController's Megatron streaming path rejects active MoE balancing losses
+and router z-loss with either sequence or group normalization: their mixed
+gradients cannot receive a separate denominator at step completion.
+
+This mode requires v2 SingleController GRPO, Megatron, token-level importance
+ratios, and masks finalized in the advantage stage. Detached MTP heads are supported:
+the worker normalizes their gradients by valid tokens independently of the
+policy's group denominator. It rejects attached MTP with a nonzero loss weight,
+active MoE auxiliary losses, in-loss sequence filtering, positive-example NLL,
+and OPD. Draft training retains its existing independent normalization and
+backend restrictions, including the prohibition on packed deferred draft loss.
+
+`GroupTokenMeanReduction` declares one extra field,
+`group_token_mean_inverse_tokens`. Setup registers the declared fields before
+producers start, and the controller requests the same fields for training. The
+advantage stage calls `prepare_batch` after finalizing masks; the group reducer
+checks complete rollout groups and returns a float32 `1 / T_g` scalar per
+response. Global-token and sequence reducers declare no extra fields and return
+no prepared tensors. `T_g` includes all valid generated tokens before IS
+filtering, including zero-advantage tokens. Excluded groups receive zero.
+Packing preserves these row weights. The split worker accumulates `L_i / T_g`
+across chunks and DP ranks, recovering the group count once at optimizer-step
+finish; TP/CP/PP replicas do not add group counts. Actor and reference-KL
+objectives use this denominator, while token diagnostics retain their original
+token denominator. IcePop filtering never changes the group denominator.
+
 #### An example of what this changes
 
 Consider a batch of two responses — one 10 tokens long, one 1000 tokens long — where every token happens to have the same per-token value:
 
-- Under `token_level_loss: true`, the denominator is $10 + 1000 = 1010$, so the long response accounts for about 99% of the update and the short one about 1%.
-- Under `token_level_loss: false`, each response is averaged over its own length first, so the two contribute 50% each. Per token, that means each token of the short response carries roughly 100× the weight of each token of the long response.
+- Under `normalization: global_token_mean`, the denominator is $10 + 1000 = 1010$, so the long response accounts for about 99% of the update and the short one about 1%.
+- Under `normalization: sequence_mean`, each response is averaged over its own length first, so the two contribute 50% each. Per token, that means each token of the short response carries roughly 100× the weight of each token of the long response.
 
 That is arithmetic, not a recommendation — which weighting is preferable depends on the algorithm and the workload. See [Choosing a setting](#choosing-a-setting) below.
 
 #### Objectives under each setting
 
-`token_level_loss` lives on `ClippedPGLossFn`, the loss shared by the policy-gradient algorithms. The table below writes out the full objective for each one under both settings. To keep the expressions readable they show the base objective only; optional terms — the KL penalty, dual clipping (`ratio_clip_c`), and the importance-sampling correction (`use_importance_sampling_correction`) — are applied on top of it and are documented in the sections that follow.
+`normalization` lives on `ClippedPGLossFn`, the loss shared by the policy-gradient algorithms. The table below writes out the full objective for each one under the global-token and sequence settings. To keep the expressions readable they show the base objective only; optional terms — the KL penalty, dual clipping (`ratio_clip_c`), and the importance-sampling correction (`use_importance_sampling_correction`) — are applied on top of it and are documented in the sections that follow.
 
 Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i,t})}$ is the per-token probability ratio, $A_i$ is the advantage for response $i$, $\text{sg}(\cdot)$ is the stop-gradient operator, and $\varepsilon_{\text{low}}$, $\varepsilon_{\text{high}}$ are `ratio_clip_min`/`ratio_clip_max`.
 
-| Algorithm | `token_level_loss: true` | `token_level_loss: false` |
+| Algorithm | `normalization: global_token_mean` | `normalization: sequence_mean` |
 | --- | --- | --- |
 | **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
-| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not supported by this implementation; the loss constructor rejects `sequence_mean`. |
 | **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
 | **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
 
@@ -502,7 +554,8 @@ Two notes on the table:
 
 #### Losses that do not expose this parameter
 
-`token_level_loss` is a field of `ClippedPGLossConfig` only. Every other loss fixes its normalization as a class attribute, so setting `token_level_loss` in, say, an SFT config has no effect:
+Use `loss_fn.normalization` to choose how the GRPO/PPO policy loss is averaged.
+This setting does not affect other losses, such as SFT or DPO; their averaging rules are fixed and listed below.
 
 | Loss function | Used by | Normalization |
 | --- | --- | --- |
@@ -515,14 +568,14 @@ Two notes on the table:
 
 #### How metrics are normalized
 
-Some of the metrics logged during training follow `token_level_loss`, and some do not. This matters when comparing runs: switching `token_level_loss` changes the scale of `loss` and `kl_penalty`, but leaves the token-normalized diagnostics directly comparable.
+Some of the metrics logged during training follow `normalization`, and some do not. This matters when comparing runs: switching `normalization` changes the scale of `loss` and `kl_penalty`, but leaves the token-normalized diagnostics directly comparable.
 
 The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO family). Other algorithms report a different, generally smaller set.
 
 | Behavior | Metrics |
 | --- | --- |
-| **Follows `token_level_loss`** — token-normalized when `true`, sequence-normalized when `false` | `loss`, `kl_penalty` |
-| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Follows `normalization`** — global token mean, sequence mean, or group token mean | `loss`, `kl_penalty` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `token_abs_logprob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
 | **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
 
@@ -530,7 +583,7 @@ The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn
 
 #### Choosing a setting
 
-For CISPO and GSPO there is nothing to choose — each admits only one setting, as shown above. For vanilla GRPO (and PPO) both are available, and the tradeoff is the weighting described in the example above.
+GSPO requires sequence mean. CISPO supports global token mean and, on the supported SingleController path, group token mean. Vanilla GRPO supports all three; PPO supports global token and sequence means. The tradeoff is the weighting described above.
 
 The argument most often made for token-level normalization comes from the [DAPO paper](https://arxiv.org/abs/2503.14476) (§3.3, "Token-Level Policy Gradient Loss"), in the context of long chain-of-thought training. Their reasoning is that under sequence-level normalization, "since all samples are assigned the same weight in the loss calculation, tokens within longer responses (which contain more tokens) may have a disproportionately lower contribution to the overall loss." They argue this cuts both ways: for high-quality long responses, "this effect can impede the model's ability to learn reasoning-relevant patterns within them." For low-quality ones, "excessively long samples often exhibit low-quality patterns such as gibberish and repetitive words. Thus, sample-level loss calculation, due to its inability to effectively penalize those undesirable patterns in long samples, leads to an unhealthy increase in entropy and response length."
 
@@ -612,7 +665,7 @@ grpo:
 loss_fn:
   seq_logprob_error_in_loss: true
   force_on_policy_ratio: true
-  token_level_loss: true
+  normalization: global_token_mean
   reference_policy_kl_penalty: 0.0
 ```
 
@@ -679,6 +732,30 @@ grpo:
 ```
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
+
+#### Per-Environment Settings
+
+In a multi-environment NeMo-Gym run, `grpo.agent_overrides` sets `overlong_filtering` and `adv_estimator.normalize_rewards` for one environment's rows. Unset fields inherit the run-wide value, and environments without an entry keep the run-wide values.
+
+```yaml
+grpo:
+  overlong_filtering: false                 # run-wide
+  adv_estimator: {normalize_rewards: true}  # run-wide
+  agent_overrides:
+    rubric_judge_agent:
+      overlong_filtering: true   # this environment's truncated rows leave the loss
+      normalize_rewards: false   # no division by the group's reward std
+```
+
+| Field | Replaces |
+|---|---|
+| `overlong_filtering` | `grpo.overlong_filtering` |
+| `normalize_rewards` | `grpo.adv_estimator.normalize_rewards` (needs `adv_estimator.name: grpo`) |
+
+- **Key.** Each key is the rows' attribution key, the same key as `grpo.length_penalty.agent_overrides`: the NeMo-Gym agent name for flat rows, and the `task_id.taskset` for materialized task rows (see [NeMo Gym integration](../design-docs/nemo-gym-integration.md)). Use the name that appears in the `<name>/reward/*` metrics. A key that matches no row is ignored. Keys that contain `:` must be set in YAML, not as a Hydra command-line override.
+- **Where it works.** SingleController with `token_capture.enabled: true` only, because the token-capture finalizer tags each row with its key. The SingleController config validation rejects it without token capture, and the legacy `setup()` rejects it.
+- **Dynamic sampling.** With `use_dynamic_sampling: true` and `masked_reward_policy: exclude`, an `overlong_filtering` override must equal the run-wide value, because dynamic sampling votes with the run-wide flag.
+- **Metrics.** `num_masked_seqs_by_overlong_filtering/<key>` counts each configured key's rows that overlong filtering removed, and `num_rows_without_agent_tag` counts rows that fell back to the run-wide values (expected 0). Forest runs (`token_capture.forest_training`) do not log these two metrics.
 
 #### Advantage Clipping
 
@@ -757,7 +834,7 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error`, `token_abs_logprob_error`, and `gen_prev_logprob_mismatch_tokens` to monitor training–generation logprob mismatch.
 `loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
@@ -768,6 +845,17 @@ $$
 $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
+
+### Mismatched Logprob Token Count
+`gen_prev_logprob_mismatch_tokens` counts the valid tokens whose generation logprob differs from the training logprob; a NaN counts as a difference. It is a raw count, not normalized by tokens or sequences. A run with zero train/generation mismatch reports 0 on every step, including differences too small to move `gen_kl_error` away from 0.
+
+### Absolute Token Logprob Error
+
+`token_abs_logprob_error` averages the absolute difference between the previous policy's logprob and the generation logprob for the sampled token, in nats. Each of the $n$ valid tokens has equal weight.
+
+$$
+\text{token-abs-logprob-error} = \frac{1}{n}\sum_{i=1}^{n} \left|\log p_{\mathrm{prev},i} - \log p_{\mathrm{gen},i}\right|
+$$
 
 ### KL Divergence Error
 This feature is controlled by the following metrics:

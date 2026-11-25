@@ -70,7 +70,6 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     CheckpointMutationKind,
@@ -125,6 +124,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
     row_group_ids,
     split_meta_by_prompt_group,
+    validate_forest_estimator,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -168,17 +168,17 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.checkpoint import checkpoint_io
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
-    DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
-    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -200,7 +200,6 @@ from nemo_rl.experience.rollout_manager import (
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
-from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -241,6 +240,7 @@ from nemo_rl.utils.path_utils import (
     is_msc_path,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -303,24 +303,6 @@ def _pooled_opd_metrics(
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
-
-
-def _train_fields_for_step(
-    *,
-    policy_logprobs_required: bool,
-    reference_logprobs_required: bool,
-    sampler_head_required: bool,
-) -> tuple[str, ...]:
-    """Return only the data-plane columns produced for this train step."""
-    fields = tuple(
-        field
-        for field in DP_TRAIN_FIELDS
-        if (policy_logprobs_required or field != "prev_logprobs")
-        and (reference_logprobs_required or field != "reference_policy_logprobs")
-    )
-    if sampler_head_required:
-        fields += SAMPLER_TOPK_FIELDS
-    return fields
 
 
 def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
@@ -441,13 +423,7 @@ class SingleControllerActor:
         )
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
-        self._train_fields = _train_fields_for_step(
-            policy_logprobs_required=self._policy_logprobs_required,
-            reference_logprobs_required=self._reference_logprobs_required,
-            # Score centering and sampler replay both read the captured head.
-            sampler_head_required=master_config.loss_fn.score_centering
-            or sampler_replay_enabled(master_config.policy["generation"]),
-        )
+        self._train_fields = stage_cfg.train_fields(master_config)
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -490,6 +466,7 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    loss_normalization=master_config.loss_fn.resolved_normalization,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
@@ -534,6 +511,10 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
+        self._train_fields = (
+            *self._train_fields,
+            *self._advantage_stage_config.objective_reduction.extra_fields,
+        )
         self._value_loss_fn: LossFunction | None = getattr(
             actor_args, "value_loss_fn", None
         )
@@ -561,7 +542,6 @@ class SingleControllerActor:
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
-                dp_client=self._dp_client,
                 generation=self._gen,
             )
         )
@@ -665,6 +645,9 @@ class SingleControllerActor:
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, with only its actor handle.
+            self._weight_synchronizer.attach(self._gen)
 
         restored_trainer_version = (
             actor_args.save_state.trainer_version
@@ -751,6 +734,9 @@ class SingleControllerActor:
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+
+        self._trainer_warmup_task: Optional[asyncio.Task[dict[str, Any]]] = None
+        self._trainer_warmup_kwargs = actor_args.trainer_warmup_kwargs
 
         # Per-step counts of how each step got made whole with spare prompts (logged
         # so a step's batch size stays explainable after the fact).
@@ -879,7 +865,8 @@ class SingleControllerActor:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
         await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
+        # The RefitActor proxy answers is_stale with blocking calls to the actor.
+        if await asyncio.to_thread(lambda: self._weight_synchronizer.is_stale):
             await self._sync_weights()
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_manager.set_tally_step_provider(
@@ -894,6 +881,8 @@ class SingleControllerActor:
             await asyncio.to_thread(self._gen.snapshot_step_metrics)
         except RayActorError as error:
             log.warning("Skipping generation snapshot metrics: %s", error)
+
+        self._maybe_start_trainer_warmup()
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -982,6 +971,10 @@ class SingleControllerActor:
                 await self._finish_pending_save(blocking=True)
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error publishing the pending checkpoint: {e}", flush=True)
+            if self._trainer_warmup_task is not None:
+                # Not in `tasks`: the train pump awaits it and surfaces its failure.
+                self._trainer_warmup_task.cancel()
+                await asyncio.gather(self._trainer_warmup_task, return_exceptions=True)
             if self._engine_supervisor is not None:
                 # Not in `tasks`: the supervisor creates a task per restart, on demand, so
                 # there is nothing to cancel in that list. Without this an in-flight
@@ -1015,6 +1008,24 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
         }
+
+    def _maybe_start_trainer_warmup(self) -> None:
+        """Run the warm-up beside the first rollouts if setup chose it and did not run it."""
+        kwargs = self._trainer_warmup_kwargs
+        if kwargs is None:
+            return
+        self._trainer_warmup_task = asyncio.create_task(
+            asyncio.to_thread(self._trainer.warmup_first_pass, self._loss_fn, **kwargs)
+        )
+
+    async def _finish_trainer_warmup(self) -> None:
+        task = self._trainer_warmup_task
+        if task is None:
+            return
+        with self._timer.time("trainer_warmup_wait"):
+            summary = await task
+        self._trainer_warmup_task = None
+        print(f"  ✓ Trainer warm-up (rank 0): {summary}", flush=True)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -1743,7 +1754,7 @@ class SingleControllerActor:
             await self._log_data_plane_metrics_impl(total_step_time)
 
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
-        """Log this step's data-plane cost. No-op unless observability is enabled.
+        """Log this step's data-plane cost.
 
         This client's share depends on the configuration: it writes the rollout
         rows unless token capture moves that to the finalizer actors, and it
@@ -1753,18 +1764,15 @@ class SingleControllerActor:
         cluster view. The fan-out blocks on ``ray.get``, so it runs off the
         event loop.
 
-        nixl's unit metrics (retired memory, SSD spills) are logged even with
-        observability off: a leak only shows over a long run, in the runs that
-        need it.
+        nixl's unit metrics (retired memory, SSD spills) and Mooncake's master
+        counters (memory use, SSD offload) are logged even with observability
+        off: a leak only shows over a long run, in the runs that need it, and
+        the first SSD spill / offload of a run logs its warning from here.
         """
-        if self._dp_backend == "nixl":
-            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
-
-            unit = unit_metrics()
-            if unit:
-                self._logger.log_metrics(
-                    unit, self._train_steps, prefix="data_plane/nixl"
-                )
+        health = await asyncio.to_thread(backend_health_metrics, self._dp_backend)
+        if health:
+            prefix, metrics = health
+            self._logger.log_metrics(metrics, self._train_steps, prefix=prefix)
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,
@@ -2764,7 +2772,7 @@ class SingleControllerActor:
                 b. Full-batch PPO closes each actor epoch here (kept for ppo_epochs > 1);
                     streaming PPO and GRPO accumulate across chunks and close the policy
                     step in 5. Streaming PPO requires ppo.ppo_epochs=1.
-            4. Close the chunk. Refresh min_sample_version and the dispatch tally. The
+            4. Close the chunk. Collect sample lags and refresh the dispatch tally. The
                 consumed rows stay in TQ: staged capture deltas are read by the policy
                 workers during 3, so nothing is cleared until the step closes.
                 Streaming PPO prepares the critic before waiting for the next chunk.
@@ -2808,7 +2816,7 @@ class SingleControllerActor:
             self._step_assembler.begin_step(version_during_step)
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
-            min_sample_version = None
+            sample_lags: list[int] = []
             step_open = False
             value_inference_prepared = False
             chunks_dispatched = 0
@@ -3098,6 +3106,9 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
+                    if self._trainer_warmup_task is not None:
+                        await self._finish_trainer_warmup()
+
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:
                         # Doing value inference first keeps each chunk to one visit
@@ -3331,17 +3342,12 @@ class SingleControllerActor:
                         )
 
                     # ---- 4. Clear the batch ----
-                    # Refresh min_sample_version
-                    curr_min_sample_version = min(
-                        t["weight_version"]
+                    # Pool across chunks so each retained rollout has equal weight.
+                    sample_lags.extend(
+                        version_during_step - t["weight_version"]
                         for t in train_meta.tags  # type: ignore
+                        if not forest_training or t["segment_index"] == 0
                     )
-                    if min_sample_version is not None:
-                        min_sample_version = min(
-                            min_sample_version, curr_min_sample_version
-                        )
-                    else:
-                        min_sample_version = curr_min_sample_version
 
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
@@ -3436,6 +3442,19 @@ class SingleControllerActor:
                         * self._async_cfg.rollout_failure.min_step_batch_fraction
                     )
                 )
+                if (
+                    forest_training
+                    and not skipped_step
+                    and (
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
+                        or len(logical_owners)
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
+                    )
+                ):
+                    raise ValueError(
+                        "Forest optimizer step requires complete retained logical groups"
+                    )
                 if skipped_step:
                     if step_open:
                         await asyncio.to_thread(self._trainer.abort_train_step)
@@ -3541,15 +3560,6 @@ class SingleControllerActor:
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
-                    if forest_training and (
-                        groups_dispatched
-                        != self._target_groups_for_step(version_during_step)
-                        or len(logical_owners)
-                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
-                    ):
-                        raise ValueError(
-                            "Forest optimizer step requires complete retained logical groups"
-                        )
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -3883,14 +3893,18 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # min sample version refers to the version each consumed sample was
-            # generated with; lag = training version - oldest sample version.
-            lag = (
-                version_during_step - min_sample_version
-                if min_sample_version is not None
-                else 0
-            )
-            step_metrics["weight_version_lag"] = lag
+            lag = step_metrics["weight_version_lag_max"] = max(sample_lags, default=0)
+            if sample_lags:
+                step_metrics["weight_version_lag_mean"] = statistics.fmean(sample_lags)
+                percentiles = (
+                    statistics.quantiles(sample_lags, n=100, method="inclusive")
+                    if len(sample_lags) > 1
+                    else sample_lags * 99
+                )
+                for percentile in (50, 90, 95, 99):
+                    step_metrics[f"weight_version_lag_p{percentile}"] = percentiles[
+                        percentile - 1
+                    ]
             # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
@@ -4687,6 +4701,16 @@ class SingleControllerActor:
             metrics["vllm_requests_waiting"] = sum(waiting.values())
         if kv_usage:
             metrics["vllm_kv_cache_usage_mean"] = sum(kv_usage.values()) / len(kv_usage)
+        for state in ("queued", "inflight"):
+            frontend_calls = _latest_generation_values(
+                generation_metrics, f"dynamo_frontend_{state}_requests"
+            )
+            if frontend_calls:
+                metrics[f"dynamo_frontend_requests_{state}"] = sum(
+                    frontend_calls.values()
+                )
+            for frontend, calls in frontend_calls.items():
+                metrics[f"dynamo_frontend_{frontend}_requests_{state}"] = calls
         if generated_tokens is not None:
             metrics["generation_output_tokens"] = float(generated_tokens)
 
@@ -4839,29 +4863,41 @@ class SingleControllerActor:
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group. The environment keeps running: its state lives only
         # in rollout snapshots taken after this checkpoint.
-        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            _save_adaptive_loss_state(save_state, self._loss_fn)
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            save_state.next_nemo_gym_task_index = (
-                self._rollout_manager.get_next_nemo_gym_task_index()
-            )
+        async with contextlib.AsyncExitStack() as capture_resources:
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                _save_adaptive_loss_state(save_state, self._loss_fn)
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                save_state.next_nemo_gym_task_index = (
+                    self._rollout_manager.get_next_nemo_gym_task_index()
+                )
 
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
-            )
-            captured = await self._rollout_snapshots.capture(
-                cut, checkpoint_path, "trainer_checkpoint"
-            )
+                checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                    self._checkpointer.init_tmp_checkpoint,
+                    self._train_steps,
+                    vars(save_state),
+                    self._master_config,
+                )
+                captured_snapshot = await self._rollout_snapshots.capture(
+                    cut, checkpoint_path, "trainer_checkpoint", allow_deferred=True
+                )
+                captured = captured_snapshot.state
+                if captured_snapshot.data_plane is not None:
+                    capture_resources.push_async_callback(
+                        checkpoint_io, captured_snapshot.data_plane.release
+                    )
+
+            # Canonical publication can resume while the retained TQ cut and its
+            # recovery state are saved, which still finishes before model
+            # save/publication.
+            if captured_snapshot.data_plane is not None:
+                captured = await captured_snapshot.persist()
 
         # Save value model
         if self._is_ppo:
@@ -5013,6 +5049,9 @@ class SingleControllerActor:
         is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
         if budget_s is None:
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights, kv_scales=kv_scales
@@ -5046,6 +5085,30 @@ class SingleControllerActor:
                 "bound has passed, so a generation rank is most likely alive but not "
                 "answering -- a Ray actor call has no timeout of its own, so waiting here "
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` for a RefitActor: await its ObjectRef, no thread."""
+        synchronizer = cast(RemoteWeightSynchronizer, self._weight_synchronizer)
+        try:
+            refit_ref = await asyncio.to_thread(
+                synchronizer.submit_sync_weights, kv_scales
+            )
+            await asyncio.wait_for(asyncio.wrap_future(refit_ref.future()), budget_s)
+        except RayActorError as error:
+            await asyncio.to_thread(synchronizer.raise_if_actor_died, error)
+            raise
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
             ) from None
 
     async def _sync_weights(
@@ -5297,18 +5360,26 @@ class SingleControllerActor:
         if value_loss_fn is None:
             raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
+        # Forest steps carry a variable number of physical rows; the critic
+        # takes all of them as one optimizer step, like the policy.
+        gbs = sum(m.size for m in metas) if has_logical_owners(metas[0]) else None
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
-                    self._value.train_from_meta, full_meta, value_loss_fn
+                    self._value.train_from_meta,
+                    full_meta,
+                    value_loss_fn,
+                    gbs=gbs,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects
             # all step chunks before training the critic.
             for _ in range(num_epochs):
-                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                await asyncio.to_thread(
+                    self._value.begin_train_step, value_loss_fn, gbs=gbs
+                )
                 for meta in metas:
                     await asyncio.to_thread(
                         self._value.train_microbatches_from_meta, meta
@@ -5342,15 +5413,7 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            if (
-                self._is_ppo
-                or not isinstance(self._algo_cfg, GRPOConfig)
-                or self._algo_cfg.adv_estimator.name != "grpo"
-                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-            ):
-                raise ValueError(
-                    "Forest logical owners require the standard GRPO estimator"
-                )
+            validate_forest_estimator(self._advantage_estimator, is_ppo=self._is_ppo)
             validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
