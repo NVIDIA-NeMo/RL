@@ -19,7 +19,7 @@ import subprocess
 import sys
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -29,6 +29,8 @@ from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorke
 from nemo_rl.models.generation.sglang.utils.nccl_reshard import (
     SGLangNcclReshardReceiver,
     build_sglang_refit_param_map,
+    load_nccl_reshard,
+    serialize_nccl_reshard_command,
 )
 from nemo_rl.models.generation.sglang.utils.train_utils import MultiprocessingSerializer
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
@@ -121,6 +123,122 @@ def test_receiver_rejects_native_source_when_destination_lacks_nccl_m2n(
             refit_info={**_metadata(), "source_uses_real_reshard_op": True}
         )
     assert receiver.refit_info is None
+
+
+def test_loader_joins_global_and_per_stage_groups_at_receiver_rank(monkeypatch) -> None:
+    groups = [MagicMock() for _ in range(3)]
+    create_group = MagicMock(side_effect=groups)
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_rl.distributed.stateless_process_group",
+        SimpleNamespace(StatelessProcessGroup=create_group),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.distributed",
+        SimpleNamespace(
+            get_tensor_model_parallel_rank=lambda: 1,
+            get_tensor_model_parallel_world_size=lambda: 2,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    model = _model(tp_size=2)
+
+    def load(operation: str, **payload) -> None:
+        encoded = serialize_nccl_reshard_command(operation, payload)
+        load_nccl_reshard(model, MultiprocessingSerializer.deserialize(encoded))
+
+    collective = dict(ip="trainer", port=1000, world_size=6, train_world_size=4)
+    bulk = dict(
+        pp_ips=["stage0", "stage1"],
+        pp_ports=[1010, 1011],
+        pp_size=2,
+        train_ranks_per_stage=2,
+        sub_world_size=4,
+    )
+    load("init_collective", **collective)
+    load("init_bulk", **bulk)
+    with pytest.raises(RuntimeError, match="already initialized"):
+        load("init_collective", **collective)
+    with pytest.raises(RuntimeError, match="already initialized"):
+        load("init_bulk", **bulk)
+
+    assert create_group.call_args_list == [
+        call(master_address="trainer", port=1000, rank=5, world_size=6),
+        call(master_address="stage0", port=1010, rank=3, world_size=4),
+        call(master_address="stage1", port=1011, rank=3, world_size=4),
+    ]
+    for group in groups:
+        group.init_nccl_communicator.assert_called_once_with(device=3)
+
+
+def test_refit_receives_into_live_weights_before_loading_misc(monkeypatch) -> None:
+    model = _model(tp_size=2)
+    model.config = SimpleNamespace(model_type="qwen2")
+    model.load_weights = MagicMock()
+    receiver = SGLangNcclReshardReceiver(model, tp_rank=1, tp_size=2)
+    receiver.model_update_group = MagicMock()
+    receiver.pp_comm_groups = {0: MagicMock(), 1: MagicMock()}
+    plan = _metadata()
+    plan["source_uses_real_reshard_op"] = False
+    plan["misc_meta"] = {"norm.weight": {"shape": [4], "dtype": "torch.bfloat16"}}
+    for info in plan["per_layer_params"]["model.layers.0"]:
+        shard_dim = 1 if info["name"].endswith("down_proj.weight") else 0
+        info.update(
+            pp_stage=1,
+            src_mesh_info={"mesh": [1]},
+            src_placements=[{}],
+            dst_mesh_info={"mesh": [2, 3]},
+            dst_placements=[{"dim": shard_dim}],
+        )
+    monkeypatch.setattr("nemo_rl.weight_sync.xferdtensor._reshard", None)
+    receiver.prepare(refit_info=plan)
+    stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    device_sync = MagicMock()
+    monkeypatch.setattr(torch.cuda, "synchronize", device_sync)
+    weights = iter([11, 22, 33])
+
+    def receive(
+        src,
+        src_mesh,
+        src_placements,
+        dst,
+        dst_mesh,
+        dst_placements,
+        group,
+        active_stream,
+    ) -> None:
+        assert src is None
+        assert src_mesh.mesh.tolist() == [1] and src_placements[0].is_replicate()
+        assert dst_mesh.mesh.tolist() == [2, 3]
+        assert group is receiver.pp_comm_groups[1] and active_stream is stream
+        shard_dim = dst_placements[0].dim
+        assert dst.shape[shard_dim] == 2 * dst._local_tensor.shape[shard_dim]
+        dst._local_tensor.fill_(next(weights))
+
+    norm = torch.ones(4, dtype=torch.bfloat16)
+
+    def receive_misc(*, iterator, group, src, post_unpack_func) -> None:
+        stream.synchronize.assert_called_once_with()
+        device_sync.assert_not_called()
+        assert list(iterator) == [("norm.weight", ((4,), torch.bfloat16))]
+        assert group is receiver.model_update_group and src == 0
+        post_unpack_func([("norm.weight", norm)])
+
+    monkeypatch.setattr("nemo_rl.weight_sync.xferdtensor.xferdtensor", receive)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.utils.nccl_reshard.packed_broadcast_consumer",
+        receive_misc,
+    )
+    receiver.refit(refit_timeout_s=None)
+
+    mlp = model.model.layers[0].mlp
+    gate, up = mlp.gate_up_proj.weight.chunk(2)
+    assert torch.all(gate == 11) and torch.all(up == 22)
+    assert torch.all(mlp.down_proj.weight == 33)
+    model.load_weights.assert_called_once_with([("norm.weight", norm)])
+    device_sync.assert_called_once_with()
 
 
 def _config() -> dict:
