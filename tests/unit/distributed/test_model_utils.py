@@ -2756,3 +2756,45 @@ def test_sampling_filter_chunk_equivalence_gloo(tmp_path, tp_size):
         nprocs=tp_size,
         join=True,
     )
+
+
+def test_replay_reference_kl_chunks_the_packed_logits_in_their_dtype(
+    single_rank_gloo_group,
+):
+    """Under sampler replay, the packed reference-KL pass chunks the logits in their own dtype."""
+    _, _, packed, data = _score_centering_packed_inputs()
+    data.update(token_mask=torch.ones(2, 8), sample_mask=torch.ones(2))
+    loss_fn = SimpleNamespace(
+        input_type=LossInputType.LOGPROB, reference_policy_kl_penalty=0.1
+    )
+    weights = torch.randn(2, 7)
+
+    def run(chunk_size):
+        logits = packed.detach().to(torch.bfloat16).requires_grad_()
+        with patch.object(
+            ChunkedDistributedLogprob, "apply", wraps=ChunkedDistributedLogprob.apply
+        ) as kernel:
+            _, out = prepare_packed_loss_input(
+                logits * 1.0,  # non-leaf logits, as in training
+                dict(data),
+                loss_fn,
+                (0, 5, 12),
+                (0, 8, 20),
+                vocab_parallel_rank=0,
+                vocab_parallel_group=single_rank_gloo_group,
+                sampling_params=TrainingSamplingParams(
+                    top_k=8, top_p=0.9, sampler_replay=True
+                ),
+                chunk_size=chunk_size,
+            )
+        unfiltered = out["curr_logprobs_unfiltered"]
+        (grad,) = torch.autograd.grad((unfiltered * weights).sum(), logits)
+        return kernel, unfiltered, grad
+
+    _, *unchunked = run(None)
+    kernel, *chunked = run(6)
+    # One chunked call on the bf16 logits themselves, not on a float32 copy.
+    assert kernel.call_count == 1
+    assert kernel.call_args.args[0].dtype == torch.bfloat16
+    for actual, expected in zip(chunked, unchunked):
+        torch.testing.assert_close(actual, expected)
