@@ -1,0 +1,89 @@
+
+# KubeRay RayJob example for NeMo RL using k8s_entry.sh as the entrypoint.
+#
+# Here KubeRay owns the Ray cluster bringup (head + workers). k8s_entry.sh
+# detects the already-running cluster (KUBERAY_GEN_RAY_START_CMD is set on
+# KubeRay pods) and therefore does NOT start a second Ray instance -- it just
+# runs the training command as the driver. You may also skip k8s_entry.sh and
+# call `uv run ...` directly here, since KubeRay already owns the cluster
+# lifecycle. This is the recommended path when you want KubeRay to manage
+# autoscaling, restarts, and teardown for you.
+
+#
+# Prerequisites:
+#   - KubeRay operator installed (provides the RayJob / RayCluster CRDs).
+#   - A NeMo RL image and a shared PVC (here: rl-workspace) mounted at /workspace.
+#
+# Usage:
+#   kubectl apply -f rayjob-grpo.yaml
+#   kubectl get rayjob grpo-rayjob -w
+
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: grpo-rayjob
+spec:
+  # k8s_entry.sh sees the KubeRay-managed cluster and only runs the driver.
+  entrypoint: >-
+    bash /opt/nemo-rl/k8s_entry.sh
+    uv run --locked examples/run_grpo.py
+    --config examples/configs/grpo_math_1B.yaml
+    cluster.num_nodes=2 cluster.gpus_per_node=8
+
+  submissionMode: HTTPMode
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 60
+  rayClusterSpec:
+    rayVersion: "2.52.0"
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-head
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            resources:
+              requests: { cpu: "2", memory: "8Gi" }
+              limits:   { cpu: "8", memory: "32Gi" }
+            ports:
+            - { containerPort: 6379, name: gcs-server }
+            - { containerPort: 8265, name: dashboard }
+            - { containerPort: 10001, name: client }
+            volumeMounts:
+            - { name: rl-workspace, mountPath: /workspace }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+          - name: dshm
+            emptyDir: { medium: Memory }
+    workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        # Advertise the worker_units tag init_ray() expects (one per GPU).
+        num-gpus: "8"
+        resources: '{"worker_units": 8, "slurm_managed_ray_cluster": 1}'
+      template:
+        spec:
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: ray-worker
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            resources:
+              requests: { cpu: "32", memory: "200Gi", nvidia.com/gpu: "8" }
+              limits:   { cpu: "128", memory: "800Gi", nvidia.com/gpu: "8" }
+            volumeMounts:
+            - { name: rl-workspace, mountPath: /workspace }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+          - name: dshm
+            emptyDir: { medium: Memory }
