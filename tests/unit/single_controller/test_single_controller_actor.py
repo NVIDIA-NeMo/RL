@@ -270,6 +270,26 @@ def _init_controller(master_config, actor_args):
     )
 
 
+@pytest.mark.parametrize("restored_version", [None, 7])
+def test_rollout_budget_tracks_remaining_updates_on_resume(
+    tmp_path: Path, restored_version: int | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
+    config = _grpo_master_config(tmp_path)
+    config.grpo.max_num_steps = 6
+    state = _initial_grpo_save_state()
+    state.current_step = 3
+    state.trainer_version = restored_version
+    ctrl = _init_controller(config, _actor_args_for_init(save_state=state))
+    last_target = (3 if restored_version is None else restored_version) + 2
+
+    ctrl._sampler.restore_dispatch_index(last_target - 1)
+    assert ctrl._can_admit_rollout_step()
+    ctrl._sampler.restore_dispatch_index(last_target)
+    assert not ctrl._can_admit_rollout_step()
+
+
 @pytest.mark.parametrize(
     ("packed", "dynamic", "expected_groups"),
     [(False, False, 2), (True, False, 1), (False, True, 1)],
