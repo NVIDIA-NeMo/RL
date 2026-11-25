@@ -77,6 +77,7 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
+    build_zero_token_terminal_fixture,
     f32,
 )
 
@@ -306,6 +307,113 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # The finalizer cleared its staged rows after publishing.
     with pytest.raises(KeyError):
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
+
+
+def test_finalize_group_marks_terminal_length_truncation(tq_client, partitions):
+    """Terminal length evidence survives receipt assembly (#4737).
+
+    One group, five rollouts, ``max_seq_len`` far above every row length so
+    the length-equality check cannot fire; only the terminal verdict can
+    mark a row truncated:
+    - g0: zero-token context-exhausted final turn: the terminal call staged
+      only its carried prefix (mask 0) with ``finish_reason="length"``.
+      Gym rejects the chain (``empty_generation``), so the finalizer must
+      publish a masked placeholder, never a trainable row.
+    - g1: terminal length exhaustion below the total limit:
+      ``finish_reason="length"`` -> truncated.
+    - g2: ordinary completed response: ``finish_reason="stop"`` -> not
+      truncated.
+    - g3: content-filtered response: ``finish_reason="content_filter"`` ->
+      not truncated.
+    - g4: legacy receipt: terminal record without ``finish_reason`` -> not
+      truncated (falls back to the length check).
+    The published TRUNCATED column and the downstream overlong filter must
+    agree: only g1 is masked for overlong filtering.
+    """
+    # Deferred: the algorithm stack is heavy for a data-plane test module.
+    from nemo_rl.algorithms.grpo import _apply_async_sample_masks
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    group_id = "grp_trunc"
+    rollout_ids = [f"{group_id}_g{i}" for i in range(5)]
+
+    receipts = []
+    # g0: zero-token terminal call, staged separately.
+    zero_records, zero_receipt = build_zero_token_terminal_fixture(
+        rollout_id=rollout_ids[0]
+    )
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    for record in zero_records:
+        assert sink.stage(record).ok
+    receipts.append(zero_receipt.model_dump())
+
+    # g1-g4: worked-example rows; only the terminal manifest row's finish
+    # reason differs. The reason is not covered by the staged digest, so
+    # patching the receipt dict cannot break verification.
+    terminal_endings = [
+        ("length", "incomplete"),
+        ("stop", "completed"),
+        ("content_filter", "incomplete"),
+        (None, None),
+    ]
+    for rollout_id, (finish_reason, response_status) in zip(
+        rollout_ids[1:], terminal_endings, strict=True
+    ):
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        terminal = receipt["manifest"][-1]
+        terminal["finish_reason"] = finish_reason
+        terminal["response_status"] = response_status
+        receipts.append(receipt)
+
+    finalizer = _finalizer(tq_client)  # max_seq_len=4096, rows are ~7 tokens
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [0.0, 1.0, 1.0, 1.0, 1.0],
+        mask_sample=[False] * 5,
+        fallback_weight_version=9,
+        prompt_idx=17,
+    )
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == rollout_ids
+    # Only the length-cut terminal counts toward truncation; the zero-token
+    # placeholder never trains and the legacy receipt has no verdict.
+    assert finalized.metrics["finalize/truncated_count"] == 1.0
+    assert finalized.reward_truncated == [True, False, False, False]
+
+    rows = _fetch_rows(tq_client, rollout_ids)
+    assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    ]
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+
+    # Downstream overlong filtering on the published batch masks exactly the
+    # length-truncated row; the placeholder stays masked by its zero loss
+    # multiplier, not by overlong filtering.
+    overlong_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.as_tensor(rows["sample_mask"]).flatten().float(),
+            "truncated": torch.as_tensor(rows["truncated"]).flatten().bool(),
+            "mask_sample": torch.as_tensor(rows["mask_sample"]).flatten().bool(),
+        }
+    )
+    metrics, _ = _apply_async_sample_masks(overlong_batch, overlong_filtering=True)
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
+    assert metrics["num_masked_seqs_by_loss_multiplier"] == 1
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert overlong_batch["loss_multiplier"].tolist() == [0.0, 0.0, 1.0, 1.0, 1.0]
 
 
 def test_finalize_group_stamps_agent_names_for_agent_overrides(tq_client, partitions):

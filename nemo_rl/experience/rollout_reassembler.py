@@ -108,6 +108,18 @@ if TYPE_CHECKING:
     from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
+# Terminal incomplete reasons that mean the generation stopped because the
+# context ran out, mirroring nemo_gym_rollout_hit_max_tokens (#4491) in
+# nemo_rl/experience/rollouts.py. The finalizer must not import that module
+# (it pulls in Ray and the Gym environment adapter), so the set is repeated
+# here. Gym's LinearizedRow.incomplete_reason reports exactly these values
+# for length-cut terminal calls; anything else (stop, content_filter, or a
+# missing verdict on legacy receipts) is not length truncation.
+_TERMINAL_LENGTH_INCOMPLETE_REASONS = frozenset(
+    {"max_output_tokens", "length", "max_tokens"}
+)
+
+
 @dataclass(frozen=True)
 class FinalizedRollout:
     """One rollout's canonical row, or its rejection."""
@@ -142,6 +154,11 @@ class FinalizedRollout:
     # (model call ID, weight version stamped when it began, tokens it generated)
     # for the same owned calls.
     call_versions: tuple[tuple[str, int, int], ...] = ()
+    # Gym's verdict on why the terminal call's response is incomplete
+    # (LinearizedRow.incomplete_reason): "max_output_tokens" when the final
+    # turn hit the context limit, None for completed, content-filtered, or
+    # legacy receipts without the metadata. Read by _truncated_flags.
+    terminal_incomplete_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -763,6 +780,7 @@ class RolloutReassembler:
             reward_metrics=reward_metrics,
             sampler_topk_token_ids=sampler_topk_token_ids,
             sampler_topk_logprobs=sampler_topk_logprobs,
+            terminal_incomplete_reason=row.incomplete_reason,
         )
 
     def _decode(self, token_ids: Sequence[int]) -> str:
@@ -890,7 +908,9 @@ class RolloutReassembler:
         row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
-        instead, from each row's rebuilt length against ``max_seq_len``.
+        instead, from each row's rebuilt length against ``max_seq_len`` or
+        from the terminal call's context-exhaustion verdict carried on the
+        finalized row (``terminal_incomplete_reason``).
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -1219,11 +1239,18 @@ class RolloutReassembler:
         """Per-row truncation, shared by the TRUNCATED column and termination rates.
 
         Forest rows carry their rollout's Gym-reported truncation; ordinary rows
-        count as truncated when they fill ``max_seq_len``.
+        count as truncated when they fill ``max_seq_len`` or when the terminal
+        call's response was cut by the context limit (``terminal_incomplete_reason``,
+        carried from Gym's receipt rebuild). A completed, content-filtered, or
+        legacy receipt without that verdict is not length truncation.
         """
         if logical is not None:
             return list(logical.truncated)
-        return [len(row.token_ids) == self._max_seq_len for row in rows]
+        return [
+            len(row.token_ids) == self._max_seq_len
+            or row.terminal_incomplete_reason in _TERMINAL_LENGTH_INCOMPLETE_REASONS
+            for row in rows
+        ]
 
     def _publish_rows(
         self,
