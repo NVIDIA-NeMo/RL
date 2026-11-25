@@ -90,7 +90,7 @@ What you can expect:
 - **Efficient resource management using Ray**, enabling scalable and flexible deployment across different hardware configurations.
 - **Hackable** with native PyTorch-only paths for quick research prototypes.
 - **High performance with Megatron Core**, supporting various parallelism techniques for large models and large context lengths.
-- **Seamless integration with Hugging Face** for ease of use, allowing users to leverage a wide range of pre-trained models and tools.
+- **Seamless integration with Hugging Face** for ease of use, so you can use a wide range of pre-trained models and tools.
 - **Comprehensive documentation** that is both detailed and user-friendly, with practical examples.
 
 Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/main/docs/design-docs) for more details on the architecture and design philosophy.
