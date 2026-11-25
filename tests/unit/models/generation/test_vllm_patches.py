@@ -187,6 +187,7 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
                 is_act_and_mul=False,
             )
             self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
+            self.shared_expert_online_loader = None
             self.ckpt_gate_proj_name = "up_proj"
             self.ckpt_down_proj_name = "down_proj"
             self.ckpt_up_proj_name = ""
