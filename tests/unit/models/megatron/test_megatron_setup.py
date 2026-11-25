@@ -3620,6 +3620,61 @@ def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
     return mock_container.call_args.kwargs["dist"]
 
 
+def _ddp_config_of(**ddp_overrides: Any) -> Any:
+    from nemo_rl.models.megatron.setup import _ddp_config
+
+    config = _megatron_config()
+    config["megatron_cfg"]["distributed_data_parallel_config"].update(ddp_overrides)
+    return _ddp_config(
+        config, reuse_grad_buf_for_mxfp8_param_ag=False, fp8_param_enabled=False
+    )
+
+
+@pytest.mark.mcore
+class TestDdpConfig:
+    """policy.megatron_cfg.distributed_data_parallel_config reaches Megatron's DDP config."""
+
+    def test_required_and_derived_fields(self):
+        ddp = _ddp_config_of()
+
+        assert ddp.data_parallel_sharding_strategy == "no_shard"
+        assert ddp.overlap_grad_reduce is False
+        assert ddp.check_for_nan_in_grad is True
+        assert ddp.average_in_collective is False
+        assert ddp.use_distributed_optimizer is False
+
+    def test_other_dataclass_fields_pass_through(self):
+        ddp = _ddp_config_of(bucket_size=12345, pad_buckets_for_high_nccl_busbw=True)
+
+        assert ddp.bucket_size == 12345
+        assert ddp.pad_buckets_for_high_nccl_busbw is True
+
+    def test_unknown_field_raises(self):
+        with pytest.raises(TypeError, match="not_a_ddp_field"):
+            _ddp_config_of(not_a_ddp_field=1)
+
+    def test_missing_required_key_raises(self):
+        from nemo_rl.models.megatron.setup import _ddp_config
+
+        config = _megatron_config()
+        del config["megatron_cfg"]["distributed_data_parallel_config"][
+            "overlap_grad_reduce"
+        ]
+        with pytest.raises(KeyError, match="overlap_grad_reduce"):
+            _ddp_config(
+                config, reuse_grad_buf_for_mxfp8_param_ag=False, fp8_param_enabled=False
+            )
+
+    def test_derived_field_with_its_derived_value_is_accepted(self):
+        assert (
+            _ddp_config_of(average_in_collective=False).average_in_collective is False
+        )
+
+    def test_derived_field_with_another_value_is_rejected(self):
+        with pytest.raises(ValueError, match="average_in_collective"):
+            _ddp_config_of(average_in_collective=True)
+
+
 @pytest.mark.mcore
 class TestCreateMegatronConfigGlooProcessGroups:
     """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
