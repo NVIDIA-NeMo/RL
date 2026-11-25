@@ -98,6 +98,12 @@ The list may include `vllm` itself and nightly wheels. The listed requirements a
 
 When the overridden venv has a Triton wheel with its own `ptxas-blackwell`, the build also sets `TRITON_PTXAS_BLACKWELL_PATH` to it for that venv (through a `.pth` file, unless the variable is already set). Otherwise flashinfer points Triton at the base image's `ptxas`, which can be too old for the GPU the overridden torch targets.
 
+`MCORE_VENV_PACKAGE_OVERRIDES` does the same for the worker venvs that carry the `mcore` extra, with the same index list. By default it installs Triton 3.9.0, whose compiler knows Rubin (sm_107). The compiled training extensions are built against the locked torch, so use it for packages that do not link to torch. The default is equivalent to:
+
+```sh
+--build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
+```
+
 The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.
 
 ## Stripping the uv Cache
