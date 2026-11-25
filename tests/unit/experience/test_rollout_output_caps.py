@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.failures import UnsupportedOutputCap
 from nemo_rl.experience.rollouts import _attach_output_caps
 
 
@@ -40,5 +41,5 @@ def test_no_caps_leave_generation_input_unchanged(extra_env_info):
 
 
 def test_caps_fail_loudly_on_backends_that_ignore_them():
-    with pytest.raises(ValueError, match="only supported by the vLLM"):
+    with pytest.raises(UnsupportedOutputCap, match="only supported by the vLLM"):
         _attach([{"max_output_tokens": 4}], backend="megatron")

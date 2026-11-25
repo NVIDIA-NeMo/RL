@@ -79,7 +79,7 @@ from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
 )
 from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
-from nemo_rl.experience.failures import GymRowFailure
+from nemo_rl.experience.failures import GymRowFailure, UnsupportedOutputCap
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -425,7 +425,7 @@ def _output_caps(
         return None
     generation_config = getattr(policy_generation, "cfg", None) or {}
     if generation_config.get("backend") != "vllm":
-        raise ValueError(
+        raise UnsupportedOutputCap(
             "Per-sample max_output_tokens caps are only supported by the vLLM "
             "generation backend."
         )
@@ -1513,6 +1513,8 @@ async def run_sample_multi_turn_rollout(
                     per_worker_token_counts.get(worker_idx, 0) + gen_token_count
                 )
 
+        except UnsupportedOutputCap:
+            raise
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
             break

@@ -190,6 +190,14 @@ class RestoredHarnessChanged(RuntimeError):
     """
 
 
+class UnsupportedOutputCap(ValueError):
+    """A per-sample ``max_output_tokens`` cap that the generation path cannot honor.
+
+    Every capped request fails the same way, so it is terminal for the run: the
+    native multi-turn rollout re-raises it instead of ending only that sample.
+    """
+
+
 class RolloutStall(RuntimeError):
     """Rollouts are in flight but none has committed within the watchdog deadline."""
 

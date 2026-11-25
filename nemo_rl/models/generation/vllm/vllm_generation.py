@@ -1722,7 +1722,10 @@ class VllmGeneration(GenerationInterface):
         """One rollout through the frontend, sampled by the engine as natively."""
         # Local import: nemo_rl.experience pulls the rollout stack, which must not
         # become a load-time dependency of the generation backend.
-        from nemo_rl.experience.failures import GenerationUnavailable
+        from nemo_rl.experience.failures import (
+            GenerationUnavailable,
+            UnsupportedOutputCap,
+        )
         from nemo_rl.models.generation.dynamo.rollout_client import (
             post_rollout,
             rollout_payload,
@@ -1734,7 +1737,7 @@ class VllmGeneration(GenerationInterface):
             "outside this method."
         )
         if (data.get("max_output_tokens") or [None])[0] is not None:
-            raise ValueError(
+            raise UnsupportedOutputCap(
                 "Per-sample max_output_tokens caps are not supported through the "
                 "Dynamo frontend; set policy.generation.dynamo=false to use them."
             )
