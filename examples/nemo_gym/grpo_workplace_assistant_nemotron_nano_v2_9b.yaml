@@ -69,7 +69,7 @@ loss_fn:
   use_on_policy_kl_approximation: false
   truncated_importance_sampling_ratio: null
   use_importance_sampling_correction: false
-  token_level_loss: true
+  normalization: global_token_mean
 
 checkpointing:
   enabled: true
