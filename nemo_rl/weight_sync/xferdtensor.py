@@ -77,14 +77,18 @@ class DTensorRef:
 
 def _get_xferdtensor_selection() -> str:
     """Apply environment overrides to the default implementation selection."""
-    for selection in ("GOLDEN", "PYTHON"):
-        if os.environ.get(f"NRL_XFERDTENSOR_{selection}", "").lower() in (
+    for env_suffix, selection in (
+        ("GOLDEN", "NEMO_RL_GOLDEN"),
+        ("PYTHON", "NEMO_RL_PYTHON"),
+        ("NCCL", "NCCL_EXTENSION"),
+    ):
+        if os.environ.get(f"NRL_XFERDTENSOR_{env_suffix}", "").lower() in (
             "1",
             "true",
             "yes",
             "on",
         ):
-            return f"NEMO_RL_{selection}"
+            return selection
     return _XFERDTENSOR_DEFAULT_SELECTION
 
 
@@ -105,7 +109,7 @@ def follow_source_reshard_path(source_uses_real_op: bool) -> None:
     elif not uses_real_reshard_op():
         raise RuntimeError(
             "The refit source transfers with nccl.m2n.reshard, but this destination "
-            "cannot: select NCCL_EXTENSION, install nccl-extensions in its venv, "
+            "cannot: set NRL_XFERDTENSOR_NCCL=1, install nccl-extensions in its venv, "
             "and unset NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
             "NRL_XFERDTENSOR_PYTHON=1 for the source."
         )

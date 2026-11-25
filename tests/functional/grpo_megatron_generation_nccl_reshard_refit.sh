@@ -71,9 +71,10 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 rm -rf "$EXP_DIR"
 mkdir -p "$LOG_DIR"
 
-# Exercise the default dispatcher rather than forcing either fallback path.
+# Exercise the default dispatcher with all backend overrides unset.
 unset NRL_XFERDTENSOR_GOLDEN
 unset NRL_XFERDTENSOR_PYTHON
+unset NRL_XFERDTENSOR_NCCL
 
 cd "$PROJECT_ROOT"
 uv run coverage run -a \

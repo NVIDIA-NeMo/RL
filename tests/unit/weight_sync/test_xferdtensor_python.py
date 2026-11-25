@@ -89,7 +89,7 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     expected: str,
 ) -> None:
     dispatcher = import_module("nemo_rl.weight_sync.xferdtensor")
-    monkeypatch.setattr(dispatcher, "_XFERDTENSOR_DEFAULT_SELECTION", "NCCL_EXTENSION")
+    monkeypatch.setenv("NRL_XFERDTENSOR_NCCL", "1")
     backends = {name: Mock() for name in ("native", "python", "golden")}
     monkeypatch.setattr(
         dispatcher, "_reshard", backends["native"] if native_available else None
@@ -340,7 +340,7 @@ def test_striped_geometry_distributes_replica_receives():
 def test_destination_follows_a_source_on_the_python_path(monkeypatch):
     from nemo_rl.weight_sync import xferdtensor
 
-    monkeypatch.setattr(xferdtensor, "_XFERDTENSOR_DEFAULT_SELECTION", "NCCL_EXTENSION")
+    monkeypatch.setenv("NRL_XFERDTENSOR_NCCL", "1")
     monkeypatch.delenv("NRL_XFERDTENSOR_PYTHON", raising=False)
     monkeypatch.delenv("NRL_XFERDTENSOR_GOLDEN", raising=False)
     monkeypatch.setattr(xferdtensor, "_reshard", object())
