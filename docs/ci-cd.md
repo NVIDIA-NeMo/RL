@@ -42,16 +42,16 @@ Tests are organized into levels of increasing scope and cost:
 
 ## Nightly CI with `/nightly-ci`
 
-Members of the `automation` or `rl_autobot_approvers` GitHub teams can comment `/nightly-ci test-case=<nemo-ci job name>` on a PR to launch NVIDIA's internal nemo-ci pipeline. The pipeline builds the RL image from the PR head. For example:
+Members of the `automation` or `rl_autobot_approvers` GitHub teams can comment `/nightly-ci test-case=<test name>` on a PR to run NVIDIA's nightly CI on the PR head. The pipeline builds the RL image from the PR head. For example:
 
 ```text
 /nightly-ci test-case=llm_grpo_llama3_2_1b_instruct_1n8g_megatron
 ```
 
-- **Enroll once (NVIDIA employees only):** `run_as: requester` makes the pipeline run as the commenter's own GitLab account. Follow ["Enroll once" in the `trigger-gitlab-ci` README of `NVIDIA-NeMo/CI-Events-Workflows`](https://github.com/NVIDIA-NeMo/CI-Events-Workflows/blob/main/apps/workflows/capability/shared/trigger-gitlab-ci/README.md#enroll-once) (NVIDIA-internal). Without enrollment, Autobot refuses the command with a neutral check explaining what to do.
+- **Enroll once (NVIDIA employees only):** `run_as: requester` runs the pipeline as the commenter. Enroll once as described in the internal Autobot `/nightly-ci` docs. Without enrollment, Autobot refuses the command with a neutral check explaining what to do.
 - **Fork PRs:** first have the PR head vetted with `/ok to test <full-sha>` and wait for the copy-pr-bot mirror to match that head.
 - **Settings:** `test-suites` defaults to `nightly`; the default cluster is configured in [`.github/autobot/nightly-ci.yml`](https://github.com/NVIDIA-NeMo/RL/blob/main/.github/autobot/nightly-ci.yml). A command may override `test-cluster` (`h100-2`, the default, or `gb200-1`) and `test-suites`.
-- **Results:** the **`Autobot nightly CI`** check shows the applied settings, including `run as | requester`, and the pipeline result. A new push supersedes the run; the GitLab pipeline is not cancelled.
+- **Results:** the **`Autobot nightly CI`** check shows the applied settings, including `run as | requester`, and the pipeline result. A new push supersedes the run; the running pipeline is not cancelled.
 
 ## Required Checks
 
