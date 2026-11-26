@@ -158,10 +158,11 @@ def test_per_device_patch_is_found_by_name():
 
 
 def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
+    patched = []
     monkeypatch.setattr(
         compile_cache,
         "_vllm_patches",
-        lambda: {"_patch_vllm_compile_cache_per_device": lambda logger: None},
+        lambda: {"_patch_vllm_compile_cache_per_device": patched.append},
     )
     (caches / "shared/vllm/vllm/torch_compile_cache").mkdir(parents=True)
     (caches / "shared/vllm/vllm/torch_compile_cache/entry").write_text("compiled")
@@ -169,6 +170,7 @@ def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
 
     compile_cache._prepare_vllm_engine_on_this_node(engine)
     assert (caches / "local/vllm_engines/0/torch_compile_cache/entry").exists()
+    assert len(patched) == 1
 
 
 def test_deterministic_runs_warn_when_autotune_results_are_shared(
