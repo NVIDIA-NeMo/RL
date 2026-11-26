@@ -2831,28 +2831,37 @@ def _megatron_worker_method_ast(worker_kind, name):
 def test_megatron_worker_init_validates_manual_gc_early_and_enables_it_last(
     worker_kind,
 ):
-    """__init__ fails on a bad config before setup and disables GC only at the end.
+    """__init__ fails on a bad config before setup and sets GC up only at the end.
 
     The worker constructor needs GPUs and a model, so this checks the call sites in
-    the source: one validation call, and enabling as the last statement.
+    the source: one validation call, then enabling manual GC and freezing the
+    surviving objects as the last two statements.
     """
     init_fn = _megatron_worker_method_ast(worker_kind, "__init__")
+    gc_methods = (
+        "_manual_gc_interval_from_cfg",
+        "_maybe_enable_manual_gc",
+        "_freeze_gc_after_init",
+    )
     calls = [
         node.func.attr
         for node in ast.walk(init_fn)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr
-        in ("_manual_gc_interval_from_cfg", "_maybe_enable_manual_gc")
+        and node.func.attr in gc_methods
     ]
-    assert calls.count("_manual_gc_interval_from_cfg") == 1
-    assert calls.count("_maybe_enable_manual_gc") == 1
-    last = init_fn.body[-1]
-    assert (
-        isinstance(last, ast.Expr)
-        and isinstance(last.value, ast.Call)
-        and last.value.func.attr == "_maybe_enable_manual_gc"
-    ), "_maybe_enable_manual_gc must be the last statement of __init__"
+    for name in gc_methods:
+        assert calls.count(name) == 1, name
+    last_two = [
+        stmt.value.func.attr
+        for stmt in init_fn.body[-2:]
+        if isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+    ]
+    assert last_two == ["_maybe_enable_manual_gc", "_freeze_gc_after_init"], (
+        "__init__ must end with _maybe_enable_manual_gc() then _freeze_gc_after_init()"
+    )
 
 
 @pytest.mark.parametrize("worker_kind", sorted(_MANUAL_GC_WORKERS))

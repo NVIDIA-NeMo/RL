@@ -570,6 +570,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
+        self._freeze_gc_after_init()
 
     def validate_forest_execution_padding(self) -> None:
         """Apply the policy's Forest router checks to the critic."""

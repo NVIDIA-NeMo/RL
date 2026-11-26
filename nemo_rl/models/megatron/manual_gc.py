@@ -17,6 +17,9 @@ An automatic full Python GC lands on whichever rank crosses its threshold, and
 every other rank then waits for it in the next collective. With
 ``megatron_cfg.manual_gc`` set, a worker disables automatic GC and every rank
 collects together every ``megatron_cfg.manual_gc_interval`` optimizer steps.
+
+Independently of ``manual_gc``, a worker freezes the objects that survive setup,
+so the explicit and periodic full collections after it skip them.
 """
 
 import gc
@@ -28,12 +31,13 @@ class ManualGCMixin:
     """Manual GC for Megatron workers that train across data-parallel ranks.
 
     The host class must set ``self.cfg`` (with a ``"megatron_cfg"`` entry) and make
-    three calls:
+    four calls:
 
     - ``self._manual_gc_interval_from_cfg()`` early in ``__init__``, to fail on a
       bad config before the expensive setup;
-    - ``self._maybe_enable_manual_gc()`` as the last statement of ``__init__``,
-      so model, optimizer and checkpoint setup run with automatic GC on;
+    - ``self._maybe_enable_manual_gc()`` at the end of ``__init__``, so model,
+      optimizer and checkpoint setup run with automatic GC on;
+    - ``self._freeze_gc_after_init()`` as the last statement of ``__init__``;
     - ``self._maybe_run_manual_gc()`` once after every optimizer step.
     """
 
@@ -79,6 +83,21 @@ class ManualGCMixin:
         gc.disable()
         os.register_at_fork(after_in_child=gc.enable)
         self._manual_gc_interval = interval
+
+    def _freeze_gc_after_init(self) -> None:
+        """Collect the garbage left by setup, then freeze every surviving object.
+
+        Every full collection scans all tracked objects, and setup leaves many
+        long-lived ones (model, optimizer, configs) that later collections can never
+        free. ``gc.freeze()`` moves them to the permanent generation, which
+        collections skip. Setup garbage held in reference cycles, such as the
+        reference model's DDP buffers, must be collected first, or it would be
+        frozen and never freed. Objects created later are collected as before.
+        """
+        if self._manual_gc_interval is None:
+            # With manual GC on, _maybe_enable_manual_gc() has just collected.
+            gc.collect()
+        gc.freeze()
 
     def _maybe_run_manual_gc(self) -> None:
         """Collect every manual_gc_interval optimizer steps; every rank runs it in lockstep."""
