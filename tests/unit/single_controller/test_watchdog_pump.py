@@ -31,6 +31,7 @@ import ray.exceptions
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.models.generation.fleet_health import (
@@ -744,6 +745,39 @@ class TestEnvHealthCheck:
             env_handles={"nemo_gym": _Handle()},
         )
         asyncio.run(_run_full_ticks(ctrl, 2))
+
+    def test_an_unhealthy_actor_of_the_second_shard_is_named_by_its_label(self):
+        """The pump reads a shard set under "nemo_gym" and asks each of its actors.
+
+        The shard set has no health check of its own, and only the actor of the
+        second shard is unhealthy. The tests of ``NemoGymShardSet.check_health`` in
+        ``tests/unit/environments/test_nemo_gym_utils.py`` cover how the actors are
+        asked.
+        """
+        healthy = SimpleNamespace(health_check=SimpleNamespace(remote=_completed))
+        unhealthy = SimpleNamespace(
+            health_check=SimpleNamespace(
+                remote=lambda: _failed(
+                    RuntimeError("Process `search` finished unexpectedly!")
+                )
+            )
+        )
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"tools": [healthy], "search": [unhealthy]}
+                )
+            },
+        )
+        with pytest.raises(
+            RuntimeError, match="'nemo_gym' instance 'search' reported unhealthy"
+        ):
+            asyncio.run(_run_full_ticks(ctrl, 2))
 
 
 def _completed(_value=None):
