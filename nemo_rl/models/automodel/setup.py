@@ -972,8 +972,16 @@ def setup_model_and_optimizer(
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    # force_hf means the HF implementation was loaded even though the architecture
+    # has a custom entry in ModelRegistry, so the registry lookup alone would
+    # misreport it as non-HF. That matters for the autocast gate below: an HF MoE
+    # model needs autocast to reconcile the fp32 activations produced by
+    # MixedPrecisionPolicy(output_dtype=float32) with its bf16 params, and without
+    # it the first unwrapped matmul raises "expected mat1 and mat2 to have the same
+    # dtype, float != c10::BFloat16" at lm_head.
     is_hf_model = (
-        model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
+        automodel_kwargs.get("force_hf", False)
+        or model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
     # Autocast is disabled for custom MoE models (non-HF) to avoid numerical issues
     autocast_enabled = not (is_moe_model and not is_hf_model)
@@ -989,6 +997,28 @@ def setup_model_and_optimizer(
     )
     if is_tied_lm_head:
         model.tie_weights()
+
+    # Freeze parameters matching the configured substrings. A submodule that never
+    # receives gradients (e.g. the nemotron_h `mtp.*` head during distillation, where
+    # loss flows only through lm_head) still has requires_grad=True by default, so the
+    # optimizer expects state for it on resume but none was saved -> "Missing key in
+    # checkpoint state_dict: optim.state.mtp...". Setting requires_grad=False makes
+    # save/load symmetric. Default [] -> no-op.
+    freeze_patterns = config.get("freeze_parameter_patterns") or []
+    if freeze_patterns:
+        n_matched = 0
+        n_frozen = 0
+        for name, param in model.named_parameters():
+            if any(pat in name for pat in freeze_patterns):
+                n_matched += 1
+                if param.requires_grad:
+                    param.requires_grad_(False)
+                    n_frozen += 1
+        if rank == 0:
+            print(
+                f"Freeze patterns matched {n_matched} parameters; newly froze "
+                f"{n_frozen}: freeze_parameter_patterns={list(freeze_patterns)}"
+            )
 
     # CPU offload if needed
     if cpu_offload:
