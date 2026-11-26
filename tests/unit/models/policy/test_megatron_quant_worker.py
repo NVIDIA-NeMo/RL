@@ -773,6 +773,67 @@ def test_real_quant_refit_rendezvouses_between_materialized_groups(monkeypatch):
     )
 
 
+@requires_weight_folding
+def test_real_quant_refit_sync_every_bounds_rendezvous(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_refit_sync_every"] = 2
+    worker._real_quant_refit_sync_group = object()
+    events = []
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker.torch.distributed,
+        "monitored_barrier",
+        lambda **kwargs: events.append("barrier"),
+    )
+
+    def export_groups(*args, **kwargs):
+        for i in range(3):
+            events.append(f"export_{i}")
+            yield ((f"model.layers.{i}.mlp.down_proj.weight", torch.ones(2, 2)),)
+
+    worker.megatron_bridge.export_hf_weight_groups_modelopt = export_groups
+    names = [name for name, _ in worker._iter_real_quant_refit_params()]
+
+    assert names == [f"model.layers.{i}.mlp.down_proj.weight" for i in range(3)]
+    # Requests 0 and 2 rendezvous; request 3 ends the stream and always does.
+    assert events == [
+        "barrier",
+        "export_0",
+        "export_1",
+        "barrier",
+        "export_2",
+        "barrier",
+    ]
+
+
+@requires_weight_folding
+def test_real_quant_refit_sync_every_aligned_end_syncs_once(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_refit_sync_every"] = 2
+    worker._real_quant_refit_sync_group = object()
+    events = []
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker.torch.distributed,
+        "monitored_barrier",
+        lambda **kwargs: events.append("barrier"),
+    )
+
+    def export_groups(*args, **kwargs):
+        for i in range(2):
+            events.append(f"export_{i}")
+            yield ((f"model.layers.{i}.mlp.down_proj.weight", torch.ones(2, 2)),)
+
+    worker.megatron_bridge.export_hf_weight_groups_modelopt = export_groups
+    list(worker._iter_real_quant_refit_params())
+
+    assert events == ["barrier", "export_0", "export_1", "barrier"]
+
+
 def _distributed_refit_group_rendezvous_worker(rank, world_size, init_file):
     torch.distributed.init_process_group(
         "gloo",

@@ -234,6 +234,15 @@ def configure_generation_config(
                 raise ValueError(
                     "generation.real_quant_export_cpu_offload must be a boolean"
                 )
+            sync_every = config.get("real_quant_refit_sync_every", 1)
+            if (
+                isinstance(sync_every, bool)
+                or not isinstance(sync_every, int)
+                or sync_every < 1
+            ):
+                raise ValueError(
+                    "generation.real_quant_refit_sync_every must be a positive integer"
+                )
             colocated = config.get("colocated")
             if not export_cpu_offload and (
                 colocated is None or config.get("refit_transport") is not None

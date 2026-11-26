@@ -264,6 +264,11 @@ class VllmConfig(GenerationConfig):
     # Required when real_quant is true. Disabling CPU offload keeps packed export
     # tensors on GPU for default CUDA-IPC or collective refit.
     real_quant_export_cpu_offload: NotRequired[bool]
+    # Real-quant collective refit: policy ranks rendezvous (gloo monitored
+    # barrier over all policy ranks) every N exported groups. 1 (default) syncs
+    # before every group. Larger values let ranks overlap export with rank 0's
+    # broadcast, bounding run-ahead to N groups; the stream end always syncs.
+    real_quant_refit_sync_every: NotRequired[int]
 
     # FQN of a worker extension class to use instead of the resolved default
     # generation worker. Must be a subclass of the resolved worker and cannot

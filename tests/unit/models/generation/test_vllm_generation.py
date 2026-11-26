@@ -2750,6 +2750,34 @@ def test_configure_generation_config_rejects_non_boolean_real_quant_export() -> 
         )
 
 
+@pytest.mark.parametrize("sync_every", [0, -1, 1.5, "2", True])
+def test_configure_generation_config_rejects_invalid_real_quant_refit_sync_every(
+    sync_every,
+) -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = True
+    vllm_config["real_quant_refit_sync_every"] = sync_every
+
+    with pytest.raises(ValueError, match="real_quant_refit_sync_every"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_accepts_real_quant_refit_sync_every() -> None:
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = True
+    vllm_config["real_quant_refit_sync_every"] = 64
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_refit_sync_every"] == 64
+
+
 def test_configure_generation_config_rejects_gpu_export_without_colocated_config() -> (
     None
 ):

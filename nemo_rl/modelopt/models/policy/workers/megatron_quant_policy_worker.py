@@ -34,6 +34,7 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
 try:
     from modelopt.torch.quantization.utils import apply_without_qdq
 except ImportError:  # ModelOpt predating #3124, which is where this landed upstream.
@@ -63,6 +64,7 @@ except ImportError:  # ModelOpt predating #3124, which is where this landed upst
             finally:
                 member._disabled = disabled
         return inputs
+
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
@@ -618,18 +620,33 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 export_plan=plan,
             )
         )
+        # Rendezvous every ``sync_every`` groups (1 = before every group). Every
+        # rank requests the same group sequence, so all ranks agree on which
+        # requests carry a barrier; the end of the stream always does.
+        sync_every = generation_cfg.get("real_quant_refit_sync_every", 1)
+        num_requested = 0
+
+        def _rendezvous():
+            torch.distributed.monitored_barrier(
+                group=self._real_quant_refit_sync_group,
+                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS),
+                wait_all_ranks=True,
+            )
+
         while True:
-            if self._real_quant_refit_sync_group is not None:
-                torch.distributed.monitored_barrier(
-                    group=self._real_quant_refit_sync_group,
-                    timeout=timedelta(
-                        milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
-                    ),
-                    wait_all_ranks=True,
-                )
+            synced = False
+            if (
+                self._real_quant_refit_sync_group is not None
+                and num_requested % sync_every == 0
+            ):
+                _rendezvous()
+                synced = True
+            num_requested += 1
             try:
                 group = next(groups)
             except StopIteration:
+                if self._real_quant_refit_sync_group is not None and not synced:
+                    _rendezvous()
                 return
             try:
                 yield group
