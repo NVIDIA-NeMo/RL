@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import re
-from typing import Callable, Optional
+import string
+from collections import Counter
+from typing import Callable, Optional, Union
 
 import numpy as np
 from math_verify.errors import TimeoutException
@@ -83,6 +85,111 @@ def exact_answer_alphanumeric_reward(
         if answer_clean == ground_truth_clean:
             return 1.0, True
     return 0.0, False
+
+
+_ARTICLES_RE = re.compile(r"\b(a|an|the)\b")
+_PUNCTUATION = frozenset(string.punctuation)
+
+
+def normalize_qa_answer(text: str) -> str:
+    """SQuAD-style answer normalization used by open-domain QA benchmarks.
+
+    Lowercases, strips punctuation, drops the articles "a", "an" and "the",
+    and collapses whitespace. This is the normalization behind the EM and F1
+    numbers reported for NQ, TriviaQA, HotpotQA, MuSiQue and Search-R1.
+    """
+    text = text.lower()
+    text = "".join(ch for ch in text if ch not in _PUNCTUATION)
+    text = _ARTICLES_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _extract_last_tagged_answer(response: str, answer_tag: str) -> Optional[str]:
+    """Return the contents of the last <answer_tag>...</answer_tag> block, if any.
+
+    The last block is used because multi-turn agents often mention the tag in
+    their reasoning (or in retrieved text) before committing a final answer.
+    """
+    matches = re.findall(rf"<{answer_tag}>([\s\S]*?)</{answer_tag}>", response)
+    return matches[-1] if matches else None
+
+
+def _as_answer_list(ground_truth: Union[str, list[str]]) -> list[str]:
+    return [ground_truth] if isinstance(ground_truth, str) else list(ground_truth)
+
+
+def _token_f1(prediction: str, gold: str) -> float:
+    pred_tokens = normalize_qa_answer(prediction).split()
+    gold_tokens = normalize_qa_answer(gold).split()
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+    num_same = sum((Counter(pred_tokens) & Counter(gold_tokens)).values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def qa_exact_match_reward(
+    ground_truth: Union[str, list[str]], response: str, answer_tag: str = "answer"
+) -> tuple[float, bool]:
+    """SQuAD-normalized exact match on the last <{answer_tag}> block.
+
+    `ground_truth` may be a single string or a list of acceptable answers; the
+    response scores 1.0 if it matches any of them after `normalize_qa_answer`.
+    An answer that normalizes to the empty string never matches.
+    """
+    answer = _extract_last_tagged_answer(response, answer_tag)
+    if answer is None:
+        return 0.0, False
+    normalized = normalize_qa_answer(answer)
+    if not normalized:
+        return 0.0, False
+    for gold in _as_answer_list(ground_truth):
+        if normalized == normalize_qa_answer(gold):
+            return 1.0, True
+    return 0.0, False
+
+
+def qa_f1_reward(
+    ground_truth: Union[str, list[str]],
+    response: str,
+    answer_tag: str = "answer",
+    format_floor: float = 0.0,
+) -> tuple[float, bool]:
+    """SQuAD token-level F1 on the last <{answer_tag}> block, best over the gold answers.
+
+    A dense alternative to `qa_exact_match_reward`: partially correct answers
+    get partial credit, which gives GRPO a non-zero advantage on groups where
+    no rollout is an exact match. This matters most for small policies, where
+    exact-match-only rewards leave many groups with all-zero rewards.
+
+    Args:
+        ground_truth: A single answer string or a list of acceptable answers.
+        response: The full model response.
+        answer_tag: Tag that wraps the final answer.
+        format_floor: Reward given to a response that has a well-formed answer
+            block but zero token overlap (ReSearch uses 0.1). Responses with
+            no answer block always score 0.0.
+
+    Returns:
+        (reward, is_correct), where is_correct is the normalized exact match.
+    """
+    if not 0.0 <= format_floor <= 1.0:
+        raise ValueError(f"format_floor must be in [0, 1], got {format_floor}")
+    answer = _extract_last_tagged_answer(response, answer_tag)
+    if answer is None:
+        return 0.0, False
+    golds = _as_answer_list(ground_truth)
+    f1 = max((_token_f1(answer, gold) for gold in golds), default=0.0)
+    normalized = normalize_qa_answer(answer)
+    is_correct = bool(normalized) and any(
+        normalized == normalize_qa_answer(gold) for gold in golds
+    )
+    if f1 == 0.0:
+        return format_floor, is_correct
+    return f1, is_correct
 
 
 def bbox_giou_reward(
