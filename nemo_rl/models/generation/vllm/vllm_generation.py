@@ -3102,12 +3102,14 @@ class VllmGeneration(GenerationInterface):
         return True
 
     def get_generation_prefix_counts(self) -> dict[str, int]:
-        """Sum over workers of generation-prefix restore and cut counts."""
+        """Sum over workers and their HTTP frontends of generation-prefix counts."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-        futures = self._fan_out("get_generation_prefix_counts")
+        futures = self._fan_out("get_generation_prefix_counts_per_frontend")
         totals: dict[str, int] = {}
-        for counts in ray.get(futures):
+        for counts in (
+            frontend for frontends in ray.get(futures) for frontend in frontends
+        ):
             for name, value in counts.items():
                 totals[name] = totals.get(name, 0) + value
         return totals

@@ -197,7 +197,7 @@ def test_plan_engines_lays_replicas_out_contiguously(
 
 
 def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
-    with pytest.raises(AssertionError, match="replica width 3 GPUs"):
+    with pytest.raises(ValueError, match="replica width 3 GPUs"):
         plan_engines(
             8,
             layout=DisaggConfig(enabled=True),

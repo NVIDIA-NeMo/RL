@@ -134,6 +134,9 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
@@ -721,7 +724,7 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
     ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and normalization=global_token_mean (legacy token_level_loss=true)"
+            "and normalization=global_token_mean"
         )
     # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
     if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
@@ -893,6 +896,8 @@ def setup(
             "SingleController token-capture path"
         )
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
@@ -5220,7 +5225,7 @@ def aggregate_rollout_metrics(
     - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
-    - "total_turns": summed
+    - "total_turns" and metrics ending with "/num_groups": summed
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -5244,7 +5249,8 @@ def aggregate_rollout_metrics(
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or k.endswith("/num_groups"):
+            # Counts add up across groups; averaging would always give 1.
             aggregated[k] = sum(v)
         elif k == "trajectory_duration_s":
             sorted_v = sorted(v)

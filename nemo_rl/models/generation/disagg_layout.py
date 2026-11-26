@@ -40,6 +40,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import DisaggConfig
 
 Role = Literal["prefill", "decode"]
@@ -82,6 +83,10 @@ def validate_disagg_entrypoint(
     if not resolve_disagg_layout(generation_config).enabled:
         return
     backend = generation_config["backend"]
+    if backend == "megatron" and dynamo_enabled(generation_config):
+        # Megatron prefill/decode engines behind Dynamo are a separate path with
+        # its own checks (megatron/dynamo_config.py).
+        return
     if backend not in DISAGG_BACKENDS:
         raise ValueError(
             "policy.generation.disaggregation.enabled is only supported for "
@@ -204,6 +209,22 @@ def engine_width(engine_cfg: Mapping[str, Any]) -> int:
     return int(engine_cfg["tensor_parallel_size"]) * int(1 if pp is None else pp)
 
 
+def replica_width_from(
+    layout: DisaggConfig, *, prefill_width: int, decode_width: int
+) -> int:
+    """GPUs one prefill/decode replica spans: its prefill engines plus its decode engines.
+
+    For TRT-LLM, whose frontend serves one replica, the replica must stay inside
+    one NVLink domain, since the KV cache crosses from prefill to decode on every
+    turn. Behind Dynamo the router pairs prefill and decode engines across the
+    whole fleet, so there only one engine needs NVLink.
+    """
+    return (
+        layout.num_prefill_engines * prefill_width
+        + layout.num_decode_engines * decode_width
+    )
+
+
 def replica_width(config: Mapping[str, Any], *, backend_cfg_key: str) -> int:
     """GPUs one rollout replica spans.
 
@@ -215,15 +236,14 @@ def replica_width(config: Mapping[str, Any], *, backend_cfg_key: str) -> int:
     layout = resolve_disagg_layout(config)
     if not layout.enabled:
         return engine_width(config[backend_cfg_key])
-    widths = {
-        role: engine_width(
-            role_engine_config(config, role, backend_cfg_key=backend_cfg_key)
-        )
-        for role in ROLES
-    }
-    return (
-        layout.num_prefill_engines * widths["prefill"]
-        + layout.num_decode_engines * widths["decode"]
+    return replica_width_from(
+        layout,
+        prefill_width=engine_width(
+            role_engine_config(config, "prefill", backend_cfg_key=backend_cfg_key)
+        ),
+        decode_width=engine_width(
+            role_engine_config(config, "decode", backend_cfg_key=backend_cfg_key)
+        ),
     )
 
 
@@ -248,29 +268,41 @@ def plan_engines(
     The replica *count* is derived, not configured: it follows from the cluster
     size, the same way the DP-shard count does without disaggregation. Same-role
     engines stay contiguous so each role's GPUs are adjacent.
+
+    Raises:
+        ValueError: When the engines do not tile ``world_size`` GPUs.
     """
     if not layout.enabled:
-        assert world_size % aggregated_width == 0, (
-            f"Cluster world_size ({world_size}) must be divisible by the engine "
-            f"width ({aggregated_width})."
-        )
+        if world_size % aggregated_width != 0:
+            raise ValueError(
+                f"Cluster world_size ({world_size}) must be divisible by the "
+                f"engine width ({aggregated_width})."
+            )
         n = world_size // aggregated_width
         # Without disaggregation a replica *is* an engine: one DP shard, one
-        # URL, nothing below it to front. Reporting n rather than 1 keeps
-        # "replica" meaning the same thing on both paths.
+        # URL, nothing below it to front.
         return ["aggregated"] * n, [aggregated_width] * n, n
 
     for role, value in (("prefill", prefill_width), ("decode", decode_width)):
-        assert value >= 1, f"{backend_cfg_key}.{role}_engine must span >= 1 GPU"
+        if value < 1:
+            raise ValueError(f"{backend_cfg_key}.{role}_engine must span >= 1 GPU")
 
     num_prefill = layout.num_prefill_engines
     num_decode = layout.num_decode_engines
-    width = num_prefill * prefill_width + num_decode * decode_width
-    assert world_size % width == 0, (
-        f"replica width {width} GPUs ({num_prefill} prefill x "
-        f"{prefill_width} + {num_decode} decode x {decode_width}) does not "
-        f"divide the {world_size} inference GPUs."
+    if num_prefill < 1 or num_decode < 1:
+        raise ValueError(
+            "a replica needs at least one engine of each role, got "
+            f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
+        )
+    width = replica_width_from(
+        layout, prefill_width=prefill_width, decode_width=decode_width
     )
+    if world_size % width != 0:
+        raise ValueError(
+            f"replica width {width} GPUs ({num_prefill} prefill x "
+            f"{prefill_width} + {num_decode} decode x {decode_width}) does not "
+            f"divide the {world_size} inference GPUs."
+        )
     num_replicas = world_size // width
 
     roles = (["prefill"] * num_prefill + ["decode"] * num_decode) * num_replicas

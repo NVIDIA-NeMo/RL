@@ -70,7 +70,6 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     CheckpointMutationKind,
@@ -125,6 +124,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
     row_group_ids,
     split_meta_by_prompt_group,
+    validate_forest_estimator,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -3442,6 +3442,19 @@ class SingleControllerActor:
                         * self._async_cfg.rollout_failure.min_step_batch_fraction
                     )
                 )
+                if (
+                    forest_training
+                    and not skipped_step
+                    and (
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
+                        or len(logical_owners)
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
+                    )
+                ):
+                    raise ValueError(
+                        "Forest optimizer step requires complete retained logical groups"
+                    )
                 if skipped_step:
                     if step_open:
                         await asyncio.to_thread(self._trainer.abort_train_step)
@@ -3547,15 +3560,6 @@ class SingleControllerActor:
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
-                    if forest_training and (
-                        groups_dispatched
-                        != self._target_groups_for_step(version_during_step)
-                        or len(logical_owners)
-                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
-                    ):
-                        raise ValueError(
-                            "Forest optimizer step requires complete retained logical groups"
-                        )
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -5356,18 +5360,26 @@ class SingleControllerActor:
         if value_loss_fn is None:
             raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
+        # Forest steps carry a variable number of physical rows; the critic
+        # takes all of them as one optimizer step, like the policy.
+        gbs = sum(m.size for m in metas) if has_logical_owners(metas[0]) else None
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
-                    self._value.train_from_meta, full_meta, value_loss_fn
+                    self._value.train_from_meta,
+                    full_meta,
+                    value_loss_fn,
+                    gbs=gbs,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects
             # all step chunks before training the critic.
             for _ in range(num_epochs):
-                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                await asyncio.to_thread(
+                    self._value.begin_train_step, value_loss_fn, gbs=gbs
+                )
                 for meta in metas:
                     await asyncio.to_thread(
                         self._value.train_microbatches_from_meta, meta
@@ -5401,15 +5413,7 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            if (
-                self._is_ppo
-                or not isinstance(self._algo_cfg, GRPOConfig)
-                or self._algo_cfg.adv_estimator.name != "grpo"
-                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-            ):
-                raise ValueError(
-                    "Forest logical owners require the standard GRPO estimator"
-                )
+            validate_forest_estimator(self._advantage_estimator, is_ppo=self._is_ppo)
             validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True

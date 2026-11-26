@@ -21,12 +21,12 @@ import torch
 from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmDisaggServerConfig,
     replica_width,
-    resolve_disagg_layout,
     resolve_disagg_server_config,
     resolve_role_overrides,
     role_engine_config,
@@ -100,9 +100,14 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
 
 
 @pytest.mark.parametrize(
-    ("cluster", "config_update", "error"),
+    ("cluster", "config_update", "exc", "error"),
     [
-        (_Cluster(world_size=3), {"tensor_parallel_size": 2}, "must be divisible"),
+        (
+            _Cluster(world_size=3),
+            {"tensor_parallel_size": 2},
+            ValueError,
+            "must be divisible",
+        ),
         (
             _Cluster(world_size=4),
             {
@@ -110,20 +115,27 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
                 "moe_tensor_parallel_size": 2,
                 "moe_expert_parallel_size": 1,
             },
+            AssertionError,
             "must equal tensor_parallel_size",
         ),
-        (_Cluster(), {"async_engine": False}, "requires trtllm_cfg.async_engine=true"),
+        (
+            _Cluster(),
+            {"async_engine": False},
+            AssertionError,
+            "requires trtllm_cfg.async_engine=true",
+        ),
         (
             _Cluster(world_size=4, gpus_per_node=2),
             {"tensor_parallel_size": 4},
+            AssertionError,
             "only supported for non-colocated",
         ),
     ],
 )
 def test_invalid_async_engine_configuration_fails_before_worker_start(
-    cluster, config_update, error
+    cluster, config_update, exc, error
 ):
-    with pytest.raises(AssertionError, match=error):
+    with pytest.raises(exc, match=error):
         TrtllmGeneration(cluster, _config(**config_update))
 
 
@@ -538,7 +550,27 @@ def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
     generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
     generation._disagg_cfg = resolve_disagg_layout(cfg)
 
-    with pytest.raises(AssertionError, match="replica width 3 GPUs"):
+    with pytest.raises(ValueError, match="replica width 3 GPUs"):
+        generation._plan_engines(8)
+
+
+@pytest.mark.parametrize(("num_prefill", "num_decode"), [(0, 1), (1, 0), (0, 0)])
+def test_plan_engines_rejects_a_replica_without_both_roles(num_prefill, num_decode):
+    cfg = resolve_role_overrides(
+        _config(
+            disaggregation={
+                "enabled": True,
+                "num_prefill_engines": num_prefill,
+                "num_decode_engines": num_decode,
+            },
+        )
+    )
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg_cfg = resolve_disagg_layout(cfg)
+
+    with pytest.raises(ValueError, match="at least one engine of each role"):
         generation._plan_engines(8)
 
 
