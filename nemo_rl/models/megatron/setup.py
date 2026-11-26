@@ -2978,6 +2978,16 @@ def handle_model_import(
         parallel_state.destroy_model_parallel()
 
 
+def _is_shared_frozen_peft_param(item: object, peft_enabled: bool) -> bool:
+    """Identify frozen PEFT parameters shared by the policy and reference.
+
+    Buffers and extra state can change even when the base parameters are frozen.
+    """
+    return (
+        peft_enabled and isinstance(item, torch.nn.Parameter) and not item.requires_grad
+    )
+
+
 def setup_reference_model_state(
     config: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -3119,12 +3129,7 @@ def setup_reference_model_state(
             reference_model.eval()
             # Store reference state dict on CPU
             for name, item in reference_model.state_dict(keep_vars=True).items():
-                # PEFT shares frozen parameters; buffers and extra state can change.
-                if (
-                    use_peft
-                    and isinstance(item, torch.nn.Parameter)
-                    and not item.requires_grad
-                ):
+                if _is_shared_frozen_peft_param(item, use_peft):
                     continue
                 if isinstance(item, torch.Tensor):
                     cpu_item = item.detach().to(

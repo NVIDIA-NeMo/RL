@@ -128,6 +128,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.setup import (
     _distributed_timeout_minutes,
+    _is_shared_frozen_peft_param,
     build_inference_model,
     enable_batch_invariant_mode,
     finalize_megatron_setup,
@@ -3325,12 +3326,7 @@ class MegatronPolicyWorkerImpl(
                 or "draft_model." in state_dict_key
             ):
                 continue
-            # PEFT shares frozen parameters; buffers and extra state can change.
-            if (
-                peft_enabled
-                and isinstance(param_or_buf, torch.nn.Parameter)
-                and not param_or_buf.requires_grad
-            ):
+            if _is_shared_frozen_peft_param(param_or_buf, peft_enabled):
                 continue
             if state_dict_key not in source_state_dict:
                 if raise_if_key_missing:
@@ -3383,12 +3379,7 @@ class MegatronPolicyWorkerImpl(
             )
             model_state_dict = {}
             for name, item in self.model.state_dict(keep_vars=True).items():
-                # PEFT shares frozen parameters; buffers and extra state can change.
-                if (
-                    peft_enabled
-                    and isinstance(item, torch.nn.Parameter)
-                    and not item.requires_grad
-                ):
+                if _is_shared_frozen_peft_param(item, peft_enabled):
                     continue
                 if isinstance(item, torch.Tensor):
                     item = item.detach().to(device="cpu", non_blocking=True, copy=True)
