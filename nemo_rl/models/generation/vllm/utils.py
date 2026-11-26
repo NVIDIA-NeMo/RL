@@ -1131,22 +1131,25 @@ def compute_spec_decode_metrics(
     num_draft_tokens = delta.get("vllm:spec_decode_num_draft_tokens", 0.0)
     num_accepted_tokens = delta.get("vllm:spec_decode_num_accepted_tokens", 0.0)
 
-    # acceptance_length = 1 + (accepted / drafts) represents average tokens
-    # generated per draft batch (1 target model token + accepted draft tokens)
-    acceptance_length = (
-        1.0 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else 1.0
-    )
-    acceptance_rate = (
-        num_accepted_tokens / num_draft_tokens if num_draft_tokens > 0 else 0.0
-    )
-
     spec_metrics: dict[str, float] = {
         "vllm/spec_num_drafts": num_drafts,
         "vllm/spec_num_draft_tokens": num_draft_tokens,
         "vllm/spec_num_accepted_tokens": num_accepted_tokens,
-        "vllm/spec_acceptance_length": acceptance_length,
-        "vllm/spec_acceptance_rate": acceptance_rate,
     }
+    # A window with no drafts (e.g. async GRPO's first step after a resume, when
+    # the collector is paused for the whole window) has no acceptance to report.
+    # Omit the ratios instead of logging 1.0 / 0.0, which read as a drafter that
+    # accepts nothing and bias step-window means.
+    if num_drafts > 0:
+        # acceptance_length = 1 + (accepted / drafts) represents average tokens
+        # generated per draft batch (1 target model token + accepted draft tokens)
+        spec_metrics["vllm/spec_acceptance_length"] = 1.0 + (
+            num_accepted_tokens / num_drafts
+        )
+    if num_draft_tokens > 0:
+        spec_metrics["vllm/spec_acceptance_rate"] = (
+            num_accepted_tokens / num_draft_tokens
+        )
 
     # Add per-position metrics for detailed analysis
     for key, value in delta.items():

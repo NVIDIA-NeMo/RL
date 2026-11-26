@@ -1130,6 +1130,25 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
 
 
+
+def test_compute_spec_decode_metrics_empty_window_omits_ratios():
+    """A window with no drafts reports counts but no acceptance ratios."""
+    counters = {
+        "vllm:spec_decode_num_drafts": 100.0,
+        "vllm:spec_decode_num_draft_tokens": 300.0,
+        "vllm:spec_decode_num_accepted_tokens": 200.0,
+        ("vllm:spec_decode_num_accepted_tokens_per_pos", 0): 80.0,
+    }
+
+    metrics = compute_spec_decode_metrics(counters, dict(counters))
+
+    assert metrics["vllm/spec_num_drafts"] == 0.0
+    assert metrics["vllm/spec_num_draft_tokens"] == 0.0
+    assert metrics["vllm/spec_num_accepted_tokens"] == 0.0
+    assert "vllm/spec_acceptance_length" not in metrics
+    assert "vllm/spec_acceptance_rate" not in metrics
+    assert "vllm/spec_acceptance_rate-pos-0" not in metrics
+
 def _engine_snapshot(
     prompt_tokens: float,
     generation_tokens: float,
