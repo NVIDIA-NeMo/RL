@@ -96,7 +96,6 @@ from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
-from nemo_rl.algorithms.ppo_utils.privileged_value import privilege_kwargs
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BootstrapCompatibilityIdentity,
 )
@@ -5381,7 +5380,11 @@ class SingleControllerActor:
         await asyncio.to_thread(
             self._value.get_values_from_meta,
             meta,
-            **privilege_kwargs(self._privilege_store, meta),
+            privilege_prefixes=(
+                self._privilege_store.prefixes_for(meta)
+                if self._privilege_store is not None
+                else None
+            ),
         )
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
@@ -5400,14 +5403,18 @@ class SingleControllerActor:
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
-            critic_kwargs = privilege_kwargs(self._privilege_store, full_meta)
+            privilege_prefixes = (
+                self._privilege_store.prefixes_for(full_meta)
+                if self._privilege_store is not None
+                else None
+            )
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
                     self._value.train_from_meta,
                     full_meta,
                     value_loss_fn,
                     gbs=gbs,
-                    **critic_kwargs,
+                    privilege_prefixes=privilege_prefixes,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects

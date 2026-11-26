@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from pydantic import BaseModel, Field, PositiveInt
 
@@ -34,6 +34,12 @@ from nemo_rl.models.policy import (
 )
 
 
+class PrivilegedValueConfigDisabled(BaseModel, extra="allow"):
+    """A disabled ``value.privileged_value`` block; its other keys are kept unread."""
+
+    enabled: Literal[False]
+
+
 class PrivilegedValueConfig(BaseModel, extra="forbid"):
     """``value.privileged_value``: prefix the critic input with a reference block.
 
@@ -44,8 +50,7 @@ class PrivilegedValueConfig(BaseModel, extra="forbid"):
     is truncated, a distribution shift the warm start was not trained on.
     """
 
-    # Build privileged critic inputs. False leaves the critic blind.
-    enabled: bool
+    enabled: Literal[True]
     # Token budget for the whole block.
     max_total_tokens: PositiveInt
     # Dotted path to build_privilege_prefix(extra_env_info, tokenizer, cfg) ->
@@ -103,7 +108,7 @@ class ValueConfig(TypedDict):
     # Privileged value: prefix the critic's input with a reference block the
     # policy never sees. max_total_sequence_length and the packing token budgets
     # must then cover policy length + the block budget.
-    privileged_value: NotRequired[PrivilegedValueConfig]
+    privileged_value: NotRequired[PrivilegedValueConfig | PrivilegedValueConfigDisabled]
 
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]

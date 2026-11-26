@@ -16,4 +16,3 @@ value:
   privileged_value:
     enabled: true
     max_total_tokens: 128
-    prefix_builder_fqn: nemo_rl.algorithms.ppo_utils.ground_truth_privilege_prefix.build_privilege_prefix

@@ -15,10 +15,11 @@
 """Restore the rollout parts of a resumed checkpoint.
 
 Restores the replay index (``replay_buffer_metadata.pt``), the recovery ledger
-(``rollout_recovery.pt``), the spare-prompt pool (``replacement_reserve.pt``) and,
-for turn-level groups from a rollout snapshot, the environment's rollouts. Setup
-restores the TQ rows themselves before this runs. Runs once before the pumps
-start; the rollout pump then redispatches what it loaded.
+(``rollout_recovery.pt``), the spare-prompt pool (``replacement_reserve.pt``), the
+privileged value prefixes (``privilege_prefixes.pt``) and, for turn-level groups
+from a rollout snapshot, the environment's rollouts. Setup restores the TQ rows
+themselves before this runs. Runs once before the pumps start; the rollout pump
+then redispatches what it loaded.
 """
 
 from __future__ import annotations
@@ -194,9 +195,9 @@ class RolloutRestorer(_UsesRolloutParts):
         """Restore the parts listed in the module docstring.
 
         Call it once, after the weights are in sync and before the pumps start.
-        Restores the replay buffer, the recovery ledger, the spare prompts and the
-        environment's rollouts (turn-level only), checks the sampler cursor against
-        them and logs restore timings.
+        Restores the replay buffer, the privileged value prefixes, the recovery
+        ledger, the spare prompts and the environment's rollouts (turn-level only),
+        checks the sampler cursor against them and logs restore timings.
 
         Returns:
             Whether restore queued groups only ledger-recorded dispatch can

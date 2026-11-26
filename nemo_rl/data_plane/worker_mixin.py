@@ -38,7 +38,7 @@ import numpy as np
 import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.column_io import fetch_columns
@@ -85,6 +85,9 @@ FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 _ROUTE_BLOB = "_route_fragment_blob"
 _ROUTE_INDEX = "_route_fragment_index"
+
+# Per-token columns a privileged-value prefix shifts along with input_ids.
+_PRIVILEGE_SHIFT_FIELDS = tuple(sorted(PER_TOKEN_MULTIMODAL_FIELDS))
 
 
 def _pack_route_fragments(
@@ -1070,24 +1073,34 @@ class TQWorkerMixin:
 
         ``privilege_prefixes`` (privileged value only) switches the fetched
         rows to the critic layout: ``meta`` carries critic lengths, and the
-        per-token targets are shifted past each row's reference-block prefix.
+        per-token targets and multimodal columns are shifted past each row's
+        reference-block prefix. The result then reports the prefix tokens this
+        rank spliced in as ``privilege_prefix_tokens``.
         """
         data = self._fetch(meta)
+        prefix_tokens: Optional[int] = None
         if privilege_prefixes is not None:
+            policy_tokens = int(data["input_lengths"].sum())
             data = prepend_privilege_prefix(
                 data,
                 meta,
                 privilege_prefixes,
-                shift_fields=tuple(f for f in PPO_VALUE_FIELDS if f in data),
+                shift_fields=tuple(
+                    f for f in _PRIVILEGE_SHIFT_FIELDS + PPO_VALUE_FIELDS if f in data
+                ),
             )
+            prefix_tokens = int(data["input_lengths"].sum()) - policy_tokens
         data = self._attach_or_repack_pack_metadata(data, meta)
-        return self.train(  # type: ignore[attr-defined]
+        result = self.train(  # type: ignore[attr-defined]
             data,
             loss_fn=loss_fn,
             eval_mode=eval_mode,
             gbs=gbs,
             mbs=mbs,
         )
+        if prefix_tokens is not None:
+            result["all_mb_metrics"]["privilege_prefix_tokens"] = [prefix_tokens]
+        return result
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
@@ -1291,7 +1304,12 @@ class TQWorkerMixin:
         policy_lengths: Optional[torch.Tensor] = None
         if privilege_prefixes is not None:
             policy_lengths = data["input_lengths"].clone()
-            data = prepend_privilege_prefix(data, meta, privilege_prefixes)
+            data = prepend_privilege_prefix(
+                data,
+                meta,
+                privilege_prefixes,
+                shift_fields=tuple(f for f in _PRIVILEGE_SHIFT_FIELDS if f in data),
+            )
             write_meta = policy_view_meta(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_values(  # type: ignore[attr-defined]

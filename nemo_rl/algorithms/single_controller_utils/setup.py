@@ -69,10 +69,7 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
-from nemo_rl.algorithms.ppo_utils.privileged_value import (
-    PrivilegePrefixStore,
-    resolve_prefix_builder,
-)
+from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
@@ -165,6 +162,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.models.value.config import PrivilegedValueConfig
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -2803,12 +2801,8 @@ def setup_single_controller(
         else None
     )
     privilege_store = (
-        PrivilegePrefixStore(
-            tokenizer,
-            privilege_cfg,
-            resolve_prefix_builder(privilege_cfg.prefix_builder_fqn),
-        )
-        if privilege_cfg is not None and privilege_cfg.enabled
+        PrivilegePrefixStore(tokenizer, privilege_cfg)
+        if isinstance(privilege_cfg, PrivilegedValueConfig)
         else None
     )
 

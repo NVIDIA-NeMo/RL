@@ -384,7 +384,7 @@ class TestTQValueSplitFanout:
         wg.get_all_worker_results.assert_called_once()
 
 
-class TestPrivilegedCritic:
+class TestPrivilegedValue:
     """Privileged value: the critic runs on ``prefix + policy row`` while
     ``values`` reaches TQ in the policy layout GAE reads."""
 
@@ -472,6 +472,9 @@ class TestPrivilegedCritic:
                 "returns": torch.tensor(
                     [[0.0, 0.5, 0.5, 0, 0, 0, 0], [0.0, 1.0, 0, 0, 0, 0, 0]]
                 ),
+                "mm_token_type_ids": torch.tensor(
+                    [[0, 1, 1, 0, 0, 0, 0], [0, 2, 0, 0, 0, 0, 0]]
+                ),
             }
         )
 
@@ -487,7 +490,7 @@ class TestPrivilegedCritic:
     def test_worker_values_land_in_the_policy_layout(self):
         class _Worker(_ValueStubWorker):
             def _fetch(self, meta):
-                return TestPrivilegedCritic._fetched()
+                return TestPrivilegedValue._fetched()
 
             def get_values(self, data, micro_batch_size=None):
                 self.calls.append(("get_values", data, micro_batch_size))
@@ -507,6 +510,11 @@ class TestPrivilegedCritic:
             [9, 9, 9, 9, 4, 5, 0],
         ]
         assert forward["input_lengths"].tolist() == [7, 6]
+        # Per-token multimodal columns move with their tokens.
+        assert forward["mm_token_type_ids"].tolist() == [
+            [0, 0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 2, 0],
+        ]
         write_meta, written = write_columns.call_args.args[1:3]
         # Jagged write-back sized by the policy rows, not the critic rows.
         assert write_meta.sequence_lengths == [3, 2]
@@ -515,14 +523,14 @@ class TestPrivilegedCritic:
     def test_worker_training_shifts_the_targets_past_the_prefix(self):
         class _Worker(_ValueStubWorker):
             def _fetch(self, meta):
-                return TestPrivilegedCritic._fetched()
+                return TestPrivilegedValue._fetched()
 
             def train(self, data, **kwargs):
                 self.calls.append(("train", data))
-                return {}
+                return {"all_mb_metrics": {}}
 
         w = _Worker()
-        w.train_presharded(
+        result = w.train_presharded(
             meta=self._critic_meta(),
             loss_fn="LF",
             privilege_prefixes={"repo__1": self._PREFIX},
@@ -536,3 +544,9 @@ class TestPrivilegedCritic:
         ]
         assert data["returns"][0].tolist() == [0, 0, 0, 0, 0.0, 0.5, 0.5]
         assert data["returns"][1].tolist() == [0, 0, 0, 0, 0.0, 1.0, 0]
+        assert data["mm_token_type_ids"].tolist() == [
+            [0, 0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 2, 0],
+        ]
+        # Two rows, a 4-token prefix each.
+        assert result["all_mb_metrics"]["privilege_prefix_tokens"] == [8]

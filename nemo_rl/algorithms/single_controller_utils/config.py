@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import math
+import sys
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Optional, cast
 
+from hydra.utils import get_method
 from pydantic import (
     BaseModel,
     Field,
@@ -87,6 +89,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
+from nemo_rl.models.value.config import PrivilegedValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -1455,16 +1458,26 @@ def _validate_privileged_value(master_config: MasterConfig) -> None:
     if value_cfg is None:
         return
     privilege_cfg = value_cfg.get("privileged_value")
-    if privilege_cfg is None or not privilege_cfg.enabled:
+    if not isinstance(privilege_cfg, PrivilegedValueConfig):
         return
     ppo_config = master_config.ppo
     assert ppo_config is not None  # a value block implies the PPO path
+    if master_config.token_capture.forest_training:
+        raise ValueError(
+            "value.privileged_value does not support token_capture.forest_training yet."
+        )
     if ppo_config.value_training_mode != "whole_batch":
         raise ValueError(
             "value.privileged_value requires ppo.value_training_mode="
             "whole_batch: the split value-training path does not splice the "
             "reference block, so the critic would train blind."
         )
+    builder = get_method(privilege_cfg.prefix_builder_fqn)
+    validate_kwargs = getattr(
+        sys.modules[builder.__module__], "validate_prefix_builder_kwargs", None
+    )
+    if validate_kwargs is not None:
+        validate_kwargs(privilege_cfg.prefix_builder_kwargs)
     needed = master_config.policy["max_total_sequence_length"] + (
         privilege_budget_tokens(privilege_cfg)
     )

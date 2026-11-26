@@ -20,7 +20,10 @@
 
 from typing import Any
 
-from nemo_rl.algorithms.ppo_utils.privileged_value import cap_tokens, count_tokens
+from nemo_rl.algorithms.ppo_utils.privilege_prefix_utils import (
+    cap_tokens,
+    count_tokens,
+)
 from nemo_rl.models.value.config import PrivilegedValueConfig
 
 GROUND_TRUTH_KEY = "ground_truth"

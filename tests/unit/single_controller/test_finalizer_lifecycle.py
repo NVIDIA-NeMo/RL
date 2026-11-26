@@ -1004,20 +1004,20 @@ def test_eviction_releases_the_prefixes_of_groups_that_can_no_longer_train() -> 
                     partition_id="canonical",
                     task_name="train",
                     sample_ids=[f"{group_id}_g0"],
-                    tags=[{GROUP_ID_TAG: group_id}],
+                    tags=[{GROUP_ID_TAG: group_id, PROMPT_IDX_TAG: prompt_idx}],
                 ),
                 _PRIVILEGED_ENV_INFO,
             )
         )
-        for group_id in ("evicted", "buffered", "selected")
+        for prompt_idx, group_id in enumerate(("evicted", "buffered", "selected"))
     }
     ctrl._buffer = SimpleNamespace(group_ids=("buffered",))
 
     ctrl._prune_finalizer_state({"selected"})
 
-    # Each group holds its own prefix here; only the live groups keep theirs.
-    assert store.state_dict()["prefixes"].keys() == {"groupbuffered", "groupselected"}
-    assert metas["evicted"].tags[0][PRIVILEGE_KEY_TAG] == "groupevicted"
+    # Each group holds its own prompt's prefix; only the live groups keep theirs.
+    assert store.state_dict()["prefixes"].keys() == {"prompt1", "prompt2"}
+    assert metas["evicted"].tags[0][PRIVILEGE_KEY_TAG] == "prompt0"
 
 
 @pytest.mark.parametrize("agent", [None, "agent"])

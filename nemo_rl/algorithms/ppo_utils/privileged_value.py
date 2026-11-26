@@ -13,11 +13,12 @@
 # limitations under the License.
 """Privileged value for PPO on the SingleController (asymmetric actor-critic).
 
-The critic sees a reference block the policy never does. The block is a prefix. The value head is causal, so ``V(s_t)`` attends only to
-tokens before ``t``, and the only placement every supervised position can reach
-is before the first assistant token. The policy cannot see the reference, so
-``a_t ⊥ z | s_t`` and ``E[∇log π(a_t|s_t) · V(s_t, z)] = 0``: the policy
-gradient stays unbiased. The prefixes must never reach the policy worker.
+The critic sees a reference block the policy never does. The block is a prefix.
+The value head is causal, so ``V(s_t)`` attends only to tokens before ``t``, and
+the only placement every supervised position can reach is before the first
+assistant token. The policy cannot see the reference, so ``a_t ⊥ z | s_t`` and
+``E[∇log π(a_t|s_t) · V(s_t, z)] = 0``: the policy gradient stays unbiased. The
+prefixes must never reach the policy worker.
 
 A prefix builder, selected by ``value.privileged_value.prefix_builder_fqn``,
 turns one prompt's ``extra_env_info`` into the block:
@@ -28,7 +29,9 @@ turns one prompt's ``extra_env_info`` into the block:
 ``wanted_tokens`` and ``kept_tokens`` (the block's size before and after
 truncation) and ``truncated_fields`` (the names of the parts that were cut);
 they feed the ``privilege/*`` metrics. The builder must be a pure function of
-the prompt, so sibling rollouts of one prompt share an identical block.
+the prompt, so sibling rollouts of one prompt share an identical block. Its
+module may also define ``validate_prefix_builder_kwargs(kwargs)``, which config
+validation calls at startup on ``prefix_builder_kwargs``.
 
 :class:`PrivilegePrefixStore` caches one tokenized block per prompt on the
 controller and stamps its key and length on each row's tags. The row layout
@@ -36,12 +39,12 @@ itself is in ``nemo_rl.data_plane.privilege_prefix``.
 """
 
 import asyncio
-import importlib
 import os
 from dataclasses import replace
 from typing import Any, Callable, Collection, Iterable, Optional, Sequence
 
 import torch
+from hydra.utils import get_method
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.grouping import prompt_group_ids
@@ -62,60 +65,11 @@ PrivilegePrefixBuilder = Callable[
 # keep their reference blocks.
 PRIVILEGE_PREFIXES_FILENAME = "privilege_prefixes.pt"
 
-TRUNCATION_MARKER = "\n... [truncated]"
-# A part that had content but got no budget is marked rather than omitted, so
-# "this exists but was cut" and "this prompt has none" do not look identical.
-OMITTED_MARKER = "... [omitted: token budget]"
-
 # Markup / chat-template slack on top of the block's token budget.
 _TEMPLATE_SLACK_TOKENS = 256
 
-
-def resolve_prefix_builder(fqn: str) -> PrivilegePrefixBuilder:
-    """Import the prefix builder named by ``value.privileged_value.prefix_builder_fqn``."""
-    module_name, _, function_name = fqn.rpartition(".")
-    try:
-        builder = getattr(importlib.import_module(module_name), function_name)
-    except (ImportError, AttributeError, ValueError) as error:
-        raise ValueError(
-            f"Cannot load value.privileged_value.prefix_builder_fqn {fqn!r}: {error}"
-        ) from error
-    if not callable(builder):
-        raise ValueError(
-            f"value.privileged_value.prefix_builder_fqn {fqn!r} is not callable"
-        )
-    return builder
-
-
-def cap_tokens(text: str, max_tokens: int, tokenizer: Any) -> tuple[str, bool]:
-    """Truncate ``text`` to ``max_tokens``, deterministically.
-
-    Returns the kept text and whether anything was cut. The flag, not a token
-    count, decides truncation: a field cut down to the bare marker can count as
-    many tokens as the original.
-
-    Truncation is a pure function of the instance, never of the rollout, so
-    sibling rollouts of one task share an identical block.
-    """
-    if not text:
-        return "", False
-    # Char pre-cut at 20 chars/token, above any text's ratio, so a multi-MB field
-    # is never fully tokenized.
-    head = text[: max_tokens * 20]
-    ids = tokenizer.encode(head, add_special_tokens=False)
-    if len(ids) <= max_tokens:
-        return head, len(head) < len(text)
-    # Reserve room for the marker so the result respects max_tokens.
-    marker_len = len(tokenizer.encode(TRUNCATION_MARKER, add_special_tokens=False))
-    keep = max(max_tokens - marker_len, 0)
-    return tokenizer.decode(ids[:keep]) + TRUNCATION_MARKER, True
-
-
-def count_tokens(text: str, tokenizer: Any, hint: int) -> int:
-    """Token count, with a char pre-cut so a multi-MB field is never fully encoded."""
-    if not text:
-        return 0
-    return len(tokenizer.encode(text[: max(hint, 1) * 20], add_special_tokens=False))
+# What a prefix builder's stats must carry; step_metrics reads all three.
+_STATS_KEYS = ("wanted_tokens", "kept_tokens", "truncated_fields")
 
 
 def privilege_budget_tokens(cfg: PrivilegedValueConfig) -> int:
@@ -143,15 +97,10 @@ class PrivilegePrefixStore:
     committed-but-untrained group references it.
     """
 
-    def __init__(
-        self,
-        tokenizer: Any,
-        cfg: PrivilegedValueConfig,
-        build_prefix: PrivilegePrefixBuilder,
-    ) -> None:
+    def __init__(self, tokenizer: Any, cfg: PrivilegedValueConfig) -> None:
         self._tokenizer = tokenizer
         self._cfg = cfg
-        self._build_prefix = build_prefix
+        self._build_prefix: PrivilegePrefixBuilder = get_method(cfg.prefix_builder_fqn)
         self._prefixes: dict[str, torch.Tensor] = {}
         self._stats: dict[str, dict[str, Any]] = {}
         self._group_keys: dict[str, str] = {}
@@ -166,6 +115,12 @@ class PrivilegePrefixStore:
             raise ValueError(
                 f"privileged value: the prefix builder returned an empty block for "
                 f"{key!r}. Training on would silently produce a blind critic."
+            )
+        missing = [name for name in _STATS_KEYS if name not in stats]
+        if missing:
+            raise ValueError(
+                f"privileged value: the prefix builder "
+                f"{self._cfg.prefix_builder_fqn!r} returned stats without {missing}."
             )
         rendered = self._tokenizer.apply_chat_template(
             [{"role": "system", "content": block}],
@@ -196,14 +151,13 @@ class PrivilegePrefixStore:
         ``commit_finalized`` for token-capture groups.
 
         Raises:
-            ValueError: The builder returned an empty block, or the rendered
-                block exceeds ``privilege_budget_tokens``, so critic rows could
-                outgrow the validated sequence lengths.
+            ValueError: The builder returned an empty block or incomplete stats,
+                or the rendered block exceeds ``privilege_budget_tokens``, so
+                critic rows could outgrow the validated sequence lengths.
         """
         group_id = _only_group_id(meta)
         assert meta.tags is not None  # _only_group_id read the group from them
-        prompt_idx = meta.tags[0].get(PROMPT_IDX_TAG)
-        key = f"prompt{prompt_idx}" if prompt_idx is not None else f"group{group_id}"
+        key = f"prompt{meta.tags[0][PROMPT_IDX_TAG]}"
         if key not in self._prefixes:
             self._prefixes[key], self._stats[key] = await asyncio.to_thread(
                 self._render, key, extra_env_info or {}
@@ -361,15 +315,3 @@ class PrivilegePrefixStore:
             f"{len(metas)} restored replay group(s)",
             flush=True,
         )
-
-
-def privilege_kwargs(
-    store: Optional[PrivilegePrefixStore], meta: KVBatchMeta
-) -> dict[str, Any]:
-    """Critic-call kwargs carrying the batch's reference-block prefixes.
-
-    Empty without a store, so a blind critic's calls are unchanged.
-    """
-    if store is None:
-        return {}
-    return {"privilege_prefixes": store.prefixes_for(meta)}

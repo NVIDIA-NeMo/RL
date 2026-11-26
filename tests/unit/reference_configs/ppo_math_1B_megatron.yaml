@@ -360,13 +360,9 @@ value:
     # Only the SingleController entrypoint supports it; run_ppo.py rejects enabled: true.
     enabled: false
     max_total_tokens: 32768
-    prefix_builder_fqn: nemo_rl.algorithms.ppo_utils.swe_privilege_prefix.build_privilege_prefix
-    prefix_builder_kwargs:
-      caps:
-        golden_patch: 24576
-        test_patch: 16384
-        pass_to_pass: 4096
-        fail_to_pass: 4096
+    # Built-in builders under nemo_rl.algorithms.ppo_utils: ground_truth_privilege_prefix
+    # and swe_privilege_prefix (the latter needs prefix_builder_kwargs.caps).
+    prefix_builder_fqn: nemo_rl.algorithms.ppo_utils.ground_truth_privilege_prefix.build_privilege_prefix
 
   reward_model_cfg:
     enabled: false

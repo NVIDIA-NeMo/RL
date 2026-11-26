@@ -29,7 +29,7 @@ from typing import Any
 
 from pydantic import BaseModel, PositiveInt
 
-from nemo_rl.algorithms.ppo_utils.privileged_value import (
+from nemo_rl.algorithms.ppo_utils.privilege_prefix_utils import (
     OMITTED_MARKER,
     cap_tokens,
     count_tokens,
@@ -110,7 +110,7 @@ def _as_lines(value: Any) -> str:
 
 
 def _is_test_path(path: str) -> bool:
-    """Path heuristic for the fix/tests split, used only for a record without relevant_files.
+    """Path heuristic for the fix/tests split, overridden for paths relevant_files names.
 
     Deliberately does not treat bare ``test*.py`` names as tests.
     """
@@ -315,6 +315,11 @@ def build_reference_block(
         )
     parts.append("</reference>")
     return "\n".join(parts), stats
+
+
+def validate_prefix_builder_kwargs(kwargs: dict[str, Any]) -> None:
+    """Startup check of value.privileged_value.prefix_builder_kwargs."""
+    SwePrefixBuilderKwargs.model_validate(kwargs)
 
 
 def build_privilege_prefix(

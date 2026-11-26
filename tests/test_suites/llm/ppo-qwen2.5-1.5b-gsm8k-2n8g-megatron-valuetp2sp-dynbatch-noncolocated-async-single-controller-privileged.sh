@@ -51,6 +51,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'len(data["train/privilege/n_instances"]) == 40' \
         'min(data["train/privilege/n_instances"]) > 0' \
         'max(data["train/privilege/frac_truncated"]) == 0' \
+        'len(data["train/critic/privilege_prefix_tokens"]) == 40' \
+        'min(data["train/critic/privilege_prefix_tokens"]) > 0' \
         'max({**data.get("data_plane/cluster/step/hash/mismatches", {}), **data.get("data_plane/driver/step/hash/mismatches", {})}) == 0' \
         'max({**data.get("data_plane/cluster/step/hash/rows_checked", {}), **data.get("data_plane/driver/step/hash/rows_checked", {})}) > 0'
 

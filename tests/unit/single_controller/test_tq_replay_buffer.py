@@ -561,6 +561,25 @@ class TestTQReplayBufferReserveCommit:
         assert "teacher_reference_logprobs" in meta.fields
         assert buf.ready_list == [True]
 
+    def test_commit_chains_enrichers_in_registration_order(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        seen_by_second = []
+
+        async def first(meta, extra_env_info):
+            return meta.with_fields(["from_first"])
+
+        async def second(meta, extra_env_info):
+            seen_by_second.append(list(meta.fields))
+            return meta.with_fields(["from_second"])
+
+        buf.add_post_write_enricher(first)
+        buf.add_post_write_enricher(second)
+        group_id = buf.reserve(weight_version=3)
+        meta = _run(buf.commit(group_id, _make_record(), 3, 3))
+
+        assert "from_first" in seen_by_second[0]
+        assert {"from_first", "from_second"} <= set(meta.fields)
+
     def test_commit_rolls_back_when_post_write_enrichment_fails(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)

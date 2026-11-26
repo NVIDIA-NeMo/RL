@@ -14,7 +14,7 @@
 import pytest
 
 from nemo_rl.algorithms.ppo_utils import ground_truth_privilege_prefix as gtp
-from nemo_rl.algorithms.ppo_utils.privileged_value import TRUNCATION_MARKER
+from nemo_rl.algorithms.ppo_utils.privilege_prefix_utils import TRUNCATION_MARKER
 from nemo_rl.models.value.config import PrivilegedValueConfig
 from tests.unit.algorithms.test_privileged_value import _CharTokenizer
 

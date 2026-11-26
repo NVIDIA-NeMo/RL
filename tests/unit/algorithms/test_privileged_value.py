@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.ppo_utils import privileged_value as pv
+from nemo_rl.algorithms.ppo_utils.privilege_prefix_utils import cap_tokens
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     GROUP_ID_TAG,
@@ -46,7 +47,7 @@ class _CharTokenizer:
 def _answer_builder(extra_env_info, tokenizer, cfg):
     """Fake prefix builder: the prompt's answer, cut to the budget."""
     answer = extra_env_info.get("answer", "")
-    block, truncated = pv.cap_tokens(answer, cfg.max_total_tokens, tokenizer)
+    block, truncated = cap_tokens(answer, cfg.max_total_tokens, tokenizer)
     stats = {
         "truncated_fields": ["answer"] if truncated else [],
         "wanted_tokens": len(answer),
@@ -55,24 +56,27 @@ def _answer_builder(extra_env_info, tokenizer, cfg):
     return block, stats
 
 
-def _config(max_total_tokens=64):
+def _statless_builder(extra_env_info, tokenizer, cfg):
+    """Fake prefix builder whose stats lack ``kept_tokens``."""
+    return "block", {"truncated_fields": [], "wanted_tokens": 5}
+
+
+def _config(max_total_tokens=64, builder="_answer_builder"):
     return PrivilegedValueConfig(
         enabled=True,
         max_total_tokens=max_total_tokens,
-        prefix_builder_fqn=f"{__name__}._answer_builder",
+        prefix_builder_fqn=f"{__name__}.{builder}",
     )
 
 
 def _store(max_total_tokens=64, tokenizer=None):
     return pv.PrivilegePrefixStore(
-        tokenizer or _CharTokenizer(), _config(max_total_tokens), _answer_builder
+        tokenizer or _CharTokenizer(), _config(max_total_tokens)
     )
 
 
-def _meta(group_id, n, lengths, prompt_idx=None):
-    tag = {"weight_version": 0, GROUP_ID_TAG: group_id}
-    if prompt_idx is not None:
-        tag[PROMPT_IDX_TAG] = prompt_idx
+def _meta(group_id, n, lengths, prompt_idx=0):
+    tag = {"weight_version": 0, GROUP_ID_TAG: group_id, PROMPT_IDX_TAG: prompt_idx}
     return KVBatchMeta(
         partition_id="p",
         task_name="train",
@@ -86,28 +90,6 @@ def _meta(group_id, n, lengths, prompt_idx=None):
 
 def _cached(store):
     return len(store.state_dict()["prefixes"])
-
-
-def test_resolve_prefix_builder_imports_the_function():
-    assert pv.resolve_prefix_builder(_config().prefix_builder_fqn) is _answer_builder
-
-
-@pytest.mark.parametrize(
-    "fqn",
-    ["no_dots", "nemo_rl.no_such_module.build", f"{__name__}.no_such_function"],
-)
-def test_resolve_prefix_builder_rejects_an_unloadable_path(fqn):
-    with pytest.raises(ValueError, match="prefix_builder_fqn"):
-        pv.resolve_prefix_builder(fqn)
-
-
-def test_resolve_prefix_builder_rejects_a_non_callable():
-    with pytest.raises(ValueError, match="not callable"):
-        pv.resolve_prefix_builder(f"{pv.__name__}.TRUNCATION_MARKER")
-
-
-def test_privilege_budget_adds_the_template_slack():
-    assert pv.privilege_budget_tokens(_config(max_total_tokens=100)) == 356
 
 
 def test_enrich_renders_the_block_as_a_system_turn():
@@ -142,18 +124,18 @@ def test_enrich_stamps_rows_and_shares_one_prefix_per_prompt():
     assert _cached(store) == 0
 
 
-def test_enrich_without_a_prompt_tag_keys_the_prefix_by_group():
-    store = _store()
-    meta_a = asyncio.run(store.enrich(_meta("ga", 1, [4]), {"answer": "42"}))
-    meta_b = asyncio.run(store.enrich(_meta("gb", 1, [4]), {"answer": "42"}))
-
-    assert meta_a.tags[0][PRIVILEGE_KEY_TAG] == "groupga"
-    assert meta_b.tags[0][PRIVILEGE_KEY_TAG] == "groupgb"
-
-
 def test_enrich_fails_loudly_on_an_empty_block():
     store = _store()
     with pytest.raises(ValueError, match="empty block"):
+        asyncio.run(store.enrich(_meta("ga", 1, [4]), {}))
+    assert _cached(store) == 0
+
+
+def test_enrich_rejects_builder_stats_missing_a_key():
+    store = pv.PrivilegePrefixStore(
+        _CharTokenizer(), _config(builder="_statless_builder")
+    )
+    with pytest.raises(ValueError, match=r"_statless_builder.*kept_tokens"):
         asyncio.run(store.enrich(_meta("ga", 1, [4]), {}))
     assert _cached(store) == 0
 
@@ -214,16 +196,15 @@ def test_restore_rejects_a_prefix_over_the_resumed_budget():
     meta = asyncio.run(store.enrich(_meta("ga", 1, [4]), {"answer": "a"}))
     state = store.state_dict()
     budget = pv.privilege_budget_tokens(_config(max_total_tokens=8))
-    state["prefixes"]["groupga"] = torch.zeros(budget + 1, dtype=torch.int32)
+    state["prefixes"]["prompt0"] = torch.zeros(budget + 1, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="over this run's budget"):
         _store(max_total_tokens=8).restore(state, [meta])
 
 
 def test_release_resolves_forest_padding_rows_by_their_group_tag():
-    # Forest rows name their group in dispatch_group_id. A group id containing
-    # "_g" and a padding row "{group}_pad0" cannot be parsed back reliably from
-    # the sample ids, so the store must not try.
+    # Forest rows name their group in dispatch_group_id; sample ids such as
+    # "x_gfoo_pad0" cannot be parsed back to it reliably.
     def forest_meta(group_id):
         return KVBatchMeta(
             partition_id="p",
@@ -231,12 +212,15 @@ def test_release_resolves_forest_padding_rows_by_their_group_tag():
             sample_ids=[f"{group_id}_g0_s0", f"{group_id}_pad0"],
             fields=["input_ids"],
             sequence_lengths=[4, 1],
-            tags=[{"dispatch_group_id": group_id}, {"dispatch_group_id": group_id}],
+            tags=[
+                {"dispatch_group_id": group_id, PROMPT_IDX_TAG: 1},
+                {"dispatch_group_id": group_id, PROMPT_IDX_TAG: 1},
+            ],
         )
 
     store = _store()
     owned = asyncio.run(store.enrich(forest_meta("x_gfoo"), {"answer": "a"}))
-    other = asyncio.run(store.enrich(_meta("x", 1, [4]), {"answer": "c"}))
+    other = asyncio.run(store.enrich(_meta("x", 1, [4], prompt_idx=2), {"answer": "c"}))
 
     store.release([owned])
 
@@ -281,17 +265,3 @@ def test_step_metrics_are_per_prompt_and_name_the_truncated_fields():
     assert metrics["privilege/wanted_tokens_mean"] == 20.0
     assert metrics["privilege/block_tokens_max"] == 20.0
     assert metrics["privilege/dropped_tokens_mean"] == 5.0
-
-
-def test_privilege_kwargs_are_empty_for_a_blind_critic():
-    assert pv.privilege_kwargs(None, _meta("ga", 1, [4])) == {}
-
-
-def test_privilege_kwargs_carry_the_batch_prefixes():
-    store = _store()
-    meta = asyncio.run(store.enrich(_meta("ga", 1, [4]), {"answer": "42"}))
-
-    kwargs = pv.privilege_kwargs(store, meta)
-
-    assert kwargs.keys() == {"privilege_prefixes"}
-    assert kwargs["privilege_prefixes"].keys() == {"groupga"}

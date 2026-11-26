@@ -4080,7 +4080,7 @@ class _NoOpValue:
         self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
-    def get_values_from_meta(self, meta: KVBatchMeta) -> None:
+    def get_values_from_meta(self, meta: KVBatchMeta, **kwargs) -> None:
         del meta
         self._record("get_values_from_meta")
 
@@ -4195,7 +4195,7 @@ class _PrivilegedValue(_NoOpValue):
         return super().train_from_meta(meta, loss_fn)
 
 
-def test_privileged_critic_calls_carry_the_batch_prefixes() -> None:
+def test_privileged_value_calls_carry_the_batch_prefixes() -> None:
     # Without these kwargs the critic would train and predict blind, silently.
     first_meta = _single_group_meta()
     second_meta = _single_group_meta()
@@ -4680,7 +4680,7 @@ class _StreamingPPOValue(_NoOpValue):
         self.inference_prepared = True
         super().prepare_for_inference()
 
-    def get_values_from_meta(self, meta: KVBatchMeta) -> None:
+    def get_values_from_meta(self, meta: KVBatchMeta, **kwargs) -> None:
         assert self.inference_prepared
         super().get_values_from_meta(meta)
 

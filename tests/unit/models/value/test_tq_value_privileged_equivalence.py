@@ -43,7 +43,7 @@ from tests.unit.models.value.test_megatron_value_worker import (
     _create_value_test_config,
 )
 
-_PARTITION = "privileged_critic_equivalence"
+_PARTITION = "privileged_value_equivalence"
 _FIELDS = [
     "input_ids",
     "input_lengths",
@@ -157,7 +157,7 @@ def test_privileged_values_and_loss_match_explicit_prefix_concatenation(
     _apply_config_updates(config, {batching: True})
     tokenizer = get_tokenizer(config["tokenizer"])
     cluster = RayVirtualCluster(
-        name=f"test-privileged-critic-equivalence-tp{tp}-{batching}",
+        name=f"test-privileged-value-equivalence-tp{tp}-{batching}",
         bundle_ct_per_node_list=[2],
         use_gpus=True,
         num_gpus_per_node=2,
@@ -199,7 +199,6 @@ def test_privileged_values_and_loss_match_explicit_prefix_concatenation(
                     }
                 },
             ),
-            build_privilege_prefix,
         )
 
         # Two groups (two instances), each written in the policy layout and stamped
