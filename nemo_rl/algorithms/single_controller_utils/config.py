@@ -779,6 +779,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Forest only. Cap physical rows, retaining a scored-call row; None keeps all.
+    max_rows_per_rollout: Optional[PositiveInt] = None
     # Which Forest segments the token-level reward penalties (unwanted tokens,
     # malformed think tags) check.
     # scored_segment: only the segment holding the scored call (default).
@@ -793,10 +795,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
-        if self.forest_penalty_scope != "scored_segment" and not self.forest_training:
-            raise ValueError(
-                "token_capture.forest_penalty_scope requires forest_training=true"
-            )
+        forest_only = {
+            "max_rows_per_rollout": self.max_rows_per_rollout is not None,
+            "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
+        }
+        if not self.forest_training and any(forest_only.values()):
+            names = ", ".join(name for name, set_ in forest_only.items() if set_)
+            raise ValueError(f"token_capture.{names} requires forest_training=true")
         return self
 
 

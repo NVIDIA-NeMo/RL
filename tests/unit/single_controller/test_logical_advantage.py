@@ -138,6 +138,17 @@ def test_forest_penalty_scope_requires_forest_training():
         TokenCaptureConfig(forest_penalty_scope="all_segments")
 
 
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+def test_max_rows_per_rollout_requires_forest_training(policy):
+    assert TokenCaptureConfig(
+        forest_training=True,
+        selection_policy=policy,
+        max_rows_per_rollout=16,
+    )
+    with pytest.raises(ValueError, match="max_rows_per_rollout.*forest_training"):
+        TokenCaptureConfig(max_rows_per_rollout=16)
+
+
 def _controller(
     meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
 ):
