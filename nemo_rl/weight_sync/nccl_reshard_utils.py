@@ -971,6 +971,11 @@ def sglang_nccl_reshard_violations(policy: Any, generation: Any) -> list[str]:
         violations.append("SGLang NCCL reshard requires abort or retract pause mode.")
     if server["needs_offload"]:
         violations.append("SGLang NCCL reshard currently requires needs_offload=false.")
+    if "cpu_offload_gb" in config and config["cpu_offload_gb"] > 0:
+        violations.append(
+            "SGLang NCCL reshard requires GPU-resident weights. "
+            "Set sglang_cfg.cpu_offload_gb to 0 or omit it."
+        )
     if config["sglang_fault_tolerance_config"].get("use_fault_tolerance"):
         violations.append("SGLang NCCL reshard engine recovery is not supported yet.")
     return violations

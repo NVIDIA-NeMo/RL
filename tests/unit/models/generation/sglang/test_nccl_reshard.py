@@ -292,8 +292,20 @@ def _synchronizer() -> tuple[SGLangNcclReshardWeightSynchronizer, MagicMock]:
     return sync, generation
 
 
-def test_setup_accepts_dense_bf16_sglang() -> None:
-    check_nccl_reshard_refit_support(SimpleNamespace(policy=_config()))
+@pytest.mark.parametrize(
+    "offload_config", [{}, {"cpu_offload_gb": 0}], ids=["omitted", "zero"]
+)
+def test_setup_accepts_dense_bf16_sglang(offload_config: dict[str, int]) -> None:
+    config = _config()
+    config["generation"]["sglang_cfg"].update(offload_config)
+    check_nccl_reshard_refit_support(SimpleNamespace(policy=config))
+
+
+def test_setup_rejects_cpu_weight_offload() -> None:
+    config = _config()
+    config["generation"]["sglang_cfg"]["cpu_offload_gb"] = 2
+    with pytest.raises(ValueError, match="cpu_offload_gb"):
+        check_nccl_reshard_refit_support(SimpleNamespace(policy=config))
 
 
 @pytest.mark.parametrize("key,value", [("pp_size", 2), ("ep_size", 2), ("dp_size", 2)])
