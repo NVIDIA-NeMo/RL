@@ -7,7 +7,7 @@ name = "flow-grpo"
 version = "0.1.0"
 description = "Experimental Flow-GRPO image diffusion training on NeMo RL"
 readme = "README.md"
-requires-python = ">=3.13.14,<3.14"
+requires-python = ">=3.13.18,<3.14"
 dependencies = [
   "nemo-rl[automodel]",
   "diffusers>=0.37",
