@@ -58,8 +58,8 @@ dependencies = [
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  # 5.18.0). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.18.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -141,7 +141,8 @@ dependencies = [
 
 
 [project.optional-dependencies]
-# Megatron-Core and FlashInfer 0.7 (vllm) require cuDNN frontend >=1.31; other backends retain 1.25.
+# Megatron-Core and FlashInfer 0.7 (vllm) require cuDNN frontend >=1.31; nemo-automodel[cuda] requires
+# >=1.27 (automodel pins 1.27.0); other backends retain 1.25.
 # Keep these pins per backend so the existing conflicting extras resolve separately.
 automodel = [
   # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
@@ -150,7 +151,7 @@ automodel = [
   # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend[cutedsl]==1.27.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "apache-tvm-ffi==0.1.11",
   "nemo-automodel[moe]",
   # Keep AutoModel's existing TileLang versions independent of Megatron's pin.
@@ -160,12 +161,11 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors nemo-automodel's own `transformers==5.18.0` pin.
+  "transformers==5.18.0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
-  "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
@@ -597,7 +597,7 @@ constraint-dependencies = [
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
   "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
-  # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
+  # Same story for megatron-fsdp, which nemo-automodel resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
   # in sync with 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
   "megatron-fsdp @ git+https://github.com/yuhezhang-ai/Megatron-LM.git@455389c480af6b3acdca74c7830c68b3274eb083#subdirectory=megatron/core/distributed/fsdp/src",

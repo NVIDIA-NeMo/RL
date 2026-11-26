@@ -18,7 +18,7 @@ Notes:
 
 ## Environment
 
-Use the standard NeMo RL environment described in the [installation guide](../../../about/installation.md). The Automodel submodule pinned on `main` (`r0.6.0` at `b916107a5` or later) registers `NemotronH_Omni_Reasoning_V3` and includes the fixes these recipes depend on (Automodel [#3874](https://github.com/NVIDIA-NeMo/Automodel/pull/3874) and [#4211](https://github.com/NVIDIA-NeMo/Automodel/pull/4211)); the stock vLLM pin registers the same architecture for generation. No custom source checkouts or manual builds are needed. For container and worker-venv details, see [Dependency Management](../../../design-docs/dependency-management.md).
+Use the standard NeMo RL environment described in the [installation guide](../../../about/installation.md). The Automodel submodule pinned on `main` (`41f926247` or later) registers `NemotronH_Omni_Reasoning_V3` and includes the fixes these recipes depend on (Automodel [#3801](https://github.com/NVIDIA-NeMo/Automodel/pull/3801) and [#3889](https://github.com/NVIDIA-NeMo/Automodel/pull/3889)); the stock vLLM pin registers the same architecture for generation. No custom source checkouts or manual builds are needed. For container and worker-venv details, see [Dependency Management](../../../design-docs/dependency-management.md).
 
 All recipes train [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16): the text recipe on the DAPO-Math-17K training set with AIME-2024 validation, the image recipe on CLEVR-CoGenT (trainA / valA), and the agentic recipe on the NeMo Gym `workplace_assistant` tasks, all from Hugging Face. Set `HF_HOME` to a cache visible from every node:
 

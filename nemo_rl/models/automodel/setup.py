@@ -112,16 +112,26 @@ def _has_optimizer_fp32_master(
     )
 
 
+# Dense architectures that NeMo RL runs on the HuggingFace implementation unless
+# force_hf is set explicitly. Their Automodel adapters lacked convert_single_tensor_to_hf,
+# so force_hf was auto-set; Automodel dropped those adapters, which would otherwise
+# switch these models to the custom implementation silently.
+_DEFAULT_FORCE_HF_ARCHS = frozenset(
+    {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+)
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
-    Custom model implementations (e.g. Qwen2, Llama) use state_dict_adapters to
-    convert between native and HF weight formats. NeMo RL's weight syncing requires
-    the adapter to implement `convert_single_tensor_to_hf`. Some adapters (like
-    CombinedProjectionStateDictAdapter) don't implement this yet.
+    Custom model implementations use state_dict_adapters to convert between native
+    and HF weight formats. NeMo RL's weight syncing requires the adapter to
+    implement `convert_single_tensor_to_hf`.
 
-    This function checks the adapter BEFORE model loading to avoid wasting time:
+    The checks run in this order, BEFORE model loading to avoid wasting time:
     - force_hf=True: no check needed, HF model won't have an adapter.
+    - arch in _DEFAULT_FORCE_HF_ARCHS: force_hf not set -> auto-set force_hf=True;
+      force_hf=False -> kept, Automodel's implementation is used.
     - force_hf not set + adapter incompatible: auto-set force_hf=True with a warning.
     - force_hf=False + adapter incompatible: raise an error telling the user to set
       force_hf=True or file an issue to NeMo-Automodel.
@@ -142,6 +152,9 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         return
 
     arch = architectures[0]
+    if arch in _DEFAULT_FORCE_HF_ARCHS:
+        automodel_kwargs.setdefault("force_hf", True)
+        return
     model_cls = ModelRegistry.model_arch_name_to_cls[arch]
 
     # Check the adapter class from the model's sibling state_dict_adapter module.

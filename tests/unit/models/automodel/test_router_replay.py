@@ -360,7 +360,7 @@ def test_gate_with_num_experts_attribute_is_range_checked():
 
 @pytest.mark.automodel
 def test_replay_raises_when_a_gate_never_consults_its_handle():
-    """A gate class that owns a handle but never calls it (Kimi K3) must not route live."""
+    """A gate class that owns a handle but never calls it must not route live."""
     model = _Model()
     gates = router_replay_gates(model)
     first, _ = model.gates()

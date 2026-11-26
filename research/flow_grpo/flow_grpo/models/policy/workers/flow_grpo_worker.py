@@ -65,37 +65,34 @@ def calculate_shift(
 
 def load_diffusion_pipeline(
     model_name: str, *, dtype: Any, device: Any, peft_cfg: Any = None
-) -> tuple[Any, dict[str, Any]]:
+) -> Any:
     """Load the diffusers pipeline through the NeMo Automodel stack.
 
-    Returns the ``(pipe, managers)`` two-tuple of
-    ``NeMoAutoDiffusionPipeline.from_pretrained``: `pipe` is the real diffusers
-    pipeline (``encode_prompt``/``vae``/private pack helpers all usable),
-    `managers` maps component name -> parallel manager. Stage one of the
-    migration keeps the worker's manual DP all-reduce, so no parallel scheme is
-    requested and `managers` stays empty.
+    Returns the real diffusers pipeline from
+    ``NeMoAutoDiffusionPipeline.from_pretrained`` (``encode_prompt``/``vae``/private
+    pack helpers all usable). Stage one of the migration keeps the worker's manual
+    DP all-reduce, so no mesh context is passed and nothing is parallelized.
     """
     from nemo_automodel._diffusers.auto_diffusion_pipeline import (
         NeMoAutoDiffusionPipeline,
     )
 
-    pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device=device,
-        # _move_module_to_device (pin auto_diffusion_pipeline.py:178-188) calls
+        # _move_module_to_device (auto_diffusion_pipeline.py) calls
         # module.to(device, dtype), which also casts the text encoder's fp32
         # rotary buffers (inv_freq/original_inv_freq) to bf16 and skews prompt
         # embeddings; keep the load on CPU and move device-only below.
         move_to_device=False,
         load_for_training=True,
-        parallel_scheme=None,
         peft_cfg=peft_cfg,
-        # Only consulted on the peft_cfg path (pin 24b47e85 behavior).
+        # Only consulted on the peft_cfg path.
         model_type="qwen_image",
     )
     pipe.to(device)
-    return pipe, managers
+    return pipe
 
 
 def build_checkpointer(*, is_peft: bool, dp_rank: int) -> Any:
@@ -120,39 +117,6 @@ def build_checkpointer(*, is_peft: bool, dp_rank: int) -> Any:
         is_peft=is_peft,
     )
     return Checkpointer(config, dp_rank=dp_rank, tp_rank=0, pp_rank=0)
-
-
-def prepare_optimizer_for_checkpoint_load(
-    model: Any, optimizer: Any, optimizer_path: str
-) -> None:
-    """Match replicated AdamW's lazy state to the saved optimizer metadata.
-
-    Qwen-Image's final text projections receive no gradients. AdamW leaves their
-    state empty, but DCP initializes every parameter when inspecting a fresh
-    optimizer and would then request nonexistent checkpoint keys. Clear only
-    wholly absent state for parameters present in the saved parameter groups;
-    partially missing state is an error, not permission to reset trained moments.
-    """
-    # Keep torch imports out of module scope so Ray can serialize the worker.
-    from torch.distributed.checkpoint import FileSystemReader
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
-    metadata = FileSystemReader(optimizer_path).read_metadata().state_dict_metadata
-    # Use the same public initialization path as Automodel's OptimizerState.
-    get_optimizer_state_dict(model, optimizer)
-    for name, param in model.named_parameters():
-        state = optimizer.state.get(param)
-        if not state:
-            continue
-        keys = {f"optim.state.{name}.{field}" for field in state}
-        missing = keys - metadata.keys()
-        if missing == keys and f"optim.param_groups.{name}.lr" in metadata:
-            # Keep an empty entry so DCP does not initialize the optimizer again.
-            state.clear()
-        elif missing:
-            raise ValueError(
-                f"Incomplete optimizer checkpoint for {name}: missing {sorted(missing)}"
-            )
 
 
 def build_peft_config(lora_cfg: dict[str, Any]) -> Any:
@@ -292,7 +256,6 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
     # because those imports are deferred into method bodies).
     device: Any
     _pipe: Any
-    _managers: dict[str, Any]
     transformer: Any
     text_encoder: Any
     tokenizer: Any
@@ -397,7 +360,7 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
         lora_cfg = self.config["lora_cfg"]
         self._lora_enabled = bool(lora_cfg["enabled"])
         model_name = self.config["model_name"]
-        pipe, self._managers = load_diffusion_pipeline(
+        pipe = load_diffusion_pipeline(
             model_name,
             dtype=self.dtype,
             device=self.device,
@@ -808,9 +771,6 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
         ckpt = self._get_checkpointer()
         ckpt.load_model(self.transformer, os.path.join(path, "model"))
         if os.path.isdir(os.path.join(path, "optim")):
-            prepare_optimizer_for_checkpoint_load(
-                self.transformer, self.optimizer, os.path.join(path, "optim")
-            )
             ckpt.load_optimizer(self.optimizer, self.transformer, path)
         return True
 

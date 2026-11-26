@@ -164,7 +164,7 @@ The policy loss path is unaffected -- draft co-training only adds a second term 
 
 ### Automodel Reuse Boundary
 
-`nemo_rl/models/automodel/draft/` is a thin extension layer over `nemo_automodel.components.speculative.*` (Automodel r0.6.0). Attention masks and the unchanged helpers are imported from there; the DSpark/DFlash model and loss are local copies whose RL deltas are listed in each file's header, and EAGLE3's per-position KL, loss mask and accuracy counting follow speculators' `kl_div_loss` / `align_for_step`.
+`nemo_rl/models/automodel/draft/` is a thin extension layer over `nemo_automodel.components.speculative.*`. Attention masks and the unchanged helpers are imported from there; the DSpark/DFlash model and loss are local copies whose RL deltas are listed in each file's header, and EAGLE3's per-position KL, loss mask and accuracy counting follow speculators' `kl_div_loss` / `align_for_step`.
 EAGLE3's network (attention, decoder layer, embedding, `fc`, `lm_head`) is a direct subclass of Automodel's `LlamaEagle3DraftModel`; NeMo RL does not reimplement the attention math.
 
 What stays local to NeMo RL, and why:

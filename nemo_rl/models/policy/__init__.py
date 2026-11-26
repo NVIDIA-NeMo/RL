@@ -50,7 +50,7 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.16.1 still ships both registry entries, so the patch remains
+    # Transformers 5.18.0 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
@@ -135,7 +135,7 @@ class AutomodelBackendConfig(TypedDict):
     # RMSNorm implementation: "te" (Transformer Engine), etc.
     rms_norm: NotRequired[str]
     # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
-    # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
+    # "torch_mm" (torch._grouped_mm); "gmm" is a deprecated alias for "torch_mm".
     experts: NotRequired[str]
     # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter) or "hybridep".
     dispatcher: NotRequired[str]

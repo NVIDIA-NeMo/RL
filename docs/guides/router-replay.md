@@ -62,7 +62,7 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-singl
 With the automodel backend, enabling Router Replay builds every Automodel MoE gate with a replay hook (`moe_overrides.enable_routing_replay`) and replays the rollout routes in the `get_logprobs` forward and in the training forward and backward.
 Reference-policy logprobs never replay rollout routes. Current requirements:
 
-- The model must use an Automodel MoE implementation; the HF / `force_hf` path has no replay hooks and fails at worker setup. A gate class that builds a replay hook but never consults it (for example Automodel's Kimi K3 gate) fails with a `RuntimeError` at the first replayed forward instead of silently routing live.
+- The model must use an Automodel MoE implementation; the HF / `force_hf` path has no replay hooks and fails at worker setup. A gate class that builds a replay hook but never consults it fails with a `RuntimeError` at the first replayed forward instead of silently routing live.
 - Sequence packing, `automodel_cfg.context_parallel_size > 1`, and `automodel_cfg.sequence_parallel` are not supported yet and fail at setup, as does `token_capture.defer_routed_experts_to_policy`.
 - vLLM may emit one route slot per MoE layer or one per decoder layer (hybrid models such as NemotronH); both layouts are mapped to the gates automatically.
 - Batch padding is never replayed. Rows other than all-`-1` missing routes that are partially negative, out of range, or repeat an expert are rejected as corrupt.
