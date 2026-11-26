@@ -17,7 +17,7 @@ import random
 import re
 import warnings
 from functools import partial, wraps
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -152,87 +152,109 @@ def calculate_baseline_and_std_per_prompt(
     """
     if std_rewards is None:
         std_rewards = rewards
-    unique_prompts = torch.unique(prompts, dim=0)
+    group_index, num_groups = _prompt_group_index(prompts, rewards.device)
 
-    baseline = torch.zeros_like(rewards)
-    sq_baseline = torch.zeros_like(rewards)
-    std = torch.zeros_like(rewards)
-    is_trivial_distribution = torch.ones_like(rewards, dtype=torch.bool)
-    device_ordinal = rewards.get_device()
-    if device_ordinal == -1:
-        reward_device = torch.device("cpu")
-    else:
-        reward_device = torch.device(f"cuda:{device_ordinal}")
-
-    for i in range(len(unique_prompts)):
-        is_matching_prompt = (prompts == unique_prompts[i]).all(1)
-        prompt_idx = torch.arange(len(prompts), device=reward_device)[
-            is_matching_prompt
-        ]
-
+    def peer_sum(values: torch.Tensor) -> torch.Tensor:
+        # Accumulate in float64 so that subtracting a row's own term below does
+        # not lose float32 precision.
+        group_sums = torch.zeros(
+            num_groups, dtype=torch.float64, device=rewards.device
+        ).index_add_(0, group_index, values.double())[group_index]
         if leave_one_out_baseline:
-            baseline_mask_matrix = (1 - torch.eye(len(prompt_idx))).to(reward_device)
-        else:
-            baseline_mask_matrix = torch.ones((len(prompt_idx), len(prompt_idx))).to(
-                reward_device
-            )
+            group_sums = group_sums - values.double()
+        return group_sums.to(rewards.dtype)
 
-        if valid_mask[prompt_idx].sum() <= 1:
-            # Ignore sample: there are no valid responses, so set baseline equal to reward
-            # to ignore it in the loss computation
-            baseline[prompt_idx] = rewards[prompt_idx]
-        else:
-            num_valid = valid_mask[prompt_idx].float().sum() - int(
-                leave_one_out_baseline
-            )
-            prompt_baseline = (
-                torch.matmul(
-                    baseline_mask_matrix, rewards[prompt_idx] * valid_mask[prompt_idx]
-                )
-                / num_valid
-            )
-            std_prompt_baseline = (
-                prompt_baseline
-                if std_rewards is rewards
-                else torch.matmul(
-                    baseline_mask_matrix,
-                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
-                )
-                / num_valid
-            )
-            std_prompt_baseline_square = (
-                torch.matmul(
-                    baseline_mask_matrix,
-                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
-                )
-                / num_valid
-            )
-            comparison_mask = baseline_mask_matrix.bool() & valid_mask[
-                prompt_idx
-            ].bool().unsqueeze(0)
-            comparison_rewards = (
-                std_rewards[prompt_idx].unsqueeze(0).expand(len(prompt_idx), -1)
-            )
-            comparison_min = comparison_rewards.masked_fill(
-                ~comparison_mask, torch.inf
-            ).amin(dim=1)
-            comparison_max = comparison_rewards.masked_fill(
-                ~comparison_mask, -torch.inf
-            ).amax(dim=1)
+    group_num_valid = (
+        torch.zeros(num_groups, dtype=torch.float64, device=rewards.device)
+        .index_add_(0, group_index, valid_mask.double())
+        .to(rewards.dtype)[group_index]
+    )
+    num_valid = group_num_valid - int(leave_one_out_baseline)
+    prompt_baseline = peer_sum(rewards * valid_mask) / num_valid
+    std_prompt_baseline = (
+        prompt_baseline
+        if std_rewards is rewards
+        else peer_sum(std_rewards * valid_mask) / num_valid
+    )
+    std_prompt_baseline_square = (
+        peer_sum(torch.pow(std_rewards, 2) * valid_mask) / num_valid
+    )
+    std = (
+        (
+            (std_prompt_baseline_square - std_prompt_baseline.square())
+            * (num_valid / (num_valid - 1))
+        )
+        .sqrt()
+        .nan_to_num(0)
+    )
 
-            baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = std_prompt_baseline_square
-            is_trivial_distribution[prompt_idx] = comparison_min == comparison_max
-            std[prompt_idx] = (
-                (
-                    (std_prompt_baseline_square - std_prompt_baseline.square())
-                    * (num_valid / (num_valid - 1))
-                )
-                .sqrt()
-                .nan_to_num(0)
-            )
+    valid = valid_mask.bool()
+    comparison_min = _group_extreme(
+        torch.where(valid, std_rewards, torch.inf),
+        group_index,
+        num_groups,
+        reduce="amin",
+        exclude_self=leave_one_out_baseline,
+    )
+    comparison_max = _group_extreme(
+        torch.where(valid, std_rewards, -torch.inf),
+        group_index,
+        num_groups,
+        reduce="amax",
+        exclude_self=leave_one_out_baseline,
+    )
 
+    # Groups with at most one valid response keep the raw reward as baseline,
+    # which ignores them in the loss computation.
+    no_peers = group_num_valid <= 1
+    baseline = torch.where(no_peers, rewards, prompt_baseline)
+    std = torch.where(no_peers, 0.0, std)
+    is_trivial_distribution = no_peers | (comparison_min == comparison_max)
     return baseline, std, is_trivial_distribution
+
+
+def _prompt_group_index(
+    prompts: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, int]:
+    """Return each row's dense prompt-group index on ``device`` and the group count."""
+    if prompts.shape[1] == 1:
+        # unique(dim=0) compares whole rows and is much slower than the 1-D kernel.
+        unique_prompts, group_index = torch.unique(
+            prompts.flatten(), return_inverse=True
+        )
+    else:
+        unique_prompts, group_index = torch.unique(prompts, dim=0, return_inverse=True)
+    return group_index.to(device), len(unique_prompts)
+
+
+def _group_extreme(
+    values: torch.Tensor,
+    group_index: torch.Tensor,
+    num_groups: int,
+    *,
+    reduce: Literal["amin", "amax"],
+    exclude_self: bool,
+) -> torch.Tensor:
+    """Return, for every row, the min or max of ``values`` over its group.
+
+    With ``exclude_self`` the row's own value is left out; a row with no other
+    value in its group gets the identity of ``reduce`` (``inf`` or ``-inf``).
+    """
+    identity = torch.inf if reduce == "amin" else -torch.inf
+    extreme = values.new_full((num_groups,), identity).scatter_reduce_(
+        0, group_index, values, reduce
+    )[group_index]
+    if not exclude_self:
+        return extreme
+    is_extreme = values == extreme
+    num_extreme = torch.zeros(
+        num_groups, dtype=torch.long, device=values.device
+    ).index_add_(0, group_index, is_extreme.long())[group_index]
+    runner_up = values.new_full((num_groups,), identity).scatter_reduce_(
+        0, group_index, values.masked_fill(is_extreme, identity), reduce
+    )[group_index]
+    # A row holding its group's only extreme value sees the runner-up instead.
+    return torch.where(is_extreme & (num_extreme == 1), runner_up, extreme)
 
 
 def calculate_trivial_reward_distributions(
@@ -247,14 +269,19 @@ def calculate_trivial_reward_distributions(
     valid reward group. It is therefore independent of leave-one-out baseline
     semantics and safe to use for prompt-level dynamic sampling.
     """
-    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
-    for prompt in torch.unique(prompts, dim=0):
-        prompt_mask = (prompts == prompt).all(1)
-        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
-        is_trivial = rewards_carry_no_signal(valid_rewards.tolist())
-        is_trivial_prompt_distribution[prompt_mask] = is_trivial
-
-    return is_trivial_prompt_distribution
+    group_index, num_groups = _prompt_group_index(prompts, rewards.device)
+    voters: list[list[float]] = [[] for _ in range(num_groups)]
+    for group, reward, valid in zip(
+        group_index.tolist(), rewards.tolist(), valid_mask.bool().tolist()
+    ):
+        if valid:
+            voters[group].append(reward)
+    is_trivial = torch.tensor(
+        [rewards_carry_no_signal(group_rewards) for group_rewards in voters],
+        dtype=torch.bool,
+        device=rewards.device,
+    )
+    return is_trivial[group_index]
 
 
 def surpress_user_warnings(f):  # type: ignore
