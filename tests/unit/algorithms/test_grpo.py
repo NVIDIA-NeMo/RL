@@ -6734,7 +6734,7 @@ def _validation_engines_config(mock_grpo_components):
     config.policy["generation"]["colocated"]["enabled"] = False
     config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
     config.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
-    config.checkpointing["metric_name"] = None
+    config.checkpointing.metric_name = None
     return config
 
 
@@ -6761,6 +6761,11 @@ def _set_async(config, key, value):
             "backend=vllm",
         ),
         (
+            lambda c: c.policy["generation"].update(dynamo=True),
+            NotImplementedError,
+            "dynamo=true",
+        ),
+        (
             lambda c: c.policy["generation"]["colocated"].update(enabled=True),
             ValueError,
             "colocated",
@@ -6779,6 +6784,13 @@ def _set_async(config, key, value):
             "refit_transport",
         ),
         (
+            lambda c: c.policy["generation"]["vllm_cfg"].update(
+                tensor_parallel_size=2, expert_parallel_size=4
+            ),
+            NotImplementedError,
+            "expert_parallel_size=4 > tensor_parallel_size=2",
+        ),
+        (
             lambda c: c.policy["generation"].update(
                 vllm_kwargs={"scheduling_policy": "fcfs"}
             ),
@@ -6791,7 +6803,7 @@ def _set_async(config, key, value):
             "debug_payload_metrics",
         ),
         (
-            lambda c: c.checkpointing.update(metric_name="val:accuracy"),
+            lambda c: setattr(c.checkpointing, "metric_name", "val:accuracy"),
             ValueError,
             "val:accuracy",
         ),
@@ -6877,7 +6889,7 @@ def _run_async_grpo_with_validation_engines(mock_grpo_components, pool):
 def test_async_grpo_validates_on_lent_engines_in_the_background(
     mock_grpo_components,
 ):
-    """Validation steps lend the engines and log results with their start step."""
+    """Validation steps lend the engines and log each result at the step it scored."""
     pool = _FakeValidationEnginePool(serving_training=True)
     mock_validate, validation_logs = _run_async_grpo_with_validation_engines(
         mock_grpo_components, pool
@@ -6891,10 +6903,11 @@ def test_async_grpo_validates_on_lent_engines_in_the_background(
     # Lent right after the refit that published the validated step's weights.
     assert pool.lent_at == [2, 4, 5]
     assert [kind for kind, _ in pool.refits] == ["before", "after"] * 5
-    assert sorted(metrics["start_step"] for metrics, _ in validation_logs) == [2, 4, 5]
+    # One result per validated step, so no two land on the same logger row.
+    assert sorted(log_step for _, log_step in validation_logs) == [2, 4, 5]
     for metrics, log_step in validation_logs:
         assert metrics["accuracy"] == 0.25
-        assert log_step >= metrics["start_step"]
+        assert metrics["collected_step"] >= log_step
 
 
 def test_async_grpo_skips_validation_while_engines_are_busy(mock_grpo_components):

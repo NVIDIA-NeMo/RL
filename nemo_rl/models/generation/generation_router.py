@@ -46,7 +46,6 @@ it is worth measuring before enabling this on a multi-turn workload.
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from typing import Any, Optional
 
@@ -64,8 +63,8 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 # Body chunk size for the streaming pass-through. Large enough that a long completion
 # does not cost thousands of iterations, small enough not to buffer a whole response.
 _STREAM_CHUNK_BYTES = 64 * 1024
-# Generation calls whose JSON body takes vLLM's per-request ``priority``.
-_PRIORITIZED_PATHS = frozenset({"/v1/chat/completions", "/v1/responses"})
+# vLLM reads a request's priority from this header before the body's ``priority`` field.
+_PRIORITY_HEADER = "X-Vllm-Priority"
 
 
 class GenerationRouterImpl:
@@ -108,9 +107,9 @@ class GenerationRouterImpl:
         # membership push puts it back. With no monitor nothing ever pushes, so the drop
         # would be permanent and a few transient blips would drain the fleet to nothing.
         self._health_managed = health_managed
-        # vLLM ``priority`` set on every generation request, so on an engine that also
-        # serves other clients these run first. None forwards bodies untouched; any
-        # other value needs the engines started with scheduling_policy="priority".
+        # vLLM priority sent as a header on every request, so on an engine that also
+        # serves other clients these run first. None adds no header; any other value
+        # needs the engines started with scheduling_policy="priority".
         self._request_priority = request_priority
         self._requests_total = 0
         self._no_backend_total = 0
@@ -308,19 +307,16 @@ class GenerationRouterImpl:
             if key.lower() not in _SKIPPED_REQUEST_HEADERS
         }
 
-        data: Any = request.content
-        if (
-            self._request_priority is not None
-            and request.method == "POST"
-            and request.rel_url.path in _PRIORITIZED_PATHS
-        ):
-            data = self._with_priority(await request.read())
+        if self._request_priority is not None:
+            # A header, not the body field: the body keeps streaming through, so a
+            # large (multimodal) request is not capped by aiohttp's client_max_size.
+            headers[_PRIORITY_HEADER] = str(self._request_priority)
 
         async with session.request(
             method=request.method,
             url=self._target_url(backend, request.rel_url.path_qs),
             headers=headers,
-            data=data,
+            data=request.content,
             # The timeout Gym's own client never sets. Without it a wedged backend holds
             # this request, and the rollout behind it, indefinitely.
             #
@@ -355,20 +351,6 @@ class GenerationRouterImpl:
                 self._backend_successes.get(backend, 0) + 1
             )
             return response
-
-    def _with_priority(self, body: bytes) -> bytes:
-        """Return a JSON request body with ``priority`` set.
-
-        A body that is not a JSON object is forwarded as is, for vLLM to reject.
-        """
-        try:
-            payload = json.loads(body)
-        except ValueError:
-            return body
-        if not isinstance(payload, dict):
-            return body
-        payload["priority"] = self._request_priority
-        return json.dumps(payload).encode()
 
     def build_app(self) -> Any:
         """Build the aiohttp application serving Gym's endpoint surface."""
@@ -485,8 +467,8 @@ def start_generation_router(
     never re-resolves it.
 
     Args:
-        request_priority: vLLM ``priority`` to set on every generation request, or
-            None to forward bodies untouched.
+        request_priority: vLLM priority to send as a header on every request, or
+            None to add no header.
 
     Returns:
         The router actor handle.

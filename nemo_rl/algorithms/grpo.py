@@ -129,6 +129,7 @@ from nemo_rl.experience.rollouts import (
     should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.generation_router import start_generation_router
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -152,6 +153,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_dp_size
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -821,6 +823,11 @@ def _validate_validation_engines(master_config: MasterConfig) -> None:
         raise NotImplementedError(
             f"{prefix} is supported only with policy.generation.backend=vllm."
         )
+    if dynamo_enabled(generation_config):
+        raise NotImplementedError(
+            f"{prefix} does not support policy.generation.dynamo=true: the Dynamo "
+            "frontends choose the engine, so engines cannot be lent to validation."
+        )
     if generation_config["colocated"]["enabled"]:
         raise ValueError(
             f"{prefix} requires policy.generation.colocated.enabled=false: a "
@@ -842,6 +849,16 @@ def _validate_validation_engines(master_config: MasterConfig) -> None:
             f"(collective NCCL refit), got {refit_transport!r}. Lent engines drop "
             "refits while they validate, which only the collective path supports."
         )
+    vllm_cfg = generation_config["vllm_cfg"]
+    tp_size = vllm_cfg.get("tensor_parallel_size", 1)
+    ep_size = vllm_cfg.get("expert_parallel_size", 1)
+    if resolve_vllm_dp_size(tp_size, ep_size) > 1:
+        raise NotImplementedError(
+            f"{prefix} does not support policy.generation.vllm_cfg."
+            f"expert_parallel_size={ep_size} > tensor_parallel_size={tp_size}: one "
+            "vLLM instance then spans several engines that share its experts, and "
+            "lending some of them would mix frozen and refitted expert weights."
+        )
     scheduling_policy = (generation_config.get("vllm_kwargs") or {}).get(
         "scheduling_policy", "priority"
     )
@@ -856,7 +873,7 @@ def _validate_validation_engines(master_config: MasterConfig) -> None:
             f"{prefix} does not support grpo.debug_payload_metrics=true: background "
             "validation traffic cannot be separated from training traffic."
         )
-    metric_name = master_config.checkpointing["metric_name"]
+    metric_name = master_config.checkpointing.metric_name
     if metric_name is not None and metric_name.startswith("val:"):
         raise ValueError(
             f"{prefix} does not support checkpointing.metric_name={metric_name!r}: "
@@ -5930,9 +5947,11 @@ def async_grpo_train(
     def record_background_validation(
         results: list[BackgroundValidationResult], log_step: int
     ) -> Optional[str]:
-        """Log background validations at ``log_step``, the step they are collected at.
+        """Log background validations at the step whose weights they scored.
 
-        "validation/start_step" is set to the step each validation started at.
+        Only one validation starts per step, so each result gets its own step and
+        the curve lines up with inline validation. "validation/collected_step" is
+        set to ``log_step``, the step the result was collected at.
 
         Returns the first early-stop message from a validation that reached the
         threshold, if any.
@@ -5940,11 +5959,13 @@ def async_grpo_train(
         early_stop_message = None
         for result in results:
             logger.log_metrics(
-                {**result.metrics, "start_step": result.val_step},
-                log_step,
+                {**result.metrics, "collected_step": log_step},
+                result.val_step,
                 prefix="validation",
             )
-            logger.log_metrics(result.timings, log_step, prefix="timing/validation")
+            logger.log_metrics(
+                result.timings, result.val_step, prefix="timing/validation"
+            )
             stop_message = _validation_early_stop_message(
                 result.metrics,
                 stop_at_validation_threshold,
@@ -6717,7 +6738,7 @@ def async_grpo_train(
                     if early_stop_message is not None:
                         # Exit at the end of this step, after checkpointing.
                         print(early_stop_message, flush=True)
-                        saving_this_step = master_config.checkpointing["enabled"]
+                        saving_this_step = master_config.checkpointing.enabled
                     if should_run_validation and early_stop_message is None:
                         if validation_engine_pool.serving_training:
                             # Training continues while validation runs on the
