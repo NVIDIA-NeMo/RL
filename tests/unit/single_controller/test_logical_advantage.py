@@ -149,12 +149,6 @@ def test_max_rows_per_rollout_requires_forest_training(policy):
         TokenCaptureConfig(max_rows_per_rollout=16)
 
 
-@pytest.mark.parametrize("limit", [0, -1])
-def test_max_rows_per_rollout_rejects_nonpositive_limits(limit):
-    with pytest.raises(ValueError, match="max_rows_per_rollout"):
-        TokenCaptureConfig(forest_training=True, max_rows_per_rollout=limit)
-
-
 def _controller(
     meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
 ):

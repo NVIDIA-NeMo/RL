@@ -2325,7 +2325,9 @@ Depending on your data shape, you may want to change these values."""
                 named, terminal_selection, attribution_reason = resolve_scored_terminal(
                     list(parsed.records), result
                 )
-            except TerminalNotIdentified:
+            except ValueError:
+                # Annotation only: an unnamed terminal or unknown Gym method
+                # keeps the receipt's default instead of failing the rollout.
                 pass
             else:
                 if named.response_id == terminal_response_id:

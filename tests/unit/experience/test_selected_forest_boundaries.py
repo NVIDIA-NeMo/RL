@@ -1600,6 +1600,16 @@ def test_unknown_gym_attribution_method_fails_loudly(forest, monkeypatch):
     monkeypatch.setattr(staging, "resolve_terminal", lambda *a, **k: attribution)
     with pytest.raises(ValueError, match="new_method.*_RECEIPT_METHOD"):
         resolve_scored_terminal(records, ordinary(replies))
+    # returned_history only annotates the receipt, so the rollout still succeeds.
+    env = _env(forest.harness)
+    env._selection_policy = "returned_history"
+    output = ordinary(replies)
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    assert processed["receipt"]["terminal_selection"] == "declared"
+    assert not processed["receipt"]["capture_poisoned"]
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
