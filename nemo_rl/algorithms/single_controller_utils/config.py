@@ -2049,9 +2049,7 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
     generation = policy["generation"]
     lora = automodel.get("lora_cfg")
     draft = policy.get("draft")
-    # The worker accepts only a complete batch, so anything that can close a step
-    # short (dynamic-sampling replacement at data exhaustion, drop budgets, finalizer
-    # drops of captured groups) is rejected here rather than failing mid-run.
+    # The worker needs a complete batch; reject everything that can close a step short.
     unsupported = {
         "ppo": is_ppo_run(master_config),
         "on_policy_distillation.enabled": opd_module.is_opd_enabled(master_config),

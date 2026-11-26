@@ -137,7 +137,7 @@ Today these functions implement top-k collection. A future candidate-selection s
 - Internal sequence packing supports `sequence_packing.fuse_loss=true`: sampler IDs are packed and shifted per sequence, TP gathers the full-vocabulary logprobs, and CP shards are reconstructed separately for each padded sequence.
   Externally prepacked inputs are rejected. The example above uses the ordinary unpacked path; enable both packing and `fuse_loss` for the packed path.
 - With sampling filters, the sampled token and the head are scored in one pass over the captured support: a gather of the `K` head logits and a logsumexp over the finite ones (under tensor parallelism, one all-reduce of those `K` logits per position), with no vocabulary top-k or softmax.
-- Automodel context-parallel sharding and DTensor logits are unsupported.
+- The Automodel trainer is not supported: Automodel SC rejects token capture.
 - Full-vocabulary on-policy distillation and fused linear logprobs are rejected because this path needs ordinary vocabulary logits.
 - Extraction checks the generated-token count, candidate count, unique IDs, nonnegative int32-compatible IDs, float32-representable logprobs (`-inf` is kept for candidates the sampler filtered out), logprobs no larger than `1e-5`, and head mass no larger than `1.0001`. Sampler logprobs are preserved without flooring or renormalization. These checks apply before staging; ignored prompt/tool positions are still zero-filled by the finalizer.
 

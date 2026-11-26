@@ -20,18 +20,16 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` at any `max_lookahead_versions`, and a streaming threshold equal to `grpo.num_prompts_per_step`.
 Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
-Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
-setup; the worker also rejects unsupported model properties before training.
+Both prompt-drop budgets must be zero.
+Explicit unsupported settings fail at setup; the worker also rejects unsupported model properties before training.
 
-Expert parallelism uses the existing AutoModel MoE path; SC does not impose
-EP=1. Configure `policy.automodel_cfg.expert_parallel_size` and a compatible
-dispatcher for the model and allocated training GPUs. The same full-batch
-lifecycle and gradient clipping operate on AutoModel's expert mesh.
+Expert parallelism uses the existing AutoModel MoE path; SC does not impose EP=1.
+Configure `policy.automodel_cfg.expert_parallel_size` and a compatible dispatcher for the model and allocated training GPUs.
+The same full-batch lifecycle and gradient clipping operate on AutoModel's expert mesh.
 
 One full-batch dispatch still runs multiple backend forward/backward passes.
-The optimizer and scheduler advance once, in `finish_train_step`; abort clears
-pending gradients without an update. The existing synchronous AutoModel training
-path retains its broader configuration support.
+The optimizer and scheduler advance once, in `finish_train_step`; abort clears pending gradients without an update.
+The existing synchronous AutoModel training path retains its broader configuration support.
 
 Run the checkpoint/resume integration smoke on two GPUs:
 
@@ -39,9 +37,9 @@ Run the checkpoint/resume integration smoke on two GPUs:
 bash tests/functional/automodel_sc_full_batch_smoke.sh
 ```
 
-The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout
-GPU. It saves after step 1 and resumes through step 4. Append normal config
-overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
+The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout GPU.
+It saves after step 1 and resumes through step 4.
+Append normal config overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
 
 For numerical parity, run the fixed-data test in the AutoModel environment:
 
@@ -52,9 +50,7 @@ uv run --extra automodel python -m torch.distributed.run --standalone --nproc-pe
   --source-sha "$(git rev-parse HEAD)"
 ```
 
-See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md)
-for the lifecycle, numerical primitives, forward-padding contract, and training
-comparison curves.
+See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md) for the lifecycle, numerical primitives, forward-padding contract, and training comparison curves.
 
 ### Mandatory settings
 

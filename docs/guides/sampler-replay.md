@@ -40,7 +40,7 @@ Replay requires:
 - SingleController with NeMo Gym and the vLLM generation backend. The legacy GRPO, PPO, and distillation trainers reject the option.
 - Top-k or top-p sampling. Top-p requires `top_k`, which bounds `S_q`.
 - `top_logprobs >= top_k`, with token capture enabled.
-- Vocabulary logits: Megatron without fused linear logprobs, or Automodel with `tensor_parallel_size=1` and `context_parallel_size=1`.
+- Vocabulary logits: Megatron without fused linear logprobs.
 
 ## Head Size and Top-p
 
