@@ -337,6 +337,14 @@ class MegatronSchedulerConfig(TypedDict):
 
 
 class MegatronDDPConfig(TypedDict):
+    """Fields of megatron.core's DistributedDataParallelConfig.
+
+    The keys below are required; any other field of that dataclass may be set too and is
+    passed through, such as `bucket_size` or `pad_buckets_for_high_nccl_busbw`. NeMo RL
+    derives `check_for_nan_in_grad`, `average_in_collective`, `use_distributed_optimizer`,
+    `reuse_grad_buf_for_mxfp8_param_ag` and `fp8_param_gather` itself.
+    """
+
     grad_reduce_in_fp32: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool

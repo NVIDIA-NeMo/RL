@@ -2243,6 +2243,56 @@ def _validate_dtype_config(
         )
 
 
+_REQUIRED_DDP_KEYS = (
+    "grad_reduce_in_fp32",
+    "overlap_grad_reduce",
+    "overlap_param_gather",
+    "data_parallel_sharding_strategy",
+)
+
+
+def _ddp_config(
+    config: PolicyConfig,
+    reuse_grad_buf_for_mxfp8_param_ag: bool,
+    fp8_param_enabled: bool,
+) -> DistributedDataParallelConfig:
+    """Megatron's DDP config from `policy.megatron_cfg.distributed_data_parallel_config`.
+
+    Every key of that section is passed to DistributedDataParallelConfig, so any of its
+    fields can be set there; a key it does not define raises. The fields NeMo RL derives
+    are set here, and a config that sets one of them to another value is rejected.
+    """
+    ddp_cfg = dict(config["megatron_cfg"]["distributed_data_parallel_config"])
+    missing = [key for key in _REQUIRED_DDP_KEYS if key not in ddp_cfg]
+    if missing:
+        raise KeyError(
+            f"policy.megatron_cfg.distributed_data_parallel_config lacks {missing}"
+        )
+    derived = {
+        "check_for_nan_in_grad": True,
+        # Required with calculate_per_token_loss=True: mcore asserts on it otherwise.
+        "average_in_collective": False,
+        "use_distributed_optimizer": config["megatron_cfg"]["optimizer"][
+            "use_distributed_optimizer"
+        ],
+        "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
+        "fp8_param_gather": fp8_param_enabled,
+    }
+    conflicting = sorted(
+        key
+        for key, value in derived.items()
+        if key in ddp_cfg and ddp_cfg[key] != value
+    )
+    if conflicting:
+        raise ValueError(
+            "policy.megatron_cfg.distributed_data_parallel_config sets "
+            f"{conflicting}, which NeMo RL derives: "
+            + ", ".join(f"{key}={derived[key]!r}" for key in conflicting)
+            + ". Remove them from the config."
+        )
+    return DistributedDataParallelConfig(**{**ddp_cfg, **derived})
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -2310,27 +2360,7 @@ def _create_megatron_config(
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
-        ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            grad_reduce_in_fp32=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["grad_reduce_in_fp32"],
-            overlap_grad_reduce=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_grad_reduce"],
-            overlap_param_gather=overlap_param_gather,
-            # we need to set average_in_collective=False with calculate_per_token_loss=T
-            # otherwise, mcore throws an assertion error.
-            average_in_collective=False,  # Required with calculate_per_token_loss=True
-            use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
-                "use_distributed_optimizer"
-            ],
-            data_parallel_sharding_strategy=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["data_parallel_sharding_strategy"],
-            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
-            fp8_param_gather=fp8_param_enabled,
-        ),
+        ddp=_ddp_config(config, reuse_grad_buf_for_mxfp8_param_ag, fp8_param_enabled),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
         tokenizer=TokenizerConfig(
