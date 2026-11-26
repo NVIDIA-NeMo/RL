@@ -65,7 +65,6 @@ from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
-    CUT_REPLY_MARGIN_S,
     DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
@@ -73,6 +72,9 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
 from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery  # noqa: E402
 from nemo_rl.models.generation.prefix_recovery.recovery import (  # noqa: E402
     _ResolvedGenerationCut,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    CUT_REPLY_MARGIN_S,
 )
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
@@ -466,9 +468,11 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
     run_cut = host._prefix_recovery.run_cut
     deadlines = []
 
-    async def record_deadline(inventory, *, deadline):
+    async def record_deadline(inventory, *, deadline, held_only):
+        # The frontend merges every engine's answer, so each names only its own.
+        assert held_only
         deadlines.append(deadline - time.monotonic())
-        return await run_cut(inventory, deadline=deadline)
+        return await run_cut(inventory, deadline=deadline, held_only=held_only)
 
     host._prefix_recovery.run_cut = record_deadline
 
