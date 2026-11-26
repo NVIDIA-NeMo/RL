@@ -44,6 +44,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossFn,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
@@ -640,7 +641,11 @@ def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
     assert "media_token_validity_mask" not in data
 
 
-def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
+@pytest.mark.parametrize("column_present", [False, True])
+@pytest.mark.parametrize("router_padding_mask", [False, True])
+def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size(
+    router_padding_mask: bool, column_present: bool
+):
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
@@ -661,6 +666,7 @@ def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
             },
             dp_size=1,
             _policy_like_cfg={},
+            _forest_router_padding_mask=router_padding_mask,
             mcore_state=SimpleNamespace(straggler_timer=None),
             model_slices_context_parallel_inputs=None,
             defer_fp32_logits=False,
@@ -669,6 +675,8 @@ def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
         data = BatchedDataDict(
             {"input_ids": torch.ones((gbs, 2), dtype=torch.long, device="cuda")}
         )
+        if column_present:
+            data[ROUTER_EXCLUDED_ROWS] = torch.zeros(gbs, dtype=torch.bool)
         rerun = SimpleNamespace(
             should_run_forward_backward=MagicMock(side_effect=[True, False])
         )
@@ -685,7 +693,7 @@ def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
             patch(
                 f"{module}.get_microbatch_iterator",
                 return_value=(iter(()), 1, 1, None, 2),
-            ),
+            ) as get_microbatch_iterator,
             patch(f"{module}.get_rerun_state_machine", return_value=rerun),
             patch(f"{module}.LossPostProcessor"),
             patch(f"{module}.megatron_forward_backward", return_value=[]),
@@ -706,6 +714,10 @@ def test_whole_batch_value_train_ticks_scheduler_by_configured_batch_size():
         ):
             MegatronValueWorkerImpl.train(worker, data, loss_fn=object(), gbs=gbs)
         worker.optimizer.step.assert_called_once_with()
+        # The router mask needs both the Forest option and the fetched column.
+        assert get_microbatch_iterator.call_args.kwargs[
+            "create_router_padding_mask"
+        ] == (router_padding_mask and column_present)
         increments.append(worker.scheduler.step.call_args.kwargs["increment"])
 
     assert increments == [2, 2]

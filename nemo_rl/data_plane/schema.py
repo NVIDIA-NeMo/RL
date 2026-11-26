@@ -63,6 +63,10 @@ MASK_SAMPLE = "mask_sample"
 TRUNCATED = "truncated"
 META_IDX = "meta_idx"
 
+# Forest rows MoE expert-bias statistics must skip: execution padding and
+# failed owners' borrowed inputs. Bool, one per row; Forest batches only.
+ROUTER_EXCLUDED_ROWS = "router_excluded_rows"
+
 # Token-aligned message-violation fields consumed by SingleController advantages.
 INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
 MALFORMED_THINKING_MASK = "malformed_thinking_mask"
@@ -114,6 +118,7 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     OPD_FULL_TEACHER_INDEX_FIELD,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    ROUTER_EXCLUDED_ROWS,
 )
 
 # Core fields the logprob workers require; multimodal extras added by TQPolicy._logprob_dispatch.

@@ -25,6 +25,7 @@ from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResu
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -333,10 +334,18 @@ def test_mixed_failed_owner_padding_replay_and_controller(
             data = plane.get_samples(
                 batch.sample_ids,
                 "train",
-                ["total_reward", "sample_mask", "token_mask", "advantages"],
+                [
+                    "total_reward",
+                    "sample_mask",
+                    "token_mask",
+                    "advantages",
+                    ROUTER_EXCLUDED_ROWS,
+                ],
             )
             assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
             assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
+            # The failed owner's row borrows input like padding; routers skip both.
+            assert data[ROUTER_EXCLUDED_ROWS].tolist() == [False] * 3 + [True] * 3
             for index in range(6):
                 mask = data["token_mask"][index].bool()
                 if index < 3:

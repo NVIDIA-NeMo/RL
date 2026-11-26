@@ -177,8 +177,10 @@ from nemo_rl.data_plane.observability import (
 )
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
+    DP_VALUE_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    ROUTER_EXCLUDED_ROWS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -428,6 +430,14 @@ class SingleControllerActor:
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
         self._train_fields = stage_cfg.train_fields(master_config)
+        # Workers mask these rows out of expert-bias statistics only when fetched.
+        self._router_excluded_fields: tuple[str, ...] = (
+            (ROUTER_EXCLUDED_ROWS,)
+            if master_config.token_capture.forest_training
+            and master_config.token_capture.exclude_padding_from_router_stats
+            else ()
+        )
+        self._train_fields += self._router_excluded_fields
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -5386,6 +5396,7 @@ class SingleControllerActor:
         # Forest steps carry a variable number of physical rows; the critic
         # takes all of them as one optimizer step, like the policy.
         gbs = sum(m.size for m in metas) if has_logical_owners(metas[0]) else None
+        train_fields = (*DP_VALUE_TRAIN_FIELDS, *self._router_excluded_fields)
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
@@ -5395,6 +5406,7 @@ class SingleControllerActor:
                     full_meta,
                     value_loss_fn,
                     gbs=gbs,
+                    train_fields=train_fields,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects

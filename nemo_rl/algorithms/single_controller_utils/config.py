@@ -779,6 +779,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Forest only. Keep execution padding and failed owners' borrowed inputs out
+    # of MoE expert-bias statistics on the policy and a PPO critic; the critic
+    # then also masks sequence-packing padding. Off (default): those tokens
+    # count, matching ordinary training.
+    exclude_padding_from_router_stats: bool = False
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -786,6 +791,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
+            )
+        if not self.forest_training and self.exclude_padding_from_router_stats:
+            raise ValueError(
+                "token_capture.exclude_padding_from_router_stats requires forest_training=true"
             )
         return self
 

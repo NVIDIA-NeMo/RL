@@ -2687,6 +2687,7 @@ def _train_pump_controller(*, sampler) -> object:
         reference_logprobs_required=False,
         sampler_head_required=False,
     )
+    ctrl._router_excluded_fields = ()
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
