@@ -37,7 +37,6 @@ import logging
 import math
 import os
 import pickle
-import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -72,7 +71,6 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
     CUT_PREFIXES_KEY,
-    CUT_REPLY_MARGIN_S,
     DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
@@ -80,6 +78,10 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
 from nemo_rl.models.generation.gym_call import GymCallResult
 from nemo_rl.models.generation.score_centering import (
     extract_score_centering_samples,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (
+    held_acks,
+    local_deadline,
 )
 from nemo_rl.models.generation.vllm.prompt_and_capture import (
     PreparedPrompt,
@@ -225,7 +227,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
 
         The frontend sends every engine the whole inventory
         (:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`), so the
-        answer names only the calls cut here.
+        answer names only the calls held here, cut or not.
         """
         del annotation, context
         # Deferred: Gym is optional outside framework-owned capture.
@@ -233,25 +235,16 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
 
         extra_args = request.get("extra_args") or {}
         inventory = GenerationCutInventory.model_validate(extra_args[INVENTORY_KEY])
-        deadline = extra_args.get(DEADLINE_KEY)
-        if deadline is not None:
-            # The frontend's wall-clock deadline on this host's monotonic clock,
-            # less the time the answer needs to get back.
-            deadline = time.monotonic() + (deadline - time.time()) - CUT_REPLY_MARGIN_S
         receipt = await self._host._prefix_recovery.run_cut(
-            inventory, deadline=deadline
+            inventory,
+            deadline=local_deadline(extra_args.get(DEADLINE_KEY)),
+            held_only=True,
         )
         yield {
             "token_ids": [],
             "index": 0,
             "finish_reason": "stop",
-            "engine_data": {
-                CUT_PREFIXES_KEY: [
-                    ack.model_dump(mode="json")
-                    for ack in receipt.prefixes
-                    if ack.disposition == "durable_prefix"
-                ]
-            },
+            "engine_data": {CUT_PREFIXES_KEY: held_acks(receipt)},
         }
 
     async def serve_rollout(
