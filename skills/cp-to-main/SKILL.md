@@ -1,6 +1,6 @@
 ---
 name: cp-to-main
-description: Manually cherry-pick a merged NVIDIA-NeMo/RL PR from a release branch (r0.X.0) back onto main when the auto cherry-pick bot failed. Stops at conflicts for the user to resolve, then verifies, pushes, opens a cp PR and posts /ok to test.
+description: Manually cherry-pick a merged NVIDIA-NeMo/RL PR from a release branch (r0.X.0) back onto main when the Autobot /cherrypick to=main backport failed or should be done by hand. Stops at conflicts for the user to resolve, then verifies, pushes, opens a cp PR and posts /ok to test.
 when_to_use: >-
   'cp #N back to main', 'auto cp failed', '/cp-to-main N', cherry-picking a release-branch PR onto main;
   resuming after the user resolved conflicts ('continue').
@@ -8,7 +8,7 @@ when_to_use: >-
 
 # cp-to-main
 
-Reverse of `cp-to-release`. Input: the original PR number `N`, already merged into a release branch `rX.Y.Z`. Since r0.8.0 PRs merge into the release branch first and a label makes the bot cherry-pick them to main as `cherry-pick-<N>-main`; this skill covers the case where that auto cp failed (typically a conflict) and the user wants it done by hand.
+Reverse of `cp-to-release`. Input: the original PR number `N`, already merged into a release branch `rX.Y.Z`. Since r0.8.0 PRs merge into the release branch first, and commenting `/cherrypick to=main` on the release-branch PR has Autobot open a `cp:` PR to main and report in the `Autobot cherrypick (main)` check. This skill covers the case where that failed (typically a conflict, which the check names) or the user wants it done by hand.
 
 The skill runs in two phases with a hand-off in the middle:
 
@@ -30,8 +30,7 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
 
 2. **Check it is not already handled.**
    - `git fetch origin`; `git log origin/main --oneline --grep="(#<N>)" | head` — already on main? stop.
-   - Open PR from the bot or a prior attempt:
-     `curl ... "/pulls?state=open&head=NVIDIA-NeMo:cherry-pick-<N>-main"` and `git ls-remote origin refs/heads/<user>/cp-<N>-main`. If either exists, ask the user.
+   - Open PR from Autobot or a prior attempt: the original PR's `Autobot cherrypick (main)` check, if any, and `git ls-remote origin refs/heads/<user>/cp-<N>-main`. If Autobot's `cp:` PR is open or the branch exists, ask the user.
 
 3. **Worktree + cherry-pick**, under a temp directory so the main checkout is untouched:
    ```bash
@@ -82,4 +81,4 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
 
 8. **CI.** Do not add labels: on `main` the `Set CI label` workflow sets the `CI:*` label, and release labels (`r0.8.0`, ...) or the bot's `cherry-pick` label must not be copied. Post `/ok to test <full head sha>` as an issue comment.
 
-9. **Report**: PR number (bare `#N`), base, commit sha, the `CI:*` label the bot set, that `/ok to test` was posted, which files had conflicts, and cleanup (`git worktree remove <path>`; the bot's own `cherry-pick-<N>-main` PR, if any, can be closed as superseded — say so, don't close it).
+9. **Report**: PR number (bare `#N`), base, commit sha, the `CI:*` label the bot set, that `/ok to test` was posted, which files had conflicts, and cleanup (`git worktree remove <path>`; Autobot's `cp:` PR, if any, can be closed as superseded — say so, don't close it).

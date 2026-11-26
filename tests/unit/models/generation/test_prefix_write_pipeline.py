@@ -223,7 +223,9 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
 
     sink.stage_generation_prefix_batch.side_effect = write
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
+    def prepare(
+        inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
         events.append(("prepare", inventory.inventory_digest, threading.get_ident()))
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
         keys = yield PrefixWrite(
@@ -358,7 +360,9 @@ def test_an_oversize_reservation_blocks_growth_but_not_release() -> None:
 def test_only_a_single_row_may_exceed_the_batch_byte_limit() -> None:
     sink = MagicMock()
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
+    def prepare(
+        inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
         records = tuple(
             SimpleNamespace(key=f"{inventory.inventory_digest}-{index}", delta_len=1)
             for index in range(2)
@@ -409,7 +413,9 @@ def test_admission_limit_rejects_new_inventories_but_shares_duplicates() -> None
         [record.key for record in records],
     )[1]
 
-    def prepare(inventory: Any, *, deadline: float | None) -> CutWrites:
+    def prepare(
+        inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
         keys = yield PrefixWrite(
             "cut", (record,), (0,), (None,), 1, lambda error: [None]
