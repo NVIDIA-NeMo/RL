@@ -429,15 +429,20 @@ class FrontendHost:
 _FrontendHostActor = ray.remote(num_cpus=0)(FrontendHost)
 
 
-def _service_env(managed_env: dict[str, str]) -> dict[str, str]:
-    """This process's environment with ``managed_env`` replacing every Dynamo setting."""
+def _service_env(
+    managed_env: dict[str, str], excluded: set[str] = set()
+) -> dict[str, str]:
+    """This process's environment with managed_env replacing every Dynamo setting.
+
+    Names in excluded are dropped from the result.
+    """
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("DYN_", "ETCD_", "NATS_"))
     }
     env.update(managed_env)
-    return env
+    return {key: value for key, value in env.items() if key not in excluded}
 
 
 class ManagedDynamoRuntime:
@@ -644,9 +649,13 @@ class ManagedDynamoRuntime:
                 f"Dynamo frontend environment {clashing} is set by both the managed "
                 "runtime and dynamo_cfg.frontend_args.extra_env."
             )
-        # The driver's environment as it is now, as the engines get it
-        # (RayWorkerGroup): an actor has only what the driver had at init_ray().
-        env = _service_env({**env, **extra_env})
+        excluded = {
+            name.strip()
+            for name in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(",")
+        }
+        # The driver's current environment minus NRL_WORKER_ENV_EXCLUDE, as the engines get
+        # it (RayWorkerGroup): an actor has only what the driver had at init_ray().
+        env = _service_env({**env, **extra_env}, excluded)
         # ray.init() raises a driver's open-file limit to 65,536, but not a Ray
         # worker's: a frontend started from one would stop at Dynamo's 8,192.
         env.setdefault("DYN_FRONTEND_FD_LIMIT_TARGET", "65536")
