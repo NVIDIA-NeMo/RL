@@ -101,6 +101,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.sglang.utils.layout import SGLangEngineSpec
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -1301,6 +1302,20 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     # No server/router was started; avoid resource cleanup in __del__.
     gen.shutdown = MagicMock()
     gen.all_engines = [engine]
+    # The one aggregated engine behind ``all_engines``; pause, flush and resume
+    # walk the engine specs.
+    gen._engine_specs = [
+        SGLangEngineSpec(
+            index=0,
+            role="aggregated",
+            width=1,
+            gpu_offset=0,
+            first_slot=0,
+            num_slots=1,
+            replica=0,
+            router=0,
+        )
+    ]
     gen.num_new_engines = 0
     gen.num_gpus_per_engine = 1
     gen.num_gpus_per_node = 1
