@@ -95,6 +95,23 @@ class TestFlattenDict:
             "scalar": 1,
         }
 
+    def test_nested_lists_flatten_to_scalars(self):
+        """A list of lists flattens to one scalar per index path.
+
+        TensorBoard's add_hparams rejects a list value, so a config holding a
+        matrix (for example Muon's polar coefficients) must not leave one.
+        """
+        d = {"coeffs": [[1.0, 2.0], [3.0, [4.0, {"x": 5}]]], "s": "a"}
+        assert flatten_dict(d) == {
+            "coeffs.0.0": 1.0,
+            "coeffs.0.1": 2.0,
+            "coeffs.1.0": 3.0,
+            "coeffs.1.1.0": 4.0,
+            "coeffs.1.1.1.x": 5,
+            "s": "a",
+        }
+        assert flatten_dict(d, expand_lists=False) == d
+
     def test_summarize_list(self):
         """_summarize_list reduces a numeric list to a bounded stat set."""
         from nemo_rl.utils.logger import _summarize_list
