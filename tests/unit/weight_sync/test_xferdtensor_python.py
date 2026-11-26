@@ -62,6 +62,7 @@ class _Stream:
     [
         ((8,), (8,), (), (), True, None, "native"),
         ((2, 4), (4, 2), (), (), True, None, "native"),
+        ((2, 4), (4, 2), (), (), True, "default", "python"),
         ((2, 4), (4, 2), (0,), (1,), True, None, "native"),
         ((2, 4), (4, 2), (0, 1), (), True, None, "python"),
         ((2, 4), (4, 2), (), (0, 1), True, None, "python"),
@@ -89,6 +90,7 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     expected: str,
 ) -> None:
     dispatcher = import_module("nemo_rl.weight_sync.xferdtensor")
+    monkeypatch.setenv("NRL_XFERDTENSOR_NCCL", "0" if override == "default" else "1")
     backends = {name: Mock() for name in ("native", "python", "golden")}
     monkeypatch.setattr(
         dispatcher, "_reshard", backends["native"] if native_available else None
@@ -339,6 +341,7 @@ def test_striped_geometry_distributes_replica_receives():
 def test_destination_follows_a_source_on_the_python_path(monkeypatch):
     from nemo_rl.weight_sync import xferdtensor
 
+    monkeypatch.setenv("NRL_XFERDTENSOR_NCCL", "1")
     monkeypatch.delenv("NRL_XFERDTENSOR_PYTHON", raising=False)
     monkeypatch.delenv("NRL_XFERDTENSOR_GOLDEN", raising=False)
     monkeypatch.setattr(xferdtensor, "_reshard", object())
@@ -347,6 +350,22 @@ def test_destination_follows_a_source_on_the_python_path(monkeypatch):
     xferdtensor.follow_source_reshard_path(False)
 
     assert not xferdtensor.uses_real_reshard_op()
+
+
+def test_destination_without_native_opt_in_rejects_native_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = import_module("nemo_rl.weight_sync.xferdtensor")
+    for name in (
+        "NRL_XFERDTENSOR_NCCL",
+        "NRL_XFERDTENSOR_PYTHON",
+        "NRL_XFERDTENSOR_GOLDEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(dispatcher, "_reshard", object())
+
+    with pytest.raises(RuntimeError, match="NRL_XFERDTENSOR_NCCL=1"):
+        dispatcher.follow_source_reshard_path(True)
 
 
 def test_destination_without_the_real_op_rejects_a_source_that_uses_it(monkeypatch):

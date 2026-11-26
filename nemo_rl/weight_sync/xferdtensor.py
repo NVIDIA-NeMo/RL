@@ -17,6 +17,7 @@
 import logging
 import os
 from contextlib import nullcontext
+from typing import Literal
 
 import torch
 from torch.distributed._tensor import Shard
@@ -34,6 +35,9 @@ except ImportError:
 
 # Log the selected reshard path once per process (real op / python / golden).
 _XFERDTENSOR_PATH_LOGGED = False
+_XFERDTENSOR_DEFAULT_SELECTION: Literal[
+    "NCCL_EXTENSION", "NEMO_RL_PYTHON", "NEMO_RL_GOLDEN"
+] = "NEMO_RL_PYTHON"  # Until NCCL_EXTENSION is fully verified.
 
 
 class DTensorRef:
@@ -71,33 +75,26 @@ class DTensorRef:
 # ===========================================================
 
 
-def _use_golden_api() -> bool:
-    """Whether ``NRL_XFERDTENSOR_GOLDEN`` forces the golden reshard path."""
-    return os.environ.get("NRL_XFERDTENSOR_GOLDEN", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _use_python_api() -> bool:
-    """Use Python only implementation in for the xferdtensor.
-
-    ``xferdtensor_python_impl`` is the backup implementation when the
-    nccl.m2n.reshard is not available.
-    """
-    return os.environ.get("NRL_XFERDTENSOR_PYTHON", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+def _get_xferdtensor_selection() -> str:
+    """Apply environment overrides to the default implementation selection."""
+    for env_suffix, selection in (
+        ("GOLDEN", "NEMO_RL_GOLDEN"),
+        ("PYTHON", "NEMO_RL_PYTHON"),
+        ("NCCL", "NCCL_EXTENSION"),
+    ):
+        if os.environ.get(f"NRL_XFERDTENSOR_{env_suffix}", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return selection
+    return _XFERDTENSOR_DEFAULT_SELECTION
 
 
 def uses_real_reshard_op() -> bool:
     """Whether this process transfers with ``nccl.m2n.reshard``."""
-    return _reshard is not None and not _use_golden_api() and not _use_python_api()
+    return _reshard is not None and _get_xferdtensor_selection() == "NCCL_EXTENSION"
 
 
 def follow_source_reshard_path(source_uses_real_op: bool) -> None:
@@ -112,8 +109,8 @@ def follow_source_reshard_path(source_uses_real_op: bool) -> None:
     elif not uses_real_reshard_op():
         raise RuntimeError(
             "The refit source transfers with nccl.m2n.reshard, but this destination "
-            "cannot: install nccl-extensions in its venv and unset "
-            "NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
+            "cannot: set NRL_XFERDTENSOR_NCCL=1, install nccl-extensions in its venv, "
+            "and unset NRL_XFERDTENSOR_PYTHON / NRL_XFERDTENSOR_GOLDEN, or set "
             "NRL_XFERDTENSOR_PYTHON=1 for the source."
         )
 
@@ -130,12 +127,12 @@ def xferdtensor(
 ):
     """Public XferDTensor entry point used by all external callers."""
     global _XFERDTENSOR_PATH_LOGGED
-    use_golden = _use_golden_api()
-    force_python = _use_python_api()
+    selection = _get_xferdtensor_selection()
+    use_golden = selection == "NEMO_RL_GOLDEN"
     # nccl-extensions 0.1.0 supports at most two mesh axes and one shard axis.
     # Both endpoints select from the same global layout before transfer starts.
     use_python = (
-        force_python
+        selection == "NEMO_RL_PYTHON"
         or _reshard is None
         or src_mesh.mesh.ndim > 2
         or dst_mesh.mesh.ndim > 2
@@ -152,7 +149,7 @@ def xferdtensor(
         print(
             f"[xferdtensor] reshard path: {path} "
             f"(real_op_available={_reshard is not None}, "
-            f"force_golden={use_golden}, force_python={force_python})",
+            f"selection={selection})",
             flush=True,
         )
         _XFERDTENSOR_PATH_LOGGED = True

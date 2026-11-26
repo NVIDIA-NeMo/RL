@@ -189,13 +189,15 @@ xferdtensor(src_tensor, src_mesh, src_placement,
             process_group, stream=None)
 ```
 
-and dispatches to one of two transports:
+and dispatches to one of the following implementations:
 
-* **Core NCCL reshard** — the reshard operation provided by the **nccl4py wrapper** (`nccl.m2n.reshard`). When the package is accessible, this is the default: the local shards, mesh rank grids, and placements are handed to the NCCL library, which executes the cross-mesh redistribution natively.
-* **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — a pure Python + nccl4py-collectives **backup implementation** for environments without a proper NCCL / nccl4py reshard installation. It computes the exact shard overlaps between the source and destination layouts, moves each destination region once via batched point-to-point (with striped receives across replica groups), and fans out to replicas with cached split-communicator broadcasts. It is a drop-in with the same signature and is selected automatically when `nccl.m2n` is not importable, or for layouts the native op does not support (meshes with more than two axes or more than one shard axis).
+* **Core NCCL reshard** — the reshard operation provided by the **nccl4py wrapper** (`nccl.m2n.reshard`). Opt in with `NRL_XFERDTENSOR_NCCL=1` on both endpoints and nccl-extensions installed: the local shards, mesh rank grids, and placements are handed to the NCCL library, which executes the cross-mesh redistribution natively.
+* **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — the **default implementation** until native Reshard is fully verified, using Python + nccl4py collectives. It computes the exact shard overlaps between the source and destination layouts, moves each destination region once via batched point-to-point (with striped receives across replica groups), and fans out to replicas with cached split-communicator broadcasts. It also serves as the fallback when `nccl.m2n` is not importable, or for layouts the native op does not support (meshes with more than two axes or more than one shard axis).
 * **`xferdtensor_golden`** (`nemo_rl/weight_sync/xferdtensor.py`) — a pure function-only implementation intended for debugging. This implementation simply broadcasts the full tensor to the destination ranks, which then discard the unused parts. While not performant, it guarantees functionally correct outputs.
 
-Both transports honor the `stream` argument so the transfer is ordered with the caller's `pre`/`post` staging work on one CUDA stream.
+`NRL_XFERDTENSOR_GOLDEN=1` forces the golden path and `NRL_XFERDTENSOR_PYTHON=1` forces Python; precedence when several overrides are enabled is GOLDEN > PYTHON > NCCL.
+
+All implementations honor the `stream` argument so the transfer is ordered with the caller's `pre`/`post` staging work on one CUDA stream.
 
 
 ## Expected Performance
