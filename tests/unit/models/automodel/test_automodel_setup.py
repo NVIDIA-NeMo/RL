@@ -2527,28 +2527,13 @@ class TestMaybeSetForceHf:
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
 
-    def test_qwen2_auto_sets_force_hf(self):
-        """Qwen2 is in _DEFAULT_FORCE_HF_ARCHS, so force_hf should be auto-set when
-        not explicitly configured."""
-        from nemo_automodel._transformers.registry import ModelRegistry
-
-        if "Qwen2ForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
-            pytest.skip("Qwen2ForCausalLM not in registry")
-
+    @pytest.mark.parametrize(
+        "arch", ["LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"]
+    )
+    def test_dense_arch_auto_sets_force_hf(self, arch):
+        """Each arch in _DEFAULT_FORCE_HF_ARCHS gets force_hf auto-set when unset."""
         kwargs = {}
-        config = self._make_config("Qwen2ForCausalLM")
-        _maybe_set_force_hf(kwargs, config)
-        assert kwargs.get("force_hf") is True
-
-    def test_llama_auto_sets_force_hf(self):
-        """Llama is also in _DEFAULT_FORCE_HF_ARCHS."""
-        from nemo_automodel._transformers.registry import ModelRegistry
-
-        if "LlamaForCausalLM" not in ModelRegistry.model_arch_name_to_cls:
-            pytest.skip("LlamaForCausalLM not in registry")
-
-        kwargs = {}
-        config = self._make_config("LlamaForCausalLM")
+        config = self._make_config(arch)
         _maybe_set_force_hf(kwargs, config)
         assert kwargs.get("force_hf") is True
 
@@ -2589,6 +2574,34 @@ class TestMaybeSetForceHf:
         config = self._make_config(arch)
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
+
+    @pytest.mark.parametrize("explicit_false", [False, True])
+    def test_adapter_without_single_tensor_conversion(
+        self, monkeypatch, explicit_false
+    ):
+        """An adapter without convert_single_tensor_to_hf forces HF, or raises."""
+        import types
+
+        class FakeStateDictAdapter:
+            pass
+
+        adapter_module = types.ModuleType("fake_arch.state_dict_adapter")
+        adapter_module.FakeStateDictAdapter = FakeStateDictAdapter
+        monkeypatch.setitem(sys.modules, "fake_arch.state_dict_adapter", adapter_module)
+        model_cls = type("FakeForCausalLM", (), {"__module__": "fake_arch.model"})
+        monkeypatch.setattr(
+            "nemo_rl.models.automodel.setup.ModelRegistry",
+            SimpleNamespace(model_arch_name_to_cls={"FakeForCausalLM": model_cls}),
+        )
+        config = self._make_config("FakeForCausalLM")
+
+        if explicit_false:
+            with pytest.raises(RuntimeError, match="force_hf=False"):
+                _maybe_set_force_hf({"force_hf": False}, config)
+        else:
+            kwargs = {}
+            _maybe_set_force_hf(kwargs, config)
+            assert kwargs["force_hf"] is True
 
 
 class _TinyLoraModel(torch.nn.Module):

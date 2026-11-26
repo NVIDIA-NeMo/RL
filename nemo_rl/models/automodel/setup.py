@@ -128,12 +128,13 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     and HF weight formats. NeMo RL's weight syncing requires the adapter to
     implement `convert_single_tensor_to_hf`.
 
-    This function checks the adapter BEFORE model loading to avoid wasting time:
+    The checks run in this order, BEFORE model loading to avoid wasting time:
     - force_hf=True: no check needed, HF model won't have an adapter.
+    - arch in _DEFAULT_FORCE_HF_ARCHS: force_hf not set -> auto-set force_hf=True;
+      force_hf=False -> kept, Automodel's implementation is used.
     - force_hf not set + adapter incompatible: auto-set force_hf=True with a warning.
     - force_hf=False + adapter incompatible: raise an error telling the user to set
       force_hf=True or file an issue to NeMo-Automodel.
-    - force_hf not set + arch in _DEFAULT_FORCE_HF_ARCHS: auto-set force_hf=True.
 
     See: https://github.com/NVIDIA-NeMo/RL/issues/2072
     """
