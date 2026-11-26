@@ -255,7 +255,7 @@ class TensorboardLogger(LoggerInterface):
         """Log a plot to Tensorboard.
 
         Args:
-            plot_data: Dictionary of plot data
+            figure: Matplotlib figure to log
             step: Global step value
         """
         self.writer.add_figure(name, figure, step)
@@ -1584,7 +1584,7 @@ class Logger(LoggerInterface):
         for the sample with the highest multiplicative probability error in the batch.
 
         Args:
-            log_data: Dictionary of log probability samples
+            data: Dictionary of log probability samples
             step: Global step value
             name: Name of the plot
         """

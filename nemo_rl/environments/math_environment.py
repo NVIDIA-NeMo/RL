@@ -459,7 +459,7 @@ class MathEnvironment(BaseMathEnvironment):
         """Runs a step in the math environment.
 
         Args:
-            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
+            message_log_batch: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
             metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness. The extracted answer will be stored to caculate cons@k.
 
         Returns:
@@ -563,7 +563,7 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
         """Runs a step in the math environment.
 
         Args:
-            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
+            message_log_batch: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
             metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness. The extracted answer will be stored to caculate cons@k.
 
         Returns:

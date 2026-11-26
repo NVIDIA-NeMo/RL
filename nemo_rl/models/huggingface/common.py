@@ -251,7 +251,7 @@ def unpack_tensor(tensor, input_lengths):
 
     Args:
         tensor (torch.Tensor): Packed tensor of shape [batch_size, packed_seq_len].
-        packed_lengths (List[int]): Original sequence lengths in the order they were packed.
+        input_lengths (List[int]): Original sequence lengths in the order they were packed.
 
     Returns:
         torch.Tensor: [num_sequences, max_seq_len], each row is one unpacked and padded sequence.

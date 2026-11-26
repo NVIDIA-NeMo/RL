@@ -171,7 +171,7 @@ def add_loss_mask_to_message_log(
     """Add token-level loss masks to each message in a message log.
 
     Args:
-        message_log (LLMMessageLogType): List of message dictionaries containing token IDs and metadata
+        batch_message_log (list[LLMMessageLogType]): Batch of message logs, each a list of message dictionaries containing token IDs and metadata
         roles_to_train_on (list[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
         only_unmask_final (bool): If True, only unmask the final message in the log. Default: False
     """

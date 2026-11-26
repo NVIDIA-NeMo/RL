@@ -187,7 +187,6 @@ def broadcast_tensors_from_last_stage(
 
     Args:
         tensors: Dictionary mapping tensor names to tensors (None on non-last stages)
-        pp_group: Pipeline parallel group (auto-detected if None)
 
     Returns:
         Dictionary of broadcasted tensors on all ranks

@@ -5613,7 +5613,6 @@ class MegatronPolicyWorkerImpl(
             micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
             percentile: Percentile for amax (e.g. 99.9).
             margin: Margin factor, e.g. 1.05.
-            save_path: If provided, rank0 will save results as JSON.
             include_q: Whether to also return Q scale (usually only K/V needed).
 
         Returns:

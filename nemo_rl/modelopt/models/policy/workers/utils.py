@@ -171,7 +171,6 @@ def quantize_model(
         tokenizer: the tokenizer.
         batch_size: the calibration batch size for each calibration inference run.
         calib_size: the total calibration dataset size.
-        auto_quantize_bits: The effective bits constraint for auto_quantize.
         data: the name of the calibration dataset.
     """
     mtq_cfg = resolve_quant_cfg(quant_cfg)
