@@ -890,7 +890,11 @@ def register_routes(
                 }
             return sampling_params
 
-    register_generation_cut_route(app, lambda: host._prefix_recovery)
+    register_generation_cut_route(
+        app,
+        lambda: host._prefix_recovery,
+        lambda: host._generation_cut_peer_urls,
+    )
 
     # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
     @app.post(CHAT_COMPLETIONS_PATH)
