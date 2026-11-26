@@ -24,6 +24,8 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -35,6 +37,11 @@ from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
+)
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    engine_widths,
+    reject_role_layouts_without_dynamo,
+    validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -72,7 +79,13 @@ class MegatronGeneration(GenerationInterface):
         """Largest GPU group requiring full NVLink connectivity.
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
+        Behind Dynamo the unit is the widest engine: the router picks a request's
+        prefill and decode engine independently across the whole fleet, so the KV
+        handoff is not kept inside a replica and only an engine's own ranks need
+        NVLink.
         """
+        if dynamo_enabled(config["generation"]):
+            return max(engine_widths(config).values())
         if config["generation"]["colocated"]["enabled"]:
             # Placement must satisfy both the resident training layout and any
             # dedicated inference layout built on those same ranks.
@@ -246,6 +259,36 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
+        if dynamo_enabled(policy_config["generation"]):
+            cls._validate_dynamo_settings(master_config)
+        elif resolve_disagg_layout(policy_config["generation"]).enabled:
+            # Only the Dynamo engine fleet reads the disaggregation block; without
+            # it the run would train plain aggregated engines.
+            raise ValueError(
+                "policy.generation.disaggregation.enabled=true with "
+                "policy.generation.backend='megatron' requires "
+                "policy.generation.dynamo=true: Megatron prefill/decode engines are "
+                "served only behind Dynamo. Set dynamo to true, or set "
+                "disaggregation.enabled to false."
+            )
+        else:
+            reject_role_layouts_without_dynamo(policy_config["generation"])
+
+    @classmethod
+    def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject ``policy.generation.dynamo=true`` until the engine fleet exists.
+
+        The config is checked first so a shape the fleet could never serve is
+        named as such; any config is then refused, because nothing builds
+        prefill/decode engines yet and the run would otherwise train plain
+        aggregated engines.
+        """
+        validate_megatron_dynamo_generation(master_config.policy["generation"])
+        raise NotImplementedError(
+            "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
+            "the Megatron prefill/decode engine fleet is not built. Remove "
+            "policy.generation.dynamo."
+        )
 
     @classmethod
     def verify_served_addresses(
@@ -532,8 +575,10 @@ class MegatronGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Build bulk communicators over the selected Megatron ranks."""
+        assert layout_index == 0, "Megatron generation has a single reshard layout"
         return [
             worker.init_nccl_reshard_comm_groups_generation.remote(
                 pp_ips=pp_ips,
@@ -546,8 +591,12 @@ class MegatronGeneration(GenerationInterface):
             for worker, rank, _original_rank in self._refit_ranked_workers(membership)
         ]
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+    def prepare_nccl_reshard_refit_info(
+        self, refit_infos: list[dict[str, Any]]
+    ) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        assert len(refit_infos) == 1, "Megatron generation has a single reshard layout"
+        refit_info = refit_infos[0]
         futures = [
             worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
             for worker, _rank, _original_rank in self._refit_ranked_workers()
@@ -648,15 +697,19 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        media_family: str | None = None,
         top_logprobs: int = 0,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        prefix_write_max_rows: int,
+        prefix_write_max_tokens: int,
+        prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
         Returns the media column spec the coordinators pinned (``None`` for
-        text-only capture).
+        text-only capture). MInf captures Omni media only.
         """
         if top_logprobs != 0:
             raise NotImplementedError(
@@ -665,6 +718,10 @@ class MegatronGeneration(GenerationInterface):
         if generation_prefix_cuts_enabled:
             raise NotImplementedError(
                 "generation-prefix recovery is not implemented for Megatron inference"
+            )
+        if capture_media and media_family != "omni":
+            raise NotImplementedError(
+                f"Megatron generation captures Omni media only; got {media_family!r}"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(

@@ -51,6 +51,8 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTED_EXPERTS_FIELD,
     SAMPLER_TOPK_FIELDS,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_METADATA_FIELDS,
@@ -105,6 +107,7 @@ class _RecordingClient:
     def __init__(self, client, *, fail_put: Exception | None = None, fail_clear=None):
         self.client = client
         self.puts: list[list[str]] = []
+        self.put_kwargs: list[dict] = []
         self.gets: list[list[str]] = []
         self.clears: list[list[str]] = []
         self.fail_put = fail_put
@@ -115,6 +118,7 @@ class _RecordingClient:
 
     def put_samples(self, **kwargs):
         self.puts.append(list(kwargs["fields"].keys()))
+        self.put_kwargs.append(kwargs)
         if self.fail_put is not None:
             raise self.fail_put
         return self.client.put_samples(**kwargs)
@@ -628,38 +632,6 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink.clear(keys)
     with pytest.raises(KeyError):
         source.fetch(keys)
-
-
-def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
-    tq_client, staging_partition
-):
-    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
-    source = TQTokenSource(tq_client, staging_partition=staging_partition)
-    records, _, _ = build_fixture_artifacts("single_call")
-    record = records[0]
-
-    first = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=0
-    )
-    second = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=1
-    )
-    keys = [
-        generation_cut_staging_key(
-            "checkpoint-1",
-            record.capture_key,
-            record.model_call_id,
-            chunk_sequence=sequence,
-        )
-        for sequence in (0, 1)
-    ]
-
-    assert first.ok and second.ok
-    assert [first.staging_key, second.staging_key] == keys
-    assert [snapshot.model_dump() for snapshot in source.fetch(keys)] == [
-        record.model_dump(exclude={"extras"}),
-        record.model_dump(exclude={"extras"}),
-    ]
 
 
 def test_fetch_prefix_chains_expanded_empty(tq_client, staging_partition):
@@ -2156,3 +2128,198 @@ def test_slice_media_tensors_rejects_inconsistent_geometry(
     slicer only adds the item-count bound."""
     with pytest.raises(ValueError, match=error):
         slice_media_tensors(validate_media_tensors(media_tensors), prev_count)
+
+
+def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_partition):
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    more_records, _, _ = build_fixture_artifacts(
+        "single_call", rollout_id="a-different-length-rollout-id"
+    )
+    records.extend(more_records)
+    keys = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batch-checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert keys == [
+        generation_cut_staging_key(
+            "batch-checkpoint",
+            record.capture_key,
+            record.model_call_id,
+            chunk_sequence=sequence,
+        )
+        for sequence, record in enumerate(records)
+    ]
+    assert len(client.put_kwargs) == 1
+    assert client.put_kwargs[0]["sample_ids"] == keys
+    assert [tag["digest"] for tag in client.put_kwargs[0]["tags"]] == [
+        record.digest for record in records
+    ]
+    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(keys)
+    assert [row.model_dump() for row in restored] == [
+        record.model_dump(exclude={"extras"}) for record in records
+    ]
+
+
+def test_generation_prefix_batch_matches_single_rows_with_routes_and_topk(
+    tq_client, media_partition
+):
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
+    source = TQTokenSource(
+        client, staging_partition=media_partition, capture_media=True
+    )
+    chain, _, _ = build_fixture_artifacts("worked_example")
+    single, _, _ = build_fixture_artifacts("single_call")
+    records = [
+        record.model_copy(
+            update={
+                "extras": {
+                    "routed_experts": encode_routed_experts(
+                        torch.arange(
+                            len(record.token_ids_delta) * 4, dtype=torch.int16
+                        ).reshape(-1, 2, 2)
+                        + offset
+                    )
+                }
+            }
+        )
+        for offset, record in enumerate([*chain[:2], single[0]])
+    ]
+    # Score centering stages each token's sampler top-k beside its routes.
+    topk = [
+        {
+            SAMPLER_TOPK_TOKEN_IDS_FIELD: torch.arange(
+                len(record.token_ids_delta) * 2, dtype=torch.int32
+            ).reshape(-1, 2)
+            + offset,
+            SAMPLER_TOPK_LOGPROBS_FIELD: torch.full(
+                (len(record.token_ids_delta), 2), -0.5 - offset
+            ),
+        }
+        for offset, record in enumerate(records)
+    ]
+
+    single_keys = []
+    for sequence, (record, attachments) in enumerate(zip(records, topk, strict=True)):
+        single_keys += sink.stage_generation_prefix_batch(
+            [record],
+            checkpoint_id="single-cut",
+            chunk_sequences=[sequence],
+            attachments=[attachments],
+        )
+    puts_before = len(client.puts)
+    batched_keys = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batched-cut",
+        chunk_sequences=list(range(len(records))),
+        attachments=topk,
+    )
+    assert len(client.puts) - puts_before == 1
+
+    single = source.fetch_for_finalization(
+        single_keys, include_route_fragments=True, include_sampler_topk=True
+    )
+    batched = source.fetch_for_finalization(
+        batched_keys, include_route_fragments=True, include_sampler_topk=True
+    )
+    for expected, actual, attachments in zip(single, batched, topk, strict=True):
+        assert actual.snapshot == expected.snapshot
+        assert actual.extras == expected.extras
+        assert actual.routed_len == expected.routed_len
+        assert actual.fragment.encoding == expected.fragment.encoding
+        _assert_same_tensor(actual.fragment.routes, expected.fragment.routes)
+        assert actual.media_present is False
+        _assert_same_tensor(actual.sampler_topk[0], expected.sampler_topk[0])
+        _assert_same_tensor(actual.sampler_topk[1], expected.sampler_topk[1])
+        _assert_same_tensor(
+            actual.sampler_topk[0], attachments[SAMPLER_TOPK_TOKEN_IDS_FIELD]
+        )
+
+
+@pytest.mark.parametrize(
+    "second_routes",
+    [
+        # A column only the first row has would be dropped by the TensorDict.
+        None,
+        # Same shape but another dtype: stack_or_nest would promote it.
+        (torch.int32, (2, 2)),
+        # Another trailing dim: stack_or_nest would nest it.
+        (torch.int16, (2, 3)),
+    ],
+)
+def test_generation_prefix_batch_rejects_mixed_layouts_before_writing(second_routes):
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+    class UnexpectedClient:
+        def put_samples(self, **kwargs):
+            pytest.fail("a mixed-layout batch must not reach TQ")
+
+    def routed(record, dtype, trailing):
+        routes = torch.zeros(len(record.token_ids_delta), *trailing, dtype=dtype)
+        return record.model_copy(
+            update={"extras": {"routed_experts": encode_routed_experts(routes)}}
+        )
+
+    sink = TQTokenSink(UnexpectedClient(), staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    assert (
+        sink.stage_generation_prefix_batch(
+            [], checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+        == []
+    )
+    second = records[1] if second_routes is None else routed(records[1], *second_routes)
+    with pytest.raises(ValueError, match="different layouts"):
+        sink.stage_generation_prefix_batch(
+            [routed(records[0], torch.int16, (2, 2)), second],
+            checkpoint_id="checkpoint",
+            chunk_sequences=[0, 1],
+        )
+
+
+def test_generation_prefix_batch_failure_discards_every_key_and_raises():
+    """A failed put may have written some fields, so every key is discarded."""
+
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+            self.cleared = []
+
+        def put_samples(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("injected partial batch write")
+
+        def clear_samples(self, **kwargs):
+            self.cleared.extend(kwargs["sample_ids"])
+
+    client = FailingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    with pytest.raises(RuntimeError, match="injected partial batch write"):
+        sink.stage_generation_prefix_batch(
+            records,
+            checkpoint_id="checkpoint",
+            chunk_sequences=list(range(len(records))),
+        )
+
+    assert client.calls == 1
+    assert client.cleared == [
+        generation_cut_staging_key(
+            "checkpoint",
+            record.rollout_id,
+            record.model_call_id,
+            chunk_sequence=sequence,
+        )
+        for sequence, record in enumerate(records)
+    ]

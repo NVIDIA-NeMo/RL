@@ -29,6 +29,7 @@ policy:
 env:
   should_use_nemo_gym: true       # Enables NeMo Gym integration
   nemo_gym:
+    truncate_noncontiguous_episodes: false
     # NeMo Gym config paths and settings
     config_paths:
       - resources_servers/math/configs/math.yaml
@@ -41,32 +42,48 @@ logger:
     log_nemo_gym_full_result_tables: false
 ```
 
-When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
-the per-agent `full_result` Tables. This prevents those payloads from entering
-the async replay buffer and avoids uploading them to W&B. Numeric per-agent
-rollout metrics are unaffected. Set the flag to `true` only when the complete
-Gym result payloads are needed for a short debugging run.
+`env.nemo_gym.truncate_noncontiguous_episodes` defaults to `false`, so a token-prefix discontinuity raises an error. When set to `true`, NeMo RL stops at the first trainable turn whose prompt does not preserve the tokens already seen, drops that turn and the remaining tail, and keeps the preceding contiguous prefix with the episode reward. This option cannot be used with `policy.router_replay.enabled: true` or `token_capture.enabled: true`. Truncation applies only to the legacy token-echo path; token-capture receipt mode bypasses that path and retains its own integrity checks. Every legacy result includes a boolean `noncontiguous_truncated` flag; its per-agent `{agent_name}/noncontiguous_truncated/mean` metric reports the fraction of episodes whose non-contiguous tail was dropped.
 
-The exposed vLLM HTTP server binds every interface of its node and, by default,
-checks no credential on its OpenAI routes; the NeMo Gym model server sends the
-placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
-to require a bearer token instead (the setting needs `expose_http_server: true`
-and is refused at setup without it): NeMo RL generates one random key per job,
-every vLLM worker refuses a `/v1/*` or `/tokenize` request without
-`Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
-model server as `policy_api_key`. The saved and logged job configuration never
-carries the key: the vLLM workers receive it in their own configuration copy,
-and the Gym servers receive it as an environment variable
-(`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so
-Gym's serialized global config, its head server's `/global_config_dict_yaml`
-endpoint and the server command lines carry only the variable name. The
-residual exposure is the server processes' environment and the Gym actor's
-constructor arguments, the same as for the token-capture secret. The setting
-covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
-check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
-setting at configuration time rather than ignoring it).
+When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct the per-agent `full_result` Tables. This prevents those payloads from entering the async replay buffer and avoids uploading them to W&B. Numeric per-agent rollout metrics are unaffected. Set the flag to `true` only when the complete Gym result payloads are needed for a short debugging run.
+
+The exposed vLLM HTTP server binds every interface of its node and, by default, checks no credential on its OpenAI routes; the NeMo Gym model server sends the placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true` to require a bearer token instead (the setting needs `expose_http_server: true` and is refused at setup without it): NeMo RL generates one random key per job, every vLLM worker refuses a `/v1/*` or `/tokenize` request without `Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym model server as `policy_api_key`. The saved and logged job configuration never carries the key: the vLLM workers receive it in their own configuration copy, and the Gym servers receive it as an environment variable (`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so Gym's serialized global config, its head server's `/global_config_dict_yaml` endpoint and the server command lines carry only the variable name. The residual exposure is the server processes' environment and the Gym actor's constructor arguments, the same as for the token-capture secret. The setting covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
+
+### Multiple vLLM HTTP frontends
+
+Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP frontend processes for each model-owner worker. They share one vLLM engine, its model weights, and one listening socket, so NeMo Gym keeps using the same URL. The count includes the owning worker's frontend: a value of `8` starts seven additional frontend processes.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `policy.generation.vllm_cfg.http_api_server_count` | `1` | Positive integer specifying the number of frontend processes per shared engine. |
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      http_api_server_count: 8
+
+async_rl:
+  generation_fleet_health:
+    enabled: false
+```
+
+Counts greater than one require:
+
+- Async HTTP serving: both `async_engine` and `expose_http_server` must be `true`.
+- Local vLLM internal data parallelism of size one, without the Ray data-parallel backend, and colocated frontend-to-engine IPC connections. Tensor parallelism and multiple NeMo RL generation replicas remain supported.
+- A refit transport other than `vllm_s3_sparse` or `vllm_zmq_sparse`.
+- `async_rl.generation_fleet_health.enabled: false` on the SingleController path.
+
+Use multiple frontends when CPU-side HTTP handling, chat-template rendering, or tokenization limits throughput. Additional frontends consume CPU and host memory; they share GPU inference capacity. A count of one keeps the single-frontend construction path.
+
+Prefix-level rollout recovery (`rollout_recovery.target_level: prefix`) works with multiple frontends. A model call's decoding state lives only in the frontend that accepted its request, so each frontend also listens on a loopback control port. Gym's generation-cut call reaches one frontend through the shared socket; that frontend asks every other one to cut the calls it serves and returns one merged receipt. A frontend that does not answer within `token_capture.control_timeout_s` leaves its calls uncut, and they restart from their last saved turn. On a TransferQueue data plane, each frontend also starts its own prefix-writer actor, which needs one free CPU on the generation node.
+
+See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 
 ### Dataset formats and routing
 
@@ -75,7 +92,7 @@ NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment 
 - **Flat rows** identify the Agent through `agent_ref.name` or `task_source`. Gym resolves the Environment Server associated with that Agent, including through `legacy_agent`.
 - **Materialized task rows** contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name.
 
-The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`.
+The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn`, `single_agent_turn_legacy`, or `harbor`.
 
 See [Data Format Translation](#data-format-translation) for the field layout of each format.
 
@@ -94,15 +111,71 @@ See [Data Format Translation](#data-format-translation) for the field layout of 
 }
 ```
 
-`task_input` must contain `responses_create_params`, because NeMo RL writes the policy's `temperature`, `top_p`, and `max_output_tokens` there. A taskset whose rows lack it fails on its first batch.
+NeMo RL passes `task_input` to the Environment Server unchanged and sends the policy's sampling values beside the task, as described under **Data flow**. The Environment Servers `single_agent_turn`, `single_agent_turn_legacy` and `harbor` apply the values, and `legacy_agent` passes the row on to its agent. Tasksets routed to `single_agent_turn` or `single_agent_turn_legacy` still need `responses_create_params` in `task_input`, because the Environment Server reads it. Gym refuses an episode at admission when its Environment Server does not apply the values.
 
 Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
 
-Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
+Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, `grpo.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length, GRPO and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
 
 Set these keys in a YAML file, where a key such as `weather:train` needs no quoting. A Hydra command-line override cannot express a key that contains `:`: `++rollout_recovery.task_source_target_level_overrides.weather:train=prompt_group` fails to parse, and `{weather:train: prompt_group}` is read as the key `weather`.
 
 An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
+
+#### Train a taskset on several harnesses
+
+A taskset is routed by exactly one of two settings. The Gym Environment Servers are usually defined in a Gym config file listed in `config_paths`; they are shown inline here:
+
+```yaml
+env:
+  nemo_gym:
+    # Gym Environment Servers: one per taskset and harness.
+    # Each pairs one agent (the harness) with the taskset's verifier.
+    swe_rebench_opencode:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    swe_rebench_pi:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    scale_swe_opencode:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: scale_swe_resources_server}
+    scale_swe_pi:
+      environment_servers:
+        single_agent_turn:
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: scale_swe_resources_server}
+
+    # One harness per taskset: every group of the taskset runs on this server.
+    environment_server_routes:
+      math: math_environment
+    # Several harnesses per taskset: each group runs on one of the taskset's servers.
+    multi_harness:
+      routes:                  # taskset -> its servers, one per harness
+        swe_rebench: [swe_rebench_opencode, swe_rebench_pi]
+        scale_swe: [scale_swe_opencode, scale_swe_pi]
+      weights:                 # optional; keyed by the servers' agent_server names
+        opencode_agent: 2      # covers swe_rebench_opencode and scale_swe_opencode
+        pi_agent: 1            # covers swe_rebench_pi and scale_swe_pi
+```
+
+`routes` lists server names. `weights` uses the servers' `agent_server` names, so one weight covers that agent in every taskset.
+
+- A taskset goes in `environment_server_routes` or in `multi_harness.routes`, never both. Setup stops if a taskset is in both.
+- The servers of one taskset must run different agents.
+- Each prompt group runs on one of its taskset's servers, chosen at random in proportion to the weight of the server's agent. With the weights above, about two thirds of the groups run on OpenCode.
+- Weights apply to the whole run. A set `weights` must list exactly the agents the servers run. A weight of 0 disables an agent, but its servers must still be listed and running; to drop a harness, remove its servers and its weight.
+
+GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness` across a resume is not supported: a checkpoint that carries unfinished rollouts records the resolved routes (each taskset's servers, their agents and weights), and a resume whose routes differ stops before any of them is restored. Changes inside a listed server's Gym config, such as its agent's turn limit, are not checked.
+
+Setup also checks that each listed server runs in exactly one shard (its replicas are fine) and that a taskset's servers share one Environment Server type and verifier: the same resources server for `single_agent_turn`, and the taskset in each server's `tasksets` for `harbor`. With `env.nemo_gym.shards`, every shard must use the shared `multi_harness` block.
+
+Metrics for a multi-harness taskset are named after the taskset and the agent, such as `swe_rebench/opencode_agent/reward/mean`. There are no `swe_rebench/...` keys, so set `checkpointing.metric_name` to a run-wide key such as `train:total_reward/mean`. Each step also logs `<taskset>/<agent>/num_groups`, the number of groups each harness ran (0 for one that ran none), so the split can be checked against the weights. Validation draws a fresh harness for each prompt on every pass, so per-harness validation numbers cover different prompts each time. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
 
 ### Shard NeMo Gym across nodes
 
@@ -234,7 +307,7 @@ flowchart LR
 The flow is:
 1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
 2. The actor calls Gym's `RolloutCollectionHelper.run_examples()` in its own process
-3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes` before calling the collector; for flat rows, the collector resolves the server associated with the Agent
+3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes`, or `multi_harness.routes` for a multi-harness taskset, before calling the collector; for flat rows, the collector resolves the server associated with the Agent
 4. Completed examples return through the collector to the actor
 5. Actor post-processes and streams each completed example back with its original row index
 6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
@@ -416,7 +489,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and adds the policy's sampling values for the rollout's phase beside the task, as `_ng_model_sampling`: `temperature` and `top_p` (or `val_temperature` and `val_top_p` for validation), and `max_new_tokens` as `max_output_tokens`. Gym carries them to the trained agent's model calls that go through Gym's model servers, and Gym's model server applies them, keeping a smaller output limit the call asks for. On the vLLM backend, calls that Gym marks as untrained keep their own sampling, for example an LLM judge that a resources server calls through Gym's server client. The vLLM HTTP server checks the trained agent's calls against the train or validation values and skips the calls Gym marks with `x-ng-sampling: null`. Recipes cannot set `sampling_overrides` on `policy_model`; NeMo RL itself pins only `logprobs` and `top_logprobs` there, for score centering. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`, or through `multi_harness.routes` by prompt group; the collector wraps each task in an episode request containing `episode_id`, `task` and `model_sampling`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`; a multi-harness taskset's metrics are further split by agent.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 

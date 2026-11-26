@@ -19,11 +19,9 @@ Saving and restoring both run them, so they are plain functions.
 
 from __future__ import annotations
 
-import re
 from typing import (
     TYPE_CHECKING,
     Any,
-    Literal,
     Optional,
 )
 
@@ -59,41 +57,18 @@ def capture_reward_settings(
         master_config.reward_penalties,
         get_effort_config(master_config.env),
         get_nemo_gym_thinking_tags(master_config.env),
+        master_config.grpo.length_penalty if master_config.grpo is not None else None,
     )
 
 
-# Sample IDs _pad_forest_step_rows gives the copies it writes for one step.
-_STEP_PADDING_ID = re.compile(r"(.+)_pad\d+")
-
-
-def _step_padding_sample_ids(
-    sample_ids: set[str], expected_sample_ids: set[str]
-) -> set[str]:
-    """Return the step padding copies of expected rows among ``sample_ids``."""
-    return {
-        sample_id
-        for sample_id in sample_ids
-        if (match := _STEP_PADDING_ID.fullmatch(sample_id)) is not None
-        and match.group(1) in expected_sample_ids
-    }
-
-
 async def validate_replay_inventory(
-    replay_metadata: TQReplayMetadataState,
-    *,
-    dp_client: Any,
-    partition_id: str,
-    step_padding: Literal["reject", "allow", "clear"] = "reject",
+    replay_metadata: TQReplayMetadataState, *, dp_client: Any, partition_id: str
 ) -> None:
     """Require the canonical TQ keys to match the SC replay index exactly.
 
     Live checkpoint callers must hold the exclusive data-plane barrier so
     commits and clears cannot race this inventory read. Restore calls are
     also safe before the rollout and train pumps start any live writers.
-
-    With forest_padding_scope=step, a rollout snapshot taken mid-step also
-    holds that step's padding copies, which no replay group lists:
-    ``step_padding="allow"`` accepts them and ``"clear"`` deletes them.
     """
     expected_sample_ids = {
         sample_id
@@ -108,19 +83,6 @@ async def validate_replay_inventory(
             partition_id=partition_id,
         )
     )
-    if step_padding != "reject":
-        padding_ids = _step_padding_sample_ids(
-            actual_sample_ids - expected_sample_ids, expected_sample_ids
-        )
-        if padding_ids and step_padding == "clear":
-            await call_data_plane(
-                dp_client,
-                "clear_samples",
-                offload_sync=True,
-                sample_ids=sorted(padding_ids),
-                partition_id=partition_id,
-            )
-        actual_sample_ids -= padding_ids
     missing_sample_ids = sorted(expected_sample_ids - actual_sample_ids)
     unexpected_sample_ids = sorted(actual_sample_ids - expected_sample_ids)
     if missing_sample_ids or unexpected_sample_ids:
@@ -138,17 +100,36 @@ async def validate_replay_inventory(
     )
 
 
+async def list_staging_keys(dp_client: Any, staging_partition: str) -> frozenset[str]:
+    """List the token-capture staging rows TQ holds.
+
+    List once per cut and pass the result to every check under that cut.
+    """
+    return frozenset(
+        await call_data_plane(
+            dp_client,
+            "list_sample_ids",
+            offload_sync=True,
+            partition_id=staging_partition,
+        )
+    )
+
+
 async def validate_rollout_recovery_inventory(
     cut: DataPlaneMutationCut,
     *,
     dp_client: Any,
     recovery_ledger: RolloutRecoveryLedger,
     staging_partition: str,
+    actual_staging_keys: frozenset[str],
     replay_metadata: Optional[TQReplayMetadataState],
     clear_unreferenced: bool,
     additional_expected_staging_keys: Optional[set[str]] = None,
 ) -> int:
-    """Validate staging ownership while the caller holds a stable cut."""
+    """Validate staging ownership while the caller holds a stable cut.
+
+    ``actual_staging_keys`` must be listed under the same cut.
+    """
     cut.require_live()
     expected_staging_keys = recovery_ledger.expected_staging_keys()
     required_staging_keys = recovery_ledger.expected_staging_keys(required_only=True)
@@ -164,14 +145,6 @@ async def validate_rollout_recovery_inventory(
                     expected_staging_keys.update(route_keys)
                     required_staging_keys.update(route_keys)
 
-    actual_staging_keys = set(
-        await call_data_plane(
-            dp_client,
-            "list_sample_ids",
-            offload_sync=True,
-            partition_id=staging_partition,
-        )
-    )
     missing = sorted(required_staging_keys - actual_staging_keys)
     if missing:
         raise RuntimeError(
@@ -179,8 +152,12 @@ async def validate_rollout_recovery_inventory(
             f"from live TQ state: missing={missing[:10]!r} "
             f"(total={len(missing)})"
         )
-    unreferenced = sorted(actual_staging_keys - expected_staging_keys)
-    if clear_unreferenced and unreferenced:
+    unreferenced = (
+        sorted(actual_staging_keys - expected_staging_keys)
+        if clear_unreferenced
+        else []
+    )
+    if unreferenced:
         await call_data_plane(
             dp_client,
             "clear_samples",

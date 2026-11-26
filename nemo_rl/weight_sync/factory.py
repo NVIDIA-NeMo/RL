@@ -59,9 +59,7 @@ def validate_offload_policy_before_refit(
         )
     supported_transports = (
         (None, "nccl_reshard")
-        if generation_backend == VLLM_BACKEND
-        else (None,)
-        if generation_backend == TRTLLM_BACKEND
+        if generation_backend in (VLLM_BACKEND, TRTLLM_BACKEND)
         else (None, "mcore", "nccl_reshard")
         if generation_backend == MEGATRON_BACKEND
         else ()
@@ -70,8 +68,37 @@ def validate_offload_policy_before_refit(
         raise ValueError(
             "offload_policy_before_refit requires non-colocated vLLM or Megatron "
             "generation with a collective, mcore, or nccl_reshard refit transport, "
-            "or non-colocated TensorRT-LLM generation with the default collective "
-            "transport."
+            "or non-colocated TensorRT-LLM generation with a collective or "
+            "nccl_reshard refit transport."
+        )
+
+
+def validate_refit_actor_transport(
+    *,
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: Optional[str],
+) -> None:
+    """Validate the topology supported by async_rl.refit_actor.
+
+    The RefitActor runs the NCCL transports that ``create_weight_synchronizer`` builds
+    for non-colocated vLLM or TensorRT-LLM generation: collective (``refit_transport``
+    null) and nccl_reshard.
+    """
+    if colocated:
+        raise ValueError(
+            "async_rl.refit_actor.enabled requires non-colocated generation: a colocated "
+            "refit is the engine's own wake-up and has to run where the engines are. "
+            "Set policy.generation.colocated.enabled=false or disable the refit actor."
+        )
+    if generation_backend not in (VLLM_BACKEND, TRTLLM_BACKEND) or (
+        refit_transport not in (None, "nccl_reshard")
+    ):
+        raise ValueError(
+            "async_rl.refit_actor.enabled supports the NCCL refit transports of "
+            "non-colocated vLLM or TensorRT-LLM generation (policy.generation."
+            "refit_transport null for collective, or nccl_reshard), got backend "
+            f"{generation_backend!r} with refit_transport {refit_transport!r}."
         )
 
 

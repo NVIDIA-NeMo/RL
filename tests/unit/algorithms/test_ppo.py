@@ -35,7 +35,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -381,9 +381,8 @@ def test_raw_reward_basic_broadcast_and_masking():
     """RawRewardAdvantageEstimator broadcasts scalar reward across the response.
 
     Validates the no-value-model path: advantages are the per-sample reward
-    expanded to ``mask.shape`` (broadcast at every position, including
-    masked-out trailing pads — the downstream loss masking is responsible
-    for zeroing those out). ``returns`` is None since there is no value head.
+    expanded to ``mask.shape``, zero at masked-out positions as with GAE.
+    ``returns`` is None since there is no value head.
     """
     estimator_config = GAEConfig(name="raw_reward", normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
@@ -406,8 +405,8 @@ def test_raw_reward_basic_broadcast_and_masking():
 
     expected = torch.tensor(
         [
-            [2.0, 2.0, 2.0, 2.0],
-            [-1.0, -1.0, -1.0, -1.0],
+            [2.0, 2.0, 2.0, 0.0],
+            [-1.0, -1.0, 0.0, 0.0],
         ]
     )
     torch.testing.assert_close(advantages, expected)
@@ -1006,12 +1005,12 @@ def _run_mock_ppo_train(
             "make_sequence_length_divisible_by": 1,
         },
         loss_fn=_make_loss_config(),
-        checkpointing={
-            "enabled": checkpoint_path is not None,
-            "checkpoint_must_save_by": None,
-            "save_period": 100,
-            "metric_name": None,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=checkpoint_path is not None,
+            checkpoint_must_save_by=None,
+            save_period=100,
+            metric_name=None,
+        ),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
@@ -1614,10 +1613,9 @@ def _make_noncolocated_setup_config(
             gpus_per_node=total_gpus_per_node,
             segment_size=segment_size,
         ),
-        checkpointing={
-            "enabled": False,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            enabled=False, save_optimizer=False
+        ),
     )
 
 
@@ -2495,7 +2493,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
-        checkpointing={"checkpoint_must_save_by": None},
+        checkpointing=CheckpointingConfig.model_construct(checkpoint_must_save_by=None),
     )
 
 
@@ -2552,8 +2550,10 @@ def test_legacy_ppo_entrypoint_rejects_split_value_training(
     monkeypatch.setattr(
         run_ppo,
         "MasterConfig",
-        lambda **_: SimpleNamespace(
-            ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+        SimpleNamespace(
+            model_validate=lambda _: SimpleNamespace(
+                ppo=SimpleNamespace(async_ppo={}, value_training_mode="split")
+            )
         ),
     )
     monkeypatch.setattr(run_ppo, "init_ray", init_ray)
@@ -2827,10 +2827,9 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     config.ppo.val_at_end = False
     config.ppo.num_prompts_per_step = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        checkpoint_must_save_by=None, ft_save_period=None
+    )
     policy = MagicMock()
     generation = MagicMock()
     generation.requires_kv_scale_sync = False
@@ -2885,10 +2884,9 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     config.ppo.max_rollout_turns = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
     config.ppo.adv_estimator = GAEConfig(name="raw_reward", normalize_advantages=False)
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        checkpoint_must_save_by=None, ft_save_period=None
+    )
 
     replay_actor = MagicMock()
     collector_actor = MagicMock()

@@ -43,6 +43,7 @@ from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
@@ -384,16 +385,16 @@ def test_train_pump_drives_mcore_training_step(
             logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
             # Actor __init__ builds a CheckpointManager + TimeoutChecker from
             # this block; enabled=False keeps the run write-free.
-            checkpointing={
-                "enabled": False,
-                "checkpoint_dir": str(tmp_path / "checkpoints"),
-                "metric_name": None,
-                "higher_is_better": False,
-                "keep_top_k": None,
-                "save_period": 10_000,
-                "save_optimizer": False,
-                "checkpoint_must_save_by": None,
-            },
+            checkpointing=CheckpointingConfig(
+                enabled=False,
+                checkpoint_dir=str(tmp_path / "checkpoints"),
+                metric_name=None,
+                higher_is_better=False,
+                keep_top_k=None,
+                save_period=10_000,
+                save_optimizer=False,
+                checkpoint_must_save_by=None,
+            ),
         )
 
         actor_args = SingleControllerActorArgs(
@@ -444,7 +445,7 @@ def test_train_pump_drives_mcore_training_step(
             assert math.isfinite(metrics["advantages/mean"])
             assert metrics["evicted_stale_prompt_groups"] == 0
             assert metrics["aborted_stale_inflight_groups"] == 0
-            assert metrics["weight_version_lag"] >= 0
+            assert metrics["weight_version_lag_max"] >= 0
 
         # The final "timing/train" log of each step must carry step_finished=True
         # (the behavior this restores) so W&B commits the step; the "train" log must not.

@@ -71,6 +71,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     write_gym_checkpoint_manifest,
 )
 from nemo_rl.experience.rollout_manager import (
+    RolloutManager,
     RolloutOutcome,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -213,7 +214,10 @@ class _PendingLedger:
             for group in self._groups
         ]
 
-    def state_dict(self) -> dict[str, Any]:
+    def state_dict(
+        self, *, exclude_group_ids: set[str] | None = None
+    ) -> dict[str, Any]:
+        excluded = exclude_group_ids or set()
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [
@@ -231,6 +235,7 @@ class _PendingLedger:
                     "phase": ("reserved" if group.target_step is None else "admitted"),
                 }
                 for group in self._groups
+                if group.group_id not in excluded
             ],
         }
 
@@ -253,6 +258,13 @@ class _RecoveryRolloutManager:
     def __init__(self, ledger: RolloutRecoveryLedger) -> None:
         self.recovery_ledger = ledger
         self.recovered: list[tuple[str, int | None]] = []
+
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
 
     async def complete_recovery(
         self,
@@ -300,6 +312,13 @@ class _BlockingRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
+
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
 
     def get_next_nemo_gym_task_index(self) -> int:
         return self.next_nemo_gym_task_index
@@ -559,6 +578,8 @@ def _reserve_controller() -> Any:
     controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
+    # Pooled replacements: the fault-tolerance reserve path reads this directly.
+    controller._sampler = SimpleNamespace(uses_pooled_replacements=True)
     controller._rollout_recovery_enabled = True
     # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
     controller._dynamic_sampling_enabled = False
@@ -623,7 +644,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(
             max_num_epochs=1,
             data_plane_checkpoint=True,
         )
-        config.checkpointing["metric_name"] = "train:loss"
+        config.checkpointing.metric_name = "train:loss"
         actor_args = _make_actor_args(
             save_state=save_state,
             dataloader=dataloader,

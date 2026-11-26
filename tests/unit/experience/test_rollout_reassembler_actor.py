@@ -172,6 +172,32 @@ def test_actor_forwards_capture_media_to_the_reassembler(
     assert finalizer._staging._capture_media is capture_media
 
 
+@pytest.mark.parametrize("stamp_agent_names", [False, True])
+def test_actor_forwards_stamp_agent_names_to_the_reassembler(
+    stamp_agent_names: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """grpo.agent_overrides: actor config -> RolloutReassembler row tagging."""
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        actor_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
+    )
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+        top_logprobs=0,
+        capture_media=False,
+        media_columns=None,
+        stamp_agent_names=stamp_agent_names,
+    )
+    actor = object.__new__(actor_cls)
+    actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
+    assert actor._finalizer._stamp_agent_names is stamp_agent_names
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -218,6 +244,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "canonical_output_tokens",
         "metrics",
         "reward_observations",
+        "reward_mask_sample",
+        "reward_truncated",
+        "reward_original",
+        "loss_multiplier",
         "dropped",
         "drop_reason",
         "valid_row_count",
@@ -225,6 +255,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "token_metrics",
         # One (model call ID, weight version, tokens) tuple per trained call.
         "call_versions",
+        # Controller-set verdict: the finalized group scored all-same reward.
+        "zero_variance",
     }
 
 

@@ -177,27 +177,41 @@ def reject_outdated_mcore_generation_keys(config: dict[str, Any]) -> None:
             )
 
 
+def _dynamo_frontend_args(config: dict[str, Any]) -> dict[str, Any]:
+    """``policy.generation.dynamo_cfg.frontend_args``, or ``{}`` when absent."""
+    node: Any = config
+    for key in ("policy", "generation", "dynamo_cfg", "frontend_args"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return node if isinstance(node, dict) else {}
+
+
 def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
     """Fail when the Dynamo frontend's removed router-reset-states key is present.
 
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
     """
-    policy = config.get("policy")
-    if not isinstance(policy, dict):
-        return
-    generation = policy.get("generation")
-    if not isinstance(generation, dict):
-        return
-    dynamo_cfg = generation.get("dynamo_cfg")
-    if not isinstance(dynamo_cfg, dict):
-        return
-    frontend_args = dynamo_cfg.get("frontend_args")
-    if isinstance(frontend_args, dict) and "router_reset_states" in frontend_args:
+    if "router_reset_states" in _dynamo_frontend_args(config):
         raise ValueError(
             "policy.generation.dynamo_cfg.frontend_args.router_reset_states was "
             "removed: Dynamo 1.4 dropped the frontend's --router-reset-states flag. "
             "Delete the key."
+        )
+
+
+def reject_outdated_dynamo_router_mode(config: dict[str, Any]) -> None:
+    """Fail on the Dynamo router mode that Dynamo 1.7 removed.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    if _dynamo_frontend_args(config).get("router_mode") == "power-of-two":
+        raise ValueError(
+            "policy.generation.dynamo_cfg.frontend_args.router_mode='power-of-two' "
+            "was removed: Dynamo 1.7 dropped the power-of-two router. Use "
+            "'least-loaded', or 'kv' to route on cached prefixes."
         )
 
 
@@ -209,8 +223,10 @@ _REMOVED_DYNAMO_CFG_KEYS = {
     "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
     "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
     "worker_args": (
-        "Dynamo serves only NeMo RL's own rollouts, which need no chat parsers or "
-        "templates; engines are configured through vllm_cfg and vllm_kwargs"
+        "NeMo RL's chat engine in the frontend renders and parses NeMo-Gym's calls "
+        "with the native server's vllm_cfg.http_server_serving_chat_kwargs and "
+        "parser plugins, and engines are configured through vllm_cfg and "
+        "vllm_kwargs"
     ),
 }
 _REMOVED_DYNAMO_FRONTEND_KEYS = (
@@ -257,8 +273,9 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                 if key in frontend_args:
                     problems.append(
                         f"policy.generation.dynamo_cfg.frontend_args.{key} was "
-                        "removed: NeMo RL's rollouts send token IDs, which the "
-                        "frontend never tokenizes."
+                        "removed: NeMo RL never uses the frontend's tokenizer: "
+                        "rollouts send token IDs, and NeMo-Gym's chat calls are "
+                        "rendered by NeMo RL's own chat engine."
                     )
     if problems:
         raise ValueError(" ".join(problems))
@@ -314,29 +331,13 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
-def reject_outdated_forest_population_options(config: dict[str, Any]) -> None:
-    """Reject deferred Forest whitening and padding-source options.
-
-    Args:
-        config: The resolved user configuration before schema validation.
-    """
-    ppo = config.get("ppo")
-    estimator = ppo.get("adv_estimator") if isinstance(ppo, dict) else None
-    if isinstance(estimator, dict):
-        removed = {"normalize_over", "whiten_execution_padding"} & estimator.keys()
-        if removed:
-            raise ValueError(
-                f"ppo.adv_estimator no longer accepts {sorted(removed)!r}. "
-                "Remove these keys; GAE whitening uses only loss-participating "
-                "rows and excludes execution padding. All-row and padding "
-                "whitening are not supported."
-            )
-    token_capture = config.get("token_capture")
-    if isinstance(token_capture, dict) and "forest_pad_source" in token_capture:
+def reject_outdated_token_level_loss(loss_config: dict[str, Any]) -> None:
+    """Reject the removed loss selector and explain how to preserve its reduction."""
+    if "token_level_loss" in loss_config:
         raise ValueError(
-            "token_capture.forest_pad_source is no longer supported. Remove the "
-            "key; Forest step padding always copies the first row. Cyclic "
-            "padding is not supported."
+            "loss_fn.token_level_loss was removed. Set loss_fn.normalization="
+            "global_token_mean for true or sequence_mean for false, and remove "
+            "token_level_loss. If its value is null, just remove the key."
         )
 
 
@@ -346,7 +347,8 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     Call this from every entrypoint on the resolved config, before the MasterConfig is
     built. Validation rejects a missing required key on its own terms, so a check that
     runs after it can never explain a removal that changed such a key's shape. Add a
-    check here whenever a key is removed or the shape it accepts changes.
+    check here when a previously supported key is removed or its accepted shape changes.
+    Spellings or shapes introduced and replaced within the same unmerged PR need no check.
 
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
@@ -357,7 +359,10 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_dynamo_router_mode(config)
     reject_outdated_dynamo_backend(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)
-    reject_outdated_forest_population_options(config)
+    loss_config = config.get("loss_fn")
+    if isinstance(loss_config, dict):
+        reject_outdated_token_level_loss(loss_config)

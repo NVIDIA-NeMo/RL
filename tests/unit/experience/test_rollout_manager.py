@@ -25,12 +25,14 @@ Two groups:
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import tempfile
 import uuid
+import weakref
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -48,18 +50,23 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
+    GymRowFailure,
     GymTerminalEpisodeFailure,
+    RestoredHarnessChanged,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.reward_penalties import RewardLogContext
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -70,8 +77,10 @@ from nemo_rl.experience.rollout_manager import (
     _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
+    PromptGroupPhase,
     RecoveryGranularity,
     RecoveryTargetLevel,
+    RolloutAttemptStatus,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
@@ -1280,6 +1289,314 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
         assert "reward" not in json.loads(context.full_result_json)
 
 
+def test_streamed_receipt_names_a_mixed_taskset_reward_by_harness():
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def result_ref():
+                result = _mask_gate_receipt_result()
+                result["full_result"]["_ng_harness"] = "pi_agent"
+                return (0, None, {**result, "attribution_key": "swe"}, None)
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    streamed = []
+    pending_row = {"_rowidx": 0, "task_id": {"taskset": "swe"}, "task_input": {}}
+
+    async def on_completion(generation_index, completion):
+        streamed.append(completion)
+
+    _run(
+        impl._stream_rows(
+            env,
+            [pending_row],
+            [None],
+            [None],
+            1,
+            "timing/test",
+            on_completion=on_completion,
+        )
+    )
+
+    (completion,) = streamed
+    # The finalizer names reward metrics after this context, per harness;
+    # attribution stays the taskset.
+    assert completion.env_extras["ng_reward_log_context"].agent_name == ("swe/pi_agent")
+    assert completion.env_extras["attribution_key"] == "swe"
+
+
+class _PiGroupGym:
+    """A Gym actor stand-in whose rows all ran on Pi."""
+
+    def options(self, **kwargs):
+        return self
+
+    def remote(self, pending, *args, **kwargs):
+        async def value(row):
+            result = _mask_gate_result()
+            result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+            result["full_result"]["_ng_harness"] = "pi_agent"
+            return row["_rowidx"], None, {**result, "attribution_key": "swe"}, None
+
+        async def stream():
+            for row in pending:
+                yield value(row)
+
+        return stream()
+
+
+def _run_one_pi_group(env):
+    from nemo_rl.utils.timer import Timer
+
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+    inputs = [
+        {"_rowidx": i, "task_id": {"taskset": "swe", "task_id": "1"}, "task_input": {}}
+        for i in range(2)
+    ]
+    _, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+    return metrics
+
+
+def test_group_rollout_metrics_are_named_by_the_groups_harness():
+    metrics = _run_one_pi_group(SimpleNamespace(run_rollouts=_PiGroupGym()))
+
+    # One group runs on one harness, so its metrics are named by that harness.
+    assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(1.0)
+    assert "swe/reward/mean" not in metrics
+    assert metrics["swe/pi_agent/num_groups"] == 1
+
+
+def test_group_counts_zero_for_the_tasksets_other_harnesses():
+    env = NemoGymShardSet(
+        handles={"only": [SimpleNamespace(run_rollouts=_PiGroupGym())]},
+        multi_harness=_SWE_ROUTES,
+    )
+
+    metrics = _run_one_pi_group(env)
+
+    assert metrics["swe/pi_agent/num_groups"] == 1
+    assert metrics["swe/opencode_agent/num_groups"] == 0
+
+
+_SWE_ROUTES = MultiHarnessRoutes(
+    candidates=(
+        (
+            "swe",
+            (
+                ("opencode_agent", "swe_opencode", 1.0),
+                ("pi_agent", "swe_pi", 1.0),
+            ),
+        ),
+    )
+)
+
+
+def _swe_impl(routes):
+    impl = _nemo_gym_impl(True)
+    impl._task_to_env = {
+        "nemo_gym": NemoGymShardSet(handles={"only": [Mock()]}, multi_harness=routes)
+    }
+    return impl
+
+
+def _swe_sample():
+    return {
+        "extra_env_info": {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {},
+        }
+    }
+
+
+def _restored_group(*recorded):
+    """Group g-17: finished rows that recorded these names, then one unfinished row."""
+    finished = [
+        SimpleNamespace(
+            current_attempt=SimpleNamespace(
+                status=RolloutAttemptStatus.SEALED,
+                reward_log_context=None
+                if name is None
+                else RewardLogContext(name, None),
+            )
+        )
+        for name in recorded
+    ]
+    unfinished = SimpleNamespace(
+        current_attempt=SimpleNamespace(
+            status=RolloutAttemptStatus.DISPATCHED, reward_log_context=None
+        )
+    )
+    return SimpleNamespace(group_id="g-17", siblings=[*finished, unfinished])
+
+
+def _check_restored_group(routes, *recorded):
+    """Run the resume check on group g-17 whose finished rows recorded these names."""
+    RolloutManager._require_unchanged_harness(
+        SimpleNamespace(_impl=_swe_impl(routes)),
+        _swe_sample(),
+        _restored_group(*recorded),
+    )
+
+
+def test_restored_group_continues_on_the_harness_its_rows_recorded():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    _check_restored_group(_SWE_ROUTES, f"swe/{harness}", f"swe/{harness}")
+    # Single-harness tasksets, including ledgers that recorded no context.
+    _check_restored_group(None, "swe", None)
+
+
+def test_restored_group_that_would_change_harness_stops_the_run():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    other = "pi_agent" if harness == "opencode_agent" else "opencode_agent"
+    for routes, recorded in (
+        (_SWE_ROUTES, f"swe/{other}"),  # edited weights or routes
+        (_SWE_ROUTES, "swe"),  # taskset moved into multi_harness
+        (None, f"swe/{harness}"),  # taskset moved out of multi_harness
+        (_SWE_ROUTES, None),  # nothing recorded to verify against
+    ):
+        with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
+            _check_restored_group(routes, recorded)
+
+
+def test_harness_change_stops_a_restored_group_before_any_state_changes():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    other = "pi_agent" if harness == "opencode_agent" else "opencode_agent"
+    manager = object.__new__(RolloutManager)
+    manager._impl = _swe_impl(_SWE_ROUTES)
+    manager._recovery_ledger = Mock()
+    manager._recovery_ledger.get_group.return_value = _restored_group(f"swe/{other}")
+    manager._recovery_mutation = Mock()
+    manager._tq_buffer = Mock()
+
+    with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
+        _run(
+            manager._generate_for_finalization_attempt(
+                _swe_sample(), recovery_group_id="g-17", inflight_registry=None
+            )
+        )
+    # Raised before the ledger is rewritten or buffer slots are reserved.
+    manager._recovery_mutation.assert_not_called()
+    manager._tq_buffer.reserve.assert_not_called()
+
+
+def test_harness_change_on_resume_is_not_retried():
+    manager = SimpleNamespace(
+        _tq_buffer=object(),
+        _forest_training=False,
+        _num_generations_per_prompt=2,
+        _recovery_ledger=SimpleNamespace(
+            get_group=lambda _: SimpleNamespace(
+                phase=PromptGroupPhase.ADMITTED, expected_generations=2
+            )
+        ),
+        _retry_policy=RolloutRetryPolicy(
+            max_infra_attempts=3, max_data_attempts=3, max_gym_row_attempts=1
+        ),
+        _generate_for_finalization_attempt=AsyncMock(
+            side_effect=RestoredHarnessChanged("moved")
+        ),
+    )
+
+    with pytest.raises(RestoredHarnessChanged):
+        _run(
+            RolloutManager.generate_for_finalization(
+                manager, {"idx": 0}, lineage_group_id="g-17"
+            )
+        )
+
+    assert manager._generate_for_finalization_attempt.await_count == 1
+
+
+_REWEIGHTED_SWE_ROUTES = MultiHarnessRoutes(
+    candidates=(
+        (
+            "swe",
+            (
+                ("opencode_agent", "swe_opencode", 1.0),
+                ("pi_agent", "swe_pi", 3.0),
+            ),
+        ),
+    )
+)
+
+
+def test_resume_requires_the_routes_the_checkpoint_saved():
+    manager = object.__new__(RolloutManager)
+    saved = _SWE_ROUTES.to_state()
+    manager._impl = _swe_impl(_SWE_ROUTES)
+    manager.require_unchanged_multi_harness(saved)
+
+    replaced = MultiHarnessRoutes(
+        candidates=(
+            (
+                "swe",
+                (
+                    ("opencode_agent", "swe_opencode_v2", 1.0),
+                    ("pi_agent", "swe_pi", 1.0),
+                ),
+            ),
+        )
+    )
+    for current, checkpoint in (
+        (_REWEIGHTED_SWE_ROUTES, saved),  # weights changed
+        (replaced, saved),  # a server replaced by another running the same agent
+        (_SWE_ROUTES, None),  # multi_harness added
+        (None, saved),  # multi_harness removed
+    ):
+        manager._impl = _swe_impl(current)
+        with pytest.raises(RestoredHarnessChanged, match="multi_harness differs"):
+            manager.require_unchanged_multi_harness(checkpoint)
+
+    # A run without multi_harness resumes a checkpoint saved without it.
+    manager._impl = _swe_impl(None)
+    manager.require_unchanged_multi_harness(None)
+
+
+def test_changed_routes_stop_restore_before_any_group_is_restored(
+    tmp_path, monkeypatch
+):
+    from nemo_rl.algorithms.rollout_checkpointing import restore as restore_mod
+
+    # A group whose generations were all mid-episode passes the per-group check.
+    _check_restored_group(_REWEIGHTED_SWE_ROUTES)
+    manager = object.__new__(RolloutManager)
+    manager._impl = _swe_impl(_REWEIGHTED_SWE_ROUTES)
+    manager._recovery_ledger = Mock()
+    restorer = object.__new__(restore_mod.RolloutRestorer)
+    restorer._resume = SimpleNamespace(
+        path=str(tmp_path),
+        data_plane_metadata={"rollout_recovery_payload_sha256": "sha"},
+    )
+    restorer._rollout_manager = manager
+    restorer._master_config = None
+    restorer._groups_to_regenerate = []
+    restorer._data_plane_checkpoint_barrier = Mock()
+    restorer._validate_forest_checkpoint_metadata = lambda: None
+
+    async def read_sidecar(*args, **kwargs):
+        return SimpleNamespace(multi_harness_routes=_SWE_ROUTES.to_state())
+
+    monkeypatch.setattr(restore_mod, "read_recovery_sidecar", read_sidecar)
+
+    with pytest.raises(RestoredHarnessChanged, match="multi_harness differs"):
+        _run(restorer._restore_recovery_ledger(restored_replay_groups=0))
+    # Refused before the ledger is touched, so no group is restored.
+    restorer._data_plane_checkpoint_barrier.mutation.assert_not_called()
+    manager._recovery_ledger.load_state_dict.assert_not_called()
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
@@ -1296,6 +1613,139 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def test_stream_closures_release_completed_receipts_without_cyclic_gc() -> None:
+    class WeakResult(dict):
+        pass
+
+    references: list[weakref.ReferenceType[WeakResult]] = []
+
+    class RunRollouts:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            async def result_ref():
+                result = WeakResult(_mask_gate_receipt_result())
+                references.append(weakref.ref(result))
+                return 0, {"name": "agent"}, result, None
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    async def exercise() -> None:
+        await _nemo_gym_impl(True)._stream_rows(
+            SimpleNamespace(run_rollouts=RunRollouts()),
+            [{"_rowidx": 0}],
+            [None],
+            [None],
+            1,
+            "test",
+        )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _run(exercise())
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def _assert_stream_rows_frees_received_result(stream_tail, run_stream) -> None:
+    """Land row 0, end the group through ``stream_tail``, and check row 0 is freed."""
+
+    class WeakResult(dict):
+        pass
+
+    references: list[weakref.ReferenceType[WeakResult]] = []
+
+    class RunRollouts:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            async def result_ref():
+                result = WeakResult(_mask_gate_receipt_result())
+                references.append(weakref.ref(result))
+                return 0, {"name": "agent"}, result, None
+
+            async def stream():
+                yield result_ref()
+                async for item_ref in stream_tail():
+                    yield item_ref
+
+            return stream()
+
+    async def exercise() -> None:
+        await run_stream(
+            _nemo_gym_impl(True)._stream_rows(
+                SimpleNamespace(run_rollouts=RunRollouts()),
+                [{"_rowidx": 0}, {"_rowidx": 1}],
+                [None, None],
+                [None, None],
+                2,
+                "test",
+            )
+        )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _run(exercise())
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_stream_rows_deadline_releases_received_results_without_cyclic_gc() -> None:
+    async def hang():
+        await asyncio.Event().wait()
+        yield
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(stream_rows, timeout=0.1)
+
+    _assert_stream_rows_frees_received_result(hang, run_stream)
+
+
+def test_stream_rows_failed_stream_releases_received_results_without_cyclic_gc() -> (
+    None
+):
+    async def broken():
+        raise RuntimeError("stream broke")
+        yield
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(RuntimeError, match="stream broke"):
+            await stream_rows
+
+    _assert_stream_rows_frees_received_result(broken, run_stream)
+
+
+def test_stream_rows_deferred_row_failure_releases_received_results_without_cyclic_gc() -> (
+    None
+):
+    async def infra_failure():
+        async def failure_ref():
+            # Built here so the test holds no reference to the raised error.
+            return GymRowFailure(rowidx=1, error=ConnectionError("gym down"))
+
+        yield failure_ref()
+
+    async def run_stream(stream_rows) -> None:
+        with pytest.raises(ConnectionError, match="gym down"):
+            await stream_rows
+
+    _assert_stream_rows_frees_received_result(infra_failure, run_stream)
 
 
 def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
@@ -1469,10 +1919,13 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
 ):
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
+    result["reward_original"] = 1.0
 
     completions, penalty_counts = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
+    # Dynamic sampling still sees the reward the penalty overwrote.
+    assert completions[0].reward_original == 1.0
     assert penalty_counts[count_key] == 1
     assert sum(penalty_counts.values()) == 1
     assert impl._compute_reward_penalty_metrics(penalty_counts, 1) == {metric_name: 1.0}
@@ -1608,7 +2061,7 @@ def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) ->
     assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
-def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_stamps_sampling():
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
@@ -1629,20 +2082,43 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
 
     rows = impl._build_inputs(input_sample, task_index=7)
 
+    task_params = original["extra_env_info"]["task_input"]["responses_create_params"]
     assert input_sample == original
     assert len(rows) == 2
     for row in rows:
         assert row["task_id"] == original["extra_env_info"]["task_id"]
         assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
-        params = row["task_input"]["responses_create_params"]
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 32
-        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        # The task is left as the dataset wrote it; the values ride beside it.
+        assert row["task_input"]["responses_create_params"] == task_params
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
         assert "responses_create_params" not in row
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
     assert rows[1]["task_input"]["task_data"] == {"state": ["meeting-1"]}
+
+
+def test_nemo_gym_build_inputs_stamps_a_task_without_responses_create_params():
+    impl = _nemo_gym_impl(True)
+    input_sample = {
+        "extra_env_info": {
+            # A multi-turn Harbor task has no top-level responses_create_params.
+            "task_id": {"taskset": "harbor:train", "task_id": "7"},
+            "task_input": {"task_data": {"repo": "demo"}},
+        }
+    }
+
+    rows = impl._build_inputs(input_sample, task_index=3)
+
+    assert rows[0]["task_input"] == {"task_data": {"repo": "demo"}}
+    assert rows[0][NEMO_GYM_MODEL_SAMPLING_KEY] == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_output_tokens": 100,
+    }
 
 
 @pytest.mark.parametrize(
@@ -2062,12 +2538,11 @@ def test_async_nemo_gym_rollout_manager(
             None,
         )
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt (279 or 1077), so only the first four ids are fixed.
+        token_ids = last_assistant["token_ids"].tolist()
+        assert len(token_ids) == 5 and token_ids[:4] == [151667, 198, 32313, 11], (
+            f"Completion {i}: last assistant token_ids {token_ids}"
         )
 
         # 3. reward
@@ -2192,7 +2667,11 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert new_token_ids is not None, (
             f"Completion {i}: no assistant message in manager"
         )
-        assert torch.equal(orig_token_ids, new_token_ids), (
+        # Sampling runs at temperature 1.0. On vLLM 0.33 the fifth token varies between
+        # requests for the same prompt, so only the first four ids are compared.
+        assert len(orig_token_ids) == len(new_token_ids) and torch.equal(
+            orig_token_ids[:4], new_token_ids[:4]
+        ), (
             f"Completion {i}: last assistant token_ids mismatch\n"
             f"  original:  {orig_token_ids.tolist()}\n"
             f"  manager:   {new_token_ids.tolist()}"
@@ -2391,6 +2870,26 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_streamed_identity_and_routing_do_not_copy_sealed_receipts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mgr = _make_capture_manager(_FakeCaptureBuffer())
+        ledger = mgr.recovery_ledger
+        original_copy = ledger._copy_group
+
+        def copy_unsealed_group(record):
+            assert all(
+                sibling.current_attempt.receipt is None for sibling in record.siblings
+            ), "identity/routing lookup copied sealed receipts"
+            return original_copy(record)
+
+        monkeypatch.setattr(ledger, "_copy_group", copy_unsealed_group)
+        request, _ = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert len(request.receipts) == 2
+        assert request.resolved_agent_name == "resolved-agent"
+        assert request.attribution_key == "resolved-agent"
+
     @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
     @pytest.mark.parametrize("materialized", [False, True])
     def test_resolved_route_survives_all_sealed_restore(
@@ -2957,7 +3456,12 @@ def _scored_record(*rewards: float) -> PromptGroupRecord:
         prompt=[],
         extra_env_info=None,
         metadata={},
-        completions=[SimpleNamespace(reward=reward) for reward in rewards],
+        completions=[
+            SimpleNamespace(
+                reward=reward, reward_original=None, env_extras=None, truncated=False
+            )
+            for reward in rewards
+        ],
         rollout_metrics={},
     )
 
@@ -3034,3 +3538,58 @@ class TestStepRewardMetrics:
         _run(mgr.generate_and_push({"idx": 0}))
 
         assert mgr._step_rewards == {}
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_length_penalty_runs_after_group_collection_or_is_saved_for_capture(capture):
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+    from nemo_rl.utils.timer import Timer
+
+    class Remote:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, pending, *args, **kwargs):
+            async def value(row):
+                index = row["_rowidx"]
+                result = _mask_gate_receipt_result() if capture else _mask_gate_result()
+                result["input_message_log"] = [{"role": "user", "token_ids": [9]}]
+                result["full_result"]["response"] = {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"text": "x" * (index + 1) * 10}],
+                        }
+                    ]
+                }
+                return index, {"name": "agent"}, result, None
+
+            async def stream():
+                for row in reversed(pending):
+                    yield value(row)
+
+            return stream()
+
+    impl = _nemo_gym_impl(True)
+    impl._length_penalty_config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type="chars", group_total_length_penalty_coeff=0.2
+        )
+    )
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": SimpleNamespace(run_rollouts=Remote())}
+    inputs = [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(2)]
+    completions, _, metrics = _run(impl._run_rollouts(inputs, Timer(), "test"))
+    if capture:
+        assert [completion.reward for completion in completions] == [1.0, 1.0]
+        assert [
+            completion.env_extras["ng_reward_checks"].length_penalty.answer_length
+            for completion in completions
+        ] == [10, 20]
+        assert "length_penalty/adjusted_frac" not in metrics
+    else:
+        assert [completion.reward for completion in completions] == pytest.approx(
+            [1.1, 0.9]
+        )
+        assert metrics["length_penalty/env_reward_mean"] == 1.0
+        assert metrics["length_penalty/adjusted_frac"] == 1.0

@@ -4,11 +4,7 @@
 
 # Async path (proposed)
 
-The data-plane interface covers both sync and async, but the **sync
-trainer (`grpo_train_sync`) uses only half of it**. The other half is
-reserved for the async trainer (not yet landed). Everything below
-documents the design proposal and open questions for that path. None
-of it is wired into production today.
+The data-plane interface covers both sync and async, but the **sync trainer (`grpo_train_sync`) uses only half of it**. The other half is reserved for the async trainer (not yet landed). Everything below documents the design proposal and open questions for that path. None of it is wired into production today.
 
 ## Sync vs Async at a glance
 
@@ -19,37 +15,20 @@ of it is wired into production today.
 | **Consumer cursor?** | Not needed — driver controls who reads what | `claim_meta` advances a per-task cursor; `check_consumption_status` confirms drain |
 | **Step boundary** | `kv_clear(meta.keys)` at end of step | Same |
 
-In sync mode the driver always knows exactly which keys are in TQ
-because it triggered every write. The task-mediated API
-(`claim_meta` / `get_data` / `check_consumption_status`) is implemented
-and tested but **not yet wired into any production codepath** — it's
-the future async-trainer's entry point.
+In sync mode the driver always knows exactly which keys are in TQ because it triggered every write. The task-mediated API (`claim_meta` / `get_data` / `check_consumption_status`) is implemented and tested but **not yet wired into any production codepath** — it's the future async-trainer's entry point.
 
 ### Why two API surfaces?
 
 The deciding question is **"does the caller already know the keys?"**
 
-- **Yes** → use direct-by-key (`kv_batch_get`). The sync trainer is
-  always in this case: the rollout actor's return value carries
-  `meta.keys`. Cheapest path, no coordination.
-- **No** → use task-mediated (`claim_meta` → `get_data`). The async
-  trainer is in this case: rollouts and training run concurrently, so
-  the trainer must ask TQ "what's ready for me to consume?" The
-  consumer cursor (`task_name`) prevents the same sample from being
-  claimed twice.
+- **Yes** → use direct-by-key (`kv_batch_get`). The sync trainer is always in this case: the rollout actor's return value carries `meta.keys`. Cheapest path, no coordination.
+- **No** → use task-mediated (`claim_meta` → `get_data`). The async trainer is in this case: rollouts and training run concurrently, so the trainer must ask TQ "what's ready for me to consume?" The consumer cursor (`task_name`) prevents the same sample from being claimed twice.
 
-verl follows the same split — its `ReplayBuffer.sample()` returns a
-`KVBatchMeta` from keys it tracks via `global_steps` tags, then fetches
-via `kv_batch_get`. No `claim_meta` is used in verl's sync trainer
-either.
+verl follows the same split — its `ReplayBuffer.sample()` returns a `KVBatchMeta` from keys it tracks via `global_steps` tags, then fetches via `kv_batch_get`. No `claim_meta` is used in verl's sync trainer either.
 
 ## Proposed E2E flow — async GRPO
 
-In the async path, rollout and training run concurrently on separate
-Ray actors. The trainer doesn't know which samples are ready ahead of
-time, so it uses the task-mediated half of the API
-(`claim_meta` / `get_data` / `check_consumption_status`) instead of
-direct-by-key reads.
+In the async path, rollout and training run concurrently on separate Ray actors. The trainer doesn't know which samples are ready ahead of time, so it uses the task-mediated half of the API (`claim_meta` / `get_data` / `check_consumption_status`) instead of direct-by-key reads.
 
 ```
 [PRODUCER — continuous, never waits for trainer]
@@ -108,21 +87,13 @@ direct-by-key reads.
 
 ## Filtering without fetching bulk
 
-**Design constraint:** rollout writes samples continuously; many will
-be discarded (off-policy beyond tolerance, DAPO `std == 0`,
-format-check failures, length thresholds, …). The filter decision
-**must not require reading bulk tensor data**.
+**Design constraint:** rollout writes samples continuously; many will be discarded (off-policy beyond tolerance, DAPO `std == 0`, format-check failures, length thresholds, …). The filter decision **must not require reading bulk tensor data**.
 
-The filter state has to live somewhere small. Three alternative
-options — pick one based on what TQ/dataplane features are available
-and how decoupled you want the cleanup to be.
+The filter state has to live somewhere small. Three alternative options — pick one based on what TQ/dataplane features are available and how decoupled you want the cleanup to be.
 
 ### Option 1 — In TQ as a gating field (works today)
 
-The producer (or an intermediate stage) writes a small marker column
-ONLY for samples that should be visible to downstream tasks. The
-consumer `claim_meta(required_fields=["marker"])` only matches
-samples where that field exists.
+The producer (or an intermediate stage) writes a small marker column ONLY for samples that should be visible to downstream tasks. The consumer `claim_meta(required_fields=["marker"])` only matches samples where that field exists.
 
 ```python
 # Producer writes a small bool per survivor:
@@ -138,15 +109,11 @@ meta = dp_client.claim_meta(task_name="train",
 
 - ✅ Server-side enforcement; consumer needs no special exclusion logic.
 - ✅ Works with TQ as-is.
-- ✗ Decision must be made at write time; no good story for filters
-  that become true *after* the write (e.g. weight-version drift).
+- ✗ Decision must be made at write time; no good story for filters that become true *after* the write (e.g. weight-version drift).
 
 ### Option 2 — In TQ as tags (needs tag propagation in `KVBatchMeta`)
 
-The producer stamps primitive metadata (`weight_version`, `std`,
-`total_reward`, `produced_at`) as **tags** on each key. Tags live on
-the TQ controller alongside production status; reading them needs no
-data RPC. The consumer inspects them in-memory:
+The producer stamps primitive metadata (`weight_version`, `std`, `total_reward`, `produced_at`) as **tags** on each key. Tags live on the TQ controller alongside production status; reading them needs no data RPC. The consumer inspects them in-memory:
 
 ```python
 # Producer:
@@ -163,16 +130,11 @@ meta = meta.subset(survivors)
 
 - ✅ Zero data fetch — tags travel with the meta.
 - ✅ Works for *time-varying* filters (compare tag vs. current state).
-- ✗ **Requires our `KVBatchMeta` to expose `tags`** (todo — see
-  feature proposal below).
+- ✗ **Requires our `KVBatchMeta` to expose `tags`** (todo — see feature proposal below).
 
 ### Option 3 — Outside TQ entirely, in `AsyncTrajectoryCollector`
 
-The collector keeps a small driver-side ledger: `dict[key,
-SampleMetadata]` tracking `weight_version`, `produced_at`, `status`,
-etc. Sampling for training first consults the ledger, applies the
-filter, and only then issues direct-by-key reads against TQ. TQ never
-sees the filter — it's just a KV store.
+The collector keeps a small driver-side ledger: `dict[key, SampleMetadata]` tracking `weight_version`, `produced_at`, `status`, etc. Sampling for training first consults the ledger, applies the filter, and only then issues direct-by-key reads against TQ. TQ never sees the filter — it's just a KV store.
 
 ```python
 # inside AsyncTrajectoryCollector (Ray @remote)
@@ -192,15 +154,11 @@ def sample(self, batch_size: int, max_age: int) -> KVBatchMeta:
 
 - ✅ Zero TQ-side changes.
 - ✅ Maximum flexibility — any predicate, any state.
-- ✗ Two sources of truth (collector ledger vs. TQ controller). On a
-  collector crash the ledger evaporates; needs reconciliation (e.g.
-  walk TQ partition on restart and reseed).
+- ✗ Two sources of truth (collector ledger vs. TQ controller). On a collector crash the ledger evaporates; needs reconciliation (e.g. walk TQ partition on restart and reseed).
 
 ## Timestamping / staleness specifically
 
-A common case worth singling out: rollouts produced under weight
-version `v` may be too stale by version `v + N`. Four ways to handle
-it, no bulk fetch needed in any of them:
+A common case worth singling out: rollouts produced under weight version `v` may be too stale by version `v + N`. Four ways to handle it, no bulk fetch needed in any of them:
 
 | Approach | Where state lives | Filter cost | Needs new feature? |
 |---|---|---|---|
@@ -209,18 +167,13 @@ it, no bulk fetch needed in any of them:
 | **Versioned partitions** (`train_v17`, `train_v18`, …) | TQ partition naming | zero | partition lifecycle helpers |
 | `AsyncTrajectoryCollector` ledger with TTL | driver-side dict | zero | new collector method |
 
-**Versioned partitions** is interesting because it makes wholesale
-staleness handling free: producers write into `train_v<current>`,
-trainer claims from `[train_v<current-N> .. train_v<current>]`, and
-`kv_clear(partition_id="train_v<old>")` retires an entire generation
-of samples in one call.
+**Versioned partitions** is interesting because it makes wholesale staleness handling free: producers write into `train_v<current>`, trainer claims from `[train_v<current-N> .. train_v<current>]`, and `kv_clear(partition_id="train_v<old>")` retires an entire generation of samples in one call.
 
 ## Mark-as-stale, defer the kv_clear
 
 Filtered keys' bulk still sits in TQ. Two cleanup patterns:
 
-**Pattern A — driver-side stale set + batched clear (recommended for
-single-collector deployments):**
+**Pattern A — driver-side stale set + batched clear (recommended for single-collector deployments):**
 
 ```python
 stale_keys: set[str] = set()
@@ -236,8 +189,7 @@ No TQ-side coordination. Bulk lingers briefly, bounded by the threshold.
 
 **Pattern B — TQ-side stale-marker field + cleanup task (decoupled):**
 
-`claim_meta` filters on field production, not tag values — so marking
-via tags alone doesn't gate cleanup. Write a dedicated marker field:
+`claim_meta` filters on field production, not tag values — so marking via tags alone doesn't gate cleanup. Write a dedicated marker field:
 
 ```python
 dp_client.kv_batch_put(
@@ -253,62 +205,31 @@ cleanup_meta = dp_client.claim_meta(
 dp_client.kv_clear(keys=cleanup_meta.keys, partition_id="train")
 ```
 
-Pattern A is simpler. Pattern B decouples the cleanup cadence from
-the filter site (useful if multiple producers can mark stale).
+Pattern A is simpler. Pattern B decouples the cleanup cadence from the filter site (useful if multiple producers can mark stale).
 
 ## Proposed enhancements
 
 **TQ / data-plane side (in priority order):**
 
-1. **Propagate `tags` through nemo-rl `KVBatchMeta`** (small change,
-   high leverage). TQ's `KVBatchMeta` already carries `tags:
-   list[dict]`; our `interfaces.py:KVBatchMeta` only lifts
-   `input_lengths`. Add `tags: list[dict] | None` and have the
-   adapter pass them through. Unlocks Option 2 entirely.
-2. **Server-side tag filtering in `claim_meta`**: e.g.
-   `claim_meta(..., tag_filter=lambda t: t["weight_version"] >= cutoff)`.
-   Today the consumer must claim everything ready and then filter
-   in-memory; a tag predicate would push this server-side. Requires
-   upstream TQ change.
-3. **Versioned-partition helpers**: convenience methods
-   `register_versioned_partition(prefix, version)` + `claim_meta`
-   variant that takes a partition range. Cheap because TQ already
-   supports per-partition lifecycle.
+1. **Propagate `tags` through nemo-rl `KVBatchMeta`** (small change, high leverage). TQ's `KVBatchMeta` already carries `tags: list[dict]`; our `interfaces.py:KVBatchMeta` only lifts `input_lengths`. Add `tags: list[dict] | None` and have the adapter pass them through. Unlocks Option 2 entirely.
+2. **Server-side tag filtering in `claim_meta`**: e.g. `claim_meta(..., tag_filter=lambda t: t["weight_version"] >= cutoff)`.
+   Today the consumer must claim everything ready and then filter in-memory; a tag predicate would push this server-side. Requires upstream TQ change.
+3. **Versioned-partition helpers**: convenience methods `register_versioned_partition(prefix, version)` + `claim_meta` variant that takes a partition range. Cheap because TQ already supports per-partition lifecycle.
 
 **`AsyncTrajectoryCollector` side (no TQ changes needed):**
 
-1. **Per-key ledger**: `dict[str, SampleMetadata]` on the collector
-   actor, populated at write time with `weight_version`,
-   `produced_at`, `seq_len`, `status`.
-2. **`sample(batch_size, predicate)`**: returns a `KVBatchMeta` of
-   survivors after applying `predicate` to ledger entries. Trainer
-   never touches TQ for filtering.
-3. **Mark-stale set + periodic batched `kv_clear`**: collector also
-   owns a background coroutine that drains stale keys on a cadence
-   (every K steps or by buffer pressure).
-4. **Backpressure hook**: when ledger size approaches
-   `storage_capacity`, evict by oldest weight version. Decouples
-   producer from training rate.
+1. **Per-key ledger**: `dict[str, SampleMetadata]` on the collector actor, populated at write time with `weight_version`, `produced_at`, `seq_len`, `status`.
+2. **`sample(batch_size, predicate)`**: returns a `KVBatchMeta` of survivors after applying `predicate` to ledger entries. Trainer never touches TQ for filtering.
+3. **Mark-stale set + periodic batched `kv_clear`**: collector also owns a background coroutine that drains stale keys on a cadence (every K steps or by buffer pressure).
+4. **Backpressure hook**: when ledger size approaches `storage_capacity`, evict by oldest weight version. Decouples producer from training rate.
 
-The collector-side path is the cheapest to land (zero TQ changes) and
-gives the most flexibility; the TQ-side path scales better when
-filtering needs to live close to the data (e.g. multiple trainers
-filtering differently on the same partition).
+The collector-side path is the cheapest to land (zero TQ changes) and gives the most flexibility; the TQ-side path scales better when filtering needs to live close to the data (e.g. multiple trainers filtering differently on the same partition).
 
 ## Open questions
 
-- **`required_fields` granularity**: gate trainer on the full
-  `DP_TRAIN_FIELDS` set, or pipeline — start training as soon as
-  `input_ids` + `generation_logprobs` are ready and gate on
-  `advantages` per microbatch?
-- **Stale-data policy**: if the producer is multiple weight-versions
-  ahead of the trainer, drop those samples or use them with
-  importance-sampling correction?
-- **Polling cadence**: `claim_meta_poll_interval_s` controls how often
-  `claim_meta` retries. Too aggressive = wasted CPU; too lazy =
-  trainer-rollout coupling.
-- **Backpressure**: if rollout outpaces training, when does the
-  producer start blocking on TQ capacity?
+- **`required_fields` granularity**: gate trainer on the full `DP_TRAIN_FIELDS` set, or pipeline — start training as soon as `input_ids` + `generation_logprobs` are ready and gate on `advantages` per microbatch?
+- **Stale-data policy**: if the producer is multiple weight-versions ahead of the trainer, drop those samples or use them with importance-sampling correction?
+- **Polling cadence**: `claim_meta_poll_interval_s` controls how often `claim_meta` retries. Too aggressive = wasted CPU; too lazy = trainer-rollout coupling.
+- **Backpressure**: if rollout outpaces training, when does the producer start blocking on TQ capacity?
   (`storage_capacity` × `num_storage_units` is the hard cap.)
-- **Cleanup cadence**: stale-key batch size for `kv_clear` —
-  per-step, per-N-steps, or size-threshold?
+- **Cleanup cadence**: stale-key batch size for `kv_clear` — per-step, per-N-steps, or size-threshold?

@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
+import warnings
 from typing import TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -45,6 +47,69 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 0, truncated responses get zero reward.
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> "RewardShapingConfig":
+        """Validate active shaping parameters before any backend consumes them."""
+        if not self.enabled:
+            return self
+
+        coef = self.stop_properly_penalty_coef
+        if coef is not None:
+            if not 0 <= coef <= 1:
+                raise ValueError(
+                    f"reward_shaping.stop_properly_penalty_coef={coef} must be in "
+                    "[0, 1]. It scales a truncated row's reward."
+                )
+            return self
+
+        buffer_length = self.overlong_buffer_length
+        buffer_penalty = self.overlong_buffer_penalty
+        max_response_length = self.max_response_length
+        if (
+            buffer_length is None
+            or buffer_penalty is None
+            or max_response_length is None
+        ):
+            missing = [
+                name
+                for name, value in (
+                    ("overlong_buffer_length", buffer_length),
+                    ("overlong_buffer_penalty", buffer_penalty),
+                    ("max_response_length", max_response_length),
+                )
+                if value is None
+            ]
+            raise ValueError(
+                f"reward_shaping is enabled but {', '.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} unset. DAPO overlong "
+                "shaping needs all three, or set stop_properly_penalty_coef to use "
+                "the truncation penalty instead."
+            )
+
+        # The buffer is the divisor; non-positive values crash or invert the penalty.
+        if buffer_length <= 0:
+            raise ValueError(
+                f"reward_shaping.overlong_buffer_length={buffer_length} must be "
+                "positive. The overlong penalty divides by it."
+            )
+        # NaN fails only at consumption, while infinity produces non-finite rewards.
+        if not math.isfinite(buffer_penalty) or buffer_penalty < 0:
+            raise ValueError(
+                f"reward_shaping.overlong_buffer_penalty={buffer_penalty} must be "
+                "finite and >= 0. It is subtracted from the reward, so a negative "
+                "one rewards overlong responses and a non-finite one makes every "
+                "overlong row's reward non-finite."
+            )
+        if max_response_length <= buffer_length:
+            warnings.warn(
+                f"reward_shaping.max_response_length={max_response_length} is not "
+                f"greater than reward_shaping.overlong_buffer_length={buffer_length}. "
+                "The overlong penalty starts at a non-positive response length; "
+                "check whether these values were swapped.",
+                stacklevel=2,
+            )
+        return self
 
 
 def apply_reward_shaping(

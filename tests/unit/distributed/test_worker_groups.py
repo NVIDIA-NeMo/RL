@@ -528,6 +528,28 @@ def test_custom_environment_variables_override_existing(
     worker_group.shutdown(force=True)
 
 
+def test_excluded_driver_environment_variables_are_not_forwarded(
+    register_test_actor, virtual_cluster, monkeypatch
+):
+    """Test that NRL_WORKER_ENV_EXCLUDE drops both driver values and explicit env_vars."""
+    monkeypatch.setenv("DUMMY_DRIVER_ONLY", "driver_value")
+    monkeypatch.setenv("DUMMY_EXPLICIT", "driver_value")
+    monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", "DUMMY_DRIVER_ONLY,DUMMY_EXPLICIT")
+
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=RayWorkerBuilder(register_test_actor),
+        workers_per_node=1,
+        env_vars={"DUMMY_EXPLICIT": "explicit_value"},
+    )
+    worker = worker_group.workers[0]
+
+    assert ray.get(worker.get_env_var.remote("DUMMY_DRIVER_ONLY")) is None
+    assert ray.get(worker.get_env_var.remote("DUMMY_EXPLICIT")) is None
+
+    worker_group.shutdown(force=True)
+
+
 def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     builder = RayWorkerBuilder(actor_fqn)

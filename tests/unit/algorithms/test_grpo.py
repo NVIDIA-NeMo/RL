@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     AdvEstimatorConfig,
+    AgentOverrideConfig,
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
@@ -120,6 +121,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
@@ -158,11 +160,8 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     )
 
 
-@pytest.mark.parametrize("load_replay_buffer", [True, None])
-def test_restore_async_replay_buffer_checkpoint_by_default(
-    tmp_path, load_replay_buffer
-):
-    """True and the legacy absent-key case both restore the buffer."""
+def test_restore_async_replay_buffer_checkpoint_by_default(tmp_path):
+    """load_replay_buffer=true restores the buffer."""
     (tmp_path / "replay_buffer.pt").touch()
     replay_buffer = MagicMock()
     replay_buffer.load_from_path.remote.return_value = {"restored": 7}
@@ -171,7 +170,7 @@ def test_restore_async_replay_buffer_checkpoint_by_default(
         metadata = _maybe_restore_async_replay_buffer_checkpoint(
             replay_buffer,
             str(tmp_path),
-            load_replay_buffer=load_replay_buffer,
+            load_replay_buffer=True,
             num_prompts_per_step=32,
             current_training_step=4,
             max_age_steps=1,
@@ -211,7 +210,7 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
     metadata = _maybe_restore_async_replay_buffer_checkpoint(
         replay_buffer,
         str(tmp_path),
-        load_replay_buffer=None,
+        load_replay_buffer=True,
         num_prompts_per_step=32,
         current_training_step=4,
         max_age_steps=1,
@@ -668,7 +667,7 @@ def test_trainers_dynamic_sampling_honors_masked_reward_policy(
 
     with ExitStack() as stack:
         if use_tq:
-            cfg.data_plane = {"enabled": True}
+            cfg.data_plane = {"enabled": True, "backend": "simple"}
             stack.enter_context(mock_sync_grpo_infrastructure(components["policy"]))
             grpo_sync_mod.SyncRolloutActor.options.return_value.remote.return_value.rollout_to_tq.remote.return_value = (
                 meta,
@@ -1138,11 +1137,9 @@ def mock_grpo_components():
             "loss_fn": ClippedPGLossConfig(
                 use_importance_sampling_correction=True  # Required for async mode
             ),
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                enabled=False, checkpoint_must_save_by=None, save_period=10
+            ),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {
@@ -1580,7 +1577,7 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
     # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
     # train on the media a Gym dataset omits from ``extra_env_info``.
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
         with pytest.raises(NotImplementedError, match="NeMo-Gym"):
             _validate_multimodal_dedup_capability(master_config)
@@ -1601,7 +1598,7 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     # blocked by a multimodal validator.
     master_config.grpo.deduplicate_multimodal_data = False
     master_config.policy["generation"]["backend"] = "sglang"
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
         _validate_multimodal_dedup_capability(master_config)
 
@@ -2461,9 +2458,9 @@ def test_async_checkpoint_rollouts_state_frontier_key_contract(
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -2534,9 +2531,9 @@ def test_async_checkpoint_persists_lowered_cut_not_trained_frontier(
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -4413,6 +4410,24 @@ def test_setup_rejects_megatron_router_replay_before_side_effects(
     mock_logger.assert_not_called()
 
 
+def test_setup_rejects_agent_overrides_before_side_effects(mock_grpo_components):
+    """Only the SingleController advantage stage applies grpo.agent_overrides."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.agent_overrides = {
+        "rubric_judge_agent": AgentOverrideConfig(overlong_filtering=True)
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(NotImplementedError, match="grpo.agent_overrides"),
+    ):
+        setup(master_config, MagicMock(), MagicMock(), None)
+
+    mock_logger.assert_not_called()
+
+
 def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     mock_grpo_components, monkeypatch
 ):
@@ -4511,6 +4526,34 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_megatron_engines_behind_dynamo_are_refused_outside_the_single_controller(
+    mock_grpo_components,
+):
+    """Legacy GRPO names the entrypoint to use before touching the config or cluster."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "dynamo": True,
+        "mcore_generation_config": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+
+
 def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> None:
     """The deferred-vLLM branch is the one path that forwards a real key: the
     workers enforce it, so Gym's model server must send the same one."""
@@ -4586,7 +4629,7 @@ def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> No
 
     class DummyVllmGeneration:
         weight_synchronizer = None
-        dp_openai_server_base_urls = ["http://vllm-worker.example/v1"]
+        client_base_urls = ["http://vllm-worker.example/v1"]
         # What the real class generates when the recipe requires a key.
         http_server_api_key = "per-job-key"
 
@@ -5340,9 +5383,9 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 1000
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 1000
+    master_config.checkpointing.metric_name = None
 
     single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
     single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
@@ -5413,7 +5456,7 @@ def test_grpo_train_without_epoch_limit_cycles_until_max_num_steps(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = False
+    master_config.checkpointing.enabled = False
 
     single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
     single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
@@ -5472,10 +5515,10 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100  # only the final step saves
-    master_config.checkpointing["ft_save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 100  # only the final step saves
+    master_config.checkpointing.ft_save_period = 2
+    master_config.checkpointing.metric_name = None
 
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
     # Both paths write latest_checkpoint_status.json under checkpoint_dir; give
@@ -5563,10 +5606,10 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing.enabled = True
     # Step 2 saves via save_period; step 3 saves as the last step.
-    master_config.checkpointing["save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.save_period = 2
+    master_config.checkpointing.metric_name = None
     master_config.policy["generation"]["colocated"]["enabled"] = True
 
     events = []
@@ -6346,7 +6389,7 @@ def test_periodic_validation_starts_at_configured_step(
     with ExitStack() as stack:
         validate_target = "nemo_rl.algorithms.grpo.validate"
         if train_func is grpo_train_sync:
-            master_config.data_plane = {"enabled": True}
+            master_config.data_plane = {"enabled": True, "backend": "simple"}
             stack.enter_context(
                 mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
             )
@@ -6409,7 +6452,7 @@ def _enter_stop_test_mocks(
 ):
     """Enter per-trainer infrastructure mocks; returns the validate patch target."""
     if train_func is grpo_train_sync:
-        master_config.data_plane = {"enabled": True}
+        master_config.data_plane = {"enabled": True, "backend": "simple"}
         stack.enter_context(
             mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
         )
@@ -6547,10 +6590,10 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
     master_config.grpo.stop_at_validation_metric = "accuracy"
     master_config.grpo.stop_at_validation_threshold = 0.5
     master_config.grpo.val_at_end = False
-    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing.enabled = True
     # save_period alone can never fire, so only the early stop saves.
-    master_config.checkpointing["save_period"] = 1000
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.save_period = 1000
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -6617,9 +6660,9 @@ def test_adaptive_ppo_clip_state_advances_and_is_checkpointed(
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
     master_config.grpo.val_at_end = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 2
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 2
+    master_config.checkpointing.metric_name = None
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
     checkpointer.checkpoint_dir = tmp_path
@@ -6917,9 +6960,9 @@ def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
     master_config.grpo.max_num_epochs = 2
     master_config.grpo.max_num_steps = 100
     master_config.policy["generation"]["colocated"]["enabled"] = False
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["save_period"] = 100
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_period = 100
+    master_config.checkpointing.metric_name = None
 
     checkpointer = mock_grpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
@@ -6975,8 +7018,8 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.metric_name = None
     mock_grpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
@@ -8524,6 +8567,16 @@ class TestAggregateRolloutMetrics:
         assert result["min_completion_rate"] == pytest.approx(0.5)
         assert result["max_completion_rate"] == pytest.approx(0.6)
 
+    def test_harness_group_counts_summed(self):
+        metrics = {
+            "swe/pi_agent/num_groups": [1, 0, 1],
+            "swe/pi_agent/reward/mean": [1, 0, 1],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        # Counts add up over a step's groups; other per-group values average.
+        assert result["swe/pi_agent/num_groups"] == 2
+        assert result["swe/pi_agent/reward/mean"] == pytest.approx(2 / 3)
+
     def test_total_turns_summed(self):
         metrics = {"total_turns": [10, 20, 30]}
         result = aggregate_rollout_metrics(metrics)
@@ -8658,7 +8711,7 @@ def test_resolve_logprob_skip_flags(kw, expected):
 
 def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_components):
     config = mock_grpo_components["master_config"]
-    config.data_plane = {"enabled": True}
+    config.data_plane = {"enabled": True, "backend": "simple"}
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.grpo.skip_reference_policy_logprobs_calculation = True
@@ -8697,7 +8750,7 @@ def test_grpo_train_sync_applies_length_penalty_to_training_rollouts(
     import nemo_rl.algorithms.grpo_sync as grpo_sync_module
 
     config = mock_grpo_components["master_config"]
-    config.data_plane = {"enabled": True}
+    config.data_plane = {"enabled": True, "backend": "simple"}
     config.grpo.max_num_steps = 1
     config.grpo.val_period = 0
     config.grpo.val_at_start = False
@@ -8739,7 +8792,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     if draft is not None:
         config.policy["draft"] = draft
@@ -8757,7 +8810,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     [
         ({"grpo": {"seq_logprob_error_threshold": None}}, "requires seq_logprob"),
         ({"loss_fn": {"force_on_policy_ratio": False}}, "force_on_policy_ratio"),
-        ({"loss_fn": {"token_level_loss": False}}, "token_level_loss"),
+        ({"loss_fn": {"normalization": "sequence_mean"}}, "normalization"),
         ({"loss_fn": {"use_kl_in_reward": True}}, "advantage estimator"),
         ({"loss_fn": {"positive_example_nll_weight": 0.1}}, "NLL"),
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
@@ -8773,7 +8826,7 @@ def test_single_forward_rejects_unsupported_configs(
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     config.policy["draft"] = {"enabled": False}
     for section, values in override.items():
@@ -8942,7 +8995,7 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     )
 
     master_config = mock_grpo_components["master_config"]
-    master_config.data_plane = {"enabled": True}
+    master_config.data_plane = {"enabled": True, "backend": "simple"}
     master_config.grpo.max_num_steps = 1
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
@@ -9013,7 +9066,7 @@ def test_tq_rollout_and_trainer_masked_rewards(
     """Exercise real actor payloads, driver statistics, and estimator inputs."""
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9294,7 +9347,7 @@ def test_tq_include_kl_in_reward_sees_real_logprobs_of_masked_rows(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9378,7 +9431,7 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9453,7 +9506,7 @@ def test_tq_pct_diagnostics_use_the_statistics_mask(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
     cfg.grpo.num_generations_per_prompt = 4
@@ -9537,7 +9590,7 @@ def test_tq_forwards_should_mask_flagged_samples(
     """
     components = mock_grpo_components
     cfg = components["master_config"]
-    cfg.data_plane = {"enabled": True}
+    cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.env = {"should_mask_flagged_samples": mask_flagged}
     cfg.grpo.max_num_steps = 1
     cfg.grpo.val_period = 0
@@ -9646,7 +9699,7 @@ def test_trainers_never_let_over_length_prompts_vote(
     estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
     policy_mock = components["policy"]
     if train_func is grpo_train_sync:
-        cfg.data_plane = {"enabled": True}
+        cfg.data_plane = {"enabled": True, "backend": "simple"}
         cfg.grpo.max_num_steps = 1
         cfg.grpo.val_period = 0
         cfg.grpo.num_generations_per_prompt = 2

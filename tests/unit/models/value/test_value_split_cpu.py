@@ -34,6 +34,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.data.multimodal_utils import attach_media_token_validity_mask
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.value.utils import gather_and_right_shift_values
 
@@ -94,6 +95,7 @@ def worker_type(monkeypatch):
         "defaultdict": defaultdict,
         "LossType": LossType,
         "MetricNormalizer": MetricNormalizer,
+        "attach_media_token_validity_mask": attach_media_token_validity_mask,
         "gather_and_right_shift_values": gather_and_right_shift_values,
         "parallel_state": SimpleNamespace(get_data_parallel_group=lambda: None),
         "get_pg_collection": lambda model: SimpleNamespace(mp=None),
@@ -215,6 +217,7 @@ def make_worker(cls):
     w._policy_like_cfg = {}
     w.mcore_state = SimpleNamespace(straggler_timer=None)
     w.defer_fp32_logits = False
+    w.media_placeholder_token_id = None
     w._maybe_run_manual_gc = MagicMock()
     return w
 
@@ -321,6 +324,16 @@ def test_incomplete_batch_cannot_commit(worker_type):
         worker.finish_train_step()
     assert worker.optimizer.steps == 0
     worker.abort_train_step()
+
+
+def test_scheduler_ticks_by_configured_batch_size(worker_type):
+    cls, _ = worker_type
+    worker = make_worker(cls)
+    worker.cfg["train_global_batch_size"] = 2
+    worker.begin_train_step(MseValueLossFn(MseValueLossConfig()), gbs=4)
+    worker.train_microbatch(batch())
+    worker.finish_train_step()
+    worker.scheduler.step.assert_called_once_with(increment=2)
 
 
 def test_backward_error_restores_hooks_and_requires_abort(worker_type):

@@ -53,6 +53,7 @@ from nemo_rl.environments.nemo_gym import (
     extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
+    spinup_nemo_gym_actor,
     validate_reward_components_match_scalar,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -70,6 +71,7 @@ from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     _reattach_static_multimodal_payloads_to_result,
@@ -200,6 +202,19 @@ def test_multimodal_content_types_cover_responses_media_aliases():
         "audio",
         "audio_url",
     } <= MULTIMODAL_CONTENT_TYPES
+
+
+def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
+    with pytest.raises(ValueError, match="not compatible with router replay"):
+        spinup_nemo_gym_actor(
+            {"nemo_gym": {"truncate_noncontiguous_episodes": True}},
+            base_urls=["http://127.0.0.1:30000/v1"],
+            model_name="test-model",
+            tokenizer=object(),
+            enable_router_replay=True,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
 
 
 def _external_health_response(
@@ -1409,7 +1424,7 @@ example_multi_step_simple_agent:
         name: example_multi_step_resources_server
       model_server:
         type: responses_api_models
-        name: openai_model
+        name: policy_model
 example_multi_step_environment_server:
   environment_servers:
     legacy_agent:
@@ -1417,7 +1432,7 @@ example_multi_step_environment_server:
       agent_server:
         type: responses_api_agents
         name: example_multi_step_simple_agent
-openai_model:
+policy_model:
   responses_api_models:
     vllm_model:
       entrypoint: app.py
@@ -1432,6 +1447,7 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        truncate_noncontiguous_episodes=False,
         checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
         turn_checkpointing_enabled=False,
     )
@@ -1552,6 +1568,7 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
 @pytest.mark.parametrize(
     ("token_fields", "expected_count"),
     [
@@ -1572,7 +1589,9 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         ),
     ],
 )
-def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
+def test_nemo_gym_postprocess_uses_batch_decode(
+    truncate_noncontiguous_episodes, token_fields, expected_count
+):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1610,7 +1629,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     nemo_gym_result.update(token_fields)
 
     class _MockSelf:
-        cfg = {}
+        cfg = {"truncate_noncontiguous_episodes": truncate_noncontiguous_episodes}
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1626,6 +1645,7 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["full_result"]["noncontiguous_truncated"] is False
     assert result["reasoning_token_count"] == expected_count
     assert result["response_token_count"] == expected_count
     assert result["token_extraction_valid"] is (expected_count is not None)
@@ -1638,6 +1658,102 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def _make_noncontiguous_nemo_gym_result():
+    return {
+        "reward": 0.75,
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 99, 3, 4],
+                    "generation_token_ids": [6],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _JoinTokenizer:
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+
+def test_nemo_gym_postprocess_noncontiguous_asserts_when_truncation_disabled():
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": False}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+
+
+@pytest.mark.parametrize("divergent_prompt", [[1, 99, 3, 4], [1]])
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled(divergent_prompt):
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": True}
+
+    nemo_gym_result = _make_noncontiguous_nemo_gym_result()
+    output = nemo_gym_result["response"]["output"]
+    output[1]["prompt_token_ids"] = divergent_prompt
+    # Even a later turn that matches the retained prefix belongs to the dropped tail.
+    output.append(
+        {
+            "prompt_token_ids": [1, 2, 3, 4],
+            "generation_token_ids": [7],
+            "generation_log_probs": [-0.3],
+        }
+    )
+    dropped_tail = deepcopy(output[1:])
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _JoinTokenizer()
+        )
+    )
+
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert result["message_log"][1]["role"] == "assistant"
+    torch.testing.assert_close(
+        result["message_log"][1]["generation_logprobs"], torch.tensor([-0.1])
+    )
+    assert result["input_message_log"] == result["message_log"][:1]
+    assert result["full_result"]["reward"] == 0.75
+    assert result["full_result"]["noncontiguous_truncated"] is True
+    assert output[0]["generation_str"] == "3"
+    assert output[1:] == dropped_tail
+
+
+@pytest.mark.parametrize("first_truncated", [False, True])
+def test_nemo_gym_postprocess_reports_truncation_for_every_result(first_truncated):
+    mock_self = SimpleNamespace(cfg={"truncate_noncontiguous_episodes": True})
+    results = []
+    for should_truncate in (first_truncated, not first_truncated):
+        raw_result = _make_noncontiguous_nemo_gym_result()
+        raw_result["noncontiguous_truncated"] = not should_truncate
+        if not should_truncate:
+            raw_result["response"]["output"][1]["prompt_token_ids"] = [1, 2, 3, 4]
+        result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            mock_self, {}, raw_result, _JoinTokenizer()
+        )
+        assert result["full_result"]["noncontiguous_truncated"] is should_truncate
+        results.append(result["full_result"])
+
+    metrics = calculate_single_metric(
+        [float(result["noncontiguous_truncated"]) for result in results],
+        len(results),
+        "agent/noncontiguous_truncated",
+    )
+    assert metrics["agent/noncontiguous_truncated/mean"] == 0.5
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
@@ -2336,14 +2452,14 @@ def test_nemo_gym_sanity(
     # Save original input before mutation for writing the actual test data file
     original_input = deepcopy(nemo_gym_sanity_test_data["input"])
 
-    # We need to match NeMo RL generation config params before sending to NeMo-Gym
+    # Rows carry NeMo RL's sampling values, which Gym applies to every policy call.
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
     for idx, example in enumerate(examples):
-        example["responses_create_params"]["temperature"] = generation_config[
-            "temperature"
-        ]
-        example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["_ng_model_sampling"] = {
+            "temperature": generation_config["temperature"],
+            "top_p": generation_config["top_p"],
+        }
         example["task_source"] = "example_multi_step_resources_server"
         example["_rowidx"] = idx
 
@@ -2412,11 +2528,11 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     NeMo-Gym's vllm_model sets logprobs=True and return_tokens_as_token_ids=True to extract
     per-token ids and logprobs for training (Gym omits top_logprobs on the capture path, so
     vLLM applies its default; Gym PR #1612 additionally pins top_logprobs=0, which is
-    equivalent). vLLM computes `logprobs = top_logprobs if logprobs else None`, so omitting
-    top_logprobs (default 0) or sending 0 returns logprobs, while an explicit null returns
-    none and silently empties the captured token ids. This exercises the real HTTP path where
-    that translation lives (the offline LLM API does not), so a vLLM bump that changes the
-    contract fails here instead of silently freezing training.
+    equivalent). Omitting top_logprobs (default 0), sending 0 and sending an explicit null
+    must all return per-token logprobs; a request that returns none silently empties the
+    captured token ids. This exercises the real HTTP path where that translation lives (the
+    offline LLM API does not), so a vLLM bump that changes the contract fails here instead
+    of silently freezing training.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.
@@ -2466,20 +2582,9 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     _assert_has_token_ids(_chat(_OMIT_TOP_LOGPROBS), "omitted top_logprobs")
     _assert_has_token_ids(_chat(0), "top_logprobs=0")
 
-    # Explicit null is the divergence that motivates the Gym fix: vLLM returns no logprobs
-    # (200 with logprobs=None) or rejects the request outright. Both mean capture gets
-    # nothing. If a future vLLM makes null behave like 0, this fails and signals the Gym
-    # workaround can be relaxed.
-    null_resp = _chat(None)
-    if null_resp.status_code == 200:
-        assert null_resp.json()["choices"][0].get("logprobs") is None
-    else:
-        # A rejection must be a client-side validation error, not an unrelated server failure
-        # that would let this branch pass vacuously.
-        assert 400 <= null_resp.status_code < 500, (
-            f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
-            f"got {null_resp.status_code}: {null_resp.text}"
-        )
+    # An explicit null used to return no logprobs, which is why Gym pins top_logprobs=0.
+    # vLLM 0.33 treats null like 0.
+    _assert_has_token_ids(_chat(None), "top_logprobs=null")
 
 
 @pytest.mark.nemo_gym
@@ -2686,3 +2791,168 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
     # A launcher's value must win over the actor's.
     monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
     assert spin_up()["nv.dl.campaign.stage"] == "SFT"
+
+
+@pytest.mark.nemo_gym
+def test_sampling_names_match_gym():
+    """RL copies Gym's sampling names, because their readers cannot import
+    nemo_gym: the driver and vLLM-only actors set the row key, and the vLLM chat
+    route also serves workers built without nemo_gym (the ModelOpt workers).
+    They must not drift."""
+    from nemo_gym.config import MODEL_SAMPLING_KEY_NAME
+    from nemo_gym.core import MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL
+
+    from nemo_rl.experience.interfaces import (
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    )
+
+    assert (
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    ) == (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL)
+
+
+@pytest.mark.nemo_gym
+def test_spinup_keeps_score_centering_on_the_required_policy_model(
+    monkeypatch, tmp_path
+):
+    """Score centering pins logprobs and top_logprobs on policy_model, which the run
+    also lists as required: Gym must still start that model server."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+    from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setenv(nemo_gym_mod._TOKEN_CAPTURE_CONTROL_ENV, "unused")
+    cfg = {
+        "initial_global_config_dict": {},
+        "model_name": "policy",
+        "base_urls": ["http://127.0.0.1:1/v1"],
+        "token_capture": {
+            "enabled": True,
+            "generation_backend": "vllm",
+            "top_logprobs": 4,
+            "capture_dir": str(tmp_path),
+            "control_auth_token": "test-token",
+        },
+    }
+    NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+    config = started[-1]
+    pins = config["policy_model"]["responses_api_models"]["vllm_model"][
+        "sampling_overrides"
+    ]
+    assert pins and set(pins) <= {"logprobs", "top_logprobs"}
+    VLLMModel(
+        config=VLLMModelConfig(
+            host="127.0.0.1",
+            port=0,
+            name="policy_model",
+            entrypoint="app.py",
+            base_url="http://unused/v1",
+            api_key="gym",  # pragma: allowlist secret
+            model="policy",
+            return_token_id_information=False,
+            uses_reasoning_parser=False,
+            sampling_overrides=pins,
+        ),
+        server_client=MagicMock(
+            spec=gym_server_utils.ServerClient, global_config_dict=config
+        ),
+    )
+
+
+@pytest.mark.nemo_gym
+def test_spinup_has_gym_apply_policy_sampling_to_the_trained_agents_calls(
+    monkeypatch,
+):
+    """Gym puts each row's _ng_model_sampling on the trained agent's model calls,
+    refuses a policy_model call without them, and keeps a judge's own sampling;
+    a sampling_overrides pin on policy_model would contradict policy.generation."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+
+    def spin_up(initial_global_config_dict):
+        cfg = {
+            "initial_global_config_dict": initial_global_config_dict,
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    assert spin_up({})["model_call_sampling"] == {
+        "required_model_servers": ["policy_model"]
+    }
+    with pytest.raises(ValueError, match="sampling_overrides"):
+        spin_up(
+            {
+                "policy_model": {
+                    "responses_api_models": {
+                        "vllm_model": {"sampling_overrides": {"temperature": 1.0}}
+                    }
+                }
+            }
+        )
+    # Servers that _copy policy_model serve the same trained policy, and the
+    # recipe's own list is kept, so Gym refuses a lost-value call on each one.
+    assert spin_up(
+        {
+            "policy_model_reasoning_off": {"_copy": "policy_model"},
+            "model_call_sampling": {"required_model_servers": ["judge_model"]},
+        }
+    )["model_call_sampling"] == {
+        "required_model_servers": [
+            "policy_model",
+            "policy_model_reasoning_off",
+            "judge_model",
+        ]
+    }

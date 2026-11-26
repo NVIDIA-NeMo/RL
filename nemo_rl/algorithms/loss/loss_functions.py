@@ -24,7 +24,7 @@ from typing import (
 )
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss.clipped_pg import (
     adaptive_ppo_clip_kept_mask,
@@ -38,16 +38,17 @@ from nemo_rl.algorithms.loss.draft import (
     streaming_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
     LossFunction,
     LossInputType,
     LossType,
     MetricNormalizer,
+    make_objective_reduction,
 )
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
-    masked_mean,
 )
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -73,6 +74,8 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_log_softmax,
 )
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.utils.outdated_config_checks import reject_outdated_token_level_loss
+from nemo_rl.utils.tensor_ops import masked_mean
 
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
@@ -170,10 +173,15 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
+LossNormalization = Literal["global_token_mean", "sequence_mean", "group_token_mean"]
+
+
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
-    token_level_loss: bool = True
+    # None selects global_token_mean.
+    # group_token_mean requires SingleController GRPO with Megatron.
+    normalization: LossNormalization | None = None
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
@@ -190,7 +198,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
-    reference_policy_kl_type: str = "k3"
+    reference_policy_kl_type: Literal["k1", "k2", "k3"] = "k3"
     kl_input_clamp_value: Optional[float] = 20.0
     kl_output_clamp_value: Optional[float] = 10.0
     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
@@ -207,7 +215,9 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: Optional[str] = None
+    truncated_importance_sampling_type: Optional[
+        Literal["tis", "icepop", "adaptive-ppo-clip", "seq-mask-tis"]
+    ] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
     # seq-mask-tis filtering
@@ -235,10 +245,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
-    # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
+    # Evaluate the algorithm's seq_logprob_error_threshold in the training loss, then
     # normalize accumulated gradients over survivors before the optimizer step.
     # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
-    # with the non-streaming or SingleController trainer.
+    # (non-streaming or SingleController) and SingleController PPO with ppo_epochs=1.
     seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
@@ -259,6 +269,16 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # token-level untruncated IS, TIS, ICEPOP and adaptive-ppo-clip.
     score_centering: bool = False
 
+    @model_validator(mode="after")
+    def reject_removed_loss_selector(self) -> "ClippedPGLossConfig":
+        reject_outdated_token_level_loss(self.model_extra or {})
+        return self
+
+    @property
+    def resolved_normalization(self) -> LossNormalization:
+        """Return the selected mode, treating None as global_token_mean."""
+        return self.normalization or "global_token_mean"
+
 
 class ClippedPGLossDataDict(TypedDict):
     """Required keys for the Clipped Policy Gradient loss function."""
@@ -272,6 +292,7 @@ class ClippedPGLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     sampler_topk_token_ids: NotRequired[torch.Tensor]
     sampler_topk_logprobs: NotRequired[torch.Tensor]
+    group_token_mean_inverse_tokens: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -283,7 +304,7 @@ class ClippedPGLossFn(LossFunction):
     - PPO (Clipped) - https://arxiv.org/abs/1707.06347
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
-    - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - GSPO (set sequence_level_importance_ratios = True and normalization = "sequence_mean") - https://arxiv.org/abs/2507.18071
     - CISPO (set use_cispo = True) - https://arxiv.org/abs/2506.13585
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
 
@@ -346,6 +367,7 @@ class ClippedPGLossFn(LossFunction):
                 rescale gradients and normalized metrics before clipping or
                 stepping the optimizer. See ``requires_survivor_normalization``.
         """
+        self.normalization = cfg.resolved_normalization
         self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
         self.seq_logprob_error_threshold = seq_logprob_error_threshold
         if self.seq_logprob_error_in_loss:
@@ -353,10 +375,13 @@ class ClippedPGLossFn(LossFunction):
                 raise ValueError(
                     "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
                 )
-            if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
+            if (
+                not cfg.force_on_policy_ratio
+                or self.normalization != "global_token_mean"
+            ):
                 raise ValueError(
                     "In-loss sequence filtering requires force_on_policy_ratio "
-                    "and token_level_loss"
+                    "and normalization=global_token_mean"
                 )
             if cfg.positive_example_nll_weight != 0:
                 raise ValueError("In-loss sequence filtering does not support NLL")
@@ -423,8 +448,15 @@ class ClippedPGLossFn(LossFunction):
         # Compile the actor objective lazily on the worker after Ray has
         # serialized the loss function.
         self._compiled_actor_objective = None
-        self.loss_type = (
-            LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
+        self.objective_reduction = make_objective_reduction(self.normalization)
+        self.loss_type = self.objective_reduction.loss_type
+        # Authoritative check for every construction path (legacy trainers, tests);
+        # validate_single_controller_config repeats it to fail before cluster start.
+        self.objective_reduction.validate_loss_options(
+            sequence_level_importance_ratios=cfg.sequence_level_importance_ratios,
+            opd_full=self.opd_full is not None,
+            positive_example_nll_weight=cfg.positive_example_nll_weight,
+            seq_logprob_error_in_loss=cfg.seq_logprob_error_in_loss,
         )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
@@ -452,7 +484,7 @@ class ClippedPGLossFn(LossFunction):
                 "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
             )
             assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
+                "use_cispo requires global_token_mean or group_token_mean normalization."
             )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
@@ -539,19 +571,15 @@ class ClippedPGLossFn(LossFunction):
         # that pick the denominators — so split-API trainers can undo the
         # placeholder global_valid_*=1 normalization without maintaining a
         # consumer-side table. Keep in sync with __call__'s return dict.
-        grad_normalizer = (
-            MetricNormalizer.TOKENS
-            if self.loss_type == LossType.TOKEN_LEVEL
-            else MetricNormalizer.SEQUENCES
-        )
         self.metric_normalizations: dict[str, MetricNormalizer] = {
-            # Normalized like the gradient (loss_type-dependent).
-            "loss": grad_normalizer,
-            KL_PENALTY_KEY: grad_normalizer,
+            # Normalized like the gradient (by the objective reduction).
+            "loss": MetricNormalizer.LOSS_DIVISOR,
+            KL_PENALTY_KEY: MetricNormalizer.LOSS_DIVISOR,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "token_abs_logprob_error": MetricNormalizer.TOKENS,
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
@@ -565,6 +593,7 @@ class ClippedPGLossFn(LossFunction):
             # Raw count — the downstream per-microbatch sum IS the value.
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "num_valid_samples": MetricNormalizer.NONE,
+            "gen_prev_logprob_mismatch_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
             "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
             "num_masked_seqs_by_logprob_error": MetricNormalizer.NONE,
@@ -585,6 +614,8 @@ class ClippedPGLossFn(LossFunction):
                 "policy_support_excluded_tokens",
                 "positive_nll_loss",
                 "token_mult_prob_error",
+                "gen_prev_logprob_mismatch_tokens",
+                "token_abs_logprob_error",
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
@@ -618,8 +649,8 @@ class ClippedPGLossFn(LossFunction):
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
             self.metric_normalizations = {
-                "loss": grad_normalizer,
-                KL_PENALTY_KEY: grad_normalizer,
+                "loss": MetricNormalizer.LOSS_DIVISOR,
+                KL_PENALTY_KEY: MetricNormalizer.LOSS_DIVISOR,
                 "num_valid_samples": MetricNormalizer.NONE,
                 "opd_full_reverse_kl": MetricNormalizer.TOKENS,
                 "opd_full_reverse_kl_min": MetricNormalizer.NONE,
@@ -706,6 +737,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_cross_entropy: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
         policy_logprobs_at_sampler_topk: Optional[Tensor] = None,
+        global_objective_denominator: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -726,6 +758,11 @@ class ClippedPGLossFn(LossFunction):
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            global_objective_denominator: Streaming split-API divisor passed by
+                ``StreamingObjectiveLoss`` for reductions with
+                ``requires_explicit_denominator``; None on synchronous paths,
+                where ``loss_divisor`` falls back to ``global_valid_toks`` or
+                ``global_valid_seqs``.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -746,6 +783,7 @@ class ClippedPGLossFn(LossFunction):
                 opd_full_divergence=opd_full_divergence,
                 opd_full_entropy=opd_full_entropy,
                 opd_full_cross_entropy=opd_full_cross_entropy,
+                global_objective_denominator=global_objective_denominator,
             )
         assert next_token_logprobs is not None, (
             "ClippedPGLossFn requires next_token_logprobs"
@@ -804,6 +842,9 @@ class ClippedPGLossFn(LossFunction):
             seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
                 (sample_mask - filtered_sample_mask).sum().item()
             )
+            seq_error_metrics[SEQ_LOGPROB_KEEP_MASK_KEY] = (
+                (errors <= self.seq_logprob_error_threshold).float().cpu().tolist()
+            )
             sample_mask = filtered_sample_mask
             mask = token_mask * sample_mask.unsqueeze(-1)
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
@@ -843,6 +884,14 @@ class ClippedPGLossFn(LossFunction):
         if self.seq_logprob_error_in_loss:
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+
+        per_response_weights = self.objective_reduction.per_response_weights(data)
+        objective_denominator = self.objective_reduction.loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=global_objective_denominator,
+        )
+
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
             # When top-k/top-p filtering is enabled, we need special handling for KL:
@@ -881,16 +930,14 @@ class ClippedPGLossFn(LossFunction):
             )
 
             # Reduce KL loss
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                kl = masked_mean(
-                    kl, kl_mask, global_normalization_factor=global_valid_toks
-                )
-            else:
-                kl = masked_mean(
-                    masked_mean(kl, kl_token_mask, dim=-1),
-                    kl_sample_mask,
-                    global_normalization_factor=global_valid_seqs,
-                )
+            kl = self.objective_reduction.reduce(
+                kl,
+                token_mask=kl_token_mask,
+                sample_mask=kl_sample_mask,
+                mask=kl_mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
+            )
         else:
             kl = curr_logprobs.new_zeros(())
 
@@ -1055,8 +1102,7 @@ class ClippedPGLossFn(LossFunction):
             mask=mask,
             sample_mask=sample_mask,
             importance_weights=importance_weights_to_use,
-            global_valid_toks=global_valid_toks,
-            global_valid_seqs=global_valid_seqs,
+            objective_denominator=objective_denominator,
             ratio_clip_min=self.ratio_clip_min,
             ratio_clip_max=self.ratio_clip_max,
             ratio_clip_c=(self.ratio_clip_c if self.ratio_clip_c is not None else -1.0),
@@ -1064,7 +1110,8 @@ class ClippedPGLossFn(LossFunction):
             force_on_policy_ratio=self.force_on_policy_ratio,
             sequence_level_importance_ratios=self.sequence_level_importance_ratios,
             use_cispo=self.use_cispo,
-            token_level_loss=self.loss_type == LossType.TOKEN_LEVEL,
+            reduction=self.objective_reduction,
+            per_response_weights=per_response_weights,
         )
 
         score_centering_metrics: dict[str, Tensor] = {}
@@ -1084,17 +1131,15 @@ class ClippedPGLossFn(LossFunction):
                 adaptive_ppo_clip_advantages=advantages,
                 adaptive_ppo_clip_outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
             )
-            correction = advantages * centering
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                actor_loss = actor_loss + masked_mean(
-                    correction, mask, global_normalization_factor=global_valid_toks
-                )
-            else:
-                actor_loss = actor_loss + masked_mean(
-                    masked_mean(correction, token_mask, dim=-1),
-                    sample_mask,
-                    global_normalization_factor=global_valid_seqs,
-                )
+            # Reduce the correction exactly like the actor objective it corrects.
+            actor_loss = actor_loss + self.objective_reduction.reduce(
+                advantages * centering,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                mask=mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
+            )
             score_centering_metrics["score_centering_head_mass"] = masked_mean(
                 head_mass, mask, global_normalization_factor=global_valid_toks
             )
@@ -1145,6 +1190,12 @@ class ClippedPGLossFn(LossFunction):
         metric_tensors = {"loss": loss.detach()}
         with torch.no_grad():
             lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            metric_tensors["gen_prev_logprob_mismatch_tokens"] = (
+                (lp_error != 0) & mask.bool()
+            ).sum()
+            metric_tensors["token_abs_logprob_error"] = masked_mean(
+                lp_error, mask, global_normalization_factor=global_valid_toks
+            )
             metric_tensors["token_mult_prob_error"] = masked_mean(
                 torch.exp(lp_error * mask),
                 mask,
@@ -1195,6 +1246,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor],
         opd_full_entropy: Optional[Tensor],
         opd_full_cross_entropy: Optional[Tensor],
+        global_objective_denominator: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
 
@@ -1213,6 +1265,8 @@ class ClippedPGLossFn(LossFunction):
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            global_objective_denominator: Streaming split-API divisor forwarded
+                from ``__call__``; see its docstring.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -1228,24 +1282,22 @@ class ClippedPGLossFn(LossFunction):
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
-            """Reduce a per-token tensor the way the gradient is normalized.
+        objective_denominator = self.objective_reduction.loss_divisor(
+            global_valid_toks=global_valid_toks,
+            global_valid_seqs=global_valid_seqs,
+            global_objective_denominator=global_objective_denominator,
+        )
+        per_response_weights = self.objective_reduction.per_response_weights(data)
 
-            SEQUENCE_LEVEL averages within each sequence first, so every sequence
-            contributes equally regardless of length; a flat masked_mean against
-            ``global_valid_seqs`` would instead divide a token sum by a sequence
-            count and scale the loss by the mean sequence length.
-            """
-            if self.loss_type == LossType.TOKEN_LEVEL:
-                return masked_mean(
-                    per_token_values,
-                    mask,
-                    global_normalization_factor=global_valid_toks,
-                )
-            return masked_mean(
-                masked_mean(per_token_values, token_mask, dim=-1),
-                sample_mask,
-                global_normalization_factor=global_valid_seqs,
+        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
+            """Reduce a per-token tensor exactly like the policy-gradient objective."""
+            return self.objective_reduction.reduce(
+                per_token_values,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                mask=mask,
+                denominator=objective_denominator,
+                per_response_weights=per_response_weights,
             )
 
         actor_loss = reduce_like_loss(opd_full_divergence)

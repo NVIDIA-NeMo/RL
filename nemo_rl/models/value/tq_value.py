@@ -118,10 +118,9 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(VALUE_SEED_FIELDS),
             task_name="value_fwd",
-            # A value model consumes tokens only; unioning the rollout's
-            # multimodal columns in would fetch and broadcast pixels this
-            # forward discards.
-            include_multimodal=False,
+            # Only the Megatron critic supports VLM inputs. AutoModel critics
+            # must not receive media because their packing path is text-only.
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -154,7 +153,6 @@ class TQValue(TQDriverMixin, Value):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        train_fields: tuple[str, ...] = DP_VALUE_TRAIN_FIELDS,
     ) -> dict[str, Any]:
         """1-hop counterpart to train. One call is one optimizer step.
 
@@ -165,7 +163,6 @@ class TQValue(TQDriverMixin, Value):
             gbs: Global batch size; defaults to the config's train_global_batch_size.
             mbs: Micro batch size; defaults to the config's train_micro_batch_size.
             timer: Optional timer for nested value_training measurements.
-            train_fields: Columns the workers fetch for this step.
 
         Returns:
             Aggregated training-step output dict.
@@ -176,10 +173,9 @@ class TQValue(TQDriverMixin, Value):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=list(train_fields),
+            fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            # See get_values: token-only inputs, so no multimodal union.
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -233,13 +229,13 @@ class TQValue(TQDriverMixin, Value):
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
-        """Accumulate a token-only chunk using the existing presharded worker API."""
+        """Accumulate a training chunk using the existing presharded worker API."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
