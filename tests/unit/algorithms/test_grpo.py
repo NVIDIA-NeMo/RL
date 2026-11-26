@@ -10939,3 +10939,78 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+def _deferred_publisher(tmp_path, *, enabled, poll_results=()):
+    from nemo_rl.algorithms.grpo import _DeferredAsyncCheckpointPublisher
+
+    policy = MagicMock()
+    policy.poll_async_save.side_effect = list(poll_results)
+    checkpointer = MagicMock()
+    checkpointer.checkpoint_dir = tmp_path
+    publisher = _DeferredAsyncCheckpointPublisher(policy, checkpointer, enabled=enabled)
+    return publisher, policy, checkpointer
+
+
+def _latest_status_step(tmp_path):
+    import json
+
+    path = tmp_path / "latest_checkpoint_status.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())["last_checkpoint_step"]
+
+
+def test_deferred_async_checkpoint_waits_for_poll_before_publishing(tmp_path):
+    publisher, policy, checkpointer = _deferred_publisher(
+        tmp_path, enabled=True, poll_results=[False, False, True]
+    )
+
+    publisher.submit("/ckpt/tmp_step_4", 4)
+    # Write still in flight: nothing renamed, status untouched, no blocking finalize.
+    assert publisher.pending == ("/ckpt/tmp_step_4", 4)
+    checkpointer.begin_finalization.assert_not_called()
+    assert _latest_status_step(tmp_path) is None
+
+    assert publisher.publish(blocking=False) is False
+    assert publisher.publish(blocking=False) is True
+    checkpointer.begin_finalization.assert_called_once_with("/ckpt/tmp_step_4")
+    assert _latest_status_step(tmp_path) == 4
+    policy.finalize_async_save.assert_not_called()
+    assert publisher.publish(blocking=False) is True
+    assert policy.poll_async_save.call_count == 3
+
+
+def test_deferred_async_checkpoint_blocking_publish_finalizes(tmp_path):
+    publisher, policy, checkpointer = _deferred_publisher(
+        tmp_path, enabled=True, poll_results=[False]
+    )
+
+    publisher.submit("/ckpt/tmp_step_2", 2)
+    assert publisher.publish(blocking=True) is True
+    policy.finalize_async_save.assert_called_once_with()
+    checkpointer.begin_finalization.assert_called_once_with("/ckpt/tmp_step_2")
+    assert _latest_status_step(tmp_path) == 2
+    assert publisher.pending is None
+
+
+def test_deferred_async_checkpoint_rejects_overlapping_submit(tmp_path):
+    publisher, _, _ = _deferred_publisher(tmp_path, enabled=True, poll_results=[False])
+
+    publisher.submit("/ckpt/tmp_step_2", 2)
+    with pytest.raises(RuntimeError, match="still pending"):
+        publisher.submit("/ckpt/tmp_step_4", 4)
+
+
+def test_deferred_async_checkpoint_disabled_keeps_background_finalize(tmp_path):
+    publisher, policy, checkpointer = _deferred_publisher(tmp_path, enabled=False)
+
+    publisher.submit("/ckpt/tmp_step_6", 6)
+    checkpointer.begin_finalization.assert_called_once_with(
+        "/ckpt/tmp_step_6", wait_fn=policy.finalize_async_save
+    )
+    assert _latest_status_step(tmp_path) == 6
+    assert publisher.pending is None
+    policy.poll_async_save.assert_not_called()
+    assert publisher.publish(blocking=True) is True
+    policy.finalize_async_save.assert_not_called()

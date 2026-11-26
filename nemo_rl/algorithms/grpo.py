@@ -3192,6 +3192,64 @@ def _write_latest_checkpoint_status(
         json.dump(status, f)
 
 
+class _DeferredAsyncCheckpointPublisher:
+    """Publish a checkpoint (tmp_step_N -> step_N rename + status file) after its writes land.
+
+    With Megatron async save, ``policy.save_checkpoint`` returns once tensors are
+    staged and the disk write continues in the background. Finalizing that write
+    runs collectives on the policy workers, so it must happen on the training
+    loop between policy calls. A blocking finalize handed to the checkpointer's
+    rename thread would instead occupy every policy worker until the write
+    finished, queueing the next refit/train behind it (async save in name only).
+
+    When ``enabled`` (Megatron async save), :meth:`submit` leaves the checkpoint
+    pending; :meth:`publish` polls without waiting (``blocking=False``) or waits
+    (``blocking=True``, before the next save and at training exit). Otherwise
+    :meth:`submit` keeps the original behavior: rename in the background after
+    ``policy.finalize_async_save`` and record the status immediately.
+    """
+
+    def __init__(self, policy: Any, checkpointer: CheckpointManager, *, enabled: bool):
+        self._policy = policy
+        self._checkpointer = checkpointer
+        self._enabled = enabled
+        self._pending: Optional[tuple[str, int]] = None
+
+    @property
+    def pending(self) -> Optional[tuple[str, int]]:
+        return self._pending
+
+    def submit(self, checkpoint_path: Any, step: int) -> None:
+        if not self._enabled:
+            self._checkpointer.begin_finalization(
+                checkpoint_path, wait_fn=self._policy.finalize_async_save
+            )
+            _write_latest_checkpoint_status(
+                self._checkpointer, last_checkpoint_step=step
+            )
+            return
+        if self._pending is not None:
+            raise RuntimeError(
+                f"Checkpoint {self._pending[0]} is still pending; publish it first."
+            )
+        self._pending = (str(checkpoint_path), step)
+        self.publish(blocking=False)
+
+    def publish(self, *, blocking: bool) -> bool:
+        """Publish the pending checkpoint if its writes are done. True if none remains."""
+        if self._pending is None:
+            return True
+        if blocking:
+            self._policy.finalize_async_save()
+        elif not self._policy.poll_async_save():
+            return False
+        path, step = self._pending
+        self._pending = None
+        self._checkpointer.begin_finalization(path)
+        _write_latest_checkpoint_status(self._checkpointer, last_checkpoint_step=step)
+        return True
+
+
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
     return get_effort_config(master_config.env)
@@ -5914,10 +5972,25 @@ def async_grpo_train(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
+    # Megatron async save: publish (rename + status) from this loop between
+    # policy calls once the background write lands. See
+    # _DeferredAsyncCheckpointPublisher.
+    _megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+    async_checkpoint_publisher = _DeferredAsyncCheckpointPublisher(
+        policy,
+        checkpointer,
+        enabled=bool(
+            _megatron_cfg.get("enabled")
+            and (_megatron_cfg.get("checkpoint") or {}).get("async_save")
+        ),
+    )
+
     # Main training loop
     try:
         while step < max_num_steps:
             ray.get(trajectory_collector.check_health.remote())
+            # Publish the previous async checkpoint once every worker's write is done.
+            async_checkpoint_publisher.publish(blocking=False)
             refit_metrics: dict[str, float] = {}
             early_stop_message: Optional[str] = None
             print(f"\n{'=' * 25} Step {step + 1}/{max_num_steps} {'=' * 25}")
@@ -6702,6 +6775,7 @@ def async_grpo_train(
                     ):
                         # Finalize the previous (possibly async) checkpoint before
                         # starting a new one. No-op with sync save / nothing pending.
+                        async_checkpoint_publisher.publish(blocking=True)
                         checkpointer.finalize_pending()
 
                         print(f"Saving checkpoint for step {step + 1}...")
@@ -6769,18 +6843,10 @@ def async_grpo_train(
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )
 
-                        # Defer the directory rename until any async write
-                        # completes; flushed at the next save or on training exit.
-                        checkpointer.begin_finalization(
-                            checkpoint_path,
-                            wait_fn=policy.finalize_async_save,
-                        )
-
-                        # Record last-successful-checkpoint time/step for external
-                        # monitoring (see _write_latest_checkpoint_status).
-                        _write_latest_checkpoint_status(
-                            checkpointer, last_checkpoint_step=step + 1
-                        )
+                        # Rename tmp_step_N -> step_N once the policy's writes
+                        # are done (Megatron async save: at a later step-start
+                        # poll, or blocking at the next save / training exit).
+                        async_checkpoint_publisher.submit(checkpoint_path, step + 1)
 
                     # On save-bound steps, engine stayed asleep after training;
                     # wake it unless the loop exits right below (last step, timeout, early stop),
@@ -6975,6 +7041,7 @@ def async_grpo_train(
     finally:
         # Finalize any pending async checkpoint before tearing down workers.
         try:
+            async_checkpoint_publisher.publish(blocking=True)
             checkpointer.shutdown()
         except Exception as e:
             print(f"Error finalizing pending checkpoint: {e}")
