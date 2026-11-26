@@ -227,12 +227,12 @@ def run(args):
         # force_on_policy_ratio=False is the documented lookahead configuration and
         # exercises the ordinary policy-ratio branch; True keeps the ratio at one and
         # relies on the importance-sampling correction alone.
-        for token_level, force_on_policy_ratio in itertools.product(
-            (True, False), (True, False)
+        for normalization, force_on_policy_ratio in itertools.product(
+            ("global_token_mean", "sequence_mean"), (True, False)
         ):
             loss_fn = ClippedPGLossFn(
                 ClippedPGLossConfig(
-                    token_level_loss=token_level,
+                    normalization=normalization,
                     reference_policy_kl_penalty=0.01,
                     force_on_policy_ratio=force_on_policy_ratio,
                     use_importance_sampling_correction=True,
@@ -284,7 +284,7 @@ def run(args):
                 torch.set_rng_state(cpu_rng)
                 torch.cuda.set_rng_state(gpu_rng)
                 del before, optim_before
-                partition = f"parity-{token_level}-{force_on_policy_ratio}-{step}"
+                partition = f"parity-{normalization}-{force_on_policy_ratio}-{step}"
                 client.register_partition(
                     partition_id=partition,
                     fields=list(batch),
@@ -358,7 +358,7 @@ def run(args):
                 dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
                 errors = dict(zip(errors, maxima.cpu().tolist()))
                 record = {
-                    "token_level": token_level,
+                    "normalization": normalization,
                     "force_on_policy_ratio": force_on_policy_ratio,
                     "step": step,
                     **errors,

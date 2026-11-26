@@ -147,11 +147,11 @@ def test_full_batch_split_parity(
     report = json.loads((tmp_path / "parity.json").read_text())
     assert report["passed"]
     assert {
-        (row["token_level"], row["force_on_policy_ratio"], row["step"])
+        (row["normalization"], row["force_on_policy_ratio"], row["step"])
         for row in report["records"]
     } == {
-        (token_level, force_on_policy_ratio, step)
-        for token_level in (True, False)
+        (normalization, force_on_policy_ratio, step)
+        for normalization in ("global_token_mean", "sequence_mean")
         for force_on_policy_ratio in (True, False)
         for step in range(2)
     }
