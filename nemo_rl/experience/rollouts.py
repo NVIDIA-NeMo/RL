@@ -87,7 +87,11 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    looping_metrics_from_flags,
+    pct,
+)
 from nemo_rl.experience.reward_penalties import (
     effort_shaping_enabled,
     has_duplicated_reasoning,
@@ -3186,6 +3190,11 @@ def _nemo_gym_group_metrics(
         return {}
 
     metrics: dict[str, Any] = _group_reward_diagnostics(results, group_size)
+    metrics.update(
+        looping_metrics_from_flags(
+            [result["full_result"].get("is_looping") for result in results]
+        )
+    )
     valid_token_counts = [
         result
         for result in results
@@ -3288,6 +3297,19 @@ def nemo_gym_rollout_hit_max_tokens(
     return incomplete_details.get("reason") in _LENGTH_LIMIT_INCOMPLETE_REASONS
 
 
+def nemo_gym_logging_metadata(batch: BatchedDataDict) -> dict[str, Any]:
+    """Project Gym assessments and verifier grades into the existing row logger."""
+    if "is_looping" not in batch:
+        return {}
+    return {
+        "metadata": [
+            {"is_looping": flag, "reasons": reasons}
+            for flag, reasons in zip(batch["is_looping"], batch["reasons"], strict=True)
+        ],
+        "verifier_rewards": batch["verifier_reward"].tolist(),
+    }
+
+
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
     results: list[dict],
@@ -3318,6 +3340,9 @@ def _postprocess_single_nemo_gym_group(
         result["attribution_key"] = attribution_key
         result["agent_ref"] = None if is_nemo_gym_task(row) else row["agent_ref"]
 
+    verifier_rewards = torch.tensor(
+        [r["full_result"]["reward"] for r in results], dtype=torch.float64
+    )
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
 
@@ -3468,7 +3493,7 @@ def _postprocess_single_nemo_gym_group(
 
             keys = set().union(*(result.keys() for result in agent_results))
             for key in keys:
-                if key in _SHARED_GENRM_METRICS:
+                if key in _SHARED_GENRM_METRICS or key == "is_looping":
                     continue
                 values = [
                     float(r[key])
@@ -3555,6 +3580,9 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    final_batch["is_looping"] = [r["full_result"].get("is_looping") for r in results]
+    final_batch["reasons"] = [r["full_result"].get("reasons", []) for r in results]
+    final_batch["verifier_reward"] = verifier_rewards
     # Carry the raw env/agent flag downstream; the advantage stage composes it
     # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:

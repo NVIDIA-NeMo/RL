@@ -18,8 +18,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch
+
+from nemo_rl.algorithms.reward_functions import (
+    RewardShapingConfig,
+    zero_looping_rewards,
+)
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.metric_utils import looping_metrics
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -104,15 +111,25 @@ def voting_rewards_from_record(
     *,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
+    reward_shaping: RewardShapingConfig | None = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from its ``Completion`` rows."""
+    rewards = [
+        completion.reward
+        if completion.reward_original is None
+        else completion.reward_original
+        for completion in record.completions
+    ]
+    if reward_shaping is not None and reward_shaping.zero_looping_rewards:
+        rewards = zero_looping_rewards(
+            torch.tensor(rewards, dtype=torch.float64),
+            [
+                (completion.env_extras or {}).get("is_looping")
+                for completion in record.completions
+            ],
+        ).tolist()
     return voting_rewards(
-        [
-            completion.reward
-            if completion.reward_original is None
-            else completion.reward_original
-            for completion in record.completions
-        ],
+        rewards,
         mask_sample=[
             mask_sample_flagged(completion.env_extras)
             for completion in record.completions
@@ -129,10 +146,20 @@ def voting_rewards_from_finalized(
     *,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
+    reward_shaping: RewardShapingConfig | None = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from a finalized capture group."""
+    rewards = finalized.reward_original
+    if reward_shaping is not None and reward_shaping.zero_looping_rewards:
+        rewards = zero_looping_rewards(
+            torch.tensor(rewards, dtype=torch.float64),
+            [
+                row.log_context.is_looping if row.log_context is not None else None
+                for row in finalized.reward_observations
+            ],
+        ).tolist()
     return voting_rewards(
-        finalized.reward_original,
+        rewards,
         mask_sample=finalized.reward_mask_sample,
         truncated=finalized.reward_truncated,
         loss_multiplier=finalized.loss_multiplier,
@@ -157,6 +184,23 @@ class StepRewardStats:
     # First attempts only: the prompts originally scheduled, not their replacements.
     first_attempt_reward_sum: float = 0.0
     first_attempt_samples: int = 0
+    looping_completed: int = 0
+    looping_assessed: int = 0
+    looping_flagged: int = 0
+
+
+def record_looping_flags(
+    step_rewards: dict[int, StepRewardStats],
+    target_step: int | None,
+    flags: Sequence[object],
+) -> None:
+    """Tally completed outputs before dynamic sampling, including masked rows."""
+    if target_step is None:
+        return
+    tally = step_rewards.setdefault(target_step, StepRewardStats())
+    tally.looping_completed += len(flags)
+    tally.looping_assessed += sum(type(flag) is bool for flag in flags)
+    tally.looping_flagged += sum(flag is True for flag in flags)
 
 
 def record_group_rewards(
@@ -212,14 +256,23 @@ def drain_step_reward_metrics(
     for old_step in list(step_rewards):
         if old_step <= step:
             del step_rewards[old_step]
-    if tally is None or not tally.groups:
+    if tally is None:
         return {}
-    metrics = {
-        "unfiltered_reward": tally.reward_sum / tally.samples,
-        "generated_prompt_groups": float(tally.groups),
-        "zero_variance_prompt_groups": float(tally.zero_variance_groups),
-        "zero_variance_fraction": tally.zero_variance_groups / tally.groups,
-    }
+    metrics = looping_metrics(
+        completed=tally.looping_completed,
+        assessed=tally.looping_assessed,
+        flagged=tally.looping_flagged,
+    )
+    if not tally.groups:
+        return metrics
+    metrics.update(
+        {
+            "unfiltered_reward": tally.reward_sum / tally.samples,
+            "generated_prompt_groups": float(tally.groups),
+            "zero_variance_prompt_groups": float(tally.zero_variance_groups),
+            "zero_variance_fraction": tally.zero_variance_groups / tally.groups,
+        }
+    )
     if tally.first_attempt_samples:
         metrics["first_attempt_reward"] = (
             tally.first_attempt_reward_sum / tally.first_attempt_samples

@@ -1169,6 +1169,7 @@ class RolloutReassembler:
             rows,
             rollout_ids,
             slot_agent_names=slot_agent_names,
+            log_contexts=log_contexts,
             mask_sample=mask_sample,
             fallback_weight_version=fallback_weight_version,
             prompt_idx=prompt_idx,
@@ -1252,6 +1253,7 @@ class RolloutReassembler:
         rollout_ids: list[str],
         *,
         slot_agent_names: Optional[list[Optional[str]]] = None,
+        log_contexts: Sequence[RewardLogContext | None],
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
@@ -1492,6 +1494,12 @@ class RolloutReassembler:
                 raise ValueError("Forest publication IDs differ from the cleanup plan")
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
+        for index, tag in enumerate(tags):
+            slot = tag.get("logical_slot") if logical is not None else index
+            context = log_contexts[slot] if slot is not None else None
+            if context is not None:
+                tag["is_looping"] = context.is_looping
+                tag["reasons"] = list(context.reasons)
         if slot_agent_names is not None:
             # grpo.agent_overrides: each row's tag names its rollout's agent
             # (Forest rows by logical slot). Rows without one, e.g. execution

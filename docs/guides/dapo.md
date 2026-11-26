@@ -43,11 +43,39 @@ Standard GRPO trains on all generated responses, even when they have identical r
  * `dynamic_sampling_num_discarded_valid_samples`: The number of samples with a nonzero standard deviation that are discarded because the total exceeds `num_prompts_per_step * num_generations_per_prompt`. If this value is frequently high (e.g., above `0.5 * num_prompts_per_step * num_generations_per_prompt`) and `dynamic_sampling_num_gen_batches` is consistently 1, it suggests that a large fraction of the dataset is being discarded unnecessarily. To improve data efficiency, consider decreasing the `batch_multiplier`.
 
 ## Reward Shaping
+
 DAPO introduces an overlong reward shaping mechanism to reduce reward noise and stabilize training. This approach penalizes responses that exceed a specified length threshold, helping to prevent the model from generating excessively long outputs while maintaining solution quality.
 
 The response length is the total number of tokens over all generated assistant turns in a sample. For multi-turn rollouts (tool use, NeMo Gym agents, `max_rollout_turns > 1`), every generated assistant turn counts toward `max_response_length`. Assistant turns in the original prompt history, including empty placeholders, and user, environment, and tool turns do not count. Generated turns are identified by their `generation_logprobs` before missing logprobs are filled for training. For a single-turn rollout this is the length of the one generated assistant response.
 
 For a detailed explanation of the overlong reward shaping mechanism, please refer to Section 3.4 of the [DAPO paper](https://arxiv.org/pdf/2503.14476). For implementation details, see the [`apply_reward_shaping`](../../nemo_rl/algorithms/reward_functions.py) function.
+
+### Severe text looping diagnostics
+
+NeMo Gym can assess severe repetition in assistant and reasoning text before token rebuilding removes the returned response. This diagnostic uses Gym's shared text classifier in one persistent spawned process per Gym actor, within the actor's existing CPU reservation. Enable it independently of result enrichment:
+
+```yaml
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    assess_looping: true
+grpo:
+  reward_shaping:
+    zero_looping_rewards: false
+```
+
+| Setting | Type and default | Behavior |
+| --- | --- | --- |
+| `env.nemo_gym.assess_looping` | Boolean, `false` | Assess returned assistant/reasoning text. Disabled runs create no diagnostic worker and do not scan text. |
+| `grpo.reward_shaping.zero_looping_rewards` | Boolean, `false` | Zero the training objective for confirmed loops after other enabled reward adjustments. PPO exposes the same field under `ppo.reward_shaping`. Requires assessment on every Gym shard. |
+
+Rows retain `is_looping` and `reasons` through normal results, recovery contexts and metadata tags. Classic training JSONL includes these fields under `metadata` and records the original grades in `verifier_rewards` alongside the training objective's `rewards`. `true` means a severe text witness, `false` means the supported checks completed, and `null` means unassessed, including unreadable text, work-limit exhaustion or unavailable process execution. Incomplete or length-limited responses remain assessable when their text is readable.
+
+Training reports `looping/rate = flagged / assessed` when any output was assessed and `looping/coverage = assessed / completed`. The population includes completed outputs before dynamic sampling, including retained masked outputs, independently of verifier grade. The accompanying `looping/*_total` counts pool groups with unequal denominators. Execution padding and failed requests contribute no completed output.
+
+SingleController omits looping ratios for restored steps whose complete pre-filter counts were not checkpointed and logs the affected step range. Reporting resumes on the next fully observed step; saved row labels still control objective zeroing throughout recovery.
+
+The safeguard is independent of length shaping's `enabled` flag. It changes only known boolean `true` rows, including the separate reward input used for dynamic-sampling standard deviation; other rows retain their configured reward variants. Raw verifier observations, published validation scores and sample/token masks retain their existing behavior. For four correct outputs with one confirmed loop, the training reward group is `[0, 1, 1, 1]` while verifier observations remain `[1, 1, 1, 1]`.
 
 ## Configuration
 

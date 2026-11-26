@@ -1361,6 +1361,8 @@ def test_ordinary_finalize_carries_nondefault_voting_fields(
         prompt_idx=99,
         loss_multiplier=0.5,
         canonical_sample_ids=["group_g0", "group_g1", "group_g2"],
+        reward_log_contexts=[RewardLogContext("agent", None, True, ("repeated_text",))]
+        * 3,
     )
 
     assert result.total_row_count == 3
@@ -1374,6 +1376,8 @@ def test_ordinary_finalize_carries_nondefault_voting_fields(
     assert result.reward_original == [0.25, 0.75]
     # The dataset-level weight is carried through unchanged (non-unit).
     assert result.loss_multiplier == 0.5
+    assert [tag["is_looping"] for tag in result.meta.tags] == [True] * 3
+    assert all(tag["reasons"] == ["repeated_text"] for tag in result.meta.tags)
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

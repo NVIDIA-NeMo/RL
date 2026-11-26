@@ -850,6 +850,7 @@ def test_nemo_gym_shutdown_is_idempotent():
         nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
     )
     actor.rh = MagicMock()
+    actor._looping_assessor = None
     run_helper = actor.rh
 
     actor.shutdown()

@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import warnings
+from collections.abc import Sequence
 from typing import TypeVar
 
 import torch
@@ -31,6 +32,8 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     """
 
     enabled: bool = False
+    # Independent of length shaping; only confirmed text loops are zeroed.
+    zero_looping_rewards: bool = False
 
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
@@ -112,7 +115,33 @@ class RewardShapingConfig(BaseModel, extra="allow"):
         return self
 
 
+def zero_looping_rewards(
+    rewards: torch.Tensor, flags: Sequence[object] | None
+) -> torch.Tensor:
+    """Zero only known boolean True labels, leaving unknown rows unchanged."""
+    if flags is None:
+        return rewards
+    looping = torch.tensor(
+        [flag is True for flag in flags], device=rewards.device, dtype=torch.bool
+    )
+    return rewards.masked_fill(looping, 0)
+
+
 def apply_reward_shaping(
+    batch: BatchedDataDict, cfg: RewardShapingConfig
+) -> BatchedDataDict:
+    """Apply length adjustments, then the optional confirmed-loop safeguard."""
+    batch = _apply_length_shaping(batch, cfg)
+    if cfg.zero_looping_rewards:
+        for key in batch:
+            if key in ("total_reward", "unshaped_total_reward") or key.startswith(
+                "reward/"
+            ):
+                batch[key] = zero_looping_rewards(batch[key], batch.get("is_looping"))
+    return batch
+
+
+def _apply_length_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
 ) -> BatchedDataDict:
     """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.

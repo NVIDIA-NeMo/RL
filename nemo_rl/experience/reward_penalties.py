@@ -417,10 +417,14 @@ class RewardLogContext:
 
     agent_name: str
     full_result_json: str | None
+    is_looping: bool | None = None
+    reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_name, str) or not self.agent_name:
             raise ValueError("reward log agent_name must be a nonempty string")
+        if self.is_looping is not None and type(self.is_looping) is not bool:
+            raise ValueError("is_looping must be a boolean or None")
         if self.full_result_json is not None:
             if not isinstance(self.full_result_json, str) or not isinstance(
                 json.loads(self.full_result_json), dict
@@ -465,9 +469,18 @@ def parse_reward_log_context(value: object) -> RewardLogContext | None:
     """Validate the optional log context stored with an unfinished attempt."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"agent_name", "full_result_json"}:
+    if (
+        not isinstance(value, dict)
+        or not {"agent_name", "full_result_json"} <= set(value)
+        or set(value) - {"agent_name", "full_result_json", "is_looping", "reasons"}
+    ):
         raise ValueError("invalid reward log context")
-    return RewardLogContext(value["agent_name"], value["full_result_json"])
+    return RewardLogContext(
+        value["agent_name"],
+        value["full_result_json"],
+        value.get("is_looping"),
+        tuple(value.get("reasons", ())),
+    )
 
 
 def compute_reward_checks(

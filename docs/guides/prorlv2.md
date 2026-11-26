@@ -92,7 +92,7 @@ grpo:
 - **Implementation**: `apply_reward_shaping()` in [`nemo_rl/algorithms/reward_functions.py`](../../nemo_rl/algorithms/reward_functions.py).
 
 :::{important}
-In the current implementation, if `stop_properly_penalty_coef` is set (not `null`), `apply_reward_shaping()` **returns early** after applying truncation scaling. That means you **cannot** apply DAPO "overlong reward shaping" in the same run unless you set `stop_properly_penalty_coef: null` and provide the DAPO overlong parameters (`overlong_buffer_length`, `overlong_buffer_penalty`, `max_response_length`).
+When `stop_properly_penalty_coef` is set, truncation scaling takes precedence over the DAPO overlong formula. To use the overlong formula, set `stop_properly_penalty_coef: null` and provide `overlong_buffer_length`, `overlong_buffer_penalty`, and `max_response_length`. The optional confirmed-loop safeguard runs after either length adjustment.
 :::
 
 ## Loss: Decoupled (Asymmetric) Clipping
