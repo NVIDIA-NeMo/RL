@@ -326,6 +326,16 @@ def test_incomplete_batch_cannot_commit(worker_type):
     worker.abort_train_step()
 
 
+def test_scheduler_ticks_by_configured_batch_size(worker_type):
+    cls, _ = worker_type
+    worker = make_worker(cls)
+    worker.cfg["train_global_batch_size"] = 2
+    worker.begin_train_step(MseValueLossFn(MseValueLossConfig()), gbs=4)
+    worker.train_microbatch(batch())
+    worker.finish_train_step()
+    worker.scheduler.step.assert_called_once_with(increment=2)
+
+
 def test_backward_error_restores_hooks_and_requires_abort(worker_type):
     cls, namespace = worker_type
     worker = make_worker(cls)

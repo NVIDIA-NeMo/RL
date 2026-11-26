@@ -73,6 +73,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     write_gym_checkpoint_manifest,
 )
 from nemo_rl.experience.rollout_manager import (
+    RolloutManager,
     RolloutOutcome,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -256,6 +257,13 @@ class _RecoveryRolloutManager:
         self.recovery_ledger = ledger
         self.recovered: list[tuple[str, int | None]] = []
 
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
+
     async def complete_recovery(
         self,
         cut: DataPlaneMutationCut,
@@ -302,6 +310,13 @@ class _BlockingRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
+
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
 
     def get_next_nemo_gym_task_index(self) -> int:
         return self.next_nemo_gym_task_index

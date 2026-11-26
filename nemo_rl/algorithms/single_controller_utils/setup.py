@@ -86,7 +86,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     dedicated_value_enabled,
     forest_execution_row_multiple,
     is_ppo_run,
-    logprob_passes_required,
     resolve_ppo_chunk_alignment,
     rollout_snapshots_enabled,
     validate_grpo_chunk_cap_alignment,
@@ -2790,12 +2789,32 @@ def setup_single_controller(
         )
     if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
-        # model before admitting rollouts, even if the first batch needs neither.
+        # models before admitting rollouts, even if the first batch needs neither.
         ray.get(
             trainer.worker_group.run_all_workers_single_data(
                 "validate_forest_execution_padding"
             )
         )
+        if value is not None:
+            ray.get(
+                value.worker_group.run_all_workers_single_data(
+                    "validate_forest_execution_padding"
+                )
+            )
+    forest_row_multiple = (
+        forest_execution_row_multiple(
+            master_config,
+            algo_cfg,
+            policy_dp=trainer.sharding_annotations.get_axis_size("data_parallel"),
+            value_dp=(
+                None
+                if value is None
+                else value.sharding_annotations.get_axis_size("data_parallel")
+            ),
+        )
+        if token_capture_cfg.forest_training
+        else 1
+    )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2825,15 +2844,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
-        execution_row_multiple=(
-            forest_execution_row_multiple(
-                trainer.cfg,
-                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
-            )
-            if token_capture_cfg.forest_training
-            else 1
-        ),
+        execution_row_multiple=forest_row_multiple,
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
         filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
         # The advantage stage's participation knobs; None on PPO, which has no group baseline.

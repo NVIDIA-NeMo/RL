@@ -510,7 +510,7 @@ def test_score_centering_keeps_a_small_positive_trainer_tail_without_replay():
     )
 
 
-def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_weight):
+def _replayed_score_centering_loss(mode, sampled_ids, normalization, sample_weight):
     """Loss for response tokens drawn from S_q = {0, 1, 2, 3}, the trainer replaying it."""
     logits = torch.tensor([0.6, -0.2, 0.1, -0.7, -1.5], requires_grad=True)
     kept = torch.tensor([True, True, True, True, False])
@@ -535,7 +535,7 @@ def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_w
         score_centering=True,
         reference_policy_kl_penalty=0,
         force_on_policy_ratio=True,
-        token_level_loss=token_level_loss,
+        normalization=normalization,
         use_importance_sampling_correction=mode != "off",
         truncated_importance_sampling_type=mode if tis else None,
         truncated_importance_sampling_ratio=1.3 if tis else None,
@@ -553,17 +553,17 @@ def _replayed_score_centering_loss(mode, sampled_ids, token_level_loss, sample_w
 
 
 @pytest.mark.parametrize("sample_weight", [1.0, 0.5])  # a fractional loss_multiplier
-@pytest.mark.parametrize("token_level_loss", [True, False])
+@pytest.mark.parametrize("normalization", ["global_token_mean", "sequence_mean"])
 @pytest.mark.parametrize("num_tokens", [1, 2])
 @pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop", "adaptive-ppo-clip"])
 def test_score_centering_cancels_in_expectation_over_the_sampler_support(
-    mode, num_tokens, token_level_loss, sample_weight
+    mode, num_tokens, normalization, sample_weight
 ):
     """With S_q replayed and a constant advantage, the expected gradient is zero."""
     expected_grad = torch.zeros(5)
     for sampled_ids in itertools.product(range(4), repeat=num_tokens):
         loss, logits, q = _replayed_score_centering_loss(
-            mode, sampled_ids, token_level_loss, sample_weight
+            mode, sampled_ids, normalization, sample_weight
         )
         weight = q[list(sampled_ids)].prod()
         expected_grad += weight * torch.autograd.grad(loss, logits)[0]

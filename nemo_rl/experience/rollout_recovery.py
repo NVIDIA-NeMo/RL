@@ -68,6 +68,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
         "finalizer_rewards_by_group",
         "reward_settings",
         "sampler_stamps_target_steps",
+        "multi_harness_routes",
     }
 )
 _GROUP_STATE_FIELDS = frozenset(
@@ -446,6 +447,8 @@ class ParsedRolloutRecoveryState:
     finalizer_metrics_by_group: dict[str, dict[str, float]]
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]]
     reward_settings: CaptureRewardSettings | None
+    # The env.nemo_gym.multi_harness routes the run resolved, or None without them.
+    multi_harness_routes: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -2274,6 +2277,7 @@ def build_rollout_recovery_state(
     finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]] | None = None,
     reward_settings: CaptureRewardSettings | None = None,
+    multi_harness_routes: dict[str, Any] | None = None,
     canonical_group_ids: set[str] | None = None,
 ) -> RolloutRecoveryState:
     """Build the complete versioned sidecar from ledger and controller state."""
@@ -2293,6 +2297,7 @@ def build_rollout_recovery_state(
     state["reward_settings"] = (
         reward_settings.to_state() if reward_settings is not None else None
     )
+    state["multi_harness_routes"] = _validate_multi_harness_routes(multi_harness_routes)
     state["finalizer_rewards_by_group"] = {
         group_id: [dataclasses.asdict(row) for row in rows]
         for group_id, rows in (finalizer_rewards_by_group or {}).items()
@@ -2312,6 +2317,44 @@ def build_rollout_recovery_state(
     # Run the same validation seam used by readers before writing a sidecar.
     parse_rollout_recovery_state(state)
     return state
+
+
+def _validate_multi_harness_routes(value: object) -> dict[str, Any] | None:
+    """Check the multi-harness routes a sidecar records; None when it has none.
+
+    The value is ``MultiHarnessRoutes.to_state()``: the selection rule and each
+    taskset's ``[agent, environment_server, weight]`` candidates.
+    """
+    if value is None:
+        return None
+    candidates = value.get("candidates") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"selection", "candidates"}
+        or not isinstance(value["selection"], str)
+        or not isinstance(candidates, list)
+        or not all(
+            isinstance(entry, list)
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], list)
+            and all(
+                isinstance(pair, list)
+                and len(pair) == 3
+                and isinstance(pair[0], str)
+                and isinstance(pair[1], str)
+                and isinstance(pair[2], (int, float))
+                and not isinstance(pair[2], bool)
+                for pair in entry[1]
+            )
+            for entry in candidates
+        )
+    ):
+        raise TypeError(
+            "rollout recovery multi_harness_routes must hold the selection rule "
+            "and each taskset's [agent, server, weight] candidates"
+        )
+    return value
 
 
 def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
@@ -2391,4 +2434,8 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         finalizer_metrics_by_group=finalizer_metrics,
         finalizer_rewards_by_group=finalizer_rewards,
         reward_settings=reward_settings,
+        # Sidecars saved before multi-harness routing lack the key: no routes.
+        multi_harness_routes=_validate_multi_harness_routes(
+            state.get("multi_harness_routes")
+        ),
     )
