@@ -82,7 +82,7 @@ from nemo_rl.models.automodel.train import (
 )
 from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -1071,9 +1071,10 @@ class AutomodelPolicyWorkerImpl(
                 draft_runtime=None,
                 tp_mesh=self.tp_mesh,
             )
-            empty_cache_steps = self.cfg["automodel_cfg"].get(
-                "clear_cache_every_n_steps"
-            )
+            # The full-batch path runs only with AutoModel enabled, so the
+            # disabled variant of the union cannot occur here.
+            automodel_cfg = cast(AutomodelConfig, self.cfg["automodel_cfg"])
+            empty_cache_steps = automodel_cfg.get("clear_cache_every_n_steps")
 
             def on_microbatch_start(mb_idx: int) -> None:
                 if empty_cache_steps and mb_idx % empty_cache_steps == 0:
@@ -1090,7 +1091,7 @@ class AutomodelPolicyWorkerImpl(
             global_valid_toks = gb_result["global_valid_toks"]
             processed_iterator, iterator_len = get_microbatch_iterator(
                 gb_result["batch"],
-                self.cfg,
+                cast(dict[str, Any], self.cfg),
                 state.mbs,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
