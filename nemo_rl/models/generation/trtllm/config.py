@@ -209,7 +209,7 @@ def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConf
     sizes the engine fleet NeMo RL creates, this is forwarded to TRT-LLM's
     ``DisaggServerConfig``.
     """
-    raw = as_dict(config["trtllm_cfg"].get("disagg_server"))
+    raw = _as_dict(config["trtllm_cfg"].get("disagg_server"))
     # Caught ahead of extra="forbid" only to point at where the key belongs.
     misplaced = sorted(set(raw) & set(DisaggConfig.model_fields))
     if misplaced:
