@@ -371,6 +371,7 @@ def test_checkpoint_rejects_partially_missing_adam_state(
 ):
     from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
     from torch.distributed.checkpoint import save
+    from torch.distributed.checkpoint.api import CheckpointException
 
     model, optimizer, peft_cfg = _lora_model_and_optimizer(seed=0)
     worker = _checkpoint_worker(model, optimizer, peft_cfg)
@@ -384,7 +385,7 @@ def test_checkpoint_rejects_partially_missing_adam_state(
 
     model2, optimizer2, peft_cfg2 = _lora_model_and_optimizer(seed=0)
     worker2 = _checkpoint_worker(model2, optimizer2, peft_cfg2)
-    with pytest.raises(ValueError, match="Incomplete optimizer checkpoint.*exp_avg"):
+    with pytest.raises(CheckpointException, match="Missing key in checkpoint.*exp_avg"):
         worker2.load_checkpoint(path)
 
 
