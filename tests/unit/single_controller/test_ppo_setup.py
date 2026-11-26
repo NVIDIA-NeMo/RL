@@ -588,7 +588,8 @@ class TestPPOValidation:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=2)
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
 
         validate_single_controller_config(mc)
 
@@ -599,7 +600,8 @@ class TestPPOValidation:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=2)
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
         mc.ppo.value_training_mode = "split"
         mc.ppo.stream_value_training = True
         mc.ppo.ppo_epochs = 1
@@ -626,7 +628,8 @@ class TestPPOValidation:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        mc.value["resources"] = ValueResourcesConfig(dedicated=dedicated, num_nodes=2)
+        mc.value["dedicated"] = dedicated
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
         mc.ppo.value_training_mode = mode
         mc.ppo.stream_value_training = True
         mc.ppo.adv_estimator.normalize_advantages = False

@@ -4076,7 +4076,9 @@ class _NoOpValue:
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
-    def prepare_for_inference(self) -> None:
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
@@ -4084,11 +4086,13 @@ class _NoOpValue:
         del meta
         self._record("get_values_from_meta")
 
-    def finish_inference(self) -> None:
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
-    def prepare_for_training(self) -> None:
+    def prepare_for_training(self, keep_resident: bool = False) -> None:
         self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
@@ -4306,7 +4310,10 @@ def test_parallel_ppo_inference_overlaps_and_joins_value_metadata() -> None:
 
         async def logprobs(meta: object, **kwargs: object) -> None:
             assert meta is original_meta
-            assert kwargs == {"step_open": True}
+            assert kwargs == {
+                "step_open": True,
+                "policy_logprobs_required": True,
+            }
             logprobs_started.set()
             await asyncio.wait_for(value_started.wait(), timeout=1.0)
 
@@ -4320,6 +4327,7 @@ def test_parallel_ppo_inference_overlaps_and_joins_value_metadata() -> None:
                 already_prepared=True,
                 preserve_train_step=True,
                 step_open=True,
+                policy_logprobs_required=True,
             ),
             timeout=1.0,
         )
@@ -4398,6 +4406,7 @@ def test_parallel_ppo_inference_drains_peer_after_failure() -> None:
                 already_prepared=False,
                 preserve_train_step=False,
                 step_open=False,
+                policy_logprobs_required=True,
             )
         )
         await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
@@ -4439,6 +4448,7 @@ def test_parallel_ppo_inference_drains_both_tasks_on_cancellation() -> None:
                 already_prepared=False,
                 preserve_train_step=False,
                 step_open=False,
+                policy_logprobs_required=True,
             )
         )
         await asyncio.wait_for(value_started.wait(), timeout=1.0)
@@ -4621,8 +4631,9 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
 
 
 @pytest.mark.parametrize("warmup", [True, False])
+@pytest.mark.parametrize("dedicated", [True, False])
 def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
-    monkeypatch, warmup
+    monkeypatch, warmup, dedicated
 ) -> None:
     """With in-loss filtering the policy loss decides rejections, but it does not
     run during critic warmup, so those steps take the separate pass instead."""
@@ -4632,6 +4643,7 @@ def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
         policy_training_start_step=1,
     )
     ctrl._warmup_policy_logprobs_required = True
+    ctrl._value_dedicated = dedicated
     if not warmup:
         ctrl._train_steps = 1
         ctrl._trainer_version = 1
@@ -5030,6 +5042,29 @@ def test_streamed_critic_failure_aborts_both_open_steps(
     assert "policy.finish_train_step" not in calls
     assert "critic.finish_train_step" not in calls
     assert "critic.abort_train_step" in calls
+    assert "policy.abort_train_step" in calls
+    assert not ctrl._value.step_open
+
+
+def test_streamed_critic_aborts_when_short_step_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(
+        monkeypatch, valid_chunks=(True, True)
+    )
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+    sampler = _DroppingSampler(metas[0], credit_in_evict=False)
+    sampler.ctrl = ctrl
+    ctrl._sampler = sampler
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.75
+    ctrl._rollout_exhausted.clear()
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "critic.abort_train_step" in calls
+    assert "critic.finish_train_step" not in calls
     assert "policy.abort_train_step" in calls
     assert not ctrl._value.step_open
 

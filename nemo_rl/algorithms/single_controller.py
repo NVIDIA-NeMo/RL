@@ -3181,7 +3181,7 @@ class SingleControllerActor:
                                             self._trainer.finish_inference
                                         )
                         if self._value_dedicated and (
-                            self._policy_logprobs_required
+                            policy_logprobs_required
                             or self._reference_logprobs_required
                         ):
                             train_meta = await self._run_parallel_ppo_inference(
@@ -3189,6 +3189,7 @@ class SingleControllerActor:
                                 already_prepared=value_inference_prepared,
                                 preserve_train_step=value_step_open,
                                 step_open=step_open,
+                                policy_logprobs_required=policy_logprobs_required,
                             )
                         else:
                             train_meta = await self._run_value_inference(
@@ -3197,11 +3198,17 @@ class SingleControllerActor:
                                 preserve_train_step=value_step_open,
                             )
                             await self._run_policy_logprobs(
-                                train_meta, step_open=step_open
+                                train_meta,
+                                step_open=step_open,
+                                policy_logprobs_required=policy_logprobs_required,
                             )
                         value_inference_prepared = False
                     else:
-                        await self._run_policy_logprobs(train_meta, step_open=step_open)
+                        await self._run_policy_logprobs(
+                            train_meta,
+                            step_open=step_open,
+                            policy_logprobs_required=policy_logprobs_required,
+                        )
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -5413,11 +5420,17 @@ class SingleControllerActor:
                 preserve_train_step=preserve_train_step,
             )
 
-    async def _run_policy_logprobs(self, meta: KVBatchMeta, *, step_open: bool) -> None:
+    async def _run_policy_logprobs(
+        self,
+        meta: KVBatchMeta,
+        *,
+        step_open: bool,
+        policy_logprobs_required: bool,
+    ) -> None:
         if step_open and self._is_ppo and not self._value_dedicated:
             with self._timer.time("training_prep"):
                 await asyncio.to_thread(self._trainer.prepare_for_training)
-        if not (self._policy_logprobs_required or self._reference_logprobs_required):
+        if not (policy_logprobs_required or self._reference_logprobs_required):
             return
         with (
             self._timer.time("logprob_inference_prep"),
@@ -5439,7 +5452,7 @@ class SingleControllerActor:
                 tracer=self._tracer,
             ),
         ):
-            if self._policy_logprobs_required:
+            if policy_logprobs_required:
                 await asyncio.to_thread(self._trainer.get_logprobs_from_meta, meta)
             if self._reference_logprobs_required:
                 await asyncio.to_thread(
@@ -5453,6 +5466,7 @@ class SingleControllerActor:
         already_prepared: bool,
         preserve_train_step: bool,
         step_open: bool,
+        policy_logprobs_required: bool,
     ) -> KVBatchMeta:
         value_task = asyncio.create_task(
             self._run_value_inference(
@@ -5462,7 +5476,11 @@ class SingleControllerActor:
             )
         )
         logprob_task = asyncio.create_task(
-            self._run_policy_logprobs(meta, step_open=step_open)
+            self._run_policy_logprobs(
+                meta,
+                step_open=step_open,
+                policy_logprobs_required=policy_logprobs_required,
+            )
         )
         pending = asyncio.gather(value_task, logprob_task, return_exceptions=True)
         try:
