@@ -53,7 +53,7 @@ The full-batch restriction describes the dispatch boundary, not the number of mo
 
 ### Enabling lookahead
 
-The exemplar defaults to lookahead zero; the Gemma4 E2B recipe below ships with lookahead one.
+The exemplar defaults to lookahead zero; the Gemma4 E2B recipe above ships with lookahead one.
 To overlap up to `N` future rollout batches with training while keeping one complete RL batch per optimizer update, apply these overrides to an AutoModel single-controller configuration, shown here for `N = 1`:
 
 ```yaml
@@ -69,7 +69,7 @@ loss_fn:
 ```
 
 The capacities must cover the current and the `N` lookahead prompt batches, so both are `(N + 1) × num_prompts_per_step`; each prompt group contains `num_generations_per_prompt` responses.
-The worker is unaware of lookahead: it always receives one complete batch, and `train/weight_version_lag` reports how many policy versions behind the trainer each batch was generated, at most `N`.
+The worker is unaware of lookahead: it always receives one complete batch, and `train/weight_version_lag_max` reports how many policy versions behind the trainer each batch was generated, at most `N`.
 Selection remains in target-step order and waits for every prompt group in the current batch.
 Training still accumulates the complete batch before one optimizer step.
 

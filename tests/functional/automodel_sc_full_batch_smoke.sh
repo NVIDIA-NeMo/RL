@@ -90,7 +90,7 @@ for run in 1 2; do
         'all_finite(data["train/grad_norm"])' \
         'all_finite(data["train/gen_kl_error"])' \
         'all_finite(data["train/max_seq_mult_prob_error"])' \
-        'max(data["train/weight_version_lag"]) == 0' \
+        'max(data["train/weight_version_lag_max"]) == 0' \
         'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
         'max(data["train/max_seq_mult_prob_error"]) < 1000' \
         'max(data["train/gen_kl_error"]) < 0.002' \
