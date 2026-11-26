@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/cicd-main.yml"
-ACTION = "NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6"
+ACTION = "NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@1ebb754bdbe6680cce2b3d81da4e63be7200380a"
 
 
 def test_nightly_notification_reports_all_direct_job_results() -> None:

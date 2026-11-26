@@ -15,35 +15,36 @@
 name: "Merge Queue Auto-Retry"
 
 on:
-  pull_request:
+  pull_request_target:
+    branches: [main]
     types:
       - dequeued
 
+permissions: {}
+
 jobs:
   requeue-pr:
+    if: github.repository == 'NVIDIA-NeMo/RL' && github.ref == 'refs/heads/main' && github.event.reason == 'CI_TIMEOUT'
+    environment:
+      name: rl-release
+      deployment: false
     runs-on: ubuntu-latest
     steps:
       - name: Generate GitHub App token
         id: generate_token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Check dequeue reason and retry count
         id: check_retry
-        if: github.event.reason == 'CI_TIMEOUT'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
-
-          # Debug: Show all comments first
-          echo "=== All PR Comments ==="
-          gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --jq '.[] | {id: .id, created_at: .created_at, body: .body[:100]}'
-
-          echo "=== Filtering for retry comments ==="
 
           # Get the current number of retry attempts from PR comments
           RETRY_COUNT=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
@@ -54,11 +55,11 @@ jobs:
           MAX_RETRIES=3
 
           if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
-            echo "should_retry=true" >> $GITHUB_OUTPUT
-            echo "retry_count=$((RETRY_COUNT + 1))" >> $GITHUB_OUTPUT
+            echo "should_retry=true" | tee -a "$GITHUB_OUTPUT"
+            echo "retry_count=$((RETRY_COUNT + 1))" | tee -a "$GITHUB_OUTPUT"
             echo "✅ Will retry (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
           else
-            echo "should_retry=false" >> $GITHUB_OUTPUT
+            echo "should_retry=false" | tee -a "$GITHUB_OUTPUT"
             echo "❌ Max retries ($MAX_RETRIES) reached for PR #${PR_NUMBER}"
           fi
 
@@ -77,26 +78,12 @@ jobs:
         if: steps.check_retry.outputs.should_retry == 'true'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+          REQUEUE_MUTATION: 'mutation($id: ID!) { enqueuePullRequest(input: {pullRequestId: $id}) { mergeQueueEntry { id } } }'
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          PR_NODE_ID="${{ github.event.pull_request.node_id }}"
-
-          echo "Requeuing PR #${PR_NUMBER}..."
-
-          # First, try using GraphQL API to enqueue the PR directly
-          GRAPHQL_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer ${{ steps.generate_token.outputs.token }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { enqueuePullRequest(input: {pullRequestId: \\\"${PR_NODE_ID}\\\"}) { clientMutationId } }\"}" \
-            https://api.github.com/graphql)
-
-          if echo "$GRAPHQL_RESPONSE" | jq -e '.data.enqueuePullRequest' > /dev/null; then
-            echo "PR #${PR_NUMBER} has been successfully requeued"
-          else
-            echo "❌ Failed to enqueue PR #${PR_NUMBER}. GraphQL response for debugging:"
-            echo "$GRAPHQL_RESPONSE"
-            exit 1
-          fi
+          gh api graphql -f id="$PR_NODE_ID" \
+            -f query="$REQUEUE_MUTATION" \
+            --jq '.data.enqueuePullRequest.mergeQueueEntry.id'
 
       - name: Max retries reached comment
         if: steps.check_retry.outputs.should_retry == 'false'
