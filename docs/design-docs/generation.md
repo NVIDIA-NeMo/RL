@@ -160,7 +160,8 @@ policy:
     top_p: 1.0
     top_k: null
     mcore_generation_config:
-      buffer_size_gb: 10               # On-GPU KV-cache block pool shared by all active requests
+      buffer_size_gb: 10               # GPU cache budget shared by active requests
+      mamba_memory_ratio: null
       num_cuda_graphs: -1              # Number of CUDA graphs to build; -1 autotunes
       max_tokens: 16384                # Maximum number of tokens for inference
       cuda_graph_sizing_distribution: hybrid
@@ -177,7 +178,8 @@ policy:
 
 The `mcore_generation_config` section controls Megatron Core inference engine behavior:
 
-- **buffer_size_gb**: Size of the on-GPU KV-cache block pool shared by all active requests. When `max_requests` is unset, Megatron-Core derives it from this pool.
+- **buffer_size_gb** sets the GPU cache budget for active requests. Hybrid models use this budget for both KV blocks and recurrent state.
+- **mamba_memory_ratio** sets the fraction reserved for recurrent state on hybrid models. Use a value strictly between 0 and 1. The default (`null`) uses `0.1 + 0.1 * num_speculative_tokens`. With automatic request sizing, raising the fraction can fit more concurrent requests when recurrent state limits capacity, at the cost of fewer KV blocks for long sequences. An explicit `max_requests` sets the request limit directly. The ratio still determines how much memory is available for KV blocks.
 - **num_cuda_graphs**: Number of CUDA graphs to build; `-1` autotunes, `null` disables inference CUDA graphs.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
 

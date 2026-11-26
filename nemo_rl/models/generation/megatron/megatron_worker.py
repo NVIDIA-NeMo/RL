@@ -254,6 +254,21 @@ def _resolve_coordinator_policy(
     )
 
 
+def _resolve_mamba_memory_ratio(
+    mcore_generation_config: Mapping[str, Any],
+    is_hybrid_model: bool,
+    num_speculative_tokens: int,
+) -> Optional[float]:
+    """Reserve a fraction of the hybrid cache budget for recurrent states."""
+    if not is_hybrid_model:
+        return None
+    ratio = mcore_generation_config.get("mamba_memory_ratio")
+    ratio = 0.1 + 0.1 * num_speculative_tokens if ratio is None else float(ratio)
+    if not 0.0 < ratio < 1.0:
+        raise ValueError(f"mamba_memory_ratio must be in (0, 1), got {ratio}.")
+    return ratio
+
+
 def _apply_optional_inference_config_kwargs(
     inference_config_kwargs: dict[str, Any],
     mcore_generation_config: dict[str, Any],
@@ -691,9 +706,8 @@ class MegatronGenerationMixin:
             ),
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
-            # Reserve more KV-cache space when speculative decoding is enabled.
-            "mamba_memory_ratio": (
-                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+            "mamba_memory_ratio": _resolve_mamba_memory_ratio(
+                mcore_generation_config, is_hybrid_model, num_speculative_tokens
             ),
             "num_speculative_tokens": num_speculative_tokens,
             "logprobs_mode": mcore_generation_config["logprobs_mode"],

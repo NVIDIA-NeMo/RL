@@ -153,6 +153,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
+    # Fraction of the hybrid inference cache budget reserved for recurrent states.
+    mamba_memory_ratio: NotRequired[float | None]
     # Hybrid (Mamba) inference state dtypes; None keeps the model dtype.
     mamba_inference_ssm_states_dtype: NotRequired[str | None]
     mamba_inference_conv_states_dtype: NotRequired[str | None]
