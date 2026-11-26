@@ -501,46 +501,29 @@ def test_rollout_pump_charges_shortfall_as_the_sampler_decides(
 
 
 def test_rollout_pump_accumulates_time_held_at_the_admission_gate() -> None:
-    buffer = _RecordingBuffer()
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-    ctrl = object.__new__(controller_cls)
-    ctrl._rollout_runtime = RolloutRuntimeState()
-    ctrl._buffer = buffer
-    ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    manager = _ScriptedRolloutManager([])
+    ctrl = _pump_controller(
+        manager, [_batch("a"), _batch("b")], on_dropped_prompt="shrink"
     )
-    ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
-    )
-    ctrl._algo_cfg = ctrl._master_config.grpo
-    ctrl._rollout_manager = _SkippingRolloutManager()
     # A zero window holds the second batch until the trainer moves.
-    ctrl._sampler = ReadyFirstSampler(buffer, max_staleness_versions=0)
-    prompt_batch = BatchedDataDict(
-        {"message_log": [[{"role": "user", "content": "prompt"}]]}
-    )
-    ctrl._dataloader = [prompt_batch, prompt_batch]
-    ctrl._rollout_permitted = asyncio.Event()
-    ctrl._rollout_permitted.set()
-    ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._buffer_capacity = asyncio.Semaphore(2)
-    ctrl._inflight_rollouts = 0
-    ctrl._inflight_by_group_id = {}
-    ctrl._dispatched_rollouts = set()
-    ctrl._trainer_version = 0
-    ctrl._current_epoch = 0
-    _init_pump_ledgers(ctrl)
+    ctrl._sampler = ReadyFirstSampler(ctrl._buffer, max_staleness_versions=0)
 
     async def exercise() -> None:
         pump = asyncio.create_task(ctrl._rollout_pump())
+        # Wait until the pump parks, so a slow runner cannot shorten the timed hold.
+        async with asyncio.timeout(5.0):
+            while ctrl._admission_gate_wait_started is None:
+                assert not pump.done(), "the pump never waited at the gate"
+                await asyncio.sleep(0.005)
         await asyncio.sleep(0.05)
-        assert ctrl._admission_gate_wait_started is not None
         ctrl._trainer_version = 1
         await asyncio.wait_for(pump, timeout=5.0)
 
     asyncio.run(exercise())
 
+    assert manager.prompts_seen == ["a", "b"]
     assert ctrl._admission_gate_wait_started is None
+    # The hold covers the 0.05 s sleep; the margin absorbs sleep jitter.
     assert ctrl._admission_gate_wait_seconds >= 0.04
 
 

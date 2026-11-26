@@ -357,7 +357,7 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
-    # Declared on the class because every admission path updates them.
+    # Declared on the class, like _tracer, so an instance built without __init__ can still time an admission.
     _admission_gate_wait_started: Optional[float] = None
     _admission_gate_wait_seconds: float = 0.0
 
