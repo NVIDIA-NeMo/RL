@@ -1,0 +1,16 @@
+defaults: distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.yaml
+# Real-quant sibling of the fake-quant QAD recipe: the same NVFP4 student, with
+# vLLM serving the policy-exported NVFP4 checkpoint through its native ModelOpt
+# loader instead of fake-quantizing BF16 weights. NVFP4 rollout needs Blackwell.
+policy:
+  generation:
+    quant_cfg: null
+    real_quant: true
+cluster:
+  gpus_per_node: 4
+logger:
+  log_dir: logs/distillation-qwen3-1.7b-1n4g-megatron-qa-nvfp4-real
+  wandb:
+    name: distillation-qwen3-1.7b-1n4g-megatron-qa-nvfp4-real
+  tensorboard:
+    log_dir: tb_logs-distillation-qwen3-1.7b-1n4g-megatron-qa-nvfp4-real

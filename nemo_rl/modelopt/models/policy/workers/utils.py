@@ -118,15 +118,27 @@ def get_forward_loop_func(
         )
 
     if dataset_name == "random":
+        # Media placeholders are not valid text-only calibration inputs.
+        special_ids = set(tokenizer.all_special_ids)
+        special_ids.update(
+            token_id
+            for token_id, token in tokenizer.added_tokens_decoder.items()
+            if token.special
+        )
+        ordinary_ids = sorted(set(tokenizer.get_vocab().values()) - special_ids)
+        if not ordinary_ids:
+            raise ValueError("Random calibration requires ordinary tokenizer IDs.")
+        vocab = torch.tensor(ordinary_ids, dtype=torch.long, device=device)
         calib_dataloader = DataLoader(
             _DictDataset(
                 {
-                    "input_ids": torch.randint(
-                        0,
-                        100,
-                        (num_samples, sample_length),
-                        device=device,
-                    )
+                    "input_ids": vocab[
+                        torch.randint(
+                            len(ordinary_ids),
+                            (num_samples, sample_length),
+                            device=device,
+                        )
+                    ]
                 }
             ),
             batch_size=batch_size,

@@ -664,7 +664,11 @@ class BaseVllmGenerationWorker:
             vllm_kwargs.update(kwarg_updates)
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
-        if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
+        # Real-quant refit fills the packed runtime from dummy weights; a BF16
+        # checkpoint cannot populate packed parameters.
+        if not self.cfg.get("real_quant") and ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(
+            self.model_name
+        ):
             load_format = "auto"
 
         # MTP speculative decoding with load_format="dummy" gets its policy

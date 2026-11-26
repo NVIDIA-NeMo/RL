@@ -2038,6 +2038,18 @@ def validate_grpo_chunk_cap_alignment(
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    generation_config = master_config.policy.get("generation")
+    if (
+        generation_config is not None
+        and generation_config["backend"] == "vllm"
+        and generation_config.get("real_quant")
+    ):
+        raise ValueError(
+            "ModelOpt real-quant rollout is not supported by SingleController: "
+            "setup requires policy-first initialization. Use the non-streaming "
+            "GRPO or distillation entrypoint. Tracked in "
+            "https://github.com/NVIDIA-NeMo/RL/issues/5415."
+        )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         _validate_seq_logprob_error_in_loss(master_config)
     megatron_cfg = master_config.policy.get("megatron_cfg")

@@ -246,6 +246,9 @@ policy: &POLICY_BASE
         stop_strings: null
         # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
         lora_refit_mode: native
+        # Keep real-quant export tensors on CPU by default. Set false for colocated
+        # CUDA-IPC or non-colocated collective refit to avoid a GPU -> CPU -> GPU round trip.
+        real_quant_export_cpu_offload: true
         vllm_cfg:
             http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
             async_engine: false

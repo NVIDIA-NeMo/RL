@@ -13,15 +13,18 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     import torch
+    from vllm.config import ModelConfig
 
 # Keep this module free of NeMo RL imports, including lazy ones inside
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
@@ -431,7 +434,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
     Applied as two INDEPENDENT edits rather than one block replacement, each
     anchored on text that is stable across loader variants. Both anchors are
-    verified against stock vLLM 0.25.1 and 0.29.0. Custom vLLM builds that
+    verified against stock vLLM 0.33.0. Custom vLLM builds that
     reshape the surrounding loader body (for example by gating the legacy
     branch or adding a native-name mapping branch) still take the required
     edit, where matching the whole body as one snippet would silently no-op.
@@ -464,7 +467,8 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
-    new_snippet = """                loaded_params.add(vllm_key)
+    # Upgrade sources already patched by main's eager-fill form of this patch.
+    previous_snippet = """                loaded_params.add(vllm_key)
 
         initializer_factor = getattr(self.config, "initializer_factor", 1.0)
         # Refit calls load_weights once per batch. Remember every LayerScale name
@@ -479,9 +483,29 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
+    new_snippet = """                loaded_params.add(vllm_key)
+
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded_params if n.endswith((".ls1", ".ls2")))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
+        for ls_name, ls_param in params_dict.items():
+            if (
+                ls_name.endswith((".ls1", ".ls2"))
+                and ls_name not in ever_loaded_ls
+                and not ls_param.is_meta
+            ):
+                # Native reload defers defaults until the complete refit ends.
+                weight_loader = getattr(ls_param, "weight_loader", default_weight_loader)
+                weight_loader(ls_param, torch.full_like(ls_param, initializer_factor))
+                ever_loaded_ls.add(ls_name)
+                loaded_params.add(ls_name)
+
+        return loaded_params
+"""
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "ls_param.data.fill_(initializer_factor)" in content:
+        if new_snippet in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
             return
 
@@ -490,19 +514,17 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         if skip_removed:
             updated = updated.replace(skip_old, skip_new, 1)
 
-        if old_snippet not in updated:
-            # Without the fill loop the parameters stay at dummy init, so refuse
-            # to write a half-applied patch and make the reason loud.
-            logger.warning(
+        if previous_snippet in updated:
+            updated = updated.replace(previous_snippet, new_snippet, 1)
+        elif old_snippet in updated:
+            updated = updated.replace(old_snippet, new_snippet, 1)
+        else:
+            # Without the fill loop the parameters stay at dummy init.
+            raise RuntimeError(
                 "Could not apply vLLM RADIO LayerScale loader patch: the "
-                "load_weights tail anchor was not found in %s. LayerScale "
-                "parameters would keep their dummy initialization; expect a "
-                "degraded vision tower and inflated token_mult_prob_error.",
-                file_to_patch,
+                f"load_weights tail anchor was not found in {file_to_patch}. "
+                "LayerScale parameters would keep their dummy initialization."
             )
-            return
-        updated = updated.replace(old_snippet, new_snippet, 1)
-
         write_back(updated)
 
     logger.info(
@@ -803,8 +825,12 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
                             "Checkpoint has final vision LayerNorm weights but "
                             "the model configuration did not construct the layer"
                         )
+                    param = vision_norm_params[param_name]
                     with torch.no_grad():
-                        default_weight_loader(vision_norm_params[param_name], w)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, w)
                     self._loaded_vision_final_layernorm_params.add(param_name)
                     if (
                         self._loaded_vision_final_layernorm_params
@@ -815,7 +841,24 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         ),
     )
     with _locked_file_patch(file_to_patch) as (content, write_back):
+        # Upgrade installations patched before final-norm loading became hook-aware.
+        previous_loader = """                    with torch.no_grad():
+                        default_weight_loader(vision_norm_params[param_name], w)
+                    self._loaded_vision_final_layernorm_params.add(param_name)
+"""
+        hook_loader = """                    param = vision_norm_params[param_name]
+                    with torch.no_grad():
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, w)
+                    self._loaded_vision_final_layernorm_params.add(param_name)
+"""
+        original_content = content
+        content = content.replace(previous_loader, hook_loader, 1)
         if all(new in content for _, new in replacements):
+            if content != original_content:
+                write_back(content)
             return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
@@ -826,6 +869,34 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             content = content.replace(old, new, 1)
         write_back(content)
     logger.info("Patched checkpoint-backed Super Omni final vision LayerNorm.")
+
+
+def _patch_vllm_nano_vl_projector_loader(logger) -> None:
+    """Backport hook-aware Nano Nemotron VL projector loading."""
+    # vLLM 0.33.0 still writes mlp1 through default_weight_loader, which native
+    # layerwise reload drops; the same fix in vLLM #61287 was closed unmerged.
+    file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    old_snippet = """                param = adapter_dict[trimmed_name]
+                with torch.no_grad():
+                    default_weight_loader(param, w)
+"""
+    new_snippet = """                param = adapter_dict[trimmed_name]
+                with torch.no_grad():
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, w)
+"""
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            return
+        if content.count(old_snippet) != 1:
+            raise RuntimeError(
+                "Nano Nemotron VL projector patch requires the pinned vLLM loader "
+                "or its hook-aware equivalent"
+            )
+        write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched Nano Nemotron VL projector parameter loading.")
 
 
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
@@ -1051,6 +1122,183 @@ def _patch_vllm_routed_experts_capture_router_fallback(
     return True
 
 
+_RADIO_INDEX_FILE = "model.safetensors.index.json"
+
+
+def _immutable_revision(model_config: "ModelConfig") -> str | None:
+    revision = (
+        getattr(model_config.hf_config, "_commit_hash", None) or model_config.revision
+    )
+    if (
+        isinstance(revision, str)
+        and len(revision) == 40
+        and all(char in "0123456789abcdefABCDEF" for char in revision)
+    ):
+        return revision
+    return None
+
+
+def _is_identity_radio(radio_config: Any) -> bool:
+    # vLLM builds its own RadioConfig and sets ls1/ls2 to initializer_factor.
+    return (
+        getattr(radio_config, "model_type", None) == "radio"
+        and getattr(radio_config, "initializer_factor", None) == 1.0
+    )
+
+
+def uses_identity_radio(model: "torch.nn.Module") -> bool:
+    """Whether the model's vision encoder is a vLLM RADIO with identity LayerScales."""
+    unwrap = getattr(model, "unwrap", None)
+    if callable(unwrap):
+        model = cast("torch.nn.Module", unwrap())
+    radio = getattr(model, "vision_model", None)
+    return _is_identity_radio(getattr(radio, "config", None))
+
+
+def prefetch_radio_checkpoint_index(model_config: "ModelConfig") -> None:
+    """Cache the RADIO checkpoint index on this worker before the first refit.
+
+    Dummy-loaded generation workers never download checkpoint files, so the
+    LayerScale identity check could otherwise miss the index at refit time.
+    """
+    if Path(model_config.model).is_dir():
+        return
+    revision = _immutable_revision(model_config)
+    if revision is None:
+        return
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(model_config.model, _RADIO_INDEX_FILE, revision=revision)
+    except Exception as error:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not cache %s for %s@%s; RADIO refits that omit LayerScales "
+            "will fail: %s",
+            _RADIO_INDEX_FILE,
+            model_config.model,
+            revision,
+            error,
+        )
+
+
+def _radio_has_identity_checkpoint(
+    radio_config: Any, model_config: "ModelConfig"
+) -> bool:
+    """Verify the original checkpoint's optional, absent identity LayerScales."""
+    if not _is_identity_radio(radio_config):
+        return False
+
+    source = Path(model_config.model)
+    index = source / _RADIO_INDEX_FILE
+    if source.is_dir():
+        if not index.is_file():
+            return False
+    else:
+        revision = _immutable_revision(model_config)
+        if revision is None:
+            return False
+        # Read only the cached immutable revision; prepare_refit_info prefetches it.
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            model_config.model, _RADIO_INDEX_FILE, revision=revision
+        )
+        if not isinstance(cached, str):
+            return False
+        index = Path(cached)
+    with index.open() as handle:
+        keys = json.load(handle)["weight_map"]
+    vision_keys = [key for key in keys if key.startswith("vision_model.")]
+    return bool(vision_keys) and not any(
+        part in ("ls1", "ls2", "layer_scale1", "layer_scale2", "lambda1")
+        for key in vision_keys
+        for part in key.split(".")
+    )
+
+
+def finalize_radio_layerscale_loading(
+    model: "torch.nn.Module", model_config: "ModelConfig"
+) -> None:
+    """Complete RADIO scales once all explicit refit weights have been loaded."""
+    unwrap = getattr(model, "unwrap", None)
+    if callable(unwrap):
+        model = cast("torch.nn.Module", unwrap())
+    radio = getattr(model, "vision_model", None)
+    initialized = getattr(radio, "_nemo_rl_loaded_layerscale", None)
+    if initialized is None:
+        return
+
+    # Read native metadata only while a real layerwise refit is active.
+    import torch
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    updates = []
+    for prefix, layer in radio.named_modules():
+        names = {name for name in ("ls1", "ls2") if name in layer._parameters}
+        if not names:
+            continue
+        info = get_layerwise_info(layer)
+        if info.kernel_tensors is None:
+            continue
+        pending = {name for name, _ in info.loaded_weights}
+        for name in names - pending:
+            full_name = f"{prefix}.{name}"
+            if full_name not in initialized:
+                updates.append((full_name, layer, name, None))
+            elif pending:
+                # A partially updated parent must retain its omitted partner.
+                updates.append((full_name, layer, name, info.kernel_tensors[0][name]))
+
+    if any(weight is None for _, _, _, weight in updates):
+        if not _radio_has_identity_checkpoint(
+            getattr(radio, "config", None), model_config
+        ):
+            raise ValueError(
+                "RADIO refit omitted uninitialized LayerScale weights without a "
+                "verified identity-only checkpoint; export the explicit policy scales"
+            )
+    for full_name, layer, name, weight in updates:
+        param = getattr(layer, name)
+        if weight is None:
+            info = get_layerwise_info(layer)
+            weight = torch.ones_like(info.kernel_tensors[0][name])
+        param.weight_loader(param, weight)
+        initialized.add(full_name)
+
+
+@contextmanager
+def radio_layerscale_full_reload(
+    model: "torch.nn.Module", model_config: "ModelConfig"
+) -> Iterator[None]:
+    """Finish buffered RADIO vision loading before the runner finalizes reload."""
+    radio = getattr(model, "vision_model", None)
+    if getattr(getattr(radio, "config", None), "model_type", None) != "radio":
+        yield
+        return
+    # vLLM models add load_weights beyond nn.Module's declared interface.
+    reloadable = cast(Any, model)
+    original = reloadable.load_weights
+    had_override = "load_weights" in vars(model)
+
+    def load_weights(
+        weights: Iterable[tuple[str, "torch.Tensor"]],
+    ) -> set[str] | None:
+        result = original(weights)
+        finalize_radio_layerscale_loading(model, model_config)
+        return result
+
+    reloadable.load_weights = load_weights
+    try:
+        yield
+    finally:
+        if had_override:
+            reloadable.load_weights = original
+        else:
+            del reloadable.load_weights
+
+
 @contextmanager
 def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
     """Temporarily expose nested ModelOpt MoE amax buffers to vLLM's loader.
@@ -1181,6 +1429,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1201,6 +1450,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture

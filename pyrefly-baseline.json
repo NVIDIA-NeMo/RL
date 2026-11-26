@@ -961,27 +961,6 @@
       "severity": "error"
     },
     {
-      "column": 38,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, () -> tuple[VllmGeneration, float, ColocatablePolicyInterface | Policy, float]]`",
-      "severity": "error"
-    },
-    {
-      "column": 40,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, () -> tuple[VllmGeneration, float, ColocatablePolicyInterface | Policy, float]]`",
-      "severity": "error"
-    },
-    {
-      "column": 38,
-      "path": "nemo_rl/algorithms/grpo.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[str, () -> tuple[VllmGeneration, float, ColocatablePolicyInterface | Policy, float]]`",
-      "severity": "error"
-    },
-    {
       "column": 5,
       "path": "nemo_rl/algorithms/grpo.py",
       "name": "unbound-name",
@@ -4073,27 +4052,6 @@
       "path": "nemo_rl/experience/sync_rollout_actor.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[KVBatchMeta, BatchedDataDict[@_], dict[str, Any], dict[str, Any] | None]` is not assignable to declared return type `tuple[KVBatchMeta, dict[str, Any], dict[str, Any], dict[str, Any] | None]`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "bad-override",
-      "concise_description": "Class member `MegatronQuantPolicyWorker._build_refit_conversion_tasks` overrides parent class `MegatronPolicyWorkerImpl` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `str` is not assignable to parameter `mode` with type `Literal['w4a16', 'w4a4']` in function `nemo_rl.modelopt.utils.nvfp4_quant_algo`",
-      "severity": "error"
-    },
-    {
-      "column": 9,
-      "path": "nemo_rl/modelopt/models/policy/workers/megatron_quant_policy_worker.py",
-      "name": "bad-override",
-      "concise_description": "Class member `MegatronQuantPolicyWorker._iter_params_with_optional_kv_scales` overrides parent class `MegatronPolicyWorkerImpl` in an inconsistent manner",
       "severity": "error"
     },
     {

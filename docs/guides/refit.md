@@ -24,7 +24,9 @@ Use this path when vLLM's post-load processing is required after every refit, fo
 
 Early measurements from this PR show that reload refit can be faster for Llama 8B and Qwen3 32B, while Qwen3 30B-A3B was about 44% slower. MXFP8 reload refit was about 2x slower in the measured run and used higher peak memory. Leave additional KV-cache headroom for MXFP8, for example by lowering `policy.generation.vllm_cfg.gpu_memory_utilization`.
 
-The reload API path currently supports only `policy.generation.backend: vllm`, `policy.generation.colocated.enabled: false`, and `policy.generation.refit_transport: null`. It is explicitly unsupported with `nccl_reshard`, ModelOpt quantization (`policy.generation.quant_cfg`), sparse refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft weights refitted from the trainer are not supported yet; use the legacy loader for those cases.
+The reload API path currently supports only `policy.generation.backend: vllm`, `policy.generation.colocated.enabled: false`, and `policy.generation.refit_transport: null`. It is explicitly unsupported with `nccl_reshard`, ModelOpt fake quantization (`policy.generation.quant_cfg`), sparse refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft weights refitted from the trainer are not supported yet; use the legacy loader for those cases.
+
+ModelOpt real-quant rollout (`policy.generation.real_quant: true`) passes canonical packed tensors and their scales directly to this API, without the legacy FP8 conversion. Its collective receiver uses one stream so deferred layer loading can safely consume tensors from earlier transfer batches.
 
 ## Constraints
 
@@ -32,7 +34,7 @@ The reload API path currently supports only `policy.generation.backend: vllm`, `
 |---|---|---|---|
 | Colocated CUDA IPC | vLLM or SGLang | Automodel or Megatron | Uses the generation backend's standard loader. |
 | NCCL | vLLM or Megatron | Automodel or Megatron | Uses the standard full-weight loader. |
-| NCCL + reload API | vLLM | Automodel or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), and Eagle/MTP trainer-refit draft weights. |
+| NCCL + reload API | vLLM | Automodel or Megatron | Default non-colocated NCCL only. ModelOpt real quant uses canonical policy-exported tensors and requires Megatron. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt fake quantization (`quant_cfg`), and Eagle/MTP trainer-refit draft weights. |
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM, Megatron or TensorRT-LLM | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). TensorRT-LLM moves only routed MoE experts shard-to-shard and needs pure expert parallelism (`moe_expert_parallel_size == tensor_parallel_size`, generation PP 1) on every engine role, with no expert load balancer; models with dense MLP layers or expert TP use the default NCCL transport (generation-side expert TP support is tracked in [#5131](https://github.com/NVIDIA-NeMo/RL/issues/5131)). Example: [`grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml`](../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml). |

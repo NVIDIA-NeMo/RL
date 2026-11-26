@@ -1,0 +1,55 @@
+# Mixed real-quant recipe for dense Megatron GPT models.
+#
+# Attention projection weights and inputs use dynamic block-32 MXFP8. MLP
+# weights use block-16 NVFP4 with native-dtype activations (W4A16). All other
+# paths remain in the model's native dtype.
+
+metadata:
+  recipe_type: ptq
+  description: MXFP8 attention with W4A16 NVFP4 MLP weights.
+
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*self_attention.linear_qkv.weight_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        block_sizes:
+          -1: 32
+          type: dynamic
+          scale_bits: e8m0
+    - quantizer_name: '*self_attention.linear_qkv.input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        block_sizes:
+          -1: 32
+          type: dynamic
+          scale_bits: e8m0
+    - quantizer_name: '*self_attention.linear_proj.weight_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        block_sizes:
+          -1: 32
+          type: dynamic
+          scale_bits: e8m0
+    - quantizer_name: '*self_attention.linear_proj.input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        block_sizes:
+          -1: 32
+          type: dynamic
+          scale_bits: e8m0
+    - quantizer_name: '*mlp*weight_quantizer'
+      enable: true
+      cfg:
+        num_bits: e2m1
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3

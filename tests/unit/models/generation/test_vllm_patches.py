@@ -35,11 +35,13 @@ source-sensitive compatibility patches:
 import ast
 import asyncio
 import inspect
+import json
 import logging
 import os
 import shutil
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -53,7 +55,7 @@ from tests.unit.models.generation.vllm_patch_source_utils import (
 
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
+_RADIO_MARKER = "and not ls_param.is_meta"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -278,7 +280,7 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
     assert 'ls_name.endswith((".ls1", ".ls2"))' in content
-    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "and not ls_param.is_meta" in content
     assert "loaded_params.add(ls_name)" in content
 
 
@@ -300,7 +302,7 @@ def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
         for node in radio_model.body
         if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
     )
-    namespace = {"default_weight_loader": default_weight_loader}
+    namespace = {"default_weight_loader": default_weight_loader, "torch": torch}
     exec(
         compile(ast.Module(body=[load_weights], type_ignores=[]), "<radio>", "exec"),
         namespace,
@@ -356,16 +358,144 @@ def test_radio_layerscale_patch_is_idempotent(patched_radio_source, monkeypatch)
     assert patched_radio_source.read_text() == before
 
 
-def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize("indexed", [False, True])
+def test_radio_defaults_never_use_a_stale_base_checkpoint(tmp_path, indexed):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    (actual / "model.safetensors").touch()
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"vision_model.encoder.weight": "base.safetensors"}})
+    )
+    if indexed:
+        (actual / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "vision_model.encoder.layer_scale1.lambda1": "actual.safetensors"
+                    }
+                }
+            )
+        )
+    config = SimpleNamespace(
+        model=str(actual),
+        revision=None,
+        hf_config=SimpleNamespace(
+            _name_or_path=str(base),
+            vision_config=SimpleNamespace(model_type=""),
+        ),
+    )
+    assert not patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, config)
+
+
+_IDENTITY_RADIO = SimpleNamespace(model_type="radio", initializer_factor=1.0)
+_REVISION = "a" * 40  # any immutable 40-hex commit
+
+
+def _write_index(path, *vision_keys):
+    weight_map = {key: "model.safetensors" for key in vision_keys}
+    path.write_text(json.dumps({"weight_map": weight_map}))
+
+
+@pytest.mark.parametrize(
+    "radio_config, ls_key, expected",
+    [
+        (_IDENTITY_RADIO, None, True),
+        (_IDENTITY_RADIO, "vision_model.radio_model.model.blocks.0.ls1", False),
+        (SimpleNamespace(model_type="radio", initializer_factor=0.5), None, False),
+        (SimpleNamespace(model_type=""), None, False),
+    ],
+)
+def test_radio_identity_uses_the_constructed_radio_config(
+    tmp_path, radio_config, ls_key, expected
+):
+    keys = ["vision_model.radio_model.model.blocks.0.attn.qkv.weight"]
+    if ls_key is not None:
+        keys.append(ls_key)
+    _write_index(tmp_path / "model.safetensors.index.json", *keys)
+    # The published checkpoint's remote-code config: empty model_type, no layerscale_value.
+    model_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        hf_config=SimpleNamespace(vision_config=SimpleNamespace(model_type="")),
+    )
+    assert (
+        patches._radio_has_identity_checkpoint(radio_config, model_config) is expected
+    )
+
+
+def test_radio_index_prefetch_fills_an_empty_generation_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    cache: dict[tuple[str, str, str], str] = {}
+    source = tmp_path / "remote-index.json"
+    _write_index(source, "vision_model.radio_model.model.blocks.0.attn.qkv.weight")
+
+    def fake_download(repo_id, filename, *, revision):
+        cache[(repo_id, filename, revision)] = str(source)
+        return str(source)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "try_to_load_from_cache",
+        lambda repo_id, filename, *, revision: cache.get((repo_id, filename, revision)),
+    )
+    model_config = SimpleNamespace(
+        model="nvidia/radio-model",
+        revision=None,
+        hf_config=SimpleNamespace(
+            _commit_hash=_REVISION, vision_config=SimpleNamespace(model_type="")
+        ),
+    )
+    model = SimpleNamespace(vision_model=SimpleNamespace(config=_IDENTITY_RADIO))
+
+    assert patches.uses_identity_radio(model)
+    assert not patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, model_config)
+    patches.prefetch_radio_checkpoint_index(model_config)
+    assert patches._radio_has_identity_checkpoint(_IDENTITY_RADIO, model_config)
+
+
+@pytest.mark.vllm
+def test_vision_loader_patches_upgrade_existing_outputs(
+    patched_radio_source, tmp_path, monkeypatch
+):
+    import vllm
+
+    previous, current = patch_snippets(_RADIO_PATCH_FN, "previous_snippet")
+    patched_radio_source.write_text(
+        patched_radio_source.read_text().replace(current, previous, 1)
+    )
+    patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
+    assert current in patched_radio_source.read_text()
+
+    model_file = tmp_path / "nano_nemotron_vl.py"
+    source = Path(vllm.__file__).parent / "model_executor/models/nano_nemotron_vl.py"
+    model_file.write_text(source.read_text())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda relative: str(model_file))
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    previous, current = patch_snippets(
+        "_patch_vllm_radio_final_layernorm", "previous_loader", "hook_loader"
+    )
+    model_file.write_text(model_file.read_text().replace(current, previous, 1))
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    patches._patch_vllm_nano_vl_projector_loader(logging.getLogger(__name__))
+    final = model_file.read_text()
+    patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
+    patches._patch_vllm_nano_vl_projector_loader(logging.getLogger(__name__))
+    assert model_file.read_text() == final
+
+
+def test_radio_layerscale_patch_raises_on_unknown_source(monkeypatch, tmp_path):
     radio_source = tmp_path / "radio.py"
     radio_source.write_text("class RadioModel:\n    pass\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(radio_source))
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match="load_weights tail anchor was not found"):
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.vllm
@@ -654,6 +784,7 @@ def _stub_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_radio_native_loader",
         "_patch_vllm_radio_final_layernorm",
+        "_patch_vllm_nano_vl_projector_loader",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)
