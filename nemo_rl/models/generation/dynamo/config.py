@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for serving NeMo RL's vLLM workers behind Dynamo.
+"""Configuration for serving NeMo RL's generation workers behind Dynamo.
 
-``policy.generation.dynamo: true`` on any vLLM config is the whole switch;
+``policy.generation.dynamo: true`` on a vLLM or Megatron config is the switch;
 ``policy.generation.dynamo_cfg`` only tunes the frontend, and every field below
 carries its default. NeMo-Gym's chat calls are rendered and parsed with the
 native server's own settings (``vllm_cfg.http_server_serving_chat_kwargs``).
@@ -101,7 +101,7 @@ class DynamoCfg(BaseModel, extra="forbid"):
 
 
 def dynamo_enabled(generation_config: Mapping[str, Any]) -> bool:
-    """Whether ``policy.generation.dynamo`` is on for a vLLM generation config."""
+    """Whether ``policy.generation.dynamo`` is on, for vLLM or Megatron generation."""
     return bool(generation_config.get("dynamo"))
 
 

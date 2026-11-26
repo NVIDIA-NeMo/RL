@@ -19,7 +19,10 @@ from hydra.utils import get_object
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.utils.venvs import (
+    create_local_venv_on_each_node,
+    driver_env_for_workers,
+)
 
 # Teardown must be bounded: it runs in a finally block, so a hung shutdown would
 # replace a real training error with an indefinite hang.
@@ -131,7 +134,7 @@ def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
     env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": actor_py_exec,
-            "env_vars": {**dict(os.environ), **extra_env_vars},
+            "env_vars": {**driver_env_for_workers(), **extra_env_vars},
         }
     ).remote(env_config)
     return env

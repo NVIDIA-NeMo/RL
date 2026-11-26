@@ -24,7 +24,7 @@ loss_fn:
   # sequence_level_importance_ratios turns GRPO -> GSPO
   sequence_level_importance_ratios: true
   # As of Mon Oct 13, token level loss as formulated in the GSPO paper is not yet supported in NeMo RL.
-  token_level_loss: false
+  normalization: sequence_mean
 
 policy:
   offload_policy_before_refit: false

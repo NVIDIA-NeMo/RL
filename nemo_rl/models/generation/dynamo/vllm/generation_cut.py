@@ -19,7 +19,7 @@ At a checkpoint NeMo-Gym posts the calls it has in flight to
 Dynamo that URL is the frontend, and the calls run in the engines. So the
 frontend serves the route itself, as a Dynamo route extension (``routes``), and
 sends the cut to every engine over Dynamo's request plane. Each engine answers
-for the calls it cut, and the answers are merged into the one receipt Gym
+for the calls it holds, and the answers are merged into the one receipt Gym
 expects.
 """
 
@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -44,6 +44,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.vllm.generation_cut_route import (
     GENERATION_CUT_ROUTE,
     answer_generation_cut,
+    fan_out_cut,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -56,40 +57,9 @@ CUT_PREFIXES_KEY = "prefixes"
 # The frontend's deadline for the cut, in extra_args: wall-clock seconds, since
 # an engine on another host does not share the frontend's monotonic clock.
 DEADLINE_KEY = "nemo_rl_generation_cut_deadline"
-# What an engine leaves of that deadline for its answer to reach the frontend.
-CUT_REPLY_MARGIN_S = 1.0
 # A cut times itself (the deadline above), so the route's own timeout is only a
 # backstop: the longest Dynamo accepts.
 _ROUTE_TIMEOUT_S = 365 * 24 * 60 * 60
-
-
-def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]]) -> Any:
-    """Build Gym's receipt for ``inventory`` from what each engine cut.
-
-    An engine acknowledges only the calls it cut. A call no engine
-    acknowledged gets Gym's failure ack, so it regenerates after a restore.
-    """
-    from nemo_gym._checkpoint.generation_cut import (
-        GenerationCutPrefixAck,
-        GenerationCutReceipt,
-    )
-
-    cut: dict[str, Any] = {}
-    for prefixes in engine_prefixes:
-        for prefix in prefixes:
-            ack = GenerationCutPrefixAck.model_validate(prefix)
-            cut.setdefault(ack.ticket_id, ack)
-    return GenerationCutReceipt(
-        checkpoint_id=inventory.checkpoint_id,
-        cut_id=f"frontend-{inventory.inventory_digest}",
-        inventory_digest=inventory.inventory_digest,
-        inventory=inventory,
-        backend_snapshot_id=f"tq-{inventory.inventory_digest}",
-        prefixes=tuple(
-            cut.get(prefix.ticket_id) or GenerationCutPrefixAck.failure(prefix)
-            for prefix in inventory.active_prefixes
-        ),
-    )
 
 
 class EngineCutFanOut:
@@ -136,29 +106,16 @@ class EngineCutFanOut:
                 DEADLINE_KEY: deadline,
             },
         }
-        cuts = {
-            asyncio.ensure_future(
-                self._cut_on_engine(client, request, instance_id)
-            ): instance_id
-            for instance_id in client.instance_ids()
-        }
-        engine_prefixes = []
-        if cuts:
-            done, late = await asyncio.wait(
-                cuts,
-                timeout=None if deadline is None else max(0.0, deadline - time.time()),
-            )
-            for cut in late:
-                cut.cancel()
-            if late:
-                LOGGER.warning(
-                    "generation cut %s: engines %s did not answer in time; calls "
-                    "they hold regenerate after a restore",
-                    inventory.checkpoint_id,
-                    sorted(cuts[cut] for cut in late),
+        return await fan_out_cut(
+            inventory,
+            {
+                f"engine {instance_id}": self._cut_on_engine(
+                    client, request, instance_id
                 )
-            engine_prefixes = [cut.result() for cut in done]
-        return merge_cut_receipts(inventory, engine_prefixes)
+                for instance_id in client.instance_ids()
+            },
+            deadline=deadline,
+        )
 
     @staticmethod
     async def _cut_on_engine(

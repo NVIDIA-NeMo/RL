@@ -704,6 +704,79 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert value_cluster is None
 
 
+@pytest.mark.parametrize(
+    ("shared_tp", "prefill", "decode", "inference_nodes", "segment_size"),
+    [
+        # Every engine TP 4: two 12-GPU replicas fill three nodes, but only one
+        # engine needs NVLink, so a segment is one node.
+        (4, {}, {}, 3, 1),
+        # Per-role widths, not the shared TP 2, size the segment: a TP 8 prefill
+        # engine fills one node.
+        (
+            2,
+            {"tensor_model_parallel_size": 8},
+            {"tensor_model_parallel_size": 4},
+            2,
+            1,
+        ),
+        # A TP 16 prefill engine spans two 8-GPU nodes, so a segment is two.
+        (
+            2,
+            {"tensor_model_parallel_size": 16},
+            {"tensor_model_parallel_size": 8},
+            4,
+            2,
+        ),
+    ],
+    ids=["uniform_tp4", "prefill_tp8_decode_tp4", "prefill_tp16"],
+)
+def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_engine_layouts(
+    monkeypatch, shared_tp, prefill, decode, inference_nodes, segment_size
+):
+    """Behind Dynamo the NVLink segment is the widest engine, not the replica."""
+    from tests.unit.models.generation.test_megatron_dynamo_config import (
+        MEGATRON_POLICY,
+        _megatron_config,
+    )
+
+    master_config = _make_master_config(backend="megatron", megatron_enabled=True)
+    generation = _megatron_config(prefill_engine=prefill, decode_engine=decode)
+    generation["mcore_generation_config"]["tensor_model_parallel_size"] = shared_tp
+    generation["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 8, "num_nodes": inference_nodes},
+    }
+    master_config.policy["megatron_cfg"] = dict(MEGATRON_POLICY["megatron_cfg"])
+    master_config.policy["generation"] = generation
+    cluster_nodes = 2 + inference_nodes
+    master_config.cluster = ClusterConfig(
+        num_nodes=cluster_nodes, gpus_per_node=8, segment_size=1
+    )
+    segment_calls = []
+
+    def fake_prepare_segment_topology(segment_size, num_nodes, *, topology=None, role):
+        segment_calls.append((role, segment_size, num_nodes))
+        if topology is None:
+            topology = {f"node{i}": ("nvlink_domain", i) for i in range(cluster_nodes)}
+        node_ids = list(topology)
+        return [{}] * num_nodes, node_ids[num_nodes:], topology
+
+    monkeypatch.setattr(
+        sc_setup_mod, "prepare_segment_topology", fake_prepare_segment_topology
+    )
+    monkeypatch.setattr(
+        sc_setup_mod, "RayVirtualCluster", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    _, inference_cluster, _, _ = sc_setup_mod._build_clusters(master_config)
+
+    assert segment_calls == [
+        ("training", 1, 2),
+        ("inference", segment_size, inference_nodes),
+    ]
+    assert inference_cluster.segment_size == segment_size
+
+
 def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
     """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
     monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")

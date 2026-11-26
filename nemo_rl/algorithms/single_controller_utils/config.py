@@ -1066,12 +1066,7 @@ def validate_forest_objective(
     unsupported = {
         f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
         != ("gae" if is_ppo else "grpo"),
-        # Name whichever selector the user set; the default is global_token_mean.
-        (
-            "loss_fn.token_level_loss"
-            if loss.normalization is None and loss.token_level_loss is not None
-            else "loss_fn.normalization"
-        ): loss.resolved_normalization != "global_token_mean",
+        "loss_fn.normalization": loss.resolved_normalization != "global_token_mean",
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",

@@ -1175,6 +1175,73 @@ def test_engine_step_metrics_reports_token_length_and_outcome_deltas():
     assert metrics["vllm/generations_failed"] == 1.0
 
 
+def test_engine_step_metrics_reports_prefix_cache_and_preemption_deltas():
+    start = {
+        "vllm:prefix_cache_queries": 1000.0,
+        "vllm:prefix_cache_hits": 400.0,
+        "vllm:num_preemptions": 2.0,
+    }
+    end = {
+        "vllm:prefix_cache_queries": 1800.0,
+        "vllm:prefix_cache_hits": 1000.0,
+        "vllm:num_preemptions": 5.0,
+    }
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prefix_cache_queries"] == 800.0
+    assert metrics["vllm/prefix_cache_hits"] == 600.0
+    assert math.isclose(metrics["vllm/prefix_cache_hit_rate"], 0.75)
+    assert metrics["vllm/preemptions"] == 3.0
+
+
+def test_prefix_cache_hit_rate_is_omitted_without_queries():
+    """A step that queried no tokens has no hit rate, not a 0% one."""
+    snapshot = {"vllm:prefix_cache_queries": 50.0, "vllm:prefix_cache_hits": 20.0}
+
+    metrics = compute_engine_step_metrics(snapshot, snapshot)
+
+    assert metrics["vllm/prefix_cache_queries"] == 0.0
+    assert "vllm/prefix_cache_hit_rate" not in metrics
+
+
+def test_prefix_cache_hit_rate_is_omitted_when_a_restart_skews_the_pair():
+    """One worker restarting while another grows can leave hits above queries."""
+    start = {"vllm:prefix_cache_queries": 1000.0, "vllm:prefix_cache_hits": 100.0}
+    end = {"vllm:prefix_cache_queries": 1500.0, "vllm:prefix_cache_hits": 1400.0}
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert "vllm/prefix_cache_hit_rate" not in metrics
+
+
+def test_prefix_cache_and_preemption_counters_survive_worker_aggregation():
+    """The new series must pass the kept-names filter, or they never reach compute."""
+
+    def worker(queries: float, hits: float, preemptions: float) -> dict[str, float]:
+        return {
+            "vllm:prefix_cache_queries": queries,
+            "vllm:prefix_cache_hits": hits,
+            "vllm:num_preemptions": preemptions,
+            # Close siblings vLLM also ships; they must not be summed in.
+            "vllm:external_prefix_cache_queries": 9999.0,
+            "vllm:external_prefix_cache_hits": 9999.0,
+        }
+
+    start = aggregate_spec_decode_counters([worker(500.0, 200.0, 1.0)] * 2)
+    end = aggregate_spec_decode_counters(
+        [worker(900.0, 500.0, 2.0), worker(900.0, 500.0, 3.0)]
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prefix_cache_queries"] == 800.0
+    assert metrics["vllm/prefix_cache_hits"] == 600.0
+    assert math.isclose(metrics["vllm/prefix_cache_hit_rate"], 0.75)
+    assert metrics["vllm/preemptions"] == 3.0
+    assert "vllm:external_prefix_cache_queries" not in end
+
+
 def test_length_is_truncation_aware_not_a_failure():
     """``length`` means max_tokens was reached, which is routine in RL.
 
@@ -1245,6 +1312,9 @@ def test_engine_metric_names_match_vllm():
         GENERATION_LENGTH_HISTOGRAMS,
         GENERATION_TOKEN_COUNTERS,
         OK_FINISH_REASONS,
+        PREEMPTION_COUNTERS,
+        PREFIX_CACHE_HIT_COUNTERS,
+        PREFIX_CACHE_QUERY_COUNTERS,
         PROMPT_LENGTH_HISTOGRAMS,
         PROMPT_TOKEN_COUNTERS,
         REQUEST_SUCCESS_COUNTERS,
@@ -1260,6 +1330,9 @@ def test_engine_metric_names_match_vllm():
         *PROMPT_LENGTH_HISTOGRAMS,
         *GENERATION_LENGTH_HISTOGRAMS,
         *REQUEST_SUCCESS_COUNTERS,
+        *PREFIX_CACHE_QUERY_COUNTERS,
+        *PREFIX_CACHE_HIT_COUNTERS,
+        *PREEMPTION_COUNTERS,
     )
     missing = [name for name in expected if f'name="{name}"' not in declared]
 

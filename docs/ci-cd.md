@@ -99,7 +99,7 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 - **VM health checks** (`healthcheck_vms.yml`): daily GPU health checks (07:00 UTC) on self-hosted runners. Auto-reboots degraded VMs and alerts via Slack on persistent failures.
 - **Merge queue retry** (`merge-queue-retry.yml`): auto-retries PRs dequeued due to CI timeout (max 3 retries before alerting).
 - **Stale cleanup** (`close-inactive-issue-pr.yml`): daily auto-close of inactive issues and PRs.
-- **Cherry-pick** (`cherry-pick-release-commit.yml`): auto-creates cherry-pick PRs from release branches back to main.
+- **Backports**: comment `/cherrypick to=<branch>` on the source PR; Autobot opens the backport PR (not a workflow in this repo).
 - **Community bot** (`community-bot.yml`): syncs issues and comments to a GitHub Project board for tracking.
 
 ## Workflow Reference
@@ -119,7 +119,6 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
 | `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
-| `cherry-pick-release-commit.yml` | push main | Release cherry-picks |
 | `close-inactive-issue-pr.yml` | schedule (01:30 UTC) | Stale issue/PR cleanup |
 | `community-bot.yml` | issues, comments | Project board sync |
 | `pr-checks-comment.yml` | PR | Post submodule check results |

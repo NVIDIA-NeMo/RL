@@ -16,6 +16,11 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel
 
+from nemo_rl.models.generation.disagg_layout import (
+    as_dict,
+    replica_width_from,
+    resolve_disagg_layout,
+)
 from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
@@ -133,24 +138,6 @@ class TrtllmConfig(GenerationConfig):
     trtllm_kwargs: NotRequired[dict[str, Any]]
 
 
-def _as_dict(raw: Any) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    if isinstance(raw, BaseModel):
-        return raw.model_dump(exclude_unset=True)
-    return dict(raw)
-
-
-def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
-    """``generation.disaggregation`` as its schema.
-
-    Absent is the same as present-and-disabled: every field carries its default
-    on :class:`DisaggConfig`, so callers read attributes unconditionally
-    instead of re-deriving a default per key at the call site.
-    """
-    return DisaggConfig.model_validate(_as_dict(config.get("disaggregation")))
-
-
 def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """``update`` over ``base``, nested dicts merged key by key; inputs untouched."""
     merged = dict(base)
@@ -247,9 +234,11 @@ def replica_width(config: TrtllmConfig) -> int:
     layout = resolve_disagg_layout(config)
     if not layout.enabled:
         return int(config["trtllm_cfg"]["tensor_parallel_size"])
-    return layout.num_prefill_engines * role_tensor_parallel_size(
-        config, "prefill"
-    ) + layout.num_decode_engines * role_tensor_parallel_size(config, "decode")
+    return replica_width_from(
+        layout,
+        prefill_width=role_tensor_parallel_size(config, "prefill"),
+        decode_width=role_tensor_parallel_size(config, "decode"),
+    )
 
 
 def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConfig:
@@ -260,7 +249,7 @@ def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConf
     sizes the engine fleet NeMo RL creates, this is forwarded to TRT-LLM's
     ``DisaggServerConfig``.
     """
-    raw = _as_dict(config["trtllm_cfg"].get("disagg_server"))
+    raw = as_dict(config["trtllm_cfg"].get("disagg_server"))
     # Caught ahead of extra="forbid" only to point at where the key belongs.
     misplaced = sorted(set(raw) & set(DisaggConfig.model_fields))
     if misplaced:
