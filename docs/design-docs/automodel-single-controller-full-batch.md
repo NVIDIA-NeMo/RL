@@ -15,7 +15,7 @@ Configure expert parallelism and the dispatcher through the existing AutoModel s
 Supported expert layouts, model architectures, and weight-refit formats remain subject to the AutoModel and generation backends.
 
 Packing, dynamic batching, HSDP, CPU offload, LoRA, draft training, VLM, quantization, PPO, distillation, dynamic sampling, token capture, colocation, and streaming dispatches are outside the supported scope.
-Configuration validation rejects unsupported combinations before allocation; worker guards also protect direct lifecycle callers.
+Configuration validation rejects unsupported combinations before allocation.
 
 ## Configuration entrypoint
 
@@ -102,28 +102,29 @@ Logprob calculation uses the existing AutoModel `get_logprobs` and reference log
 Workers fetch the required input columns and write logprobs back to TQ for advantage and loss computation.
 This phase is separate from the forward/backward calls that accumulate gradients.
 
-An internal `_TrainStepState` holds the loss function, GBS/MBS, dispatch status, completed metrics, and snapshots of mutable model state needed for cancellation.
+An internal `_TrainStepState` holds the loss function, GBS/MBS, dispatch status, completed metrics, and a snapshot of the MoE router load counters needed for cancellation.
 The worker creates this state at begin and releases it at finish or abort.
 At most one logical optimizer step can be open; the one-dispatch restriction is an explicit full-batch execution constraint.
 
 | Operation | Preconditions | Work and ownership |
 | --- | --- | --- |
-| Begin | Idle, valid capability/batch configuration | Snapshot buffers and router load counters; clear gradients; open state. |
+| Begin | Idle, valid batch configuration | Snapshot router load counters; clear gradients; open state. |
 | Dispatch | Open, no attempted dispatch | Check every DP rank has GBS/DP rows; compute all backend microbatches; retain gradients and metrics. |
 | Finish | Dispatch completed | Clip, optimizer step, existing MoE gate-bias hook, scheduler step; return metrics; release step. |
-| Abort | Open or idle | Restore pre-step buffers/router counters and discard gradients; no optimizer/scheduler update; idempotent. |
+| Abort | Open or idle | Restore pre-step router load counters and discard gradients; no optimizer/scheduler update; idempotent. |
 
 The MoE gate-bias update at finish and the router-load restore at abort are covered only by the unit test in `tests/unit/models/policy/test_automodel_split_state.py`, which drives a real AutoModel `Gate` with a positive `gate_bias_update_factor`.
 The Qwen3 and Qwen3.5 MoE validation runs set `gate_bias_update_factor=0.0`, so they do not exercise these paths.
 
 Mark dispatch attempted before execution.
 A failure requires abort before a new step; a second dispatch cannot double-count gradients.
+In this stage the controller never aborts an open step, because no supported configuration closes a step short: abort is exercised only by unit tests, and a failed dispatch ends the run.
 DP row validation uses a collective minimum/maximum before forward collectives.
 It rejects short and oversized batches.
 Full-batch admission requires the streaming threshold to equal prompts per step and zero prompt-drop budgets.
 
 Commit failures are not transactional: optimizer updates cannot be rolled back.
-The worker becomes unavailable for further SC steps after a failed commit and requires recovery.
+After a failed commit the worker rejects further SC steps, and the run has to be restarted from a checkpoint.
 Abort never clears that failure.
 Callers must not interleave legacy `train()` with an open SC step.
 Abort does not rewind RNG or controller rollout state.
@@ -150,7 +151,7 @@ Learning-rate metrics record the pre-update rate, matching V1.
 Retained-gradient logprob phases are allowed; finish restores training mode before the model's gate-bias update hook.
 
 AutoModel's `Gate` accumulates `_cumulative_expert_load` outside registered buffers.
-Snapshot and restore that counter explicitly, alongside model buffers, so aborted samples do not affect the next successful bias update.
+Snapshot and restore that counter explicitly, so aborted samples do not affect the next successful bias update.
 Dispatcher temporary tensors are released through the existing `release_moe_dispatcher_state` utility after completion/cancellation.
 Additional model-owned mutable state must be accounted for when extending architecture support; parameter rollback after commit is not promised.
 

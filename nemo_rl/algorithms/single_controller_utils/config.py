@@ -2056,10 +2056,6 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
         "grpo.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
         "token_capture.enabled": master_config.token_capture.enabled,
         "async_rl.sampler.name": not isinstance(sampler, InOrderSamplerConfig),
-        "async_rl.sampler.warmup_lookahead_versions": (
-            isinstance(sampler, InOrderSamplerConfig)
-            and sampler.warmup_lookahead_versions is not None
-        ),
         "async_rl.min_groups_for_streaming_train": (
             async_cfg.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step
         ),

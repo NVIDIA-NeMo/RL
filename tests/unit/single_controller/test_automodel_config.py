@@ -58,7 +58,6 @@ def test_full_batch_lookahead_supported(config: dict[str, Any], lookahead: int) 
         ("grpo.use_dynamic_sampling", True),
         ("token_capture.enabled", True),
         ("async_rl.sampler.name", "ready_first"),
-        ("async_rl.sampler.warmup_lookahead_versions", 1),
         ("async_rl.min_groups_for_streaming_train", 1),
         ("async_rl.rollout_failure.max_skipped_prompts", 1),
         ("async_rl.rollout_failure.max_consecutive_dropped_prompts", 1),

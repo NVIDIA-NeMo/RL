@@ -38,16 +38,13 @@ def worker(monkeypatch):
     worker.cfg = {
         "train_global_batch_size": 4,
         "train_micro_batch_size": 1,
-        "dynamic_batching": {"enabled": False},
         "automodel_cfg": {},
     }
     worker.dp_size = 2
-    worker.tp_size = worker.cp_size = 1
-    worker.cpu_offload = worker.is_vlm = worker.is_moe_model = False
-    worker.lora_enabled = worker.enable_seq_packing = False
-    worker.draft_model = None
+    worker.cp_size = 1
+    worker.is_moe_model = False
+    worker.enable_seq_packing = False
     worker.model = torch.nn.Linear(2, 1, bias=False)
-    worker.model.register_buffer("counter", torch.tensor(0))
     worker.optimizer = torch.optim.SGD(worker.model.parameters(), lr=0.1, momentum=0.9)
     worker.scheduler = torch.optim.lr_scheduler.StepLR(worker.optimizer, 1, gamma=0.5)
     worker.max_grad_norm = 1.0
@@ -164,16 +161,14 @@ def test_expert_parallel_commit_and_abort(worker, monkeypatch):
 
 
 @pytest.mark.parametrize("backward", [False, True])
-def test_abort_restores_buffers_and_does_not_update(worker, backward):
+def test_abort_does_not_update(worker, backward):
     before = worker.model.weight.detach().clone()
     worker.begin_train_step(Mock())
     if backward:
         dispatch(worker)
-    worker.model.counter.add_(1)
     worker.abort_train_step()
     worker.abort_train_step()
     torch.testing.assert_close(before, worker.model.weight)
-    assert worker.model.counter == 0
     assert worker.model.weight.grad is None
     assert not worker.optimizer.state
     assert worker.scheduler.last_epoch == 0
@@ -263,7 +258,7 @@ def test_failed_commit_requires_recovery(worker, monkeypatch):
     assert worker._train_step_state is None
     assert worker.model.weight.grad is None
     worker.abort_train_step()
-    with pytest.raises(RuntimeError, match="recover"):
+    with pytest.raises(RuntimeError, match="restart the run"):
         worker.begin_train_step(Mock())
 
 
@@ -278,7 +273,7 @@ def test_cleanup_failure_after_update_requires_recovery(worker, monkeypatch):
     assert worker.scheduler.last_epoch == 1
     assert worker._train_step_state is None
     worker.abort_train_step()
-    with pytest.raises(RuntimeError, match="recover"):
+    with pytest.raises(RuntimeError, match="restart the run"):
         worker.begin_train_step(Mock())
 
 
@@ -287,15 +282,6 @@ def test_invalid_sizes(worker, gbs, mbs):
     with pytest.raises(ValueError, match="divisible"):
         worker.begin_train_step(Mock(), gbs=gbs, mbs=mbs)
     assert worker._train_step_state is None
-
-
-@pytest.mark.parametrize(
-    "flag", ["cpu_offload", "is_vlm", "lora_enabled", "enable_seq_packing"]
-)
-def test_unsupported_worker_modes(worker, flag):
-    setattr(worker, flag, True)
-    with pytest.raises(ValueError, match="AutoModel SC"):
-        worker.begin_train_step(Mock())
 
 
 def test_dispatch_requires_begin(worker):

@@ -21,14 +21,15 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` at any `max_lookahead_versions`, and a streaming threshold equal to `grpo.num_prompts_per_step`.
 Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
 Both prompt-drop budgets must be zero.
-Explicit unsupported settings fail at setup; the worker also rejects unsupported model properties before training.
+Explicit unsupported settings fail at setup.
 
 Expert parallelism uses the existing AutoModel MoE path; SC does not impose EP=1.
 Configure `policy.automodel_cfg.expert_parallel_size` and a compatible dispatcher for the model and allocated training GPUs.
 The same full-batch lifecycle and gradient clipping operate on AutoModel's expert mesh.
 
 One full-batch dispatch still runs multiple backend forward/backward passes.
-The optimizer and scheduler advance once, in `finish_train_step`; abort clears pending gradients without an update.
+The optimizer and scheduler advance once, in `finish_train_step`.
+A failed dispatch or commit ends the run, which is then restarted from a checkpoint; in this stage `abort_train_step` is exercised only by unit tests.
 The existing synchronous AutoModel training path retains its broader configuration support.
 
 Run the checkpoint/resume integration smoke on two GPUs:

@@ -121,7 +121,6 @@ class _TrainStepState:
     loss_fn: LossFunction
     gbs: int
     mbs: int
-    buffers: list[tuple[torch.Tensor, torch.Tensor]]
     router_loads: list[tuple[Gate, Optional[torch.Tensor]]]
     dispatched: bool = False
     metrics: Optional[dict[str, Any]] = None
@@ -981,24 +980,9 @@ class AutomodelPolicyWorkerImpl(
     ) -> None:
         """Open an SC step, retaining ownership until finish or abort."""
         if self._train_step_commit_failed:
-            raise RuntimeError("SC commit failed; recover the worker from a checkpoint")
+            raise RuntimeError("SC commit failed; restart the run from a checkpoint")
         if self._train_step_state is not None:
             raise RuntimeError("a train step is already open; finish or abort it first")
-        if (
-            self.tp_size != 1
-            or self.cp_size != 1
-            or self.cpu_offload
-            or self.is_vlm
-            or self.lora_enabled
-            or self.draft_model is not None
-            or self.enable_seq_packing
-            or self.cfg["dynamic_batching"]["enabled"]
-            or self.cfg["automodel_cfg"].get("dp_replicate_size") not in (None, 1)
-        ):
-            raise ValueError(
-                "AutoModel SC requires text full-parameter training, "
-                "TP=CP=1, fixed microbatches, no CPU offload or draft model"
-            )
         if self.optimizer is None or self.scheduler is None:
             raise RuntimeError("an SC step requires an optimizer and scheduler")
         batch_size = self.cfg["train_global_batch_size"] if gbs is None else gbs
@@ -1013,9 +997,6 @@ class AutomodelPolicyWorkerImpl(
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
-            buffers=[
-                (buffer, buffer.detach().clone()) for buffer in self.model.buffers()
-            ],
             # AutoModel Gate keeps this training accumulator outside state_dict.
             router_loads=[
                 (
@@ -1176,15 +1157,12 @@ class AutomodelPolicyWorkerImpl(
         return state.metrics
 
     def abort_train_step(self) -> None:
-        """Discard gradients and restore model state without committing an update."""
+        """Discard gradients and restore router loads without committing an update."""
         state = self._train_step_state
         if state is None:
             return
-        with torch.no_grad():
-            for buffer, saved in state.buffers:
-                buffer.copy_(saved)
-            for gate, load in state.router_loads:
-                gate._cumulative_expert_load = load
+        for gate, load in state.router_loads:
+            gate._cumulative_expert_load = load
         self.optimizer.zero_grad()
         release_moe_dispatcher_state(self.model)
         self._train_step_state = None
