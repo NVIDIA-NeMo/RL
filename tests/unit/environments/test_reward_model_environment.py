@@ -55,6 +55,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
         "activation_checkpointing": False,
         "tensor_parallel_size": 1,
         "context_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "custom_parallel_plan": None,
     },
     "dynamic_batching": {"enabled": False},

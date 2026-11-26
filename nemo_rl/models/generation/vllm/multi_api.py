@@ -392,26 +392,25 @@ class MultiAPIServerPool:
                             ):
                                 raise RuntimeError("HTTP API server failed to start")
                             await asyncio.sleep(0.05)
+                        result = host._peer_control_url
+                    elif name == "peers":
+                        host.set_generation_cut_peers(args[0])
                     elif name == "capture":
                         if not ray.is_initialized():
                             ray.init(
                                 address="auto", namespace=namespace, log_to_driver=False
                             )
-                        await host.setup_token_capture(
-                            args[0],
-                            args[1],
-                            capture_media=args[2],
-                            top_logprobs=args[3],
-                            prefix_write_max_rows=args[4],
-                            prefix_write_max_tokens=args[5],
-                            prefix_read_max_rows=args[6],
-                        )
+                        await host.setup_token_capture(args[0], args[1], **args[2])
                     elif name == "version":
                         await host.set_rollout_weight_version(args[0])
                     elif name == "progress":
                         result = await host.captured_call_progress()
                     elif name == "snapshot":
                         result = host.get_data_plane_snapshot()
+                    elif name == "flush":
+                        await host.flush_obsolete_generation_cut_rows_async(args[0])
+                    elif name == "counts":
+                        result = host.get_generation_prefix_counts()
                     elif name == "stop":
                         if host.http_server is not None:
                             host.http_server.should_exit = True

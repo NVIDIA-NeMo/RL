@@ -204,6 +204,7 @@ def _create_value_test_config(
             },
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
+            "pipeline_parallel_size": 1,
             "sequence_parallel": False,
             "activation_checkpointing": False,
             "cpu_offload": False,
