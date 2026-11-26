@@ -1038,9 +1038,17 @@ def test_constructor_validates_disaggregation_before_allocating(monkeypatch):
 
 
 def test_validate_settings_refuses_disaggregation_on_the_single_controller_entrypoint():
-    aggregated = SimpleNamespace(policy={"generation": make_config(disagg=False)})
+    # The SingleController settings validate_settings reads before the layout.
+    async_rl = SimpleNamespace(
+        generation_fleet_health=SimpleNamespace(enabled=False, refit_timeout_s=None)
+    )
+    aggregated = SimpleNamespace(
+        policy={"generation": make_config(disagg=False)}, async_rl=async_rl
+    )
     assert SGLangGeneration.validate_settings(aggregated) is None
-    disaggregated = SimpleNamespace(policy={"generation": make_config()})
+    disaggregated = SimpleNamespace(
+        policy={"generation": make_config()}, async_rl=async_rl
+    )
     with pytest.raises(ValueError, match="SingleController"):
         SGLangGeneration.validate_settings(disaggregated)
 
