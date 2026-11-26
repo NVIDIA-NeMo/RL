@@ -612,6 +612,29 @@ def test_unrouted_environment_servers_can_be_duplicated_across_shards(
     assert route_to_shard == expected
 
 
+def test_multi_harness_servers_are_routable_and_reach_every_shard() -> None:
+    multi_harness = {"routes": {"swe": ["swe_opencode", "swe_pi"]}}
+    config = _sharded_config(multi_harness=multi_harness)
+    plan = parse_shard_plan(config)
+    for shard in plan.shards:
+        assert (
+            apply_shard_overlay(config, plan, shard)["multi_harness"] == multi_harness
+        )
+
+    # Environment-only entries are routable only when a route or the mix selects them.
+    route_to_shard = build_route_shard_map(
+        {
+            "first": {"swe_opencode": ["environment_servers"]},
+            "second": {
+                "swe_pi": ["environment_servers"],
+                "local_environment": ["environment_servers"],
+            },
+        },
+        multi_harness_servers={"swe_opencode", "swe_pi"},
+    )
+    assert route_to_shard == {"swe_opencode": "first", "swe_pi": "second"}
+
+
 @pytest.mark.parametrize("allowlisted", [False, True])
 def test_routed_environment_servers_cannot_be_duplicated_across_shards(
     allowlisted: bool,
@@ -829,6 +852,7 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "allowed_duplicate_entries": ["policy_model"],
             "effort_levels": {"low_weight": 0.0},
             "external_service_readiness": {"services": []},
+            "multi_harness": {"routes": {"swe": ["swe_pi"]}},
             "tokenizer_config": {"name": "policy"},
             "genrm_model": {"responses_api_models": {}},
             "safety_judge_model": {"responses_api_models": {}},
