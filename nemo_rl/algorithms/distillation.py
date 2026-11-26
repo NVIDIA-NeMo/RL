@@ -65,6 +65,9 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
     should_use_async_rollouts,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
@@ -264,6 +267,8 @@ def setup(
     )
     checkpoint_engine_config = None
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(
             policy_config, entry_point="distillation"

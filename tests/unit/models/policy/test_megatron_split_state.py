@@ -831,7 +831,7 @@ class TestFinish:
         w.model.finish_grad_sync.assert_not_called()
         w.optimizer.step.assert_not_called()
 
-    def test_picks_global_valid_toks_for_token_level_loss(self, mock_module_symbols):
+    def test_picks_global_valid_toks_for_global_token_mean(self, mock_module_symbols):
         """N selection: TOKEN_LEVEL → N = global_valid_toks (not seqs)."""
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -1153,7 +1153,7 @@ class TestFinish:
         torch.testing.assert_close(grad_seen_by_finalize[0], expected_mtp_grad)
         torch.testing.assert_close(other_param.main_grad, torch.ones(4))
 
-    def test_mtp_grads_need_no_correction_under_token_level_loss(
+    def test_mtp_grads_need_no_correction_under_global_token_mean(
         self, mock_module_symbols
     ):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -1380,7 +1380,7 @@ class TestFinish:
 
         real_loss = ClippedPGLossFn(
             ClippedPGLossConfig(
-                token_level_loss=True,
+                normalization="global_token_mean",
                 use_importance_sampling_correction=True,
                 truncated_importance_sampling_type="seq-mask-tis",
                 truncated_importance_sampling_ratio=2.0,
@@ -1415,7 +1415,7 @@ def _in_loss_seq_filter_loss_fn():
         ClippedPGLossConfig(
             seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
-            token_level_loss=True,
+            normalization="global_token_mean",
             reference_policy_kl_penalty=0,
         ),
         seq_logprob_error_threshold=2.0,
