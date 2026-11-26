@@ -14,7 +14,10 @@
 
 """Verify credential boundaries at RL workflow call sites."""
 
+import json
+import os
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -187,3 +190,85 @@ def test_docs_publishers_forward_only_named_production_credentials() -> None:
         + " || '' }}"
         for name in declared
     }
+
+
+def test_merge_queue_retries_use_authenticated_paginated_records(
+    tmp_path: Path,
+) -> None:
+    """Exercise the actual read and write scripts against offline GitHub comment fixtures."""
+    workflow = _load(GITHUB / "workflows/merge-queue-retry.yml")
+    retry = workflow["jobs"]["requeue-pr"]
+    assert retry["concurrency"] == {
+        "group": "merge-queue-retry-${{ github.event.pull_request.number }}",
+        "cancel-in-progress": "false",
+    }
+    steps = {step["name"]: step for step in retry["steps"]}
+    assert (
+        steps["Requeue Pull Request"]["if"]
+        == "steps.check_retry.outputs.action == 'retry'"
+    )
+    assert (
+        steps["Add retry comment"]["if"]
+        == "steps.check_retry.outputs.action == 'retry'"
+    )
+    data = tmp_path / "pages.json"
+    env = {
+        **os.environ,
+        "COMMENTS": str(data),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_REPOSITORY": "fixture/rl",
+        "GITHUB_RUN_ID": "10001",
+        "PR_NUMBER": "1",
+        "RETRY_COUNT": "3",
+    }
+    fixture_api = """
+      gh() {
+        case "$*" in
+          "api --paginate repos/fixture/rl/issues/1/comments?per_page=100") jq -c '.[]' "$COMMENTS" ;;
+          "api repos/fixture/rl/issues/1/comments --input - --silent") cat ;;
+          *) return 2 ;;
+        esac
+      }
+    """
+
+    def run_step(name: str) -> str:
+        """Run a workflow shell step with a local fixture in place of the GitHub CLI."""
+        return subprocess.check_output(
+            ["bash", "-euo", "pipefail", "-c", fixture_api + steps[name]["run"]],
+            env=env,
+            text=True,
+        ).strip()
+
+    def record(comment_id: int, user: int, app: int, body: str) -> dict:
+        """Build an unedited issue comment with independent author and GitHub App identities."""
+        return {
+            "id": comment_id,
+            "user": {"id": user},
+            "performed_via_github_app": {"id": app},
+            "created_at": "2026-11-01",
+            "updated_at": "2026-11-01",
+            "body": body,
+        }
+
+    new_text = json.loads(run_step("Add retry comment"))["body"]
+    legacy_text = "🔄 Auto-retry attempt {}: PR was removed from merge queue, automatically requeuing..."
+    pages = [
+        [record(1, 220789390, 1605575, legacy_text.format(2))],
+        [
+            record(2, 220789390, 1605575, legacy_text.format(3)),
+            record(3, 999, 5919753, new_text),
+            record(4, 361102006, 999, new_text),
+            record(5, 361102006, 5919753, legacy_text.format(1)),
+            record(6, 220789390, 1605575, "Quoted: " + legacy_text.format(1)),
+            record(7, 361102006, 5919753, new_text.replace(":v1 ", ":v2 ")),
+            record(8, 361102006, 5919753, new_text) | {"updated_at": "2026-11-02"},
+        ],
+    ]
+    data.write_text(json.dumps(pages))
+    assert run_step("Read authenticated retry records") == "action=retry\nretry_count=3"
+
+    pages[1].append(record(9, 361102006, 5919753, new_text))
+    data.write_text(json.dumps(pages))
+    assert run_step("Read authenticated retry records") == "action=recorded"
+    env["GITHUB_RUN_ID"] = "10002"
+    assert run_step("Read authenticated retry records") == "action=limit"
