@@ -37,43 +37,30 @@ def test_forest_config_has_no_obsolete_switch(config):
     check_outdated_config(config)
 
 
+@pytest.mark.parametrize("legacy", [True, False, None])
+def test_token_level_loss_requires_explicit_migration(legacy: bool | None) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"loss_fn\.token_level_loss was removed.*global_token_mean.*sequence_mean",
+    ):
+        check_outdated_config(
+            {
+                "loss_fn": {
+                    "token_level_loss": legacy,
+                    "normalization": "global_token_mean",
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "normalization", [None, "global_token_mean", "sequence_mean", "group_token_mean"]
+)
+def test_current_loss_normalization_is_accepted(normalization: str | None) -> None:
+    check_outdated_config({"loss_fn": {"normalization": normalization}})
+
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("normalize_over", "kept_rows"),
-        ("normalize_over", "all_rows"),
-        ("normalize_over", None),
-        ("whiten_execution_padding", False),
-        ("whiten_execution_padding", True),
-        ("whiten_execution_padding", None),
-    ],
-)
-def test_removed_forest_whitening_options_fail_at_startup(key, value):
-    with pytest.raises(ValueError, match="ppo.adv_estimator.*" + key):
-        check_outdated_config({"ppo": {"adv_estimator": {key: value}}})
-
-
-@pytest.mark.parametrize("source", ["row0", "cyclic", None])
-def test_removed_forest_padding_source_fails_at_startup(source):
-    with pytest.raises(ValueError, match="forest_pad_source.*Remove"):
-        check_outdated_config({"token_capture": {"forest_pad_source": source}})
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        {},
-        {"ppo": None, "token_capture": None},
-        {"ppo": {"adv_estimator": {"name": "gae", "normalize_advantages": True}}},
-        {"token_capture": {"forest_training": True, "forest_padding_scope": "step"}},
-    ],
-)
-def test_forest_config_without_deferred_options_is_accepted(config):
-    check_outdated_config(config)
-
 
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
 # MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.
@@ -432,6 +419,23 @@ def test_dynamo_frontend_args_without_router_reset_states_pass():
     check_outdated_config(_dynamo_frontend_config({"router_mode": "kv"}))
 
 
+# ============================================================================
+# reject_outdated_dynamo_router_mode
+# ============================================================================
+
+
+def test_dynamo_power_of_two_router_is_rejected():
+    with pytest.raises(
+        ValueError, match=r"router_mode='power-of-two' was removed.*least-loaded"
+    ):
+        check_outdated_config(_dynamo_frontend_config({"router_mode": "power-of-two"}))
+
+
+@pytest.mark.parametrize("frontend_args", [{"router_mode": "least-loaded"}, {}])
+def test_dynamo_router_modes_that_still_exist_pass(frontend_args):
+    check_outdated_config(_dynamo_frontend_config(frontend_args))
+
+
 @pytest.mark.parametrize(
     "generation",
     [
@@ -467,8 +471,8 @@ def _generation_config(**generation) -> dict:
             r"dynamo_cfg\.metrics_exclude_prefixes",
         ),
         (
-            {"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}},
-            r"dynamo_cfg\.worker_args was",
+            {"dynamo_cfg": {"worker_args": {"tool_call_parser": "hermes"}}},
+            r"dynamo_cfg\.worker_args was removed",
         ),
         (
             {"dynamo_cfg": {"frontend_args": {"tokenizer_cache": False}}},

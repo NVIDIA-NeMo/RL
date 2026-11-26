@@ -214,6 +214,7 @@ def test_megatron_fp8_refit_tasks_preserve_backend_export(
 
     worker.cfg = {"generation": {"backend": "megatron"}}
     assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
+    worker.megatron_bridge.get_conversion_tasks.assert_called_once_with([worker.model])
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
     worker.cfg = {"generation": {"backend": "vllm"}}
@@ -430,6 +431,7 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         local_hf_param_specs=lambda: (),
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.nccl_reshard_refit_infos = {}
     worker.refit_conversion_tasks = [task]
     worker.model = object()
     worker.megatron_bridge = SimpleNamespace(
@@ -450,6 +452,8 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         gen_world_size=1,
     )
 
+    assert worker.nccl_reshard_refit_infos == {0: info}
+    assert "nccl_reshard_refit_info" not in vars(worker)
     assert info["layer_names"] == []
     assert info["per_layer_params"] == {}
     assert list(info["misc_meta"]) == [misc_name]
@@ -505,6 +509,7 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.model = object()
     worker.model_update_group = object()
+    worker.nccl_reshard_refit_infos = {}
     worker.refit_conversion_tasks = export_tasks
     worker._calculate_refit_param_info = MagicMock(return_value=[])
     worker._build_bulk_refit_conversion_tasks = MagicMock(
@@ -552,6 +557,8 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
         "packed_broadcast_producer",
         lambda *, iterator, **kwargs: received.extend(iterator),
     )
+    # Misc is shared across layouts and always reads the first layout's metadata.
+    worker.nccl_reshard_refit_infos[1] = {"misc_meta": {}}
     worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0})
     assert [name for name, _ in received] == list(expected_misc)
     assert all(tensor is expected_misc[name] for name, tensor in received)
@@ -1307,15 +1314,13 @@ def test_regular_model_does_not_delegate_packing():
 
 
 def test_model_cp_slicing_capability_is_detected():
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_slices_context_parallel_inputs,
-    )
+    from nemo_rl.models.megatron.common import model_slices_context_parallel_inputs
 
     class ModelSlicesContextParallelInputs:
         model_slices_context_parallel_inputs = True
 
-    assert _model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
-    assert not _model_slices_context_parallel_inputs(object())
+    assert model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
+    assert not model_slices_context_parallel_inputs(object())
 
 
 def test_model_cp_slicing_accepts_data_plane_setup():
@@ -1780,30 +1785,33 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.my_pp_stage = 0
-    worker.pp_comm_group = object()
+    worker.pp_comm_group = {0: object()}
+    worker.cfg = {"generation": {"backend": "vllm"}}
     worker._broadcast_misc_params_packed = MagicMock()
     source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
     wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
     if source_dtype != torch.uint8:
         source = 1 + source / 1024
     layer_names = ["model.layers.0", "model.layers.1"]
-    worker.nccl_reshard_refit_info = {
-        "layer_names": layer_names,
-        "per_layer_params": {
-            layer: [
-                {
-                    "name": f"{layer}.mlp.{proj}_proj.weight",
-                    "global_shape": [2, 2],
-                    "dtype": str(wire_dtype),
-                    "src_mesh_info": object(),
-                    "src_placements": (),
-                    "dst_mesh_info": object(),
-                    "dst_placements": (),
-                }
-                for proj in ("gate", "up")
-            ]
-            for layer in layer_names
-        },
+    worker.nccl_reshard_refit_infos = {
+        0: {
+            "layer_names": layer_names,
+            "per_layer_params": {
+                layer: [
+                    {
+                        "name": f"{layer}.mlp.{proj}_proj.weight",
+                        "global_shape": [2, 2],
+                        "dtype": str(wire_dtype),
+                        "src_mesh_info": object(),
+                        "src_placements": (),
+                        "dst_mesh_info": object(),
+                        "dst_placements": (),
+                    }
+                    for proj in ("gate", "up")
+                ]
+                for layer in layer_names
+            },
+        }
     }
     current_stream = object()
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
@@ -1844,7 +1852,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
 
     worker._iter_local_hf_param_shards = iter_shards
     worker.hf_to_local_param_map = worker._build_source_hf_to_local_param_map(
-        worker.nccl_reshard_refit_info
+        worker.nccl_reshard_refit_infos[0]
     )
     first_spec = worker.hf_to_local_param_map.get(
         f"{layer_names[0]}.mlp.gate_proj.weight"
@@ -1870,7 +1878,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     first_spec.post = post
 
     def transfer(src, *args) -> None:
-        assert args[-2] is worker.pp_comm_group
+        assert args[-2] is worker.pp_comm_group[0]
         assert args[-1] is current_stream
         if failure_stage == "transfer":
             raise RuntimeError("injected transfer failure")
@@ -1912,6 +1920,104 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
+    # vLLM keeps empty_cache() after the bulk send; TRT-LLM reshard skips it.
+    assert torch.cuda.empty_cache.call_count == 2
+    worker.cfg = {
+        "generation": {"backend": "trtllm", "refit_transport": "nccl_reshard"}
+    }
+    torch.cuda.empty_cache.reset_mock()
+    worker._nccl_reshard_refit()
+    torch.cuda.empty_cache.assert_not_called()
+
+
+def test_nccl_reshard_send_materializes_each_layer_once_for_every_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import nemo_rl.weight_sync.xferdtensor as transfer_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    layer_names = ["model.layers.0", "model.layers.1"]
+    names = [f"{layer}.mlp.experts.down_proj.weight" for layer in layer_names]
+
+    def plan(role: str) -> dict:
+        # The role stands in for each layout's destination mesh.
+        return {
+            "layer_names": list(layer_names),
+            "per_layer_params": {
+                layer: [
+                    {
+                        "name": name,
+                        "global_shape": [4, 2, 2],
+                        "src_mesh_info": role,
+                        "src_placements": (),
+                        "dst_mesh_info": role,
+                        "dst_placements": (),
+                    }
+                ]
+                for layer, name in zip(layer_names, names)
+            },
+        }
+
+    worker.nccl_reshard_refit_infos = {0: plan("prefill"), 1: plan("decode")}
+    groups = {0: object(), 1: object()}
+    worker.pp_comm_group = groups
+    events = []
+
+    def make_spec(name: str) -> SimpleNamespace:
+        def materialize() -> worker_module.RefitCtx:
+            events.append(("materialize", name))
+            return worker_module.RefitCtx(buf=MagicMock(name=name))
+
+        return SimpleNamespace(
+            materialize=materialize,
+            post=lambda ctx: events.append(("post", ctx.buf._mock_name)),
+        )
+
+    specs = {name: make_spec(name) for name in names}
+    worker.hf_to_local_param_map = SimpleNamespace(get=specs.get)
+    materialize_stream = object()
+    streams = {0: MagicMock(), 1: MagicMock()}
+    layout_of = {"prefill": 0, "decode": 1}
+
+    def transfer(src, _src_mesh, _src_pl, _dst, dst_mesh, _dst_pl, group, stream):
+        assert group is groups[layout_of[dst_mesh]]
+        assert stream is streams[layout_of[dst_mesh]]
+        events.append(("send", dst_mesh, src._local_tensor._mock_name))
+
+    monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
+
+    assert worker._nccl_reshard_layout_indices() == [0, 1]
+    worker._send_bulk_params([0, 1], streams, materialize_stream)
+
+    n0, n1 = names
+    assert events == [
+        ("materialize", n0),
+        ("send", "prefill", n0),
+        ("send", "decode", n0),
+        ("post", n0),
+        ("materialize", n1),
+        ("send", "prefill", n1),
+        ("send", "decode", n1),
+        ("post", n1),
+    ]
+    # Each send stream waits for the materialization it reads.
+    for stream in streams.values():
+        assert stream.wait_stream.call_count == 2
+
+    saved_plan = worker.nccl_reshard_refit_infos.pop(1)
+    with pytest.raises(KeyError, match="1"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
+    worker.nccl_reshard_refit_infos[1] = saved_plan
+    saved_group = groups.pop(1)
+    with pytest.raises(KeyError, match="1"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
+    groups[1] = saved_group
+
+    worker.nccl_reshard_refit_infos[1]["layer_names"] = layer_names[::-1]
+    with pytest.raises(RuntimeError, match="orders the bulk layers differently"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
@@ -3461,8 +3567,8 @@ def test_worker_initialization_preserves_only_restored_rng(
             "_model_has_chunkwise_cp",
             "_model_needs_router_padding_mask",
             "_model_self_packs_mtp_loss_mask",
-            "_model_slices_context_parallel_inputs",
-            "_model_accepts_media_token_validity_mask",
+            "model_slices_context_parallel_inputs",
+            "model_media_placeholder_token_id",
             "_reserved_http_server_port_for_rank",
         )
     }
@@ -3496,7 +3602,12 @@ def test_worker_initialization_preserves_only_restored_rng(
         setup_model_and_optimizer=MagicMock(return_value=components),
         setup_reference_model_state=MagicMock(side_effect=reference),
         finalize_megatron_setup=MagicMock(side_effect=finalize),
-        compile_cache=SimpleNamespace(seed=MagicMock()),
+        compile_cache=SimpleNamespace(
+            seed=MagicMock(),
+            ShapeProfiles=SimpleNamespace(load=MagicMock(return_value=None)),
+            warn_if_autotuning_is_shared=MagicMock(),
+        ),
+        _SHAPE_PROFILE_LAYOUT=(),
     )
     exec(
         compile(
@@ -3523,7 +3634,11 @@ def test_worker_initialization_preserves_only_restored_rng(
         torch.set_rng_state(before)
         namespace["__init__"](
             worker,
-            {"megatron_cfg": {}, "sequence_packing": {"enabled": False}},
+            {
+                "model_name": "model",
+                "megatron_cfg": {},
+                "sequence_packing": {"enabled": False},
+            },
             SimpleNamespace(pad_token="pad"),
             weights_path="weights" if load_rng else None,
             optimizer_path=optimizer_path,
@@ -6701,3 +6816,182 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def test_reshard_group_rebuild_replaces_only_requested_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.distributed import refit_watchdog, stateless_process_group
+    from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
+    worker = AbstractPolicyWorker()
+    old_prefill, decode, new_prefill = MagicMock(), MagicMock(), MagicMock()
+    worker.pp_comm_group = {0: old_prefill, 1: decode}
+    old_map = worker.pp_comm_group
+    events = []
+    monkeypatch.setattr(
+        stateless_process_group, "StatelessProcessGroup", lambda **kwargs: new_prefill
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    new_prefill.init_nccl_communicator.side_effect = lambda **kwargs: events.append(
+        "init"
+    )
+    monkeypatch.setattr(
+        refit_watchdog, "release_within", lambda *args: events.append("release")
+    )
+    worker.init_nccl_reshard_comm_group(
+        pp_ips=["127.0.0.1"],
+        pp_ports=[1500],
+        pp_size=1,
+        my_pp_stage=0,
+        sub_world_size=4,
+        my_rank_in_group=0,
+        layout_index=0,
+    )
+    assert worker.pp_comm_group == {0: new_prefill, 1: decode}
+    assert old_map == {0: old_prefill, 1: decode}
+    assert events == ["init", "release"]
+
+
+class _GeneratorRngTracker:
+    """Holds torch.Generator states and, like TE's tracker, hands out a new dict."""
+
+    def __init__(self, states: dict[str, torch.Generator]):
+        self.states = states
+
+    def get_states(self) -> dict[str, torch.Generator]:
+        return dict(self.states)
+
+    def set_states(self, states: dict[str, torch.Generator]) -> None:
+        self.states = states
+
+
+class TestWarmupFirstPass:
+    """warmup_first_pass on a bare worker whose train step is mocked."""
+
+    def test_generator_rng_states_are_restored_in_place(self, monkeypatch):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        generators = {
+            "model-parallel-rng": torch.Generator().manual_seed(1),
+            "expert-parallel-rng": torch.Generator().manual_seed(2),
+        }
+        saved = {name: g.get_state() for name, g in generators.items()}
+        tracker = _GeneratorRngTracker(dict(generators))
+
+        def train_microbatch(data):
+            for g in generators.values():
+                torch.rand(4, generator=g)
+
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {
+            "max_total_sequence_length": 32,
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {"empty_unused_memory_level": 0},
+        }
+        worker.model = MagicMock(name="model")
+        worker.timer = MagicMock(name="step_timer")
+        worker._trainer_warmup_skip_reason = lambda: None
+        worker._apply_packing_prep = lambda data: data
+        worker.prepare_for_training = MagicMock()
+        worker.begin_train_step = MagicMock()
+        worker.train_microbatch = MagicMock(side_effect=train_microbatch)
+        worker.abort_train_step = MagicMock()
+        monkeypatch.setattr(worker_module, "get_cuda_rng_tracker", lambda: tracker)
+        monkeypatch.setattr(worker_module, "get_model_config", MagicMock())
+        monkeypatch.setattr(worker_module, "reset_model_temporary_tensors", MagicMock())
+        monkeypatch.setattr(worker_module, "clear_aux_losses_tracker", MagicMock())
+        monkeypatch.setattr(worker_module, "MTPLossLoggingHelper", MagicMock())
+        monkeypatch.setattr(
+            torch.cuda, "get_rng_state", lambda: torch.zeros(8, dtype=torch.uint8)
+        )
+        monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"),
+            train_fields=("input_ids", "input_lengths", "sample_mask"),
+            run_logprobs=False,
+            seqlens=[16],
+        )
+
+        assert summary["seqlens"] == [16]
+        worker.train_microbatch.assert_called_once()
+        for name, g in generators.items():
+            # The same objects: CUDA graphs captured on them stay valid.
+            assert tracker.states[name] is g
+            assert torch.equal(g.get_state(), saved[name])
+
+    @pytest.mark.parametrize(
+        ("attrs", "reason"),
+        [
+            ({"optimizer": None}, "no optimizer"),
+            (
+                {"model": SimpleNamespace(cuda_graph_impl="local")},
+                "CUDA graphs would be captured on the synthetic batch's shapes",
+            ),
+            (
+                {"_router_replay_enabled": True},
+                "router replay needs the routes recorded during generation",
+            ),
+            (
+                {"fp8_cfg": {"enabled": True, "fp8_recipe": "delayed"}},
+                "FP8 delayed scaling would keep the synthetic batch's amax history",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {"fp4_cfg": {"enabled": True}}}},
+                "FP4 and per-module precision recipes are not covered",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {"te_precision_config_file": "te.yaml"}}},
+                "FP4 and per-module precision recipes are not covered",
+            ),
+            (
+                {"cfg": {"megatron_cfg": {}, "draft": SimpleNamespace(enabled=True)}},
+                "draft-model training is not covered",
+            ),
+            (
+                {"delegate_pack_to_model": True},
+                "models that pack their own inputs are not covered",
+            ),
+            (
+                {"media_placeholder_token_id": 200},
+                "the synthetic batch could hold the media placeholder token",
+            ),
+        ],
+        ids=[
+            "no-optimizer",
+            "cuda-graphs",
+            "router-replay",
+            "fp8-delayed",
+            "fp4",
+            "te-precision-file",
+            "draft-model",
+            "model-packs-inputs",
+            "media-placeholder",
+        ],
+    )
+    def test_skipped_where_it_would_leave_state_behind(
+        self, monkeypatch, attrs, reason
+    ):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {"megatron_cfg": {}}
+        worker.fp8_cfg = None
+        worker.optimizer = MagicMock(name="optimizer")
+        worker.model = SimpleNamespace(cuda_graph_impl="none")
+        worker._router_replay_enabled = False
+        worker.delegate_pack_to_model = False
+        worker.media_placeholder_token_id = None
+        monkeypatch.setattr(worker_module, "get_model_config", lambda model: model)
+        assert worker._trainer_warmup_skip_reason() is None
+
+        for name, value in attrs.items():
+            setattr(worker, name, value)
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"), train_fields=(), run_logprobs=False, seqlens=None
+        )
+
+        assert summary == {"skipped": reason}

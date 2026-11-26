@@ -22,7 +22,36 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import unwrap_model
+
+from nemo_rl.data.multimodal_utils import (
+    chunks_accept_media_token_validity_mask,
+    media_placeholder_token_id_from_chunks,
+)
+
+
+def _unwrapped_chunks(model: Any) -> list[Any]:
+    """Return model chunks after removing distributed/module wrappers."""
+    unwrapped = unwrap_model(model)
+    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+
+
+def model_slices_context_parallel_inputs(model: Any) -> bool:
+    """Whether the model consumes full THD input and slices CP after embedding."""
+    return any(
+        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
+        for chunk in _unwrapped_chunks(model)
+    )
+
+
+def model_media_placeholder_token_id(model: Any) -> Optional[int]:
+    """Return the media token only when the model explicitly accepts its mask."""
+    chunks = _unwrapped_chunks(model)
+    if not chunks_accept_media_token_validity_mask(chunks):
+        return None
+    return media_placeholder_token_id_from_chunks(chunks)
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -192,6 +221,35 @@ def get_aux_loss_track_names(model_config: Any) -> list[str]:
         track_names.append("z_loss")
 
     return track_names
+
+
+def validate_forest_routers(model: Any) -> None:
+    """Reject routers that Forest execution padding could perturb.
+
+    Padding rows and failed owners' borrowed inputs run through the model, so
+    routing must be dropless and per-token.
+    """
+    # TODO: Exclude artificial inputs from expert-bias update counts; see
+    # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+    # meanwhile: dummy rows can affect the counts despite zero policy loss.
+    for chunk in _unwrapped_chunks(model):
+        for module in chunk.modules():
+            if not isinstance(module, Router):
+                continue
+            config = module.config
+            if (
+                not isinstance(module, TopKRouter)
+                or module.routing_type in ("sinkhorn", "quantile_balancing")
+                or config.moe_expert_capacity_factor is not None
+                or config.moe_expert_rank_capacity_factor is not None
+                or config.moe_pad_experts_for_cuda_graph_inference
+                or config.moe_token_dropping
+                or get_aux_loss_track_names(config)
+            ):
+                raise ValueError(
+                    "Forest execution padding requires dropless per-token MoE routing "
+                    "without auxiliary losses"
+                )
 
 
 def get_moe_metrics(

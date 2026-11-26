@@ -43,12 +43,11 @@ try:
 except ImportError:
     # Standalone `uv run --no-project --with "vllm==X"` bisect, which
     # docs/adding-new-models.md documents for this script: nemo_rl is not
-    # importable there, and the patch is unnecessary anyway because that env
-    # resolves openai fresh and already has NamespaceTool. The patch exists
-    # only because this repo pins openai==2.6.1.
+    # importable there, and the patches are unnecessary for this script: they
+    # only edit RADIO, GLM and Nemotron VL model files.
     pass
 else:
-    # Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+    # Must run before vLLM imports the model files these patches edit.
     ensure_vllm_source_compat()
 
 import vllm

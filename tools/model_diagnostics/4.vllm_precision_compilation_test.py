@@ -20,7 +20,7 @@ import torch
 
 from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
 
-# Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+# Must run before vLLM imports the model files these patches edit.
 ensure_vllm_source_compat()
 
 from vllm import LLM, SamplingParams  # noqa: E402
@@ -40,7 +40,7 @@ def environment(env_vars):
         # Environment variables are restored here
     """
     # Store original values
-    original_values = {}
+    original_values: dict[str, str | None] = {}
     for key in env_vars:
         if key in os.environ:
             original_values[key] = os.environ[key]

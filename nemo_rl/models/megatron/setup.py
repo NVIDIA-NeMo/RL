@@ -979,7 +979,9 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
 
     hf_model_subdir = hf_model_name
     if os.path.exists(hf_model_name):
-        hf_model_subdir = f"model_{hf_model_subdir.replace('/', '_')}"
+        # Key by the resolved path so that symlinked spellings of one checkpoint
+        # share a conversion.
+        hf_model_subdir = f"model_{os.path.realpath(hf_model_name).replace('/', '_')}"
 
     if hf_config_overrides:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
@@ -1378,6 +1380,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"
     ]
+    megatron_cfg = config["megatron_cfg"]
+    if "moe_router_enable_expert_bias" in megatron_cfg and provider_override_allowed(
+        megatron_cfg, "moe_router_enable_expert_bias"
+    ):
+        model_cfg.moe_router_enable_expert_bias = megatron_cfg[
+            "moe_router_enable_expert_bias"
+        ]
 
     model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][

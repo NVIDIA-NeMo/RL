@@ -67,13 +67,16 @@ if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
         policy.logprob_batch_size=1
         policy.max_total_sequence_length=16384
         grpo.calculate_advantages_on_gpu=false
-        loss_fn.token_level_loss=true
+        loss_fn.normalization=global_token_mean
         loss_fn.sequence_level_importance_ratios=false
         ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
         env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true
         env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=true
         'env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/workplace_assistant/configs/workplace_assistant.yaml,responses_api_agents/browsecomp_agent/configs/browsecomp_agent.yaml]'
         ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.resources_server.name=workplace_assistant
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.resources_server.type=resources_servers
+        # Since Gym #5489, browsecomp serves host /run only with allow_host_execution (development-only, no isolation).
+        ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.allow_host_execution=true
         ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.max_steps=6
         ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.keep_rounds=1
         ++env.nemo_gym.browsecomp_agent.responses_api_agents.browsecomp_agent.max_context_tokens=0
@@ -144,6 +147,14 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     if [[ "$*" == *token_capture.enabled=true* ]]; then
         # Nonzero only when a finalizer actor ran, i.e. capture really was on.
         EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+        if [[ "$*" == *router_replay.enabled=true* ]]; then
+            # Every captured row carries routed experts for the policy to replay.
+            EXTRA_CHECKS+=('min(data["train/finalize/routed_experts_row_coverage"]) == 1')
+        fi
+    fi
+    if [[ "$*" == *trainer_warmup.enabled=true* ]]; then
+        grep "Trainer warm-up (rank 0):" "$RUN_LOG" | grep -vq "'skipped'" \
+            || { echo "trainer warm-up did not run"; exit 1; }
     fi
 
     if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
@@ -163,4 +174,8 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
         'median(data["train/gen_kl_error"]) < 1.3' \
         'max(data["train/reward"]) > 0' \
         ${EXTRA_CHECKS[@]+"${EXTRA_CHECKS[@]}"}
+fi
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash $SCRIPT_DIR/check_dynamo_overlay.sh $RUN_LOG
 fi

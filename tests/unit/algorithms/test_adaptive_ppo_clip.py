@@ -34,7 +34,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 def _adaptive_loss(**overrides: Any) -> ClippedPGLossFn:
     config = {
         "reference_policy_kl_penalty": 0.0,
-        "token_level_loss": True,
+        "normalization": "global_token_mean",
         "use_importance_sampling_correction": True,
         "force_on_policy_ratio": True,
         "truncated_importance_sampling_type": "adaptive-ppo-clip",
@@ -75,11 +75,11 @@ def _loss_inputs(weights: list[float], advantages: list[float]) -> dict[str, Any
     }
 
 
-@pytest.mark.parametrize("token_level_loss", [False, True])
+@pytest.mark.parametrize("normalization", ["sequence_mean", "global_token_mean"])
 def test_filters_by_advantage_sign_and_hard_outer_bound(
-    token_level_loss: bool,
+    normalization: str,
 ) -> None:
-    loss_fn = _adaptive_loss(token_level_loss=token_level_loss)
+    loss_fn = _adaptive_loss(normalization=normalization)
     inputs = _loss_inputs(
         weights=[0.2, 0.2, 3.0, 3.0, 51.0, 51.0, 1.2, 49.0, 51.0],
         advantages=[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 0.0, 0.0],
@@ -186,7 +186,7 @@ def test_other_tis_types_do_not_acquire_adaptive_state() -> None:
         {"use_importance_sampling_correction": False},
         {"truncated_importance_sampling_ratio_min": None},
         {"truncated_importance_sampling_ratio_min": 2.0},
-        {"sequence_level_importance_ratios": True, "token_level_loss": False},
+        {"sequence_level_importance_ratios": True, "normalization": "sequence_mean"},
         {"metrics_level": "minimal"},
     ],
 )

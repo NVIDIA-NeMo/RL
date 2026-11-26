@@ -11,7 +11,7 @@ grpo:
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
 loss_fn:
-  token_level_loss: false
+  normalization: sequence_mean
   truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2.0
   truncated_importance_sampling_ratio_min: 0.5
@@ -142,6 +142,7 @@ env:
     structured_outputs_environment_server: null
     gui_coordinate_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -149,6 +150,7 @@ env:
             name: gui_coordinate_simple_agent
     string_match_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

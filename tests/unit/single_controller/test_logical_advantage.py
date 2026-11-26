@@ -31,8 +31,9 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import AgentOverrideConfig, GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -46,11 +47,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (
-    DP_VALUE_TRAIN_FIELDS,
-    GROUP_ID_TAG,
-    ROUTER_EXCLUDED_ROWS,
-)
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
@@ -135,18 +132,10 @@ def test_forest_selection_config(policy):
         TokenCaptureConfig(forest_training=True, selection_policy="guess")
 
 
-@pytest.mark.parametrize(
-    "option",
-    [
-        {"forest_penalty_scope": "all_segments"},
-        {"exclude_padding_from_router_stats": True},
-        {"forest_padding_scope": "step"},
-    ],
-)
-def test_forest_options_require_forest_training(option):
-    assert TokenCaptureConfig(forest_training=True, **option)
-    with pytest.raises(ValueError, match=f"{next(iter(option))}.*forest_training"):
-        TokenCaptureConfig(**option)
+def test_forest_penalty_scope_requires_forest_training():
+    assert TokenCaptureConfig(forest_training=True, forest_penalty_scope="all_segments")
+    with pytest.raises(ValueError, match="forest_penalty_scope.*forest_training"):
+        TokenCaptureConfig(forest_penalty_scope="all_segments")
 
 
 def _controller(
@@ -197,6 +186,9 @@ def _controller(
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -694,6 +686,50 @@ def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
 
 
+def test_agent_overrides_apply_to_whole_forest_owners():
+    """grpo.agent_overrides on Forest owners: each group comes out as a run with
+    its agent's settings run-wide, and a truncated segment drops its whole owner
+    only for the agent that filters."""
+
+    def run(overlong: bool, normalize: bool, overrides=None):
+        meta, data = _batch(
+            [
+                ("a", [(0.0, 2), (1.0, 2), (3.0, 1)]),
+                ("b", [(0.0, 1), (2.0, 1), (5.0, 1)]),
+            ]
+        )
+        for tag in meta.tags:
+            tag["agent_name"] = "graded" if tag["dispatch_group_id"] == "a" else "other"
+        data["truncated"][1] = True  # second segment of owner a_g0
+        data["truncated"][6] = True  # owner b_g1
+        grpo = {
+            "overlong_filtering": overlong,
+            "adv_estimator": AdvEstimatorConfig(
+                normalize_rewards=normalize, use_leave_one_out_baseline=False
+            ),
+            "agent_overrides": overrides,
+        }
+        asyncio.run(_controller(meta, data, grpo=grpo)._advantage_stage(meta))
+        return data["advantages"], data["sample_mask"]
+
+    mixed_adv, mixed_mask = run(
+        False,
+        True,
+        {
+            "graded": AgentOverrideConfig(
+                overlong_filtering=True, normalize_rewards=False
+            )
+        },
+    )
+    graded_adv, graded_mask = run(True, False)
+    other_adv, other_mask = run(False, True)
+    torch.testing.assert_close(mixed_adv[:5], graded_adv[:5])
+    torch.testing.assert_close(mixed_mask[:5], graded_mask[:5])
+    torch.testing.assert_close(mixed_adv[5:], other_adv[5:])
+    torch.testing.assert_close(mixed_mask[5:], other_mask[5:])
+    assert mixed_mask.tolist() == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
 @pytest.mark.parametrize("ordinary", [False, True])
 def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary):
@@ -867,11 +903,11 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
         ({"use_dynamic_sampling": True}, {}),
-        ({"reward_shaping": {"enabled": True}}, {}),
+        ({"reward_shaping": {"enabled": True, "stop_properly_penalty_coef": 0.5}}, {}),
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
-        ({}, {"token_level_loss": False}),
+        ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
         ({}, {"use_kl_in_reward": True}),
@@ -911,6 +947,9 @@ def _ppo_controller(meta, data, **gae):
         message_level_advantage_penalties_enabled=False,
         opd_full_enabled=False,
         shardable=False,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
         train_data_dump_dir=None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -1015,77 +1054,11 @@ def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
     torch.testing.assert_close(data["returns"], returns)
 
 
-def _step_padded(multiple: int = 4):
-    """Five real rows in two groups, padded once for the whole batch."""
-    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
-    data = _with_values(data, seed=2)
-    data[ROUTER_EXCLUDED_ROWS] = torch.zeros(meta.size, dtype=torch.bool)
-    meta = KVBatchMeta(
-        "train", "train", meta.sample_ids, fields=list(data.keys()), tags=meta.tags
-    )
-    store = _RowStore(
-        {
-            sid: {name: data[name][row].clone() for name in data.keys()}
-            for row, sid in enumerate(meta.sample_ids)
-        }
-    )
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
-    ctrl = object.__new__(controller_cls)
-    ctrl._dp_client = store
-    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    ctrl._forest_step_row_multiple = multiple
-    ctrl._master_config = SimpleNamespace(
-        token_capture=TokenCaptureConfig(
-            forest_training=True, forest_padding_scope="step"
-        )
-    )
-    padded, pad_meta = asyncio.run(ctrl._pad_forest_step_rows(meta))
-    return meta, padded, pad_meta, store
-
-
-def test_forest_step_padding_copies_rows_once_per_batch() -> None:
-    meta, padded, pad_meta, store = _step_padded()
-    copied = [0, 0, 0]
-    assert padded.size == 8 and pad_meta.size == 3
-    assert padded.sample_ids == meta.sample_ids + pad_meta.sample_ids
-    for pad_id, row in zip(pad_meta.sample_ids, copied, strict=True):
-        pad, real = store.rows[pad_id], store.rows[meta.sample_ids[row]]
-        torch.testing.assert_close(pad["token_mask"], real["token_mask"])
-        torch.testing.assert_close(pad["values"], real["values"])
-        assert pad["sample_mask"] == 0 and pad[ROUTER_EXCLUDED_ROWS]
-    for tag, row in zip(pad_meta.tags, copied, strict=True):
-        assert tag["is_execution_padding"] and tag["uses_borrowed_input"]
-        assert tag["dispatch_group_id"] == meta.tags[row]["dispatch_group_id"]
-        assert tag["logical_rollout_id"] is None and tag["segment_count"] == 0
-    # A batch already at the multiple is left alone.
-    _, unpadded, none, _ = _step_padded(multiple=5)
-    assert none is None and unpadded.size == 5
-
-
-def test_forest_step_padding_whitening_excludes_padding_copies() -> None:
-    _, padded, _, store = _step_padded()
-    data = store.get_samples(sample_ids=padded.sample_ids, select_fields=padded.fields)
-    inputs = data.clone()
-    ctrl = _ppo_controller(padded, data)
-    _, valid = asyncio.run(ctrl._advantage_stage(padded))
-    assert valid
-    real = torch.tensor([1.0] * 5 + [0.0] * 3)
-    expected, _ = ctrl._advantage_estimator.compute_advantage(
-        prompt_ids=None,
-        rewards=inputs["total_reward"].float(),
-        mask=inputs["token_mask"] * real.unsqueeze(-1),
-        values=inputs["values"],
-    )
-    expected = expected * inputs["token_mask"] * real.unsqueeze(-1)
-    torch.testing.assert_close(data["advantages"], expected)
-    assert data["advantages"][5:].count_nonzero() == 0
-
-
 def test_forest_objective_accepts_ppo_gae_only() -> None:
     validate_forest_objective(PPOConfig(), ClippedPGLossConfig())
     with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
         validate_forest_objective(
-            PPOConfig(adv_estimator={"name": "raw_reward"}), ClippedPGLossConfig()
+            PPOConfig(adv_estimator=GAEConfig(name="raw_reward")), ClippedPGLossConfig()
         )
     with pytest.raises(ValueError, match="ppo.use_dynamic_sampling"):
         validate_forest_objective(
@@ -1093,11 +1066,8 @@ def test_forest_objective_accepts_ppo_gae_only() -> None:
         )
 
 
-@pytest.mark.parametrize("exclude_router_rows", [False, True])
 @pytest.mark.parametrize("forest", [False, True])
-def test_critic_takes_every_forest_row_as_one_step(
-    forest: bool, exclude_router_rows: bool
-) -> None:
+def test_critic_takes_every_forest_row_as_one_step(forest: bool) -> None:
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
     if not forest:
         tags = [{GROUP_ID_TAG: "a"} for _ in meta.sample_ids]
@@ -1110,19 +1080,10 @@ def test_critic_takes_every_forest_row_as_one_step(
     ctrl._value.train_from_meta.return_value = {}
     ctrl._value_loss_fn = object()
     ctrl._algo_cfg = SimpleNamespace(value_training_mode="whole_batch")
-    ctrl._router_excluded_fields = (
-        (ROUTER_EXCLUDED_ROWS,) if forest and exclude_router_rows else ()
-    )
     asyncio.run(ctrl._value_train_epochs([meta], num_epochs=2))
     calls = ctrl._value.train_from_meta.call_args_list
     assert len(calls) == 2
     assert {call.kwargs["gbs"] for call in calls} == {meta.size if forest else None}
-    # Critics fetch the rows their routers must not count only when opted in.
-    assert {call.kwargs["train_fields"] for call in calls} == {
-        (*DP_VALUE_TRAIN_FIELDS, ROUTER_EXCLUDED_ROWS)
-        if forest and exclude_router_rows
-        else DP_VALUE_TRAIN_FIELDS
-    }
 
 
 @pytest.mark.parametrize("filtering", [False, True])

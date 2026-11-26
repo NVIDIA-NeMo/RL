@@ -30,19 +30,41 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Literal
 
+import torch
+
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
+from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_FIELD,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
+)
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
-    restore_reply_text,
+)
+from nemo_rl.models.generation.prefix_recovery.routes import (
+    _cut_chunk_routes,
+    _join_chunk_routes,
 )
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
+    CutWrites,
+    PrefixWrite,
+    PrefixWritePipeline,
+    WriteSettled,
+    estimate_prefix_row_bytes,
+)
+from nemo_rl.models.generation.score_centering import extract_score_centering_slice
+from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +113,46 @@ def _require_inventory_identity(
         )
 
 
+@dataclass(frozen=True)
+class _ResolvedGenerationCut:
+    """A verified restored prefix, with its call's routes and sampler top-k."""
+
+    snapshot: Any
+    routed_experts: torch.Tensor | None = None
+    # Score centering: the prefix's sampler top-k ``(ids, logprobs)``, one row
+    # per generated prefix token.
+    sampler_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _join_chunk_sampler_topk(
+    chunks: Sequence[Any], top_k: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Join the fetched chunks' sampler top-k, or None when score centering is off.
+
+    Raises:
+        RuntimeError: a chunk carries no top-k, or not one row per generated
+            token, e.g. it was cut before score centering was on.
+    """
+    if top_k == 0:
+        return None
+    ids_parts, logprob_parts = [], []
+    for chunk in chunks:
+        generated = sum(mask == 1.0 for mask in chunk.snapshot.token_mask_delta)
+        if chunk.sampler_topk is None:
+            raise RuntimeError(
+                f"generation-cut chunk {chunk.staging_key!r} has no sampler top-k"
+            )
+        ids, logprobs = chunk.sampler_topk
+        if tuple(ids.shape) != (generated, top_k) or ids.shape != logprobs.shape:
+            raise RuntimeError(
+                f"generation-cut chunk {chunk.staging_key!r} has sampler top-k "
+                f"{tuple(ids.shape)} for {generated} generated tokens at top_k={top_k}"
+            )
+        ids_parts.append(ids)
+        logprob_parts.append(logprobs)
+    return torch.cat(ids_parts), torch.cat(logprob_parts)
+
+
 def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bool:
     """Whether the generated text stops partway through a multi-byte character.
 
@@ -122,20 +184,44 @@ class PrefixRecovery:
         # the latest snapshot that deleted them.
         self._obsolete_keys: list[str] = []
         self._flushed_epoch = 0
-        # A dedicated thread keeps completions' TQ writes from consuming the
-        # threads needed to create the checkpoint cut.
-        self._control_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="nrl-generation-cut-control"
-        )
         # Obsolete chunk rows are deleted here, off the serving loop.
         self._cleanup_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-generation-cut-cleanup"
+        )
+        # Restores arriving together share their chunk reads; with one row
+        # per read, each restore reads on its own thread instead.
+        self._reader = (
+            PrefixReadBatcher(self._fetch_rows, max_rows=parts.prefix_read_max_rows)
+            if parts.prefix_read_max_rows > 1
+            else None
+        )
+        # Cuts run on the pipeline's own preparation thread, so completions'
+        # TQ writes never hold the threads that create a cut.
+        self._pipeline = PrefixWritePipeline(
+            limits=parts.write_limits,
+            max_batch_rows=parts.prefix_write_max_rows,
+            max_batch_tokens=parts.prefix_write_max_tokens,
+            sink=parts.sink,
+            prepare=lambda inventory, deadline, held_only: self._cut_writes(
+                inventory, deadline=deadline, held_only=held_only
+            ),
+        )
+        LOGGER.info(
+            "generation-prefix write pipeline started: max_batch_payload_bytes=%d "
+            "max_buffered_payload_bytes=%d",
+            parts.write_limits.max_batch_payload_bytes,
+            parts.write_limits.max_buffered_payload_bytes,
         )
 
     @property
     def control_token(self) -> str | None:
         """The bearer token the cut route requires; None refuses every cut."""
         return self._parts.control_token
+
+    @property
+    def control_timeout_s(self) -> float | None:
+        """How long a cut may take from its arrival; None waits indefinitely."""
+        return self._parts.control_timeout_s
 
     # ---- A call's life --------------------------------------------------
 
@@ -190,30 +276,28 @@ class PrefixRecovery:
             )
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
+            terminal_routes = None
+            routed = getattr(output, "routed_experts", None)
+            # The pinned vLLM (see progress_reader) returns the prompt's and the
+            # generated tokens' routes together, in routed_experts, on finish.
+            if (
+                state.routed_experts_dtype is not None
+                and finish_reason is not None
+                and routed is not None
+            ):
+                terminal_routes = torch.as_tensor(routed)
         except (RuntimeError, TypeError, ValueError) as error:
             state.record_error(f"{type(error).__name__}: {error}")
             return
+        if terminal_routes is not None:
+            state.record_terminal_routes(terminal_routes)
         state.record(
             generation_token_ids,
             generation_logprobs,
             start=observed,
             finish_reason=finish_reason,
             stop_reason=stop_reason,
-        )
-
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
-        """Prepend a resumed call's restored text to its final output."""
-        state = self._registry.get(request)
-        if state is None or not state.resumed_generation_token_ids:
-            return
-        restore_reply_text(
-            request,
-            request_output,
-            prefix_token_ids=state.resumed_generation_token_ids,
-            engine_prompt_token_ids=state.prompt_token_ids,
-            tokenizer=tokenizer,
+            logprobs_container=getattr(output, "logprobs", None),
         )
 
     def retire(self, staging_keys: Sequence[str]) -> None:
@@ -266,35 +350,53 @@ class PrefixRecovery:
         Returns:
             ``restored_calls`` and their total ``restored_prefix_tokens``, plus
             ``progress_reads``, ``progress_read_calls`` and the microseconds
-            they waited for and held the engine's output lock.
+            they waited for and held the engine's output lock, and the write
+            pipeline's ``pipeline_*`` counts (see :meth:`PrefixWritePipeline.counts`).
         """
         with self._lock:
-            return {
+            counts = {
                 "restored_calls": self._restored_calls,
                 "restored_prefix_tokens": self._restored_tokens,
                 **self._counts,
             }
+        counts.update(
+            (f"pipeline_{name}", value)
+            for name, value in self._pipeline.counts().items()
+        )
+        return counts
 
     def shutdown(self) -> None:
         # Waiting for a wedged TQ write here would make actor shutdown hang.
-        for executor in (self._control_executor, self._cleanup_executor):
-            executor.shutdown(wait=False, cancel_futures=True)
+        self._pipeline.close(wait=False)
+        self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
 
     # ---- A checkpoint cut -----------------------------------------------
 
-    async def run_cut(self, inventory: Any) -> Any:
-        """Cut every call Gym's inventory names, off the serving loop."""
-        # Measured from arrival so time queued behind a stale cut counts.
-        timeout_s = self._parts.control_timeout_s
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        return await asyncio.get_running_loop().run_in_executor(
-            self._control_executor,
-            functools.partial(self.checkpoint_cut, inventory, deadline=deadline),
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
+        """Cut every call Gym's inventory names, off the serving loop.
+
+        ``deadline`` is a ``time.monotonic()`` bound from a caller that waits
+        on one of its own (the Dynamo frontend). Without it the cut gets
+        ``control_timeout_s`` from its arrival here.
+
+        With ``held_only``, for one engine's share of a cut that a coordinator
+        merges, the receipt leaves out calls this process has no record of:
+        another engine holds them, and the merge fails any call no engine cut.
+        """
+        if deadline is None:
+            # Measured from arrival so time queued behind a stale cut counts.
+            timeout_s = self._parts.control_timeout_s
+            deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        future = self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
         )
+        return await asyncio.shield(asyncio.wrap_future(future))
 
     def _record_progress(
         self, states: list[_RequestCaptureState], *, deadline: float | None
-    ) -> None:
+    ) -> dict[str, list[Any]]:
         """Record the tokens each call decoded since its last record.
 
         One read at an engine output boundary copies every call's new token
@@ -303,18 +405,30 @@ class PrefixRecovery:
         engine has finished but whose consumer has not yet taken the output is
         read whole, with its finish reason. One the engine does not hold (not
         yet submitted, or aborted) keeps what it has recorded.
+
+        Returns:
+            The route pieces the same read copied, by model call ID, for each
+            router-replay call whose final output has not already brought its
+            routes; a cut stages its routes from these.
         """
         pending = [
             (state, state.call.model_call_id, state.recorded_token_count)
             for state in states
         ]
         if not pending:
-            return
+            return {}
+        route_calls = frozenset(
+            model_call_id
+            for state, model_call_id, _ in pending
+            if state.routed_experts_dtype is not None
+            and state.snapshot().terminal_routed_experts is None
+        )
         reader = self._parts.progress_reader
         try:
             read = reader.read(
                 [(model_call_id, start) for _, model_call_id, start in pending],
                 timeout_s=None if deadline is None else deadline - time.monotonic(),
+                route_calls=route_calls,
             )
         except TimeoutError:
             LOGGER.warning(
@@ -322,7 +436,7 @@ class PrefixRecovery:
                 "deadline; %d calls are cut at the tokens they have recorded",
                 len(pending),
             )
-            return
+            return {}
         with self._lock:
             self._counts["progress_reads"] += 1
             self._counts["progress_read_calls"] += len(pending)
@@ -334,10 +448,13 @@ class PrefixRecovery:
             read.wait_seconds * 1e3,
             read.hold_seconds * 1e3,
         )
+        route_pieces = {}
         for state, model_call_id, start in pending:
             progress = read.progress.get(model_call_id)
             if progress is None:
                 continue
+            if progress.route_pieces is not None:
+                route_pieces[model_call_id] = progress.route_pieces
             try:
                 generated_logprobs = reader.logprobs(
                     progress.token_ids, progress.logprobs, start=start
@@ -351,7 +468,24 @@ class PrefixRecovery:
                 start=start,
                 finish_reason=progress.finish_reason,
                 stop_reason=progress.stop_reason,
+                logprobs_container=progress.logprobs,
             )
+        return route_pieces
+
+    def _held_prefixes(self, inventory: Any) -> list[Any]:
+        """The inventory's calls this process holds live or finished state for."""
+        # The live registry first: a finishing call is remembered as completed
+        # before it leaves the registry, so it is found in one or the other.
+        live = [
+            self._registry.get_by_model_call_id(prefix.model_call_id) is not None
+            for prefix in inventory.active_prefixes
+        ]
+        with self._lock:
+            return [
+                prefix
+                for prefix, held in zip(inventory.active_prefixes, live)
+                if held or prefix.model_call_id in self._completed
+            ]
 
     @staticmethod
     def _failed_ack(prefix: Any, *, reason: str, uncut: Counter[str]) -> Any:
@@ -412,19 +546,30 @@ class PrefixRecovery:
         )
         return self._failed_ack(prefix, reason=reason, uncut=uncut)
 
-    def _cut_active(
+    def _cut_transaction(
         self,
         prefix: Any,
         state: _RequestCaptureState,
         checkpoint_id: str,
         uncut: Counter[str],
-    ) -> Any | None:
-        """Cut one live call, or return ``None`` if abort won the race."""
+        *,
+        route_pieces: list[Any] | None = None,
+    ) -> Generator[Any, Any, Any]:
+        """Hold one live call's cut frozen until its row is written and acknowledged.
+
+        Yields ``(record, chunk_sequence, attachments)``, receives the staged
+        key, then seals and returns its acknowledgement. A call with nothing new
+        to stage returns its acknowledgement (or ``None`` if abort won the race)
+        without yielding. Closing it before the seal rolls the cut back and
+        clears its row.
+
+        ``route_pieces`` are the call's router-replay route pieces, copied with
+        its tokens by the cut's progress read.
+        """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
 
-        # _checkpoint_generation_cut checked both before cutting any call.
         capture = self._parts.capture
         sink = self._parts.sink
 
@@ -512,40 +657,88 @@ class PrefixRecovery:
                     else "incomplete_utf8_boundary",
                     uncut=uncut,
                 )
+            try:
+                chunk_routes = self._chunk_routes(
+                    owned, state, progress, frozen, route_pieces
+                )
+            except (TypeError, ValueError) as error:
+                # Only this call regenerates; the rest of the inventory is cut,
+                # and the next checkpoint tries this call again.
+                owned.rollback(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: routed experts: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return self._failed_ack(
+                    prefix, reason="routed_experts_unavailable", uncut=uncut
+                )
+            try:
+                chunk_sampler_topk = self._chunk_sampler_topk(state, frozen)
+            except (RuntimeError, ValueError) as error:
+                owned.rollback(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: sampler top-k: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return self._failed_ack(
+                    prefix, reason="sampler_topk_unavailable", uncut=uncut
+                )
             staged_key = None
             try:
+                # The advertised prefix digest covers tokens and call extras,
+                # not routes: each chunk's own digest covers its routes, and a
+                # restore checks every chunk's routes against it.
+                call_extras = self._parts.prefix_row_extras(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=frozen.generated_logprobs,
+                    extras=call_extras,
                 )
                 if frozen.chunk_token_ids:
-                    chunk_record = (
-                        cumulative_record
-                        if not progress.staging_keys
-                        else capture.build_generation_chunk_record(
+                    route_extras = None
+                    attachments: dict[str, torch.Tensor] = {}
+                    if chunk_routes is not None:
+                        route_extras = {
+                            ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(
+                                chunk_routes
+                            )
+                        }
+                        attachments[ROUTED_EXPERTS_FIELD] = chunk_routes
+                    if chunk_sampler_topk is not None:
+                        attachments[SAMPLER_TOPK_TOKEN_IDS_FIELD] = chunk_sampler_topk[
+                            0
+                        ]
+                        attachments[SAMPLER_TOPK_LOGPROBS_FIELD] = chunk_sampler_topk[1]
+                    if progress.staging_keys:
+                        chunk_record = capture.build_generation_chunk_record(
                             state.call,
                             generated_token_ids=frozen.chunk_token_ids,
                             generated_logprobs=frozen.chunk_logprobs,
+                            extras=route_extras,
                         )
-                    )
-                    result = sink.stage_generation_prefix(
+                    elif route_extras is None:
+                        chunk_record = cumulative_record
+                    else:
+                        # The first chunk is the whole prefix so far, with its
+                        # routes beside the call's extras.
+                        chunk_record = capture.build_prefix_record(
+                            state.call,
+                            prompt_token_ids=state.prompt_token_ids,
+                            generated_token_ids=generated_token_ids,
+                            generated_logprobs=frozen.generated_logprobs,
+                            extras={**(call_extras or {}), **route_extras},
+                        )
+                    staged_key = yield (
                         chunk_record,
-                        checkpoint_id=checkpoint_id,
-                        chunk_sequence=frozen.chunk_sequence,
+                        frozen.chunk_sequence,
+                        attachments or None,
                     )
-                    staged_key = result.staging_key
-                    if not result.ok:
-                        raise RuntimeError(
-                            "generation-prefix staging failed for "
-                            f"{prefix.model_call_id!r}: {result.error}"
-                        )
-                    if staged_key is None:
-                        raise RuntimeError(
-                            "generation-prefix staging returned no staging key for "
-                            f"{prefix.model_call_id!r}"
-                        )
                 candidate_staging_keys = progress.staging_keys
                 if staged_key is not None:
                     candidate_staging_keys += (staged_key,)
@@ -561,10 +754,9 @@ class PrefixRecovery:
                     terminal_finish_reason=progress.terminal_finish_reason,
                     terminal_stop_reason=progress.terminal_stop_reason,
                 )
-                # Validate the complete acknowledgement before adopting the
-                # staged chunk; a failed one leaves the cut to roll back.
                 owned.seal(checkpoint_id, staged_key)
-            except Exception:
+            except BaseException:
+                # Closing the transaction early raises GeneratorExit here.
                 # Leaving the lifecycle rolls the unsealed cut back.
                 if staged_key is not None:
                     try:
@@ -577,13 +769,81 @@ class PrefixRecovery:
                 raise
             return acknowledgement
 
-    def checkpoint_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
-        """Stage a stable prefix for every call named by Gym's frozen inventory.
+    @staticmethod
+    def _chunk_routes(
+        owned: Any,
+        state: _RequestCaptureState,
+        progress: Any,
+        frozen: Any,
+        route_pieces: list[Any] | None,
+    ) -> torch.Tensor | None:
+        """The router-replay routes of the chunk a cut stages, or None.
+
+        A finished call's own output carries its routes; otherwise the cut's
+        progress read copied the engine's route pieces with its tokens.
+
+        Raises:
+            ValueError: the routes do not cover every token the cut stages.
+        """
+        dtype = state.routed_experts_dtype
+        if dtype is None:
+            return None
+        frozen_count = len(frozen.generated_token_ids)
+        staged = frozen_count - len(frozen.chunk_token_ids)
+        engine_routes = progress.terminal_routed_experts
+        if engine_routes is None and route_pieces is not None and frozen_count > staged:
+            engine_routes = owned.absorb_engine_route_pieces(route_pieces)
+        return _cut_chunk_routes(
+            engine_routes,
+            dtype=dtype,
+            prev_len=state.call.admission.prev_len,
+            prompt_len=len(state.prompt_token_ids),
+            restored=state.restored_routed_experts,
+            staged=staged,
+            frozen=frozen_count,
+        )
+
+    def _chunk_sampler_topk(
+        self, state: _RequestCaptureState, frozen: Any
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Score centering's sampler top-k for the tokens a cut stages, or None.
+
+        Read from the engine container the call's tokens were recorded from, so
+        the chunk carries what the call's final response would have.
+
+        Raises:
+            RuntimeError, ValueError: the container lacks a staged position, or
+                its candidates are malformed.
+        """
+        top_k = self._parts.sampler_top_k
+        if top_k == 0 or not frozen.chunk_token_ids:
+            return None
+        staged = len(frozen.generated_token_ids) - len(frozen.chunk_token_ids)
+        return extract_score_centering_slice(
+            frozen.chunk_token_ids,
+            state.sampler_logprobs,
+            start=staged,
+            num_candidates=top_k,
+        )
+
+    def checkpoint_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
+        """Run one cut through the write pipeline and wait for its receipt."""
+        return self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
+        ).result()
+
+    def _cut_writes(
+        self, inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
+        """Prepare transactions, then seal their rows after durable write replies.
 
         ``deadline`` is a ``time.monotonic()`` bound. Gym stops waiting for the
         receipt at its own control deadline, so calls not reached by then are
         acknowledged as failures (they regenerate after restore) instead of
-        holding the single cut-control thread for the next checkpoint.
+        holding the cut-control or pipeline preparation thread for the next
+        checkpoint.
         """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutReceipt,
@@ -594,61 +854,27 @@ class PrefixRecovery:
             cached_receipt = self._receipts.get(receipt_key)
         if cached_receipt is not None:
             return cached_receipt
+        prefixes = (
+            self._held_prefixes(inventory) if held_only else inventory.active_prefixes
+        )
         active_states = [
             state
-            for prefix in inventory.active_prefixes
+            for prefix in prefixes
             if (state := self._registry.get_by_model_call_id(prefix.model_call_id))
             is not None
         ]
-        self._record_progress(active_states, deadline=deadline)
-        acknowledgements = []
+        route_pieces = self._record_progress(active_states, deadline=deadline)
         # Why each uncut call was left uncut; Gym counts them per checkpoint.
         uncut: Counter[str] = Counter()
-        for index, prefix in enumerate(inventory.active_prefixes):
-            if deadline is not None and time.monotonic() >= deadline:
-                remaining = inventory.active_prefixes[index:]
-                LOGGER.warning(
-                    "generation cut passed its control deadline: checkpoint_id=%s "
-                    "uncut=%d of %d model_call_ids=%s",
-                    inventory.checkpoint_id,
-                    len(remaining),
-                    len(inventory.active_prefixes),
-                    [call.model_call_id for call in remaining],
-                )
-                acknowledgements.extend(
-                    self._failed_ack(call, reason="control_deadline", uncut=uncut)
-                    for call in remaining
-                )
-                break
-            state = self._registry.get_by_model_call_id(prefix.model_call_id)
-            try:
-                acknowledgement = (
-                    self._cut_active(prefix, state, inventory.checkpoint_id, uncut)
-                    if state is not None
-                    else None
-                )
-                if acknowledgement is None:
-                    acknowledgement = self._completed_ack(
-                        prefix, inventory.checkpoint_id, uncut
-                    )
-            # Gym acknowledges cuts per call, so one call's failure (a TQ write,
-            # an identity mismatch) regenerates that call alone after a restore
-            # instead of failing the receipt for every call on this worker.
-            except Exception:  # noqa: BLE001 - see above
-                LOGGER.exception(
-                    "cannot cut model call %s; it regenerates after a restore",
-                    prefix.model_call_id,
-                )
-                acknowledgement = self._failed_ack(
-                    prefix, reason="cut_error", uncut=uncut
-                )
-            acknowledgements.append(acknowledgement)
+        acknowledgements = yield from self._cut_batched(
+            inventory, prefixes, uncut, route_pieces=route_pieces, deadline=deadline
+        )
         if uncut:
             LOGGER.info(
                 "generation cut %s left %d of %d model calls uncut: %s",
                 inventory.checkpoint_id,
                 uncut.total(),
-                len(inventory.active_prefixes),
+                len(prefixes),
                 dict(sorted(uncut.items())),
             )
         receipt = GenerationCutReceipt(
@@ -665,14 +891,284 @@ class PrefixRecovery:
                 self._receipts.pop(next(iter(self._receipts)))
         return receipt
 
-    def _rebuild_prefix(self, admission: Any, prefix_token_ids: list[int]) -> Any:
-        """Fetch an admission's staged prefix chunks and rebuild the cumulative prefix."""
-        continuation = admission.generation_cut
-        # Gym requires at least one staging key per continuation.
-        staging_keys = list(continuation.staging_keys)
-        snapshots = self._parts.staging_source.fetch(staging_keys)
-        if len(snapshots) != len(staging_keys):
+    def _cut_batched(
+        self,
+        inventory: Any,
+        prefixes: Sequence[Any],
+        uncut: Counter[str],
+        *,
+        route_pieces: dict[str, list[Any]],
+        deadline: float | None,
+    ) -> CutWrites:
+        """Cut ``prefixes``, the inventory's calls, writing their rows in batches.
+
+        Each call's cut stays frozen until its batch is written and every
+        acknowledgement in the batch is built. A batch holds at most
+        ``prefix_write_max_rows`` rows and, unless one row alone is
+        larger, ``prefix_write_max_tokens`` tokens.
+
+        Gym acknowledges cuts per call, so a call that cannot be cut (a failed
+        freeze, write, acknowledgement or seal) is acknowledged as a failure
+        and regenerates after a restore; the other calls keep their cuts. A
+        failed batch write is retried one row per write, so one bad row fails
+        only its own call. Past ``deadline`` no further write starts, and the
+        calls not yet written are acknowledged as failures.
+
+        A batch also stays within ``max_batch_payload_bytes`` (estimated),
+        unless one row alone is larger; that row is written alone.
+        """
+        max_rows = self._parts.prefix_write_max_rows
+        max_tokens = self._parts.prefix_write_max_tokens
+        checkpoint_id = inventory.checkpoint_id
+        call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
+        if len(set(call_ids)) != len(call_ids):
+            raise ValueError(
+                "generation-cut inventory contains duplicate model-call identities"
+            )
+        sink = self._parts.sink
+        acknowledgements: list[Any] = []
+        pending: list[tuple[Generator[Any, Any, Any], Any, int, Any, Any]] = []
+        pending_tokens = 0
+        pending_bytes = 0
+        byte_limit = self._parts.write_limits.max_batch_payload_bytes
+        late: list[Any] = []
+
+        def past_deadline() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
+
+        def fail(prefix: Any) -> None:
+            LOGGER.exception(
+                "cannot cut model call %s; it regenerates after a restore",
+                prefix.model_call_id,
+            )
+            acknowledgements.append(
+                self._failed_ack(prefix, reason="cut_error", uncut=uncut)
+            )
+
+        def release_pending() -> None:
+            nonlocal pending_tokens, pending_bytes
+            for transaction, _, _, _, prefix in pending:
+                transaction.close()
+                late.append(prefix)
+            pending.clear()
+            pending_tokens = 0
+            pending_bytes = 0
+
+        def write_alone(
+            batch: list[tuple[Any, Any, int, Any, Any]], error: BaseException
+        ) -> list[str | None]:
+            """After a failed batch write, write each row alone once."""
+            if isinstance(error, PrefixWriterDiedError):
+                # Every later write fails too: fail the whole cut loudly
+                # instead of acknowledging each call as a failure.
+                raise error
+            # The sink has already discarded the batch's keys.
+            if len(batch) == 1:
+                if past_deadline():
+                    late.append(batch[0][4])
+                else:
+                    fail(batch[0][4])
+                return [None]
+            LOGGER.warning(
+                "generation-prefix batch of %d rows failed; writing each alone",
+                len(batch),
+                exc_info=error,
+            )
+            keys: list[str | None] = []
+            for _, record, sequence, attachments, prefix in batch:
+                if past_deadline():
+                    late.append(prefix)
+                    keys.append(None)
+                    continue
+                try:
+                    keys += sink.stage_generation_prefix_batch(
+                        [record],
+                        checkpoint_id=checkpoint_id,
+                        chunk_sequences=[sequence],
+                        attachments=[attachments],
+                    )
+                except PrefixWriterDiedError:
+                    raise
+                except Exception:
+                    fail(prefix)
+                    keys.append(None)
+            return keys
+
+        def flush() -> CutWrites:
+            nonlocal pending_tokens, pending_bytes
+            if not pending:
+                return
+            if past_deadline():
+                release_pending()
+                return
+            batch = list(pending)
+            pending.clear()
+            pending_tokens = 0
+            size, pending_bytes = pending_bytes, 0
+            keys: list[str | None] = []
+            handed = 0
+            try:
+                keys = yield PrefixWrite(
+                    checkpoint_id=checkpoint_id,
+                    records=tuple(record for _, record, _, _, _ in batch),
+                    sequences=tuple(sequence for _, _, sequence, _, _ in batch),
+                    attachments=tuple(attached for _, _, _, attached, _ in batch),
+                    payload_bytes=size,
+                    fallback=functools.partial(write_alone, batch),
+                )
+                ready = []
+                for (transaction, _, _, _, prefix), key in zip(
+                    batch, keys, strict=True
+                ):
+                    handed += 1
+                    if key is None:
+                        # Closing rolls the frozen cut back.
+                        transaction.close()
+                        continue
+                    try:
+                        # Builds the ack and seals; a failure rolls the call
+                        # back and clears its row.
+                        transaction.send(key)
+                    except StopIteration as done:
+                        acknowledgements.append(done.value)
+                    except Exception:
+                        fail(prefix)
+            finally:
+                # Only an interruption leaves written rows that no transaction
+                # received; nothing may advertise them.
+                orphaned = [key for key in keys[handed:] if key is not None]
+                if orphaned:
+                    try:
+                        sink.clear(orphaned)
+                    except Exception:  # noqa: BLE001 — preserve the interruption
+                        LOGGER.exception(
+                            "Failed to clear interrupted generation-prefix batch"
+                        )
+                for transaction, _, _, _, _ in batch:
+                    transaction.close()
+            yield WriteSettled()
+
+        try:
+            for index, prefix in enumerate(prefixes):
+                if past_deadline():
+                    release_pending()
+                    late.extend(prefixes[index:])
+                    break
+                state = self._registry.get_by_model_call_id(prefix.model_call_id)
+                try:
+                    if state is None:
+                        acknowledgements.append(
+                            self._completed_ack(prefix, checkpoint_id, uncut)
+                        )
+                        continue
+                    transaction = self._cut_transaction(
+                        prefix,
+                        state,
+                        checkpoint_id,
+                        uncut,
+                        route_pieces=route_pieces.get(prefix.model_call_id),
+                    )
+                    record, sequence, attachments = next(transaction)
+                except StopIteration as finished:
+                    acknowledgement = finished.value
+                    if acknowledgement is None:
+                        acknowledgement = self._completed_ack(
+                            prefix, checkpoint_id, uncut
+                        )
+                    acknowledgements.append(acknowledgement)
+                    continue
+                except Exception:
+                    fail(prefix)
+                    continue
+                tokens = len(record.token_ids_delta)
+                size = estimate_prefix_row_bytes(record, attachments)
+                if pending and (
+                    pending_tokens + tokens > max_tokens
+                    or pending_bytes + size > byte_limit
+                ):
+                    try:
+                        yield from flush()
+                    except BaseException:
+                        transaction.close()
+                        raise
+                pending.append((transaction, record, sequence, attachments, prefix))
+                pending_tokens += tokens
+                pending_bytes += size
+                if (
+                    len(pending) >= max_rows
+                    or pending_tokens >= max_tokens
+                    or pending_bytes >= byte_limit
+                ):
+                    # An oversized single row is written alone, never split.
+                    yield from flush()
+            yield from flush()
+        finally:
+            for transaction, _, _, _, _ in pending:
+                transaction.close()
+        if late:
+            LOGGER.warning(
+                "generation cut passed its control deadline: checkpoint_id=%s "
+                "uncut=%d of %d model_call_ids=%s",
+                checkpoint_id,
+                len(late),
+                len(prefixes),
+                [prefix.model_call_id for prefix in late],
+            )
+            acknowledgements.extend(
+                self._failed_ack(prefix, reason="control_deadline", uncut=uncut)
+                for prefix in late
+            )
+        by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
+        return [by_ticket[prefix.ticket_id] for prefix in prefixes]
+
+    def _fetch_rows(self, staging_keys: list[str]) -> list[Any]:
+        """Fetch cut rows with their extras, routes and top-k, in the requested order.
+
+        Also the fetch callback of the restore reader, which coalesces the
+        keys of concurrent restores into one call.
+        """
+        # The finalization read also returns each row's extras, which carry a
+        # media call's spans and tensor digests, and its route fragment when
+        # router replay is on; plain ``fetch`` returns neither.
+        chunks = self._parts.staging_source.fetch_for_finalization(
+            staging_keys,
+            include_route_fragments=self._parts.router_replay,
+            include_sampler_topk=self._parts.sampler_top_k > 0,
+        )
+        if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
+        return chunks
+
+    async def aclose(self) -> None:
+        """Fail pending restore reads; call before ``shutdown``."""
+        if self._reader is not None:
+            await self._reader.aclose()
+
+    def _rebuild_prefix(
+        self,
+        admission: Any,
+        prefix_token_ids: list[int],
+        chunks: list[Any],
+    ) -> _ResolvedGenerationCut:
+        """Rebuild and verify the cumulative prefix from an admission's fetched chunks.
+
+        With router replay on, each chunk's routes are verified and joined too.
+        """
+        continuation = admission.generation_cut
+        snapshots = [chunk.snapshot for chunk in chunks]
+        # A media call's spans and tensor digests ride the first chunk's extras,
+        # and the advertised prefix digest covers them. The source pops each
+        # chunk's route payload out of its decoded extras, so a router-replay
+        # chunk with nothing else decodes as ``{}``.
+        if any(chunk.extras for chunk in chunks[1:]):
+            raise RuntimeError(
+                "only the first generation-cut chunk may carry call extras"
+            )
+        # The cut digested no extras for a text call, so match it.
+        extras = chunks[0].extras or None
+        # Routes are checked per chunk and stay out of the prefix digest.
+        routed_experts = _join_chunk_routes(chunks, required=self._parts.router_replay)
+        sampler_topk = _join_chunk_sampler_topk(chunks, self._parts.sampler_top_k)
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -732,8 +1228,8 @@ class PrefixRecovery:
             token_ids_delta=token_ids_delta,
             token_mask_delta=token_mask_delta,
             generation_log_probs_delta=generation_logprobs_delta,
-            extras=None,
-            extras_digest=compute_extras_digest(None),
+            extras=extras,
+            extras_digest=compute_extras_digest(extras),
             chain_hash=compute_chain_hash(admission.parent_chain_hash, token_ids_delta),
             cumulative_hash=hash_token_ids(prefix_token_ids + token_ids_delta),
         )
@@ -760,24 +1256,37 @@ class PrefixRecovery:
             weight_versions[-1],
             prefix_ids_sha256,
         )
-        return snapshot
+        return _ResolvedGenerationCut(
+            snapshot=snapshot, routed_experts=routed_experts, sampler_topk=sampler_topk
+        )
 
-    def resolve_restore(
+    async def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
-    ) -> tuple[Any, Any | None]:
+    ) -> tuple[Any, _ResolvedGenerationCut | None]:
         """Resolve an admission's restored prefix, or drop it so the call regenerates.
 
         Gym has already consumed the restored cut when it sends this call, and
         generating the whole response from the turn boundary is always valid,
         so a prefix that cannot be fetched or does not match its admission
         costs time, not the rollout. Returns the admission to serve and the
-        verified prefix snapshot, or the admission without its cut and None.
+        verified prefix with its routes, or the admission without its cut and
+        None. Call it on the serving loop: restores arriving together share
+        one TQ read there.
         """
         continuation = admission.generation_cut
         if continuation is None:
             return admission, None
         try:
-            snapshot = self._rebuild_prefix(admission, prefix_token_ids)
+            # Gym requires at least one staging key per continuation.
+            keys = list(continuation.staging_keys)
+            if self._reader is None:
+                chunks = await asyncio.to_thread(self._fetch_rows, keys)
+            else:
+                chunks = await self._reader.fetch(keys)
+            resolved = await asyncio.to_thread(
+                self._rebuild_prefix, admission, prefix_token_ids, chunks
+            )
+            snapshot = resolved.snapshot
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
             if snapshot.digest != continuation.prefix_digest:
@@ -788,7 +1297,7 @@ class PrefixRecovery:
                     f"rebuilt prefix has {generated} generated tokens, "
                     f"admission expects {continuation.prefix_token_count}"
                 )
-            return admission, snapshot
+            return admission, resolved
         except Exception:  # noqa: BLE001 - any unusable prefix regenerates
             LOGGER.warning(
                 "cannot restore the generation prefix of model call %s; "
@@ -845,10 +1354,11 @@ class NoPrefixRecovery:
     """
 
     control_token: str | None = None
+    control_timeout_s: float | None = None
 
-    def resolve_restore(
+    async def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
-    ) -> tuple[Any, Any | None]:
+    ) -> tuple[Any, _ResolvedGenerationCut | None]:
         if admission.generation_cut is None:
             return admission, None
         # Gym only sends a restored cut to a worker that acknowledged one, so
@@ -867,11 +1377,6 @@ class NoPrefixRecovery:
         pass
 
     def observe(self, request: Any, request_output: Any) -> None:
-        pass
-
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
         pass
 
     def remember_completed(
@@ -893,11 +1398,16 @@ class NoPrefixRecovery:
     async def flush(self, epoch: int) -> None:
         pass
 
+    async def aclose(self) -> None:
+        pass
+
     def counts(self) -> dict[str, int]:
         return {"restored_calls": 0, "restored_prefix_tokens": 0}
 
     def shutdown(self) -> None:
         pass
 
-    async def run_cut(self, inventory: Any) -> Any:
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")

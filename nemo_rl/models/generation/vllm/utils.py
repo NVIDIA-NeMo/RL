@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass, replace
 from typing import Any, Optional, cast
 
+import numpy as np
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -45,6 +46,13 @@ from nemo_rl.models.generation.vllm.metric_names import (
     GENERATIONS_FAILED_KEY,
     GENERATIONS_OK_KEY,
     OK_FINISH_REASONS,
+    PREEMPTION_COUNTERS,
+    PREEMPTIONS_KEY,
+    PREFIX_CACHE_HIT_COUNTERS,
+    PREFIX_CACHE_HIT_RATE_KEY,
+    PREFIX_CACHE_HITS_KEY,
+    PREFIX_CACHE_QUERIES_KEY,
+    PREFIX_CACHE_QUERY_COUNTERS,
     PROMPT_LENGTH_HISTOGRAMS,
     PROMPT_LENGTH_MEAN_KEY,
     PROMPT_TOKEN_COUNTERS,
@@ -169,6 +177,18 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
+
+
+def model_stop_token_ids(model_config: Any, cfg: dict[str, Any]) -> frozenset[int]:
+    """The configured stops plus the generation config's EOS, read once per server.
+
+    ``model_config`` is vLLM's ``ModelConfig``; ``cfg`` is ``policy.generation``.
+    """
+    stop_token_ids = set(cfg.get("stop_token_ids") or ())
+    generation_eos = model_config.try_get_generation_config().get("eos_token_id")
+    if isinstance(generation_eos, int):
+        generation_eos = [generation_eos]
+    return frozenset(stop_token_ids | set(generation_eos or ()))
 
 
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
@@ -487,6 +507,122 @@ def check_sampling_param(
             f"({profile_top_k})"
         )
     return profile_top_k
+
+
+class OffPolicySamplingError(ValueError):
+    """A NeMo-Gym call that would sample off-policy; the trainer replays none of it."""
+
+
+# Sampling a NeMo-Gym call may not change, and the value it is served with: vLLM
+# would otherwise fill min_p and the repetition penalty from the model's
+# generation_config.json, and the trainer replays none of these.
+_FIXED_SAMPLING = {
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+}
+
+
+def _f32(value: Optional[float]) -> Optional[float]:
+    return None if value is None else float(np.float32(value))
+
+
+# SamplingParams.extra_args key: a native chat call's reasoning_ended, as
+# NeMo RL read it from the call's template render.
+REASONING_ENDED_ARG = "nemo_rl_reasoning_ended"
+
+
+def take_reasoning_ended(sampling_params: Any, engine_kwargs: dict[str, Any]) -> None:
+    """Hand the engine the ``reasoning_ended`` a call's SamplingParams carry.
+
+    vLLM's chat serving reads its own value from the spliced prompt, whose
+    earlier turns still hold their own end-of-reasoning tokens; this replaces
+    it and takes the argument back out of ``extra_args``. A call that carries
+    none is left as it is.
+    """
+    extra_args = sampling_params.extra_args
+    if not extra_args or REASONING_ENDED_ARG not in extra_args:
+        return
+    engine_kwargs["reasoning_ended"] = extra_args.pop(REASONING_ENDED_ARG)
+    if not extra_args:
+        sampling_params.extra_args = None
+
+
+def on_policy_sampling(
+    *,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    min_p: Optional[float],
+    repetition_penalty: Optional[float],
+    presence_penalty: Optional[float],
+    frequency_penalty: Optional[float],
+    logit_bias: Optional[Mapping[Any, float]],
+    generation_config: Any,
+) -> dict[str, Any]:
+    """The sampling a NeMo-Gym chat call is served with, on every serving path.
+
+    The request must match the train or validation profile
+    (:func:`check_sampling_param`) and set no sampling the trainer does not
+    replay. Floats are compared at f32: Dynamo's frontend carries them as f32,
+    so 0.7 arrives as 0.69999998.
+
+    Args:
+        temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty,
+            frequency_penalty, logit_bias:
+            The request's values; None (or missing) when it did not set them.
+        generation_config: ``policy.generation``.
+
+    Returns:
+        The ``SamplingParams`` fields to serve with: the matched profile's exact
+        temperature, top_p and top_k, and the fixed min_p and penalties.
+
+    Raises:
+        OffPolicySamplingError: The request would sample off-policy.
+    """
+    # The profile's floats at f32; top_k and val_top_k as configured.
+    profile = ChainMap(
+        {
+            key: _f32(generation_config[key])
+            for key in ("temperature", "top_p", "val_temperature", "val_top_p")
+        },
+        generation_config,
+    )
+    try:
+        served_top_k = check_sampling_param(
+            temperature=_f32(temperature),
+            top_p=_f32(top_p),
+            top_k=top_k,
+            generation_config=profile,
+        )
+    except ValueError as error:
+        raise OffPolicySamplingError(str(error)) from error
+    requested = {
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+    }
+    for key, served in _FIXED_SAMPLING.items():
+        if requested[key] not in (None, served):
+            raise OffPolicySamplingError(
+                f"request {key}={requested[key]} is not supported; leave it unset"
+            )
+    if logit_bias:
+        raise OffPolicySamplingError("request logit_bias is not supported")
+    is_train = (_f32(temperature), _f32(top_p)) == (
+        profile["temperature"],
+        profile["top_p"],
+    )
+    prefix = "" if is_train else "val_"
+    return {
+        "temperature": generation_config[f"{prefix}temperature"],
+        "top_p": generation_config[f"{prefix}top_p"],
+        "top_k": served_top_k,
+        "min_p": _FIXED_SAMPLING["min_p"],
+        "repetition_penalty": _FIXED_SAMPLING["repetition_penalty"],
+    }
 
 
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
@@ -951,6 +1087,9 @@ _KEPT_COUNTER_NAMES: tuple[str, ...] = (
     + PROMPT_LENGTH_HISTOGRAMS
     + GENERATION_LENGTH_HISTOGRAMS
     + REQUEST_SUCCESS_COUNTERS
+    + PREFIX_CACHE_QUERY_COUNTERS
+    + PREFIX_CACHE_HIT_COUNTERS
+    + PREEMPTION_COUNTERS
 )
 
 
@@ -1039,7 +1178,7 @@ def compute_engine_step_metrics(
     start_counters: dict[str | tuple[str, int], float],
     end_counters: dict[str | tuple[str, int], float],
 ) -> dict[str, float]:
-    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+    """Compute per-step vLLM engine token, length, outcome, prefix-cache and preemption metrics.
 
     These are the engine's own accounting, which is why they are worth carrying
     even though the driver already derives token counts from the tensors a
@@ -1095,6 +1234,24 @@ def compute_engine_step_metrics(
     if saw_any:
         metrics[GENERATIONS_OK_KEY] = ok
         metrics[GENERATIONS_FAILED_KEY] = failed
+
+    prefix_cache_queries = _first_delta(delta, PREFIX_CACHE_QUERY_COUNTERS)
+    if prefix_cache_queries is not None:
+        metrics[PREFIX_CACHE_QUERIES_KEY] = prefix_cache_queries
+    prefix_cache_hits = _first_delta(delta, PREFIX_CACHE_HIT_COUNTERS)
+    if prefix_cache_hits is not None:
+        metrics[PREFIX_CACHE_HITS_KEY] = prefix_cache_hits
+    # No queries is "no data", not a 0% hit rate. Hits above queries means a
+    # restart dropped part of one series but not the other, so the pair is unusable.
+    if (
+        prefix_cache_queries
+        and prefix_cache_hits is not None
+        and prefix_cache_hits <= prefix_cache_queries
+    ):
+        metrics[PREFIX_CACHE_HIT_RATE_KEY] = prefix_cache_hits / prefix_cache_queries
+    preemptions = _first_delta(delta, PREEMPTION_COUNTERS)
+    if preemptions is not None:
+        metrics[PREEMPTIONS_KEY] = preemptions
 
     return metrics
 

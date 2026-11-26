@@ -3,8 +3,8 @@
 
 """Same-evidence per-call versus segment loss/gradient conservation on CPU.
 
-Uses real staging, finalization, controller advantages, policy-gradient loss,
-and the PPO critic's value loss.
+The policy test uses real staging, finalization, controller advantages and
+policy-gradient loss; the critic tests run the real PPO advantage stage and value loss.
 Generation/storage are doubles; the order-sensitive toy model does not qualify
 Megatron, multimodal/router execution, or compaction versus no-compaction parity.
 """
@@ -515,18 +515,25 @@ def test_same_calls_as_segments_preserve_value_loss_and_gradients(
         GAEConfig(gae_lambda=1.0, gae_gamma=1.0, normalize_advantages=False),
         ClippedPGLossConfig(),
     )
-    batches = [
-        _critic_rows([[0], [1], [2], [3]]),
-        _critic_rows([[0, 1], [2], [3]]),
-    ]
-    for batch in batches:
-        batch["values"] = _old_values(model, batch["input_ids"])
-        _, batch["returns"] = estimator.compute_advantage(
-            prompt_ids=None,
-            rewards=batch["total_reward"],
-            mask=batch["token_mask"],
-            values=batch["values"],
-        )
+    per_call = _critic_rows([[0], [1], [2], [3]])
+    per_call["values"] = _old_values(model, per_call["input_ids"])
+    _, per_call["returns"] = estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=per_call["total_reward"],
+        mask=per_call["token_mask"],
+        values=per_call["values"],
+    )
+    # The Forest layout goes through the controller's PPO advantage stage.
+    merged = _critic_rows([[0, 1], [2], [3]])
+    merged["values"] = _old_values(model, merged["input_ids"])
+    meta, data = _batch([("g", [(1.0, 2), (2.0, 1)])])
+    for key in ("token_mask", "total_reward", "values"):
+        data[key] = merged[key]
+    ctrl = _ppo_controller(meta, data, normalize_advantages=False)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    merged["returns"] = data["returns"]
+    batches = [per_call, merged]
     assert _critic_targets(batches[0]) == _critic_targets(batches[1])
     assert {
         token: target for token, (_, target) in _critic_targets(batches[1]).items()

@@ -27,6 +27,11 @@ checkpointing:
     save_period: 10
     checkpoint_must_save_by: null
     save_optimizer: true
+    ft_keep_latest_k: null
+    ft_save_period: null
+    pretrained_checkpoint: null
+    save_data_plane: false
+    load_replay_buffer: true
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
@@ -224,6 +229,7 @@ policy: &POLICY_BASE
         stop_strings: null
         lora_refit_mode: native
         vllm_cfg:
+            http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
@@ -282,6 +288,8 @@ data:
 env:
     math:
         num_workers: 8
+        verifier_type: "math"
+        math_verify_impl: "hf_math_verify"
 
 logger:
     log_dir: "logs/distillation"

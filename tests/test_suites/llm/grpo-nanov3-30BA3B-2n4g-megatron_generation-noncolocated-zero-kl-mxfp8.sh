@@ -47,15 +47,16 @@ if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
     exit 1
 fi
 
-# Zero train/generation KL means bitwise agreement: gen_kl_error is exactly 0 and
-# token_mult_prob_error (max multiplicative probability error) is exactly 1 on every
-# step. Both min and max are checked so a negative KL estimate cannot slip through.
+# Zero train/generation KL means bitwise agreement: no valid token's logprob differs,
+# gen_kl_error is exactly 0 and token_mult_prob_error is exactly 1 on every step. Both
+# min and max are checked so a negative KL estimate cannot slip through.
 uv run --no-sync tests/check_metrics.py $JSON_METRICS \
     'min(data["train/num_valid_samples"]) > 0' \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
     'min(data["train/gen_kl_error"]) == 0' \
     'max(data["train/gen_kl_error"]) == 0' \
+    'max(data["train/gen_prev_logprob_mismatch_tokens"]) == 0' \
     'min(data["train/token_mult_prob_error"]) == 1' \
     'max(data["train/token_mult_prob_error"]) == 1'
 
