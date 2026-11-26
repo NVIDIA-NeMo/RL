@@ -449,14 +449,15 @@ class WindowedSampler(BaseSampler):
             )
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
-        # Unordered: any full buffer is selectable, so the minimum capacity is the streaming floor.
+        # The streaming floor bounds one dispatch, not the step: claimed groups
+        # keep their buffer permits until the step closes, so capacity is the step size.
         self.min_groups_for_streaming_train = min_groups_for_streaming_train
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
-        return self.min_groups_for_streaming_train
+        return groups_per_step
 
     def charge_step_for_lost_group(
         self, *, target_step: Optional[int], assembling_version: int
@@ -907,7 +908,8 @@ def required_buffer_capacity_for_config(
             gate_window=cfg.peak_lookahead_versions,
         )
     if isinstance(cfg, WindowedSamplerConfig):
-        return min_groups_for_streaming_train
+        # Capacity covers the whole step; the floor only bounds one dispatch.
+        return groups_per_step
     return None
 
 

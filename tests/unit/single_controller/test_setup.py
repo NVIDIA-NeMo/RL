@@ -2254,6 +2254,38 @@ class TestSetup:
         mock_spinup.assert_not_called()
 
     @pytest.mark.parametrize(
+        ("max_buffered_rollouts", "should_raise"),
+        [(4, False), (3, True)],
+        ids=["capacity_equals_step", "capacity_below_step"],
+    )
+    def test_windowed_sampler_capacity_covers_the_whole_step(
+        self,
+        max_buffered_rollouts: int,
+        should_raise: bool,
+        patched_factories: dict[str, Any],
+    ) -> None:
+        """The windowed sampler's required capacity is the step size.
+
+        Its dispatch floor bounds one chunk, but a claimed group keeps its
+        buffer permit until the step closes, so a buffer sized to the floor
+        stalls the rollout pump before the step can complete. Setup must size
+        the buffer from the step size instead.
+        """
+        mc = _make_master_config(
+            sampler_cfg=WindowedSamplerConfig(max_staleness_versions=1)
+        )
+        mc.async_rl.min_groups_for_streaming_train = 2
+        mc.async_rl.max_buffered_rollouts = max_buffered_rollouts
+
+        if should_raise:
+            with pytest.raises(ValueError, match=r"required capacity \(4\)"):
+                setup_single_controller(mc, MagicMock(pad_token_id=0))
+            patched_factories["setup_response_data"].assert_not_called()
+        else:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+            patched_factories["_build_generation"].assert_called_once()
+
+    @pytest.mark.parametrize(
         ("loss_overrides", "match"),
         [
             (
