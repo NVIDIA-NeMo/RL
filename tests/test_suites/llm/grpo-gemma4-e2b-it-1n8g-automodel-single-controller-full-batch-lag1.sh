@@ -31,6 +31,7 @@ uv run examples/run_grpo_single_controller.py \
     grpo.max_num_steps="$MAX_STEPS" \
     logger.log_dir="$LOG_DIR" \
     logger.wandb_enabled=true \
+    logger.wandb.project=nemo-rl \
     logger.wandb.name="$EXP_NAME" \
     checkpointing.checkpoint_dir="$CKPT_DIR" \
     "$@" 2>&1 | tee "$RUN_LOG"
@@ -48,3 +49,6 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'median(data["train/token_mult_prob_error"]) < 1.1'
 test -d "$CKPT_DIR/step_$MAX_STEPS/policy/weights"
 test -d "$CKPT_DIR/step_$MAX_STEPS/policy/optimizer"
+
+# Clean up checkpoint directory after successful run to save space.
+rm -rf "$CKPT_DIR"

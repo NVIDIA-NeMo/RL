@@ -72,12 +72,12 @@ async_rl:
   max_buffered_rollouts: ${mul:2,${grpo.num_prompts_per_step}}
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1
+  checkpoint_dir: results/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-lag1
   keep_top_k: 2
 logger:
-  log_dir: logs/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1
+  log_dir: logs/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-lag1
   wandb_enabled: true
   wandb:
-    name: grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1
+    name: grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-lag1
 cluster:
   gpus_per_node: 8

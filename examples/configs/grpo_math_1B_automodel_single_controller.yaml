@@ -62,7 +62,6 @@ logger:
   log_dir: logs/grpo-automodel-single-controller
   tensorboard_enabled: true
   wandb:
-    project: nemo-rl-automodel-sc
     name: grpo-automodel-single-controller
 
 cluster:

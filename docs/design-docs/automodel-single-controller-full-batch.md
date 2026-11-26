@@ -36,7 +36,7 @@ Model-specific examples inherit the same exemplar:
 
 | Recipe | Training resources | Rollout resources |
 | --- | --- | --- |
-| [Gemma4 E2B IT, lookahead one](../../examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1.yaml) | 4 GPUs, EP=1 | 4 GPUs |
+| [Gemma4 E2B IT, lookahead one](../../examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-lag1.yaml) | 4 GPUs, EP=1 | 4 GPUs |
 | [Qwen3.5-35B-A3B Base](../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-base-3n8g-automodel-ep16-single-controller-full-batch.yaml) | 16 GPUs, EP=16 with HybridEP | 8 GPUs, TP=8 |
 
 One rollout batch must supply exactly one global training batch:
@@ -232,7 +232,7 @@ To reproduce the SC batch configuration with the Gemma4 recipe above, return it 
 
 ```bash
 uv run examples/run_grpo_single_controller.py \
-  --config examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-la1.yaml \
+  --config examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch-lag1.yaml \
   async_rl.sampler.max_lookahead_versions=0 \
   async_rl.max_inflight_prompts=32 \
   async_rl.max_buffered_rollouts=32 \
