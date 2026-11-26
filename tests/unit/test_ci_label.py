@@ -34,7 +34,7 @@ _spec.loader.exec_module(ci_label)
         (["examples/configs/grpo_math_1B.yaml"], "CI:Lfast"),
         ([".github/workflows/cherry-pick-release-commit.yml"], "CI:docs"),
         ([".github/workflows/pr-description-check.yml"], "CI:docs"),
-        ([".github/scripts/ci_label.py"], "CI:docs"),
+        ([".github/scripts/ci_label.py"], "CI:Lfast"),
         ([".github/workflows/cicd-main.yml"], "CI:Lfast"),
         ([".github/workflows/_build_container.yml"], "CI:Lfast"),
         ([".github/actions/test-template/action.yml"], "CI:Lfast"),

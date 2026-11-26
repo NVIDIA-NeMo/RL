@@ -20,10 +20,21 @@ on:
 
 jobs:
   call-release-docs:
+    if: github.repository == 'NVIDIA-NeMo/RL' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-docs.yml
     with:
       dry-run: false
       publish-as-latest: false
       docs-version-override: "nightly"
       update-version-picker: false
-    secrets: inherit
+    secrets:
+      AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AKAMAI_HOST: ${{ secrets.AKAMAI_HOST }}
+      AKAMAI_CLIENT_TOKEN: ${{ secrets.AKAMAI_CLIENT_TOKEN }}
+      AKAMAI_CLIENT_SECRET: ${{ secrets.AKAMAI_CLIENT_SECRET }}
+      AKAMAI_ACCESS_TOKEN: ${{ secrets.AKAMAI_ACCESS_TOKEN }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}

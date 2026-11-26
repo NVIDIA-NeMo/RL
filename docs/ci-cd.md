@@ -15,7 +15,7 @@ Tests are organized into levels of increasing scope and cost:
 | **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, which is published only by builds of the release branch itself (pushes after merges), never by PR builds; until the first such build exists, Lfast on that branch cannot pull its image | `CI:Lfast` label |
 
 **Defaults:**
-- PRs do not run tests unless a CI label is applied.
+- PR mirror CI selects a minimum tier from the changed paths using the base branch's classification rules. A base branch that predates the classifier uses L1. The mirror honors labels that add coverage regardless of who set them, even while the separate label bot reconciles the PR. A label alone cannot reduce the required tier. A request for `CI:L0` on an Lfast change runs L1 to cover both full unit tests and fast functional tests.
 - Pushes to `main` and merge-group events force **L1**.
 - Nightly scheduled runs (09:00 UTC) run the full suite.
 - Doc-only changes are auto-detected and skip unnecessary tests.
@@ -38,7 +38,8 @@ Tests are organized into levels of increasing scope and cost:
 1. **The CI label is set for you.** On PRs to `main`, the `Set CI label` workflow picks `CI:docs`, `CI:Lfast` or `CI:L1` from the changed files (rules in `skills/cicd/SKILL.md`). Only repo maintainers can change it, for example to `CI:L1` for a large refactor or broad changes to core code; ask one if the label is wrong.
 2. **Comment** `/ok to test <commit-sha>` — a bot will acknowledge with a thumbs-up and start CI.
    - If you are an external contributor, you will need an internal NVIDIA developer to comment this on your PR to trigger CI.
-3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group). Only repo maintainers can set it.
+3. To accept a failed PR mirror run, a maintainer must apply **`Skip CICD`** and submit a GitHub pull request review on the current commit with the entire review body **`Skip CICD`**. A comment review is sufficient. Re-run the failed jobs after submitting the review. The gate verifies the live label, the review's commit, and the reviewer's current maintain or admin role. Each new PR head needs its own review.
+4. The **CI quality check** comes from the unfiltered PR mirror or the merge group's L1 run. Manual dispatches and the `CI:megatron` subset publish **CI diagnostics**.
 
 ## Nightly CI with `/nightly-ci`
 

@@ -23,11 +23,11 @@ on:
   workflow_dispatch:
     inputs:
       release-ref:
-        description: Ref (SHA or branch name) to release
+        description: Full 40-character commit SHA to release
         required: true
         type: string
       dry-run:
-        description: Compute the release but do not publish wheel, GH release, or docs.
+        description: Validate the release without publishing a GitHub release or docs.
         required: true
         default: true
         type: boolean
@@ -42,7 +42,7 @@ on:
         default: true
         type: boolean
       version-bump-branch:
-        description: Branch for version bump
+        description: Protected main or rX.Y.Z release branch for the version bump
         required: true
         type: string
       gh-release-from-tag:
@@ -55,18 +55,55 @@ defaults:
   run:
     shell: bash -x -e -u -o pipefail {0}
 
-permissions:
-  id-token: write
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
-  previous-tag:
+  validate-inputs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify the release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ inputs.release-ref || github.sha }}
+          TARGET_BRANCH: ${{ inputs.version-bump-branch }}
+        run: |
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release-ref must be a full commit SHA."
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
+            exit 0
+          fi
+          if [[ "$GITHUB_REF" != refs/heads/main || "$GITHUB_REPOSITORY" != NVIDIA-NeMo/RL ]]; then
+            echo "::error::Dispatch the release from NVIDIA-NeMo/RL main."
+            exit 1
+          fi
+          if [[ "$TARGET_BRANCH" != main && ! "$TARGET_BRANCH" =~ ^r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Select main or a protected rX.Y.Z release branch."
+            exit 1
+          fi
+          target_sha=$(gh api "repos/$GITHUB_REPOSITORY/branches/$TARGET_BRANCH" --jq 'select(.protected) | .commit.sha')
+          if [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The release target must be a protected branch."
+            exit 1
+          fi
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$RELEASE_SHA...$target_sha?per_page=1" --jq '.status')
+          if [[ "$status" != identical && "$status" != ahead ]]; then
+            echo "::error::The release commit must belong to the target branch."
+            exit 1
+          fi
+
+  previous-tag:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.find.outputs.tag }}
     steps:
@@ -101,49 +138,77 @@ jobs:
           fi
 
           echo "Previous release tag: $TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" | tee -a "$GITHUB_OUTPUT"
 
-  release:
-    needs: [previous-tag]
-    if: ${{ !cancelled() && needs.previous-tag.result == 'success' }}
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@d98ebd557712eeff155f3ab8e411abab629f4b0c # v1.6.0
+  bump:
+    needs: previous-tag
+    permissions:
+      contents: read
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
     with:
+      release-environment: rl-release
       release-ref: ${{ inputs.release-ref || github.sha }}
-      python-package: nemo_rl
-      library-name: NeMo-RL
-      app-id: ${{ vars.BOT_ID }}
+      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
       validate-only: ${{ github.event_name != 'workflow_dispatch' }}
       dry-run: ${{ inputs.dry-run || false }}
-      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
-      create-gh-release: ${{ inputs.create-gh-release || true }}
+      python-package: nemo_rl
+      library-name: NeMo-RL
       packaging: uv
-      skip-wheel-build: true
-      submodules: recursive
-      publish-docs: ${{ inputs.publish-docs || true }}
-      docs-target-path: nemo/rl
-      publish-as-latest: true
-      run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+      restrict-to-admins: true
+
+  finalize:
+    needs: [previous-tag, bump]
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    with:
+      release-environment: rl-release
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      release-version: ${{ needs.bump.outputs.release-version }}
+      library-name: NeMo-RL
+      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
+      dry-run: ${{ inputs.dry-run || false }}
+      create-gh-release: ${{ github.event_name != 'workflow_dispatch' || inputs.create-gh-release }}
       gh-release-use-changelog-builder: true
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || needs.previous-tag.outputs.tag }}
-      restrict-to-admins: true
-    secrets: inherit  # pragma: allowlist secret
+      publish-docs: false
+    secrets:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+  docs:
+    needs: [bump, finalize]
+    if: github.event_name != 'workflow_dispatch' || inputs.publish-docs
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-docs.yml
+    with:
+      github-ref: ${{ inputs.release-ref || github.sha }}
+      docs-version-override: ${{ needs.bump.outputs.release-version }}
+      dry-run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+      publish-as-latest: true
+    secrets:
+      AWS_ASSUME_ROLE_ARN: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AWS_ASSUME_ROLE_ARN || '' }}
+      AWS_ACCESS_KEY_ID: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      AKAMAI_HOST: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AKAMAI_HOST || '' }}
+      AKAMAI_CLIENT_TOKEN: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AKAMAI_CLIENT_TOKEN || '' }}
+      AKAMAI_CLIENT_SECRET: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AKAMAI_CLIENT_SECRET || '' }}
+      AKAMAI_ACCESS_TOKEN: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.AKAMAI_ACCESS_TOKEN || '' }}
+      S3_BUCKET_NAME: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry-run && secrets.S3_BUCKET_NAME || '' }}
 
   release-summary:
-    needs: [release]
-    if: ${{ !cancelled() }}
+    needs: [validate-inputs, previous-tag, bump, finalize, docs]
+    if: always()
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
-      - name: Result
+      - name: Check release results
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESULTS: ${{ toJSON(needs) }}
+          DOCS_EXPECTED: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-docs }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')
-
-          if [ "${FAILED_JOBS:-0}" -eq 0 ]; then
-              echo "✅ All previous jobs completed successfully"
-              exit 0
-          else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
-              gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required") | .name'
-              exit 1
-          fi
+          jq -e --arg docs "$DOCS_EXPECTED" '
+            all(to_entries[]; .value.result == "success" or
+              (.key == "docs" and $docs == "false" and .value.result == "skipped"))
+          ' <<< "$RESULTS"

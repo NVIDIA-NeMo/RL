@@ -62,6 +62,7 @@ MAIN_CI_FILES = (
     ".github/workflows/cicd-main.yml",
     ".github/workflows/_build_container.yml",
     ".github/actions/test-template/*",
+    ".github/scripts/ci_label.py",
     ".github/scripts/plan-tests.sh",
     ".github/scripts/checkout-megatron-lm-commit.sh",
     ".github/scripts/install-megatron-lock-artifact.sh",

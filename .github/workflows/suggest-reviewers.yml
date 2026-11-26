@@ -43,12 +43,9 @@ permissions:
 
 jobs:
   suggest-reviewers:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_suggest_reviewers.yml@b0a3760374f50b3d6a7d5f8629e826dddca3b931 # v1.10.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_suggest_reviewers.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
     with:
-      workflow_ref: b0a3760374f50b3d6a7d5f8629e826dddca3b931  # pragma: allowlist secret
-      # Same App community-bot.yml already uses in this repo for
-      # team-reviewer resolution. No PAT needed.
-      app-id: ${{ vars.BOT_ID }}
+      app-id: ${{ vars.PR_APP_ID }}
     secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
+      BOT_KEY: ${{ secrets.PR_APP_PRIVATE_KEY }}
       SLACK_TEAM_CHANNEL_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
