@@ -17,6 +17,7 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
+import asyncio
 import copy
 import json
 import os
@@ -28,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import ray.exceptions
 from omegaconf import DictConfig
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
@@ -2620,6 +2622,216 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
     assert kill.call_count == 4
     # Releasing a group twice raises; the second shutdown must not try.
     remove.assert_called_once_with(pg)
+
+
+def _gym_actor(remote):
+    """Stand in for a NemoGym actor handle whose health check call is ``remote``."""
+    return SimpleNamespace(health_check=SimpleNamespace(remote=remote))
+
+
+def _completed(_value=None):
+    """Return a future that holds a result, as a health check that passed does.
+
+    ``_value`` is ignored. It lets the caller record the call in the argument.
+    """
+    future: asyncio.Future = asyncio.get_event_loop().create_future()
+    future.set_result(None)
+    return future
+
+
+def _failed(error: BaseException):
+    """Return a future that holds ``error``, as a health check that raised does."""
+    future: asyncio.Future = asyncio.get_event_loop().create_future()
+    future.set_exception(error)
+    return future
+
+
+def test_an_unhealthy_actor_of_a_shard_set_is_named_by_its_instance_label():
+    """Each actor of the set is asked, and an unhealthy one is named by its label."""
+    asked = []
+    healthy = _gym_actor(lambda: _completed(asked.append("tools")))
+    unhealthy = _gym_actor(
+        lambda: _failed(RuntimeError("Process `search` finished unexpectedly!"))
+    )
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"tools": [healthy], "search": [unhealthy]}
+    )
+
+    problems = asyncio.run(shard_set.check_health(timeout_s=5.0))
+
+    assert len(problems) == 1, problems
+    assert "'nemo_gym' instance 'search' reported unhealthy" in problems[0]
+    assert "instance 'tools'" not in problems[0]
+    assert asked == ["tools"], "the healthy actor should have been asked too"
+
+
+def test_a_dead_gym_server_is_reported_in_one_line():
+    """Ray's task error holds the remote traceback and the dead server's output."""
+    cause = RuntimeError(
+        "Process `search` finished unexpectedly!\n"
+        "Process `search` stderr:\n" + "last output of the server\n" * 100
+    )
+    task_error = ray.exceptions.RayTaskError(
+        "health_check", "Traceback (most recent call last): ...", cause
+    ).as_instanceof_cause()
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"search": [_gym_actor(lambda: _failed(task_error))]}
+    )
+
+    assert asyncio.run(shard_set.check_health(timeout_s=5.0)) == [
+        "environment 'nemo_gym' instance 'search' reported unhealthy: "
+        "Process `search` finished unexpectedly!"
+    ]
+
+
+def test_a_dead_actor_is_reported_by_its_instance_label():
+    """A dead actor is reported like any other problem, not raised.
+
+    NemoGym actors are never restarted. Once one dies, every later call raises
+    Ray's ActorDiedError, which is not a RuntimeError. Raised out of the check,
+    it would end the run even under the stall watchdog's stall_action="warn".
+    """
+    dead = _gym_actor(lambda: _failed(ray.exceptions.ActorDiedError()))
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"search": [dead]})
+
+    problems = asyncio.run(shard_set.check_health(timeout_s=5.0))
+
+    assert len(problems) == 1, problems
+    assert "instance 'search' reported unhealthy" in problems[0]
+
+
+def test_a_shard_set_of_healthy_actors_reports_nothing():
+    """Every actor of the set is asked, and none of them is reported."""
+    asked = []
+    tools = _gym_actor(lambda: _completed(asked.append("tools")))
+    search = _gym_actor(lambda: _completed(asked.append("search")))
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"tools": [tools], "search": [search]}
+    )
+
+    assert asyncio.run(shard_set.check_health(timeout_s=5.0)) == []
+    assert set(asked) == {"tools", "search"}, (
+        "every actor of the shard set should have been asked"
+    )
+
+
+def test_a_silent_actor_of_a_shard_set_does_not_hide_the_other_actors():
+    """An actor that never answers is reported within its timeout, by its label.
+
+    The other replica of the shard is still asked, and the check returns.
+    """
+    never_resolves: list[asyncio.Future] = []
+
+    def _hang():
+        """Record and return a future that never completes."""
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        never_resolves.append(future)
+        return future
+
+    asked = []
+    silent = _gym_actor(_hang)
+    answering = _gym_actor(lambda: _completed(asked.append("tools/1")))
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [silent, answering]})
+
+    # The outer bound fails the test instead of hanging it if the check ever
+    # waits for the silent actor without a timeout.
+    problems = asyncio.run(
+        asyncio.wait_for(shard_set.check_health(timeout_s=0.01), timeout=10.0)
+    )
+
+    assert len(problems) == 1, problems
+    assert (
+        "'nemo_gym' instance 'tools/0' did not answer its health check" in problems[0]
+    )
+    assert "tools/1" not in problems[0]
+    assert never_resolves, "the silent actor was never asked"
+    assert asked, "the actor after the silent one was never asked"
+
+
+def test_every_unhealthy_actor_of_a_shard_set_is_reported():
+    """One unhealthy actor does not hide the problem of another one.
+
+    The problems are listed in the order of the shard set. The order of the answers
+    is the opposite here: the second actor fails at once, and the first one only
+    runs into its timeout.
+    """
+    silent = _gym_actor(lambda: asyncio.get_event_loop().create_future())
+    failed = _gym_actor(
+        lambda: _failed(RuntimeError("Process `search` finished unexpectedly!"))
+    )
+    shard_set = nemo_gym_mod.NemoGymShardSet(
+        handles={"tools": [silent], "search": [failed]}
+    )
+
+    # The outer bound fails the test instead of hanging it if the check ever
+    # waits for the silent actor without a timeout.
+    problems = asyncio.run(
+        asyncio.wait_for(shard_set.check_health(timeout_s=0.01), timeout=10.0)
+    )
+
+    assert len(problems) == 2, problems
+    assert "instance 'tools' did not answer its health check" in problems[0]
+    assert "instance 'search' reported unhealthy" in problems[1]
+
+
+def test_the_actors_of_a_shard_set_are_asked_concurrently():
+    """Every actor is asked before the timeout of a silent one runs out.
+
+    Asked one after another, each silent actor would add a full timeout to the check.
+    """
+    asked = []
+
+    def _hang(label):
+        """Build a health check call that records ``label`` and never answers."""
+
+        def _remote():
+            """Record the call and return a future that never completes."""
+            asked.append(label)
+            return asyncio.get_event_loop().create_future()
+
+        return _remote
+
+    replicas = [_gym_actor(_hang("tools/0")), _gym_actor(_hang("tools/1"))]
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": replicas})
+
+    async def _main():
+        """Start the check and return which actors were asked a moment later."""
+        # The timeout outlasts the test, so only a concurrent check reaches the
+        # second actor while the first one stays silent.
+        check = asyncio.ensure_future(shard_set.check_health(timeout_s=1000.0))
+        await asyncio.sleep(0.01)
+        asked_while_silent = list(asked)
+        check.cancel()
+        await asyncio.gather(check, return_exceptions=True)
+        return asked_while_silent
+
+    assert asyncio.run(_main()) == ["tools/0", "tools/1"]
+
+
+def test_silent_actors_of_a_shard_set_cost_one_timeout_together():
+    """However many actors stay silent, the check takes one timeout, not one each.
+
+    Asking every actor first and then waiting for each answer in turn passes the
+    test above, but adds a full timeout to the check for every silent actor.
+    """
+    replicas = [
+        _gym_actor(lambda: asyncio.get_event_loop().create_future()) for _ in range(3)
+    ]
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": replicas})
+    timeout_s = 0.5
+
+    async def _timed_check():
+        """Run the check and return its problems and how long it took."""
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        problems = await shard_set.check_health(timeout_s=timeout_s)
+        return problems, loop.time() - start
+
+    problems, elapsed = asyncio.run(_timed_check())
+    assert len(problems) == 3, problems
+    # One timeout for the three of them, with room for a slow machine. One
+    # timeout per actor would take three.
+    assert elapsed < 2 * timeout_s, f"three silent actors took {elapsed:.2f}s"
 
 
 _MULTI_HARNESS = {

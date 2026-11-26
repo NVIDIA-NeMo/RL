@@ -66,7 +66,7 @@ from typing import (
 )
 
 import ray
-from ray.exceptions import RayActorError, RayTaskError
+from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
@@ -186,11 +186,7 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
-from nemo_rl.environments.nemo_gym import (
-    NemoGymShardSet,
-    as_nemo_gym_shard_set,
-    should_use_nemo_gym,
-)
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -4518,67 +4514,13 @@ class SingleControllerActor:
 
         The NeMo-Gym entry of the environment handles is read with
         ``as_nemo_gym_shard_set``, the way the rollout code reads it, and every actor
-        of the set is asked; see ``_check_shard_set_health``. Other environments are
-        not asked: only NeMo-Gym has subprocess servers to lose.
+        of the set is asked; see ``NemoGymShardSet.check_health``. Other environments
+        are not asked: only NeMo-Gym has subprocess servers to lose.
         """
         nemo_gym = self._env_handles.get("nemo_gym")
         if nemo_gym is None:
             return []
-        return await self._check_shard_set_health(
-            "nemo_gym", as_nemo_gym_shard_set(nemo_gym), timeout_s
-        )
-
-    async def _check_shard_set_health(
-        self, env_name: str, shard_set: NemoGymShardSet, timeout_s: float
-    ) -> list[str]:
-        """Ask every NeMo-Gym actor of one shard set whether its servers are alive.
-
-        The actors are asked concurrently and each call has its own timeout. The check
-        therefore takes at most ``timeout_s`` however many actors stay silent, and an
-        actor that fails or stays silent does not keep the others from being asked.
-
-        Args:
-            env_name: Key of the shard set in the environment handles, used in the
-                messages.
-            shard_set: The NeMo-Gym actors to ask.
-            timeout_s: Seconds each actor has to answer.
-
-        Returns:
-            One message per actor that raised or did not answer in time, in the order of
-            ``shard_set.all_handles``. Each message names the actor by its instance
-            label. The list is empty when every actor answered without raising.
-        """
-
-        async def check_actor(actor: Any) -> str | None:
-            """Return the problem found on one actor, or None when it is healthy."""
-            label = shard_set.instance_label(actor)
-            try:
-                await asyncio.wait_for(
-                    self._ray_get(actor.health_check.remote()), timeout=timeout_s
-                )
-            except asyncio.TimeoutError:
-                return (
-                    f"environment {env_name!r} instance {label!r} did not answer its "
-                    f"health check within {timeout_s}s"
-                )
-            except Exception as error:
-                reason = str(error)
-                if isinstance(error, RayTaskError) and isinstance(
-                    error.cause, BaseException
-                ):
-                    # Ray's text is the remote traceback, and Gym's poll() error ends
-                    # with up to 64 KiB of the dead server's output. Keep one line.
-                    reason = str(error.cause).partition("\n")[0]
-                return (
-                    f"environment {env_name!r} instance {label!r} reported unhealthy: "
-                    f"{reason}"
-                )
-            return None
-
-        results = await asyncio.gather(
-            *(check_actor(actor) for actor in shard_set.all_handles)
-        )
-        return [problem for problem in results if problem is not None]
+        return await as_nemo_gym_shard_set(nemo_gym).check_health(timeout_s)
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
