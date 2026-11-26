@@ -24,15 +24,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
-from aiohttp import ClientSession, web
+from aiohttp import ClientSession, TCPConnector, web
 from aiohttp.test_utils import TestServer
 from omegaconf import OmegaConf
+from ray import cloudpickle as ray_cloudpickle
+from ray.exceptions import RayTaskError
 
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.experience.failures import (
+    FailureClass,
     GymAdmissionClosed,
     GymRowFailure,
     GymTransportError,
+    RolloutTimeout,
+    classify_rollout_failure,
 )
 from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
@@ -523,5 +528,212 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     assert result["truncated"] is False
         else:
             actor._control.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("method", "operation"), [("POST", "close-admission"), ("GET", "manifest")]
+)
+def test_ledger_control_uses_reserved_connections(
+    monkeypatch: pytest.MonkeyPatch, method: str, operation: str
+) -> None:
+    async def run() -> None:
+        data_started = asyncio.Event()
+        release_data = asyncio.Event()
+        manifest = {"capture_key": "capture-1", "records": [], "pending_call_ids": []}
+
+        async def model_request(request: web.Request) -> web.Response:
+            data_started.set()
+            await release_data.wait()
+            return web.json_response({"completed": True})
+
+        async def ledger_request(request: web.Request) -> web.Response:
+            assert request.headers["Authorization"] == "Bearer test-control"
+            return web.json_response(manifest)
+
+        path = f"/training-token-capture/control/rollouts/capture-1/{operation}"
+        app = web.Application()
+        app.router.add_get("/model", model_request)
+        app.router.add_route(method, path, ledger_request)
+        async with (
+            TestServer(app) as server,
+            ClientSession(connector=TCPConnector(limit=1)) as data_client,
+            ClientSession(connector=TCPConnector(limit=1)) as control_client,
+        ):
+            http_module = sys.modules[gym_server.get_global_aiohttp_client.__module__]
+            monkeypatch.setattr(http_module, "_GLOBAL_AIOHTTP_CLIENT", data_client)
+            monkeypatch.setattr(
+                http_module, "_GLOBAL_AIOHTTP_CONTROL_CLIENT", control_client
+            )
+            monkeypatch.delenv("NEMO_GYM_MODEL_SERVER_BASE_URL", raising=False)
+            actor = NemoGym.__ray_metadata__.modified_class({})
+            actor._server_client = gym_server.ServerClient(
+                head_server_config=gym_server.BaseServerConfig(
+                    host=server.host, port=server.port
+                ),
+                global_config_dict=OmegaConf.create(
+                    {
+                        "policy_model": {
+                            "responses_api_models": {
+                                "vllm_model": {
+                                    "host": server.host,
+                                    "port": server.port,
+                                }
+                            }
+                        }
+                    }
+                ),
+            )
+            actor._control_headers = {"Authorization": "Bearer test-control"}
+            actor._control_timeout_s = 1.0
+
+            async def occupy_data_connection() -> None:
+                async with data_client.get(f"{server.make_url('/model')}") as reply:
+                    await reply.read()
+
+            pending_data = asyncio.create_task(occupy_data_connection())
+            try:
+                await asyncio.wait_for(data_started.wait(), timeout=2.0)
+                assert await actor._control(method, path) == manifest
+                assert not pending_data.done()
+            finally:
+                release_data.set()
+                await asyncio.wait_for(pending_data, timeout=2.0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("timeout_stage", "status"), [("request", 200), ("body", 200), ("body", 503)]
+)
+def test_ledger_control_timeout_survives_serialization_as_infra(
+    timeout_stage: str, status: int
+) -> None:
+    async def run() -> None:
+        call_cancelled = asyncio.Event()
+
+        async def stall(*_args: object, **_kwargs: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                call_cancelled.set()
+                raise
+
+        response = SimpleNamespace(
+            status=status,
+            json=AsyncMock(side_effect=stall),
+            text=AsyncMock(side_effect=stall),
+        )
+        client = SimpleNamespace(
+            request=AsyncMock(side_effect=stall)
+            if timeout_stage == "request"
+            else AsyncMock(return_value=response)
+        )
+        actor = NemoGym.__ray_metadata__.modified_class({})
+        actor._server_client = client
+        actor._control_headers = {"Authorization": "Bearer test-control"}
+        actor._control_timeout_s = 0.05
+
+        # The outer fuse fails the test if the configured deadline misses a wait.
+        with pytest.raises(
+            RolloutTimeout,
+            match=r"ledger control call GET /control/deadline exceeded 0\.05s",
+        ) as error:
+            await asyncio.wait_for(
+                actor._control("GET", "/control/deadline"), timeout=1.0
+            )
+        assert error.value.__cause__ is None
+        assert call_cancelled.is_set()
+        restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(error.value))
+        assert isinstance(restored, RolloutTimeout)
+        assert str(restored) == str(error.value)
+        assert classify_rollout_failure(restored) is FailureClass.INFRA
+        wrapped = RayTaskError(
+            "run_rollouts", "traceback", restored
+        ).as_instanceof_cause()
+        assert classify_rollout_failure(wrapped) is FailureClass.INFRA
+        client.request.assert_awaited_once_with(
+            server_name="policy_model",
+            url_path="/control/deadline",
+            method="GET",
+            _control=True,
+            headers={"Authorization": "Bearer test-control"},
+        )
+        if timeout_stage == "request":
+            response.json.assert_not_awaited()
+            response.text.assert_not_awaited()
+        else:
+            (response.json if status == 200 else response.text).assert_awaited_once()
+            (response.text if status == 200 else response.json).assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_ledger_control_body_external_cancellation_propagates(status: int) -> None:
+    async def run() -> None:
+        body_started = asyncio.Event()
+        body_cancelled = asyncio.Event()
+
+        async def stall_body() -> None:
+            body_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                body_cancelled.set()
+                raise
+
+        response = SimpleNamespace(
+            status=status,
+            json=AsyncMock(side_effect=stall_body),
+            text=AsyncMock(side_effect=stall_body),
+        )
+        client = SimpleNamespace(request=AsyncMock(return_value=response))
+        actor = NemoGym.__ray_metadata__.modified_class({})
+        actor._server_client = client
+        actor._control_headers = {}
+        actor._control_timeout_s = 10.0
+        task = asyncio.create_task(actor._control("POST", "/control/cancel"))
+        try:
+            await asyncio.wait_for(body_started.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1.0)
+            assert body_cancelled.is_set()
+            client.request.assert_awaited_once_with(
+                server_name="policy_model",
+                url_path="/control/cancel",
+                method="POST",
+                _control=True,
+                headers={},
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_ledger_control_preserves_http_failure_message() -> None:
+    async def run() -> None:
+        response = SimpleNamespace(
+            status=503,
+            text=AsyncMock(return_value="control unavailable"),
+            json=AsyncMock(),
+        )
+        client = SimpleNamespace(request=AsyncMock(return_value=response))
+        actor = NemoGym.__ray_metadata__.modified_class({})
+        actor._server_client = client
+        actor._control_headers = {}
+        actor._control_timeout_s = 1.0
+        with pytest.raises(
+            RuntimeError,
+            match="ledger control call GET /control/error failed: HTTP 503 control unavailable",
+        ):
+            await actor._control("GET", "/control/error")
+        client.request.assert_awaited_once()
+        response.text.assert_awaited_once()
+        response.json.assert_not_awaited()
 
     asyncio.run(run())

@@ -985,8 +985,8 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     matches any number of levels.
 
     SingleController has no validation loop, so checkpoint selection must use
-    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
-    ``val:<name>`` settings are rejected during setup. Unknown keys are
+    ``checkpointing.metric_name=None``, ``current_step``, or a ``train:<name>``
+    metric. Inherited ``val:<name>`` settings are rejected during setup. Unknown keys are
     forbidden because a misspelled interval, retention, or restore option can
     silently disable the durability behavior the operator intended.
 
@@ -2259,20 +2259,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         # TIS corrects generation staleness; a forced ratio stays exact with one
         # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
-    # Top-k retention keys off checkpointing.metric_name, but SC has no
-    # validation loop yet (see _save_checkpoint), so a "val:" metric would
-    # never be collected and top-k would silently degrade to a no-op.
+    # The writer always persists current_step; other ranking metrics must
+    # come from training because SC has no validation loop.
     metric_name = master_config.checkpointing.metric_name
     if (
         master_config.checkpointing.enabled
         and metric_name is not None
+        and metric_name != "current_step"
         and not metric_name.startswith("train:")
     ):
         raise ValueError(
             f"checkpointing.metric_name={metric_name!r} is not usable on the "
             "SingleController path: it has no validation loop yet, so only "
-            "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
-            "'train:loss') or set checkpointing.metric_name=null."
+            "'train:<name>' metrics and the saved 'current_step' counter are "
+            "available. Use 'train:<name>' (e.g. 'train:loss'), 'current_step', "
+            "or set checkpointing.metric_name=null."
         )
 
     token_capture_config = master_config.token_capture

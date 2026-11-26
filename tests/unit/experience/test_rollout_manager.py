@@ -1981,6 +1981,43 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
+def test_harness_routing_is_bound_before_replicas_and_stable_across_attempts():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    routing = {
+        "benchmark": "avb",
+        "dataset": "avb-dss",
+        "env": "harbor-avb",
+        "task_type": "agentic",
+        "selected_harness": "codex",
+        "executed_harness": None,
+        "routing_version": "benchmark-harness-v1",
+        "routing_seed": 42,
+        "group_id": None,
+        "group_index": 1,
+    }
+    sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ID_KEY: "durable-group",
+            "harness_routing": routing,
+            "responses_create_params": {"input": ["frame-0", "frame-1"]},
+        }
+    }
+    original = deepcopy(sample)
+    first = impl._build_inputs(sample, task_index=7)
+    retry = impl._build_inputs(sample, task_index=99)
+    assert len(first) == len(retry) == 3
+    assert all(
+        row["harness_routing"]["group_id"] == "durable-group" for row in first + retry
+    )
+    assert all(row["harness_routing"]["group_index"] == 1 for row in first + retry)
+    assert all(
+        row["harness_routing"]["selected_harness"] == "codex" for row in first + retry
+    )
+    assert first[0]["harness_routing"] == retry[2]["harness_routing"]
+    assert sample == original
+
+
 @pytest.mark.parametrize("dataset_task_index", [None, 99])
 def test_nemo_gym_attempt_ids_are_fresh_and_resume_from_counter(
     monkeypatch: pytest.MonkeyPatch, dataset_task_index: int | None

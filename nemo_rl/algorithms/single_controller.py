@@ -4850,10 +4850,10 @@ class SingleControllerActor:
         if hasattr(save_state, "val_reward"):
             delattr(save_state, "val_reward")
 
-        # validate_single_controller_config already rejected anything but a
-        # "train:" prefix, so step_metrics is the only source to consult.
+        # current_step is assigned under the checkpoint barrier; training
+        # metrics are the only ranking values read from step_metrics.
         full_metric_name = self._master_config.checkpointing.metric_name
-        if full_metric_name is not None:
+        if full_metric_name is not None and full_metric_name != "current_step":
             metric_name = full_metric_name.split(":", 1)[1]
             if not is_policy_training_step or step_metrics.get("skipped_step", 0):
                 reason = (

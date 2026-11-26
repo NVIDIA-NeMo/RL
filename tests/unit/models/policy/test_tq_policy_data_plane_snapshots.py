@@ -19,9 +19,55 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
+
+
+def _rank_result(status: object = True, *, leader: bool = True) -> dict:
+    result = {
+        "global_loss": 1.0,
+        "grad_norm": 2.0,
+        "all_mb_metrics": {},
+        "is_replica_leader": leader,
+    }
+    if status != "missing":
+        result["optimizer_update_successful"] = status
+    return result
+
+
+@pytest.mark.parametrize("status", [False, None, 1, "true", "missing"])
+def test_optimizer_success_requires_true_from_every_rank(status: object) -> None:
+    assert (
+        _aggregate_train_results([_rank_result(), _rank_result()])[
+            "optimizer_update_successful"
+        ]
+        is True
+    )
+    assert (
+        _aggregate_train_results([_rank_result(), _rank_result(status)])[
+            "optimizer_update_successful"
+        ]
+        is False
+    )
+
+
+@pytest.mark.parametrize("status", [True, False, None, 1, "true", "missing"])
+def test_nonleader_optimizer_status_is_preserved_before_metric_deduplication(
+    status: object,
+) -> None:
+    trainer = SimpleNamespace(
+        flops_tracker=None,
+        worker_group=SimpleNamespace(
+            run_all_workers_single_data=lambda *_args, **_kwargs: [object()]
+        ),
+    )
+    results = [_rank_result(), _rank_result(status, leader=False)]
+    with patch("nemo_rl.models.policy.tq_policy.ray.get", return_value=results):
+        actual = TQPolicy.finish_train_step(trainer)
+    assert actual["optimizer_update_successful"] is (status is True)
 
 
 def _client() -> MetricsDataPlaneClient:

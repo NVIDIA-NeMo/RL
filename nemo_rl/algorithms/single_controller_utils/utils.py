@@ -113,6 +113,14 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     for reason, count in train_result.get("route_fallback_counts", {}).items():
         metrics[f"routed_experts_deferred_fallback/{reason}"] = float(count)
 
+    # Only the all-rank result can report whether the optimizer updated.
+    metrics.pop("optimizer_update_successful", None)
+    if "optimizer_update_successful" in train_result:
+        status = train_result["optimizer_update_successful"]
+        if type(status) is not bool:
+            raise ValueError("optimizer_update_successful must be an all-rank bool")
+        metrics["optimizer_update_successful"] = int(status)
+
     return metrics
 
 

@@ -82,6 +82,10 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
+        "optimizer_update_successful": bool(results)
+        and all(
+            result.get("optimizer_update_successful") is True for result in results
+        ),
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
@@ -866,6 +870,10 @@ class TQPolicy(TQDriverMixin, Policy):
         # dispatch; finish has no data to shard, so we dedupe here.
         leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
+        # Metric deduplication must not hide a failed/absent participating rank.
+        aggregated_results["optimizer_update_successful"] = bool(results) and all(
+            result.get("optimizer_update_successful") is True for result in results
+        )
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
