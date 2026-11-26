@@ -199,6 +199,22 @@ def test_rejects_tied_embeddings():
 
 
 def test_rejects_mtp():
-    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
+    with pytest.raises(
+        ValueError, match="hf_config_overrides.num_nextn_predict_layers"
+    ):
         _validate(_config(), model_config=SimpleNamespace(num_nextn_predict_layers=1))
     _validate(_config(), model_config=SimpleNamespace(num_nextn_predict_layers=0))
+
+
+def test_rejects_qwen3_5_mtp():
+    # Qwen3.5 has no num_nextn_predict_layers; Automodel falls back to mtp_num_hidden_layers.
+    def qwen3_5(mtp_num_hidden_layers: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            text_config=SimpleNamespace(mtp_num_hidden_layers=mtp_num_hidden_layers)
+        )
+
+    with pytest.raises(
+        ValueError, match="hf_config_overrides.text_config.mtp_num_hidden_layers"
+    ):
+        _validate(_config(), model_config=qwen3_5(1))
+    _validate(_config(), model_config=qwen3_5(0))

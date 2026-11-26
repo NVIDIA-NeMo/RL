@@ -245,11 +245,18 @@ def validate_automodel_pipeline_config(
             f"PP > 1 does not support tied embeddings ({config['model_name']} "
             "sets tie_word_embeddings=true)."
         )
-    if getattr(text_config, "num_nextn_predict_layers", 0):
+    # Read the MTP depth the way Automodel does: Qwen3.5 has no
+    # num_nextn_predict_layers and falls back to mtp_num_hidden_layers.
+    mtp_field = "num_nextn_predict_layers"
+    if getattr(text_config, mtp_field, None) is None:
+        mtp_field = "mtp_num_hidden_layers"
+    if getattr(text_config, mtp_field, None):
+        override = (
+            f"text_config.{mtp_field}" if text_config is not model_config else mtp_field
+        )
         raise ValueError(
             f"PP > 1 does not support MTP ({config['model_name']} sets "
-            "num_nextn_predict_layers > 0). Set "
-            "policy.hf_config_overrides.num_nextn_predict_layers: 0."
+            f"{mtp_field} > 0). Set policy.hf_config_overrides.{override}: 0."
         )
 
 

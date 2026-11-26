@@ -790,7 +790,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
+    Megatron backend supports pipeline parallelism (PP > 1).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

@@ -40,7 +40,7 @@ The Ray worker layout is `[PP, DP, CP, TP]` and Automodel's mesh is `(pp, dp_rep
 - A missing `pipeline` block or `defer_fsdp_grad_sync`, `M < pipeline_parallel_size`, or `logprob_batch_size != train_micro_batch_size`.
 - Sequence packing, dynamic batching, sequence parallelism, CPU offload, `clear_cache_every_n_steps`, LoRA, draft co-training, router replay, reward models, ModelOpt quantization, VLMs, non-colocated generation, and `refit_transport`.
 - Models with `tie_word_embeddings=true`.
-- Models with `num_nextn_predict_layers > 0` (MTP).
+- Models with MTP: `num_nextn_predict_layers > 0`, or for Qwen3.5, which has no `num_nextn_predict_layers`, `mtp_num_hidden_layers > 0`. The Qwen3.5 PP recipes set `policy.hf_config_overrides.text_config.mtp_num_hidden_layers: 0`.
 
 SFT also requires `sft.val_micro_batch_size == policy.train_micro_batch_size`. DPO rejects PP at setup because it runs microbatches of `2 * train_micro_batch_size`. The Automodel value worker rejects PP. Top-k logits and full logits raise `NotImplementedError` in the worker, so distillation and xtoken distillation reject a PP teacher at setup.
 
