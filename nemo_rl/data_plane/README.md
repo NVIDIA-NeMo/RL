@@ -818,8 +818,10 @@ inside the barrier. It holds each unit's published blobs (the hold `save_shard`
 uses) and writes the existing `nixl_store/` layout. With
 `data_plane.nixl.async_checkpoint` true, the adapter patches the controller
 before `tq.init`, as it does for SimpleStorage. While a capture is retained, the caller
-may put new keys. It must not update or clear a key of the cut until `release()`:
-a unit notes such a call and `persist()` then fails, with no completion marker.
+may put new keys. It must not update or clear a key of the cut until `release()`.
+A unit notes such a call. `persist()` fails, with no completion marker, if a
+unit's note is set when that unit's final check runs, after its shard write. A
+call that arrives after that check is not detected, so hold off until `release()`.
 A hold allocates nothing. Under this rule no blob is freed during a capture, so a
 capture needs no extra slab space. With the SSD tier on, new puts spill to disk.
 

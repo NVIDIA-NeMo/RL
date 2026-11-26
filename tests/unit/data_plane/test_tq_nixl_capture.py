@@ -84,7 +84,7 @@ def cluster(monkeypatch):
     actors = {0: _actor(units[0]), 1: _actor(units[1])}
     monkeypatch.setattr(ckpt.ray, "get", _fake_get)
     monkeypatch.setattr(ckpt, "_unit_actor", lambda store, u: actors[u])
-    monkeypatch.setattr(ckpt, "_active_units", lambda store: [0, 1])
+    monkeypatch.setattr(ckpt, "_active_units", lambda store, *, timeout_s=None: [0, 1])
     storage = SimpleNamespace(store=object(), unit_ids=[0, 1])
     controller = _Controller()
     monkeypatch.setattr(ckpt, "_controller_actor", lambda: controller)
@@ -166,9 +166,11 @@ class _NeverDone:
         return concurrent.futures.Future()
 
 
-def test_frozen_unit_times_out_the_capture_and_releases_the_rest(
+def test_unanswered_capture_rpc_times_out_and_releases_the_rest(
     cluster, tmp_path, monkeypatch
 ):
+    # The capture reply never arrives. The release still runs at once here, so
+    # this does not model a serial actor that queues the release behind it.
     units, client = cluster
     actors = {
         0: _actor(units[0]),
@@ -197,3 +199,92 @@ def test_capture_that_cannot_release_raises_checkpoint_release_error(
         )
     assert isinstance(info.value.__cause__, RuntimeError)
     assert "release boom" in str(info.value.__cause__)
+
+
+def _capture(client, tmp_path, timeout_s=0.1):
+    return ckpt.capture_nixl_checkpoint(
+        client, tmp_path / "dp", metadata=None, timeout_s=timeout_s
+    )
+
+
+def test_persist_submission_failure_keeps_the_original_error(cluster, tmp_path):
+    units, client = cluster
+    _put(units[0], "a", 1)
+    cap = _capture(client, tmp_path)
+
+    def refuse(*args):
+        raise RuntimeError("submit failed")
+
+    client.controller.nrl_persist_snapshot = SimpleNamespace(remote=refuse)
+    # Nothing was submitted, so the wait has no result to unpack. The submission
+    # error must not be replaced by an unpacking error.
+    with pytest.raises(RuntimeError, match="submit failed"):
+        cap.persist()
+    assert not (tmp_path / "dp" / "metadata.json").exists()
+    cap.release()
+    assert all(not u._captures for u in units) and not client.controller.views
+
+
+def test_frozen_directory_times_out_before_any_hold(cluster, tmp_path, monkeypatch):
+    units, client = cluster
+    seen = []
+
+    def frozen(store, *, timeout_s=None):
+        seen.append(timeout_s)
+        raise ckpt.ray.exceptions.GetTimeoutError("directory frozen")
+
+    monkeypatch.setattr(ckpt, "_active_units", frozen)
+    with pytest.raises(TimeoutError, match="unit lookup timed out"):
+        _capture(client, tmp_path, timeout_s=0.2)
+    assert seen == [0.2]  # the lookup got the capture budget
+    assert all(not u._captures for u in units) and not client.controller.views
+
+
+def test_active_units_passes_its_budget_to_the_directory_query():
+    seen = []
+    store = SimpleNamespace(
+        _units={0: {"unit_id": 0}, 1: {"unit_id": 1, "state": "draining"}},
+        _refresh_units=lambda *, timeout_s=None: seen.append(timeout_s),
+    )
+    assert ckpt._active_units(store, timeout_s=1.5) == [0]
+    assert seen == [1.5]
+
+
+def test_persist_and_release_timeouts_keep_the_holds_until_the_write_settles(
+    cluster, tmp_path
+):
+    units, client = cluster
+    _put(units[0], "a", 1)
+    cap = _capture(client, tmp_path)
+    pending = concurrent.futures.Future()  # the write of unit 0 is still running
+    cap.units[0].persist_shard = SimpleNamespace(remote=lambda *args: pending)
+    with pytest.raises(TimeoutError, match="timed out"):
+        cap.persist()
+    assert not (tmp_path / "dp" / "metadata.json").exists()
+    with pytest.raises(TimeoutError, match="timed out"):
+        cap.release()  # must not drop holds under a running write
+    assert units[0]._captures and units[1]._captures
+    assert client.controller.views
+    with pytest.raises(RuntimeError, match="single-attempt"):
+        cap.persist()
+    pending.set_result({"blobs": {}, "nbytes": 0})  # the write settles
+    cap.release()
+    assert all(not u._captures for u in units) and not client.controller.views
+    assert not (tmp_path / "dp" / "metadata.json").exists()
+
+
+def test_release_ack_timeout_can_be_retried(cluster, tmp_path):
+    units, client = cluster
+    _put(units[0], "a", 1)
+    cap = _capture(client, tmp_path)
+    original = cap.units[0].release_shard
+    cap.units[0].release_shard = SimpleNamespace(
+        remote=lambda token: concurrent.futures.Future()  # never answers
+    )
+    with pytest.raises(TimeoutError, match="timed out"):
+        cap.release()
+    assert not units[1]._captures and not client.controller.views  # released
+    assert units[0]._captures  # the unanswered release did not run
+    cap.units[0].release_shard = original
+    cap.release()  # the retry finishes the job
+    assert all(not u._captures for u in units)

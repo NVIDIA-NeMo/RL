@@ -107,8 +107,9 @@ def _controller_actor():
     return ray.get_actor("TransferQueueController", namespace="transfer_queue")
 
 
-def _active_units(store: UnitSlabStore) -> list[int]:
-    store._refresh_units()
+def _active_units(store: UnitSlabStore, *, timeout_s: float | None = None) -> list[int]:
+    """Active unit ids; ``timeout_s`` bounds the directory query (GetTimeoutError)."""
+    store._refresh_units(timeout_s=timeout_s)
     return sorted(
         int(u["unit_id"])
         for u in store._units.values()
@@ -193,9 +194,12 @@ class NixlCheckpointCapture(CheckpointCapture):
                     )
             finally:
                 # Partial submission still leaves owned writes to settle or release.
-                _, *results = _wait_all(
+                # Unpack after this block: with no ref submitted, unpacking here
+                # would raise ValueError and hide the submission error.
+                values = _wait_all(
                     refs, timeout_s=max(0.0, deadline - time.monotonic())
                 )
+            _, *results = values
             shards = [
                 _shard_entry(u, r) for u, r in zip(self.units, results, strict=True)
             ]
@@ -262,7 +266,16 @@ def capture_nixl_checkpoint(
     directory = Path(checkpoint_dir).resolve()
     directory.mkdir(parents=True, exist_ok=False)  # never overwrite a saved cut
     _root(directory).mkdir()
-    units = {u: _unit_actor(storage.store, u) for u in _active_units(storage.store)}
+    # The caller holds its mutation barrier, so a frozen actor must not stall it:
+    # one budget covers the unit lookup and every capture RPC.
+    deadline = time.monotonic() + timeout_s
+    try:
+        active = _active_units(storage.store, timeout_s=timeout_s)
+    except ray.exceptions.GetTimeoutError as error:
+        raise TimeoutError(
+            "nixl unit lookup timed out before any hold was taken"
+        ) from error
+    units = {u: _unit_actor(storage.store, u) for u in active}
     capture = NixlCheckpointCapture(
         directory,
         uuid.uuid4().hex,
@@ -272,12 +285,10 @@ def capture_nixl_checkpoint(
         meta,
         timeout_s,
     )
-    # The caller holds its mutation barrier, so a frozen actor must not stall it.
-    deadline = time.monotonic() + timeout_s
     try:
         _wait_all(
             [capture.controller.nrl_capture_snapshot.remote(capture.token)],
-            timeout_s=timeout_s,
+            timeout_s=max(0.0, deadline - time.monotonic()),
         )
         _wait_all(
             [a.capture_shard.remote(capture.token) for a in units.values()],
@@ -286,6 +297,9 @@ def capture_nixl_checkpoint(
         return capture
     except BaseException:
         # Release on every unit: one that did not capture ignores the token.
+        # A unit runs one method at a time, in submission order (its actor sets
+        # no max_concurrency), so this release runs after a capture_shard that
+        # timed out but is still queued or running, and drops the hold it makes.
         try:
             capture.release()
         except Exception as error:

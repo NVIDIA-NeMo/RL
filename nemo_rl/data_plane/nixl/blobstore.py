@@ -124,9 +124,11 @@ class UnitSlabStore:
         self._refresh_units()
 
     # -- membership
-    def _refresh_units(self) -> None:
+    def _refresh_units(self, *, timeout_s: float | None = None) -> None:
         self.stats["unit_refresh"] += 1
-        epoch, units = ray.get(self.directory.units.remote(self._epoch))
+        epoch, units = ray.get(
+            self.directory.units.remote(self._epoch), timeout=timeout_s
+        )
         if units:
             self._units = {int(u["unit_id"]): u for u in units}
             self._epoch = epoch
