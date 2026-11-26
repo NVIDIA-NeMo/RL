@@ -79,6 +79,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         return self._is_real_quant_model()
 
     def _synchronize_before_ipc_data_ack(self) -> None:
+        """Fence all accelerator streams used by ModelOpt post-load methods."""
         if self._is_real_quant_model():
             torch.accelerator.synchronize()
             return

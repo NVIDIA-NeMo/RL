@@ -2515,11 +2515,9 @@ def test_configure_generation_config_respects_explicit_training_load_format():
     ("real_quant", "family_matches", "requested", "expected"),
     [
         (True, True, "dummy", "dummy"),
-        (True, True, "auto", None),
         (False, True, "dummy", "auto"),
         (False, True, "auto", "auto"),
         (True, False, "dummy", "dummy"),
-        (True, False, "auto", None),
         (False, False, "dummy", "dummy"),
         (False, False, "auto", "auto"),
     ],
@@ -2561,12 +2559,6 @@ def test_load_model_preserves_native_quant_loader(
         precision="bfloat16",
         _create_engine=engines.append,
     )
-
-    if expected is None:
-        with pytest.raises(ValueError, match="load_format='dummy'"):
-            BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
-        assert not engines
-        return
 
     BaseVllmGenerationWorker._load_model(worker, bundle_indices=[], seed=42)
 

@@ -207,7 +207,6 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.
 
 This recipe contains the 300-step, 256-example-validation campaign settings.
 The GB200 nightly driver overrides it to a two-step, 32-example smoke test.
-Before running this MoE recipe, use jointly compatible ModelOpt and embedded Megatron-Bridge revisions. ModelOpt must provide `modelopt.torch.export.quantized_weight_export`; Megatron-Bridge must import the functional APIs from that module and provide `AutoBridge.export_hf_weight_groups_modelopt`. Older or independently selected revisions are unsupported.
 
 For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`, `policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct checkpoint and log directories.
 

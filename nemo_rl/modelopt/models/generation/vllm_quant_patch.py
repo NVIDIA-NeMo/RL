@@ -282,15 +282,21 @@ def _process_moe_reload(
                 or current.device != previous.device
             ):
                 raise ValueError("MoE scale metadata changed during refit")
-    for name in ("a1_gscale", "a2_gscale"):
-        scale = getattr(config, name)
-        if scale is not None:
-            layer.register_buffer(f"_nrl_{name}", scale)
+    _register_moe_reload_scales(layer, config)
     if reloading:
         # Keep the kernel bound to the scale storage native copy-back updates;
         # a rebuilt kernel would hold temporary postprocessing tensors.
         quant_method.moe_quant_config = previous_config
         quant_method.moe_kernel = previous_kernel
+
+
+def _register_moe_reload_scales(layer: torch.nn.Module, config: Any) -> None:
+    # Checkpoints lack these derived scales; persistent buffers make native
+    # reload copy them back.
+    for name in ("a1_gscale", "a2_gscale"):
+        scale = getattr(config, name)
+        if scale is not None:
+            layer.register_buffer(f"_nrl_{name}", scale)
 
 
 def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
@@ -326,12 +332,7 @@ def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
                 continue
         else:
             continue
-        # Checkpoints lack these derived scales; persistent buffers make native
-        # reload copy them back.
-        for name in ("a1_gscale", "a2_gscale"):
-            scale = getattr(method.moe_quant_config, name)
-            if scale is not None:
-                layer.register_buffer(f"_nrl_{name}", scale)
+        _register_moe_reload_scales(layer, method.moe_quant_config)
         method.process_weights_after_loading = partial(
             _process_moe_reload,
             quant_method=method,

@@ -1405,9 +1405,8 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
 
     assert events[0] == "validate"
     student_start = events.index("student")
-    assert events[student_start : student_start + 7] == [
+    assert events[student_start : student_start + 6] == [
         "student",
-        "validate",
         "config",
         "offload",
         "vllm",

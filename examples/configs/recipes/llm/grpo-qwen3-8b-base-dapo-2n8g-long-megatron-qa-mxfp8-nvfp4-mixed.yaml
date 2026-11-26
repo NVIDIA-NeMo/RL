@@ -6,8 +6,6 @@
 defaults: grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml
 
 policy:
-  # Ray/container launchers must override this repo-relative example path with
-  # an absolute path visible to every worker.
   quant_cfg: examples/modelopt/quant_configs/mxfp8_attention_nvfp4_mlp.yaml
   quant_calib_data: cnn_dailymail
   quant_calib_size: 512

@@ -32,13 +32,6 @@ Dense tensors use the ordinary ModelOpt Hugging Face representation. For a group
 | NeMo RL | Policy-first startup, configuration transfer, tensor transport, and refit lifecycle |
 | vLLM | Native ModelOpt loading, runtime layouts, post-load processing, and kernel selection |
 
-## Future Offline Export
-
-Offline export can later reuse the same functional per-weight boundary without reusing the online refit lifecycle. Megatron-Bridge keeps topology conversion and its streaming checkpoint writer. The Transformers exporter keeps its resident and layerwise writers. Both delegate supported weight formats and the deployment configuration to ModelOpt.
-
-This is a proposed follow-up, not part of the current online-refit change.
-Formats whose state is not yet represented by the functional API, including AWQ and SmoothQuant, continue through the existing Transformers export handlers until that state is supported.
-
 ## Startup
 
 Real quantization requires policy-first startup:
@@ -83,7 +76,7 @@ These entries describe loader support, not end-to-end refit validation. Recheck 
 | `FP8_PB_WO` | Dense linear layers only; **not MoE** | Supported; block-FP8 MoE layers must share one group size |
 | `MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_NVFP4_FP8` | **Not supported** | **Not supported** |
 
-These limits apply to the ModelOpt schema used by this refit path, not to ModelOpt export or every vLLM quantization loader. ModelOpt's [generic exporter](https://github.com/NVIDIA/Model-Optimizer/blob/0.48.0rc1/modelopt/torch/export/quant_utils.py) supports MXFP4 beyond GPT-OSS, but the pinned vLLM ModelOpt loader does not consume that format. ModelOpt's separate [GPT-OSS MXFP4 weight-only conversion example](https://github.com/NVIDIA/Model-Optimizer/tree/0.48.0rc1/examples/gpt-oss#deployment) emits a different checkpoint schema (`quant_method: "mxfp4"`) for vLLM's GPT-OSS loader; it does not establish generic ModelOpt MXFP4 refit support.
+These limits apply to the ModelOpt schema used by this refit path, not to ModelOpt export or every vLLM quantization loader. ModelOpt's [generic exporter](https://github.com/NVIDIA/Model-Optimizer/blob/3c815f8db9717cb7f4cf44821e8e395edbb24c2b/modelopt/torch/export/quant_utils.py) supports MXFP4 beyond GPT-OSS, but the pinned vLLM ModelOpt loader does not consume that format. ModelOpt's separate [GPT-OSS MXFP4 weight-only conversion example](https://github.com/NVIDIA/Model-Optimizer/tree/3c815f8db9717cb7f4cf44821e8e395edbb24c2b/examples/gpt-oss#deployment) emits a different checkpoint schema (`quant_method: "mxfp4"`) for vLLM's GPT-OSS loader; it does not establish generic ModelOpt MXFP4 refit support.
 
 NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for their current validation status.
 

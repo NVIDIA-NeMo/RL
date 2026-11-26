@@ -59,7 +59,7 @@ def validate_real_quant_policy_config(policy_config: PolicyConfig) -> None:
             "policy.generation.real_quant=true requires "
             "generation.vllm_cfg.kv_cache_dtype=auto"
         )
-    if vllm_cfg["precision"] == "fp8":
+    if vllm_cfg.get("precision") == "fp8":
         raise ValueError(
             "policy.generation.real_quant=true cannot use "
             "generation.vllm_cfg.precision=fp8; the policy-produced "
@@ -81,9 +81,6 @@ def prepare_real_quant_generation_config(
     policy: Any, generation_config: VllmConfig
 ) -> None:
     """Inject the policy-produced canonical ModelOpt config into vLLM config."""
-    policy_config = policy.cfg
-    validate_real_quant_policy_config(policy_config)
-
     quantization_config = policy.get_real_quantization_config()
     hf_overrides = generation_config.setdefault("vllm_kwargs", {}).setdefault(
         "hf_overrides", {}

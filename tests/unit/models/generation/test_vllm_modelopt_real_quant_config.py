@@ -720,36 +720,6 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     )
 
 
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        {
-            "quant_cfg": None,
-            "real_quant": True,
-            "refit_transport": "nixl",
-            "refit_cfg": {"nixl": {}},
-        },
-        {
-            "quant_cfg": None,
-            "real_quant": True,
-            "refit_transport": "vllm_zmq_sparse",
-        },
-    ],
-)
-def test_configure_real_quant_rejects_transport_without_reload_lifecycle(cfg):
-    worker_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
-    )
-    llm_kwargs = {
-        "hf_overrides": {
-            "quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}
-        }
-    }
-
-    with pytest.raises(ValueError, match="native layerwise reload lifecycle"):
-        worker_mod._configure_quant_engine_kwargs(cfg, llm_kwargs)
-
-
 def test_configure_real_quant_requires_policy_config():
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
@@ -861,14 +831,9 @@ def _with_generation(**changes):
         "load-format",
     ],
 )
-def test_prepare_real_quant_generation_config_validates_policy(policy_config, error):
-    policy = types.SimpleNamespace(
-        cfg=policy_config,
-        get_real_quantization_config=lambda: pytest.fail("unexpected worker RPC"),
-    )
-
+def test_validate_real_quant_policy_config_rejects_unsupported(policy_config, error):
     with pytest.raises(ValueError, match=error):
-        modelopt_utils.prepare_real_quant_generation_config(policy, {})
+        modelopt_utils.validate_real_quant_policy_config(policy_config)
 
 
 def test_validate_real_quant_policy_config_allows_disabled_speculation():

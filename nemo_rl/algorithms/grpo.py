@@ -1928,6 +1928,7 @@ def setup(
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
         ## make vllm hf overrides match the training policy
+        # Copy: real quant adds quantization_config without touching the policy's.
         vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
 
         # Real-quant vLLM loads the policy-exported ModelOpt config, so the

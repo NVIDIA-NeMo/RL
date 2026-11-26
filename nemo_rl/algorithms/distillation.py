@@ -574,6 +574,7 @@ def setup(
     if backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        # Copy: real quant adds quantization_config without touching the policy's.
         vllm_kwargs["hf_overrides"] = dict(policy_config.get("hf_config_overrides", {}))
 
     if real_quant:

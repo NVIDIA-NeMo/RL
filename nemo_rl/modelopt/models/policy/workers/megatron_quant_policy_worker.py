@@ -508,7 +508,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             # Fail instead of rolling out without quantizers the export drops (e.g. KV cache).
             check_exportable_quantizers([self.model])
             plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
-        self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan
         return plan
 
@@ -538,47 +537,35 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         generation_cfg = self.cfg["generation"]
         export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
         plan = self._get_modelopt_export_plan()
-        groups = iter(
-            self.megatron_bridge.export_hf_weight_groups_modelopt(
-                [self.model],
-                cpu=export_cpu_offload,
-                show_progress=False,
-                export_plan=plan,
-            )
+        groups = self.megatron_bridge.export_hf_weight_groups_modelopt(
+            [self.model],
+            cpu=export_cpu_offload,
+            show_progress=False,
+            export_plan=plan,
         )
-        while True:
-            if self._real_quant_refit_sync_group is not None:
-                torch.distributed.monitored_barrier(
-                    group=self._real_quant_refit_sync_group,
-                    timeout=timedelta(
-                        milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
-                    ),
-                    wait_all_ranks=True,
-                )
-            try:
-                group = next(groups)
-            except StopIteration:
-                return
-            try:
-                yield group
-            finally:
-                del group
+        # Every rank must finish consuming a group before any rank exports the next.
+        self._sync_real_quant_refit()
+        for group in groups:
+            yield group
+            del group  # release this group before the next one is exported
+            self._sync_real_quant_refit()
+
+    def _sync_real_quant_refit(self) -> None:
+        if self._real_quant_refit_sync_group is not None:
+            torch.distributed.monitored_barrier(
+                group=self._real_quant_refit_sync_group,
+                timeout=timedelta(milliseconds=MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS),
+                wait_all_ranks=True,
+            )
 
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export canonical ModelOpt deployment tensors for non-IPC transports."""
-        groups = iter(self._iter_real_quant_refit_groups(kv_scales))
-        while True:
-            try:
-                group = next(groups)
-            except StopIteration:
-                return
-            try:
-                yield from group
-            finally:
-                del group
+        for group in self._iter_real_quant_refit_groups(kv_scales):
+            yield from group
+            del group  # release this group before the next one is exported
 
     @torch.no_grad()
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:

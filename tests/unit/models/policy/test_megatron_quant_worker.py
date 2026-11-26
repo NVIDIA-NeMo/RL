@@ -450,7 +450,6 @@ def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
         ([worker.model],),
         {},
     )
-    assert worker.refit_conversion_tasks is worker.megatron_bridge.plan.conversion_tasks
     _, args, kwargs = worker.megatron_bridge.calls[1]
     assert args == ([worker.model],)
     assert kwargs["cpu"] is True

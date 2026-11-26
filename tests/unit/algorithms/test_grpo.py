@@ -5085,10 +5085,9 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
         policy_factory=DummyPolicy,
     )
 
-    assert events[:8] == [
+    assert events[:7] == [
         "validate",
         "policy",
-        "validate",
         "config",
         "offload",
         "vllm",

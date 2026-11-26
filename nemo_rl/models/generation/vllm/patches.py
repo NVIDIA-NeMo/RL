@@ -434,7 +434,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
     Applied as two INDEPENDENT edits rather than one block replacement, each
     anchored on text that is stable across loader variants. Both anchors are
-    verified against stock vLLM 0.25.1 and 0.29.0. Custom vLLM builds that
+    verified against stock vLLM 0.33.0. Custom vLLM builds that
     reshape the surrounding loader body (for example by gating the legacy
     branch or adding a native-name mapping branch) still take the required
     edit, where matching the whole body as one snippet would silently no-op.
@@ -467,6 +467,7 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
+    # Upgrade sources already patched by main's eager-fill form of this patch.
     previous_snippet = """                loaded_params.add(vllm_key)
 
         initializer_factor = getattr(self.config, "initializer_factor", 1.0)
