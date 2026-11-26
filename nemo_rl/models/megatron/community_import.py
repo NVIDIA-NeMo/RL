@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import pickle
 import shutil
+import socket
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from typing import Any, Callable, Optional
@@ -90,6 +93,55 @@ def megatron_conversion_is_complete(pretrained_path: str) -> bool:
         and os.path.getsize(path) > 0
         for relative_path in relative_paths
     )
+
+
+def _wait_for_published_conversion(
+    pretrained_path: str, *, timeout_seconds: float = 60.0
+) -> None:
+    """Wait for all ranks to see the published config, metadata and tensor shards."""
+    dist = torch.distributed
+    start = time.monotonic()
+    deadline = start + timeout_seconds
+    delay = 0.25
+    local_error = None
+    retries = 0
+    while True:
+        try:
+            if megatron_conversion_is_complete(pretrained_path):
+                if retries:
+                    logging.getLogger(__name__).info(
+                        "Published checkpoint %s became visible on rank %d after %.2fs",
+                        pretrained_path,
+                        dist.get_rank(),
+                        time.monotonic() - start,
+                    )
+                break
+        except FileNotFoundError:
+            # A shard may disappear between the isfile and getsize checks.
+            pass
+        except OSError as exc:
+            local_error = str(exc)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            local_error = f"incomplete after {timeout_seconds:g}s"
+            break
+        retries += 1
+        time.sleep(min(delay, remaining))
+        delay = min(2.0 * delay, 5.0)
+
+    # Every worker must agree before any enters the collective checkpoint load.
+    errors: list[str | None] = [None] * dist.get_world_size()
+    if local_error is not None:
+        local_error = f"rank {dist.get_rank()} on {socket.gethostname()} ({pretrained_path}): {local_error}"
+    dist.all_gather_object(errors, local_error)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        raise RuntimeError(
+            "Published HF-to-Megatron checkpoint is unavailable on "
+            + "; ".join(failures)
+            + ". Check that NRL_MEGATRON_CHECKPOINT_DIR uses the same shared filesystem on every policy node."
+        )
 
 
 def publish_megatron_conversion(
@@ -314,6 +366,8 @@ def import_model_from_hf_name(
         publish_megatron_conversion(staging_path, output_path, overwrite=overwrite)
     if dist_active:
         torch.distributed.barrier()
+        if torch.distributed.get_world_size() > 1:
+            _wait_for_published_conversion(output_path)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine

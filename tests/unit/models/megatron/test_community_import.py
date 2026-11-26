@@ -19,9 +19,13 @@ import os
 import pickle
 import sys
 import time
+from datetime import timedelta
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
+import torch.distributed.checkpoint as dcp
 
 from nemo_rl.models.policy import provider_override_allowed
 
@@ -295,3 +299,65 @@ def test_conversion_requires_every_referenced_shard(monkeypatch, tmp_path):
         )
     )
     assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def _check_conversion_across_ranks(rank: int, tmp_path: Path) -> None:
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            module = _load_community_import_module(mp)
+        module.torch = torch
+        staging = tmp_path / "staging"
+        published = tmp_path / "published"
+        iteration = "iter_0000000"
+        expected = torch.arange(8)
+        dcp.save({"weight": expected}, checkpoint_id=staging / iteration)
+        if rank == 0:
+            (staging / iteration / "run_config.yaml").write_text("{}\n")
+            module.publish_megatron_conversion(str(staging), str(published))
+        dist.barrier()
+
+        # Rank 1 initially sees the config and real DCP metadata but no shards.
+        checkpoint = published
+        if rank == 1:
+            checkpoint = tmp_path / "rank-1"
+            (checkpoint / iteration).mkdir(parents=True)
+            for name in (".metadata", "run_config.yaml"):
+                (checkpoint / iteration / name).symlink_to(published / iteration / name)
+        with pytest.raises(RuntimeError, match=r"rank 1 on .*rank-1") as exc:
+            module._wait_for_published_conversion(str(checkpoint), timeout_seconds=0)
+        assert "rank 0 on" not in str(exc.value)
+
+        with pytest.MonkeyPatch.context() as mp:
+            if rank == 1:
+                checkpoint.rename(tmp_path / "incomplete")
+                # Expose the published directory after the peer's first miss.
+                mp.setattr(
+                    module,
+                    "time",
+                    SimpleNamespace(
+                        monotonic=time.monotonic,
+                        sleep=lambda _: checkpoint.symlink_to(
+                            published, target_is_directory=True
+                        ),
+                    ),
+                )
+            module._wait_for_published_conversion(str(checkpoint), timeout_seconds=5)
+        restored = {"weight": torch.full_like(expected, -1)}
+        dcp.load(restored, checkpoint_id=checkpoint / iteration)
+        torch.testing.assert_close(restored["weight"], expected, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_conversion_visibility(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _check_conversion_across_ranks, args=(tmp_path,), nprocs=2, join=True
+    )
