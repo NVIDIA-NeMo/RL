@@ -567,3 +567,36 @@ def test_select_extracted_answer_never_raises(extracted_answer, impl, expected):
     from nemo_rl.environments.math_environment import _select_extracted_answer
 
     assert _select_extracted_answer(extracted_answer, impl) == expected
+
+
+@pytest.mark.parametrize(
+    "worker_name",
+    ["EnglishMultichoiceVerifyWorker", "MultilingualMultichoiceVerifyWorker"],
+)
+@pytest.mark.parametrize(
+    "response,ground_truth,expected_answer,expected_score",
+    [
+        ("Answer: B", "B", "B", 1.0),
+        # The prefix match is case-insensitive, so a lowercase letter is read
+        # and must be graded like its uppercase form.
+        ("Answer: b", "B", "B", 1.0),
+        ("answer: c", "C", "C", 1.0),
+        ("Answer: b", "C", "B", 0.0),
+        # The letter must stand alone, not be the first letter of a word.
+        ("Answer: because the base is even.\nAnswer: B", "B", "B", 1.0),
+        ("Answer: The correct option is C", "C", None, 0.0),
+        ("Answer: B.", "B", "B", 1.0),
+    ],
+)
+def test_multichoice_letter_extraction(
+    worker_name, response, ground_truth, expected_answer, expected_score
+):
+    from nemo_rl.environments import math_environment
+
+    worker_cls = getattr(math_environment, worker_name).__ray_metadata__.modified_class
+    scores, answers = worker_cls().verify(
+        [response], [ground_truth], return_extracted_answer=True
+    )
+
+    assert answers == [expected_answer]
+    assert scores == [expected_score]

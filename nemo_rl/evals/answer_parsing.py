@@ -14,8 +14,14 @@
 
 """Contains utility functions for answer parsing."""
 
+# The option letter must stand on its own: "Answer: because ..." or
+# "Answer: The correct option is C" should not read the first letter of a word.
+# The prefix match is case-insensitive, so the letter may come back lowercase;
+# normalize_extracted_answer upper-cases it before it is compared.
+_STANDALONE_LETTER = "(?![A-Za-z])"
+ENGLISH_ANSWER_PATTERN = r"(?i)Answer\s*:[ \t]*([A-Z])" + _STANDALONE_LETTER
 MULTILINGUAL_ANSWER_PATTERN_TEMPLATE = (
-    "(?i){}[ \t]*([A-D]|[أ-د]|[অ]|[ব]|[ড]|[ঢ]|[Ａ]|[Ｂ]|[Ｃ]|[Ｄ])"
+    "(?i){}[ \t]*([A-D]|[أ-د]|[অ]|[ব]|[ড]|[ঢ]|[Ａ]|[Ｂ]|[Ｃ]|[Ｄ])" + _STANDALONE_LETTER
 )
 # All the different ways "Answer" is written in different languages
 MULTILINGUAL_ANSWER_REGEXES = [
@@ -82,6 +88,7 @@ def normalize_extracted_answer(extracted_answer: str) -> str:
         .replace("Ｃ", " C")
         .replace("Ｄ", " D")
         .strip()
+        .upper()
     )
 
 
