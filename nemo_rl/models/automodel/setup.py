@@ -18,6 +18,7 @@ import importlib
 import inspect
 import json
 import os
+from collections.abc import Iterable
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -474,26 +475,31 @@ def validate_and_prepare_config(
     )
 
 
-def setup_reference_model_state(
-    model: torch.nn.Module,
-) -> dict[str, torch.Tensor]:
-    """Set up reference model state dict by creating a CPU copy of the model's state dict.
+def _reference_model_state_items(
+    model: torch.nn.Module, *, lora_enabled: bool
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield the entries to copy for reference scoring.
 
-    This creates a reference copy of the model weights on CPU with pinned memory
-    for efficient CPU-GPU transfers. The reference model is typically used to
-    compute reference log probabilities during RL training.
-
-    Args:
-        model: The model to create a reference copy from
-
-    Returns:
-        Dictionary mapping parameter names to CPU tensors with pinned memory
-
-    Example:
-        >>> model = setup_model(...)
-        >>> reference_model_state_dict = setup_reference_model_state(model)
+    LoRA shares frozen base parameters, while buffers such as router bias can change.
     """
-    return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
+    if not lora_enabled:
+        return model.state_dict().items()
+
+    return (
+        (name, value.detach())
+        for name, value in model.state_dict(keep_vars=True).items()
+        if not (isinstance(value, torch.nn.Parameter) and not value.requires_grad)
+    )
+
+
+def setup_reference_model_state(
+    model: torch.nn.Module, *, lora_enabled: bool = False
+) -> dict[str, torch.Tensor]:
+    """Copy the reference scoring state to pinned CPU memory."""
+    return get_cpu_state_dict(
+        _reference_model_state_items(model, lora_enabled=lora_enabled),
+        pin_memory=True,
+    )
 
 
 def setup_distributed(
