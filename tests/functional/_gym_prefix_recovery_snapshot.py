@@ -126,6 +126,24 @@ def _require_every_active_call_cut(snapshot: Path, phase_log: str) -> None:
         raise AssertionError(f"snapshot left active calls uncut: {uncut}")
 
 
+def _require_peer_frontend_cut(cuts: list[dict[str, Any]], phase_log: str) -> None:
+    """Reject a snapshot none of whose prefixes another HTTP frontend cut.
+
+    With several frontends, the one Gym's cut reaches cuts the calls it holds
+    and asks the others for theirs. A snapshot whose calls all sat on that one
+    frontend would restore without the fan-out having cut anything.
+    """
+    peer_cut = {
+        call
+        for calls in re.findall(
+            r"HTTP frontend \S+ cut \d+ model calls: \[([^\]]*)\]", phase_log
+        )
+        for call in re.findall(r"'([^']+)'", calls)
+    }
+    if not any(cut["model_call_id"] in peer_cut for cut in cuts):
+        raise AssertionError("no recoverable prefix was cut by another HTTP frontend")
+
+
 def inspect_snapshot(
     snapshot: Path,
     sentinel_event: str | None,
@@ -236,9 +254,10 @@ def select_snapshot(args: argparse.Namespace) -> None:
                     None if args.stateless_resources else args.sentinel_event,
                     min_cut_groups=args.min_cut_groups,
                 )
-                _require_every_active_call_cut(
-                    snapshot, phase_log.read_text(errors="replace")
-                )
+                log = phase_log.read_text(errors="replace")
+                _require_every_active_call_cut(snapshot, log)
+                if args.require_peer_frontend_cut:
+                    _require_peer_frontend_cut(selection["cuts"], log)
             except (AssertionError, FileNotFoundError, json.JSONDecodeError) as error:
                 last_error = f"{snapshot}: {error}"
                 continue
@@ -398,6 +417,8 @@ def _parser() -> argparse.ArgumentParser:
     # instead of silently skipping the post-mutation resources check.
     select.add_argument("--stateless-resources", action="store_true")
     select.add_argument("--min-cut-groups", type=int, default=1)
+    # Several HTTP frontends: require a prefix that the cut's fan-out cut.
+    select.add_argument("--require-peer-frontend-cut", action="store_true")
     select.set_defaults(func=select_snapshot)
 
     verify = commands.add_parser("verify-restore")

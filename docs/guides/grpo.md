@@ -462,25 +462,17 @@ There are three choices:
 - **`normalization: sequence_mean`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
 - **`normalization: group_token_mean`** — average all valid response tokens within each prompt group, then average groups equally. See [Equal prompt-group token means](#equal-prompt-group-token-means) for supported training paths.
 
-The deprecated `token_level_loss` flag remains compatible: `true` selects
-`global_token_mean`, and `false` selects `sequence_mean`. Leave both selectors
-unset or `null` to preserve the default global token mean. Supplying a non-null
-`normalization` together with either legacy boolean is an error, even when they
-agree. Shared exemplars leave both unset so old child recipes still work. To
-change a custom parent that sets the old flag, clear it explicitly:
+By default, the loss uses `global_token_mean`.
+Child recipes inherit their parent's `normalization` setting; set another value to override it, or `null` to restore global token averaging.
 
 ```yaml
 loss_fn:
-  token_level_loss: null
   normalization: sequence_mean
 ```
 
-The resolved mode is internal: saving and reloading a config preserves the
-original selector, rather than adding a second conflicting one. Unchanged legacy
-recipes retain their reduction. This does not migrate existing bootstrap
-snapshot identities: those fingerprints include the serialized configuration
-and can reject changes in selector syntax or schema across code versions, even
-when the resolved averaging is equivalent.
+> **Upgrading an interrupted run:** If your run has a bootstrap rollout snapshot but no trainer checkpoint, resume with the original NeMo-RL version and config.
+> Save a trainer checkpoint, then upgrade NeMo-RL and migrate the config.
+> Removing `token_level_loss` can make the new version reject an older bootstrap snapshot.
 
 Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
 
@@ -551,7 +543,7 @@ Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i
 | Algorithm | `normalization: global_token_mean` | `normalization: sequence_mean` |
 | --- | --- | --- |
 | **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
-| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not supported by this implementation; the loss constructor rejects `sequence_mean`. |
 | **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
 | **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
 
@@ -562,7 +554,8 @@ Two notes on the table:
 
 #### Losses that do not expose this parameter
 
-`normalization` and its legacy alias `token_level_loss` are fields of `ClippedPGLossConfig` only. Every other loss fixes its normalization as a class attribute, so setting either selector in, say, an SFT config has no effect:
+Use `loss_fn.normalization` to choose how the GRPO/PPO policy loss is averaged.
+This setting does not affect other losses, such as SFT or DPO; their averaging rules are fixed and listed below.
 
 | Loss function | Used by | Normalization |
 | --- | --- | --- |
@@ -841,7 +834,7 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` and `token_abs_logprob_error` to monitor training–generation logprob mismatch.
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error`, `token_abs_logprob_error`, and `gen_prev_logprob_mismatch_tokens` to monitor training–generation logprob mismatch.
 `loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
@@ -852,6 +845,9 @@ $$
 $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
+
+### Mismatched Logprob Token Count
+`gen_prev_logprob_mismatch_tokens` counts the valid tokens whose generation logprob differs from the training logprob; a NaN counts as a difference. It is a raw count, not normalized by tokens or sequences. A run with zero train/generation mismatch reports 0 on every step, including differences too small to move `gen_kl_error` away from 0.
 
 ### Absolute Token Logprob Error
 
