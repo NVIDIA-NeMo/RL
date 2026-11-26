@@ -403,6 +403,7 @@ data_plane:
       enabled: true                    # spill memory to local SSD above the threshold
       path: null                       # null: node NVMe (/raid if mounted, else /tmp); or an absolute dir
       offload_threshold: 0.8           # offload above this share of segment memory
+  metrics_port: 8200                   # optional TQ controller metrics; integer 1024–65535
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check

@@ -329,8 +329,8 @@ _GLOBAL_VALID_SEQS = torch.tensor(2.0)
 _GLOBAL_VALID_TOKS = torch.tensor(5.0)
 
 
-def test_opd_full_token_level_loss_normalizes_by_the_global_token_count():
-    loss, metrics = _loss_fn(token_level_loss=True)(
+def test_opd_full_global_token_mean_normalizes_by_the_global_token_count():
+    loss, metrics = _loss_fn(normalization="global_token_mean")(
         data=_microbatch(),
         global_valid_seqs=_GLOBAL_VALID_SEQS,
         global_valid_toks=_GLOBAL_VALID_TOKS,
@@ -348,7 +348,7 @@ def test_opd_full_sequence_level_loss_averages_within_each_sequence_first():
     dividing once would mix the two units; each sequence must be averaged over
     its own valid tokens before the outer mean.
     """
-    loss, _ = _loss_fn(token_level_loss=False)(
+    loss, _ = _loss_fn(normalization="sequence_mean")(
         data=_microbatch(),
         global_valid_seqs=_GLOBAL_VALID_SEQS,
         global_valid_toks=_GLOBAL_VALID_TOKS,
@@ -361,7 +361,7 @@ def test_opd_full_sequence_level_loss_averages_within_each_sequence_first():
 
 def test_opd_full_diagnostics_stay_token_normalized_under_sequence_level_loss():
     """``opd_full_reverse_kl`` declares MetricNormalizer.TOKENS either way."""
-    _, metrics = _loss_fn(token_level_loss=False)(
+    _, metrics = _loss_fn(normalization="sequence_mean")(
         data=_microbatch(),
         global_valid_seqs=_GLOBAL_VALID_SEQS,
         global_valid_toks=_GLOBAL_VALID_TOKS,
@@ -421,7 +421,9 @@ def test_opd_full_reference_kl_gradient_carries_the_score_function_term():
     )
 
     with pytest.warns(UserWarning, match="second KL"):
-        loss_fn = _loss_fn(reference_policy_kl_penalty=penalty, token_level_loss=True)
+        loss_fn = _loss_fn(
+            reference_policy_kl_penalty=penalty, normalization="global_token_mean"
+        )
 
     loss, metrics = loss_fn(
         next_token_logprobs=next_token_logprobs,
@@ -847,7 +849,7 @@ def test_opd_full_excludes_sequences_masked_out_by_sample_mask():
     """
     divergence = torch.tensor([[1.0, 3.0, 2.0], [5.0, 7.0, 0.0], [99.0, 99.0, 99.0]])
 
-    loss, metrics = _loss_fn(token_level_loss=True)(
+    loss, metrics = _loss_fn(normalization="global_token_mean")(
         data=_microbatch_with_a_filtered_sequence(),
         global_valid_seqs=_GLOBAL_VALID_SEQS,
         global_valid_toks=_GLOBAL_VALID_TOKS,
@@ -867,7 +869,7 @@ def test_opd_full_filtered_sequences_receive_no_gradient():
         [[1.0, 3.0, 2.0], [5.0, 7.0, 0.0], [99.0, 99.0, 99.0]], requires_grad=True
     )
 
-    loss, _ = _loss_fn(token_level_loss=True)(
+    loss, _ = _loss_fn(normalization="global_token_mean")(
         data=_microbatch_with_a_filtered_sequence(),
         global_valid_seqs=_GLOBAL_VALID_SEQS,
         global_valid_toks=_GLOBAL_VALID_TOKS,
@@ -889,7 +891,7 @@ def test_opd_full_normalizes_by_the_global_counts_not_the_microbatch():
     global_valid_seqs = torch.tensor(8.0)
     global_valid_toks = torch.tensor(20.0)
 
-    loss, metrics = _loss_fn(token_level_loss=True)(
+    loss, metrics = _loss_fn(normalization="global_token_mean")(
         data=_microbatch(),
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
@@ -899,7 +901,7 @@ def test_opd_full_normalizes_by_the_global_counts_not_the_microbatch():
     assert loss.item() == pytest.approx((1 + 3 + 2 + 5 + 7) / 20)
     assert metrics["opd_full_reverse_kl"] == pytest.approx((1 + 3 + 2 + 5 + 7) / 20)
 
-    loss, _ = _loss_fn(token_level_loss=False)(
+    loss, _ = _loss_fn(normalization="sequence_mean")(
         data=_microbatch(),
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
