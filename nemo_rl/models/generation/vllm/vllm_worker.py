@@ -1003,7 +1003,7 @@ class BaseVllmGenerationWorker:
         """Get the vLLM engine's Prometheus counters.
 
         Returns the engine's whole snapshot -- the spec-decode counters plus the
-        token, sequence-length and request-outcome series -- so one RPC per
+        token, sequence-length, request-outcome, prefix-cache and preemption series -- so one RPC per
         snapshot serves every metric family the driver reports on.
 
         Two shapes in the snapshot do not survive a plain ``{name: value}`` read
