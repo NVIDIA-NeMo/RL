@@ -68,6 +68,8 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
+# A tar of opt/gym_venvs built in CONTAINER; see "Python Environments on Shared Filesystems" in docs/cluster.md.
+GYM_VENV_ARCHIVE="${GYM_VENV_ARCHIVE:-}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-super-omni}"
 DRY_RUN="${DRY_RUN:-false}"
 
@@ -188,33 +190,19 @@ BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3r
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
+# GYM_VENV_DIR defaults to the image's /opt/gym_venvs, on the node's local disk.
+# shellcheck source=../gym_venv_launch_checks.sh
+source "${SNAPSHOT_DIR}/examples/nemo_gym/gym_venv_launch_checks.sh"
+gym_venv_launch_checks "${GYM_VENV_DIR}" "${GYM_VENV_ARCHIVE}" "${MOUNTS}" "${SNAPSHOT_DIR}"
+
 # The checkpoint, dataset and caches live outside the code snapshot, so their
 # filesystems have to be bind-mounted or they simply do not exist inside the
 # container. Transformers then treats an absent local path as a Hub repo id and
 # fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
 # which says nothing about mounts. Check here instead.
 mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
-# GYM_VENV_DIR defaults to a container-internal path, which needs no mount. It
-# only has to be checked when pointed at host storage -- worth doing, because
-# putting it on a shared filesystem is how Gym's skip_venv_if_present actually
-# takes effect: the container-local default is discarded with the container, so
-# every run rebuilds ~175 packages per resource server.
-[[ "${GYM_VENV_DIR}" != /opt/* ]] && mount_checked_vars+=(GYM_VENV_DIR)
 for path_var in "${mount_checked_vars[@]}"; do
-    path_value="${!path_var}"
-    mounted=false
-    IFS=',' read -ra mount_specs <<< "${MOUNTS}"
-    for spec in "${mount_specs[@]}"; do
-        host_path="${spec%%:*}"
-        [[ -n "${host_path}" && "${path_value}" == "${host_path}"* ]] && mounted=true && break
-    done
-    if [[ "${mounted}" != true ]]; then
-        echo "Error: ${path_var}=${path_value}" >&2
-        echo "  is not under any path in MOUNTS, so it will not exist in the container." >&2
-        echo "  Add its filesystem to EXTRA_MOUNTS, e.g." >&2
-        echo "    EXTRA_MOUNTS=/host/path:/host/path,/other/path:/other/path" >&2
-        exit 1
-    fi
+    gym_path_identity_mounted "${!path_var}" "${MOUNTS}" || gym_mount_error "${path_var}" "${!path_var}"
 done
 
 echo "========================================"
@@ -242,6 +230,7 @@ SBATCH_ARGS=(
 if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] COMMAND:"
     echo "${COMMAND}"
+    echo "[dry-run] SETUP_COMMAND: ${SETUP_COMMAND:-<none>}"
     echo "[dry-run] sbatch invocation:"
     echo "${SBATCH_ARGS[@]}"
 else
