@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -378,6 +378,38 @@ class GymCheckpointAdapter:
                 list(rollout_ids),
                 deadline_ts=deadline_ts,
             )
+
+    async def release(
+        self,
+        checkpoint_id: str,
+        kept: Iterable[str],
+        *,
+        deadline_ts: float,
+    ) -> dict[str, str]:
+        """Have Gym delete external state that only checkpoints outside ``kept`` use.
+
+        Only participants that report ``keeps_external_state`` are asked; the
+        others keep nothing for a release to delete.
+
+        Returns:
+            Gym's failure message for each participant whose release failed.
+            Gym keeps a record of what was left and deletes it at the next
+            release.
+        """
+        from nemo_gym._checkpoint.coordination import release
+
+        participants = self._require_participants()
+        keepers = tuple(
+            member for member in participants.members if member.keeps_external_state
+        )
+        if not keepers:
+            return {}
+        return await release(
+            replace(participants, members=keepers),
+            checkpoint_id,
+            list(kept),
+            deadline_ts=deadline_ts,
+        )
 
     async def commit(
         self,

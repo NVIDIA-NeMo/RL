@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
 )
 from nemo_rl.environments.checkpointing import build_environment_checkpoint
+from nemo_rl.environments.checkpointing import nemo_gym as gym_checkpointing
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.checkpointing.nemo_gym import (
     GymEnvironmentCheckpoint,
@@ -39,6 +42,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointEpisode,
 )
 from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     GymCheckpointNotReady,
@@ -1150,6 +1154,122 @@ def test_no_restart_only_gym_server_and_no_opt_in_passes_silently() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         asyncio.run(gym.check_startup())
+
+
+async def _commit_gym_snapshot(
+    gym: GymEnvironmentCheckpoint, snapshot_dir: Path, checkpoint_id: str
+) -> None:
+    """Commit one Gym checkpoint whose manifest lands in ``snapshot_dir``."""
+    snapshot_dir.mkdir()
+    async with snapshot_commit(gym, snapshot_dir, checkpoint_id=checkpoint_id):
+        pass
+
+
+def test_release_keeps_the_gym_checkpoint_of_every_snapshot_still_on_disk(
+    tmp_path: Path,
+) -> None:
+    """A pruned snapshot's checkpoint is left out, so Gym deletes its sandbox snapshots."""
+    actor = FakeGymActor(exported_episodes=())
+    gym = gym_environment_checkpoint(gym_coordinator(actor))
+    kept, pruned, without_gym = (
+        tmp_path / name for name in ("kept", "pruned", "without-gym")
+    )
+
+    async def exercise() -> None:
+        await _commit_gym_snapshot(gym, pruned, "save-1")
+        await _commit_gym_snapshot(gym, kept, "save-2")
+        # A snapshot taken while Gym held nothing has no Gym manifest.
+        without_gym.mkdir()
+        await gym.release([kept, without_gym])
+
+    asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+    assert actor.calls[-1][:2] == ("release", ("save-2", ("save-2",)))
+
+
+def test_release_is_skipped_when_a_kept_snapshots_gym_manifest_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Leaving that checkpoint out of kept would delete state RL can still restore."""
+    actor = FakeGymActor(exported_episodes=())
+    gym = gym_environment_checkpoint(gym_coordinator(actor))
+    corrupt = tmp_path / "corrupt"
+
+    async def exercise() -> None:
+        await _commit_gym_snapshot(gym, tmp_path / "save-1", "save-1")
+        corrupt.mkdir()
+        (corrupt / GYM_CHECKPOINT_MANIFEST_FILENAME).write_text("{")
+        with pytest.warns(UserWarning, match="Skipping the Gym checkpoint release"):
+            await gym.release([tmp_path / "save-1", corrupt])
+
+    asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+    assert "release" not in actor.operations()
+
+
+@pytest.mark.parametrize("failure", ["participant", "actor"])
+def test_a_failed_release_warns_and_never_raises(tmp_path: Path, failure: str) -> None:
+    """Gym keeps what a failed release left and deletes it at the next one."""
+    actor = FakeGymActor(
+        exported_episodes=(),
+        release_failures=(
+            {"sandboxes": "snapshot in use"} if failure == "participant" else None
+        ),
+        hang=frozenset({"release"}) if failure == "actor" else frozenset(),
+    )
+    gym = gym_environment_checkpoint(gym_coordinator(actor, control_timeout_s=0.5))
+
+    async def exercise() -> None:
+        await _commit_gym_snapshot(gym, tmp_path / "save-1", "save-1")
+        with pytest.warns(UserWarning, match="the next release retries"):
+            await gym.release([tmp_path / "save-1"])
+
+    asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+
+def test_release_reads_each_snapshots_gym_manifest_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that keeps many checkpoints must not re-read every manifest at every release."""
+    actor = FakeGymActor(exported_episodes=())
+    gym = gym_environment_checkpoint(gym_coordinator(actor))
+    read: list[str] = []
+    load = gym_checkpointing.load_gym_checkpoint_manifest
+
+    def recording_load(snapshot_dir: Path) -> Any:
+        read.append(snapshot_dir.name)
+        return load(snapshot_dir)
+
+    monkeypatch.setattr(
+        gym_checkpointing, "load_gym_checkpoint_manifest", recording_load
+    )
+    first, second, third = (tmp_path / name for name in ("first", "second", "third"))
+
+    async def exercise() -> list[tuple[str, ...]]:
+        await _commit_gym_snapshot(gym, first, "save-1")
+        await _commit_gym_snapshot(gym, second, "save-2")
+        await gym.release([first, second])
+        await _commit_gym_snapshot(gym, third, "save-3")
+        # The first snapshot was pruned.
+        await gym.release([second, third])
+        # The second snapshot's directory now holds another checkpoint.
+        manifest = second / GYM_CHECKPOINT_MANIFEST_FILENAME
+        mtime_ns = manifest.stat().st_mtime_ns
+        shutil.rmtree(second)
+        await _commit_gym_snapshot(gym, second, "save-4")
+        # Coarse file timestamps can repeat within a test; a later write's do not.
+        os.utime(manifest, ns=(mtime_ns + 10**9, mtime_ns + 10**9))
+        await gym.release([second, third])
+        return [call[1][1] for call in actor.calls if call[0] == "release"]
+
+    kept = asyncio.run(asyncio.wait_for(exercise(), _ASYNC_TEST_TIMEOUT_S))
+
+    assert kept == [
+        ("save-1", "save-2"),
+        ("save-2", "save-3"),
+        ("save-3", "save-4"),
+    ]
+    assert read == ["first", "second", "third", "second"]
 
 
 class _GateRecordingManager:

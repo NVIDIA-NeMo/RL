@@ -16,7 +16,7 @@
 
 Implements ``EnvironmentCheckpoint`` (``nemo_rl.environments.checkpointing.interfaces``)
 over a ``GymCheckpointCoordinator``. Everything that knows Gym episodes, Gym
-participants, retire/forget, and ``gym_checkpoint.json`` lives here, so the
+participants, retire/forget/release, and ``gym_checkpoint.json`` lives here, so the
 single controller only pauses, snapshots, validates and restores through the
 interface.
 """
@@ -37,6 +37,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarr
 from nemo_rl.environments.checkpointing.interfaces import RestoredEnvironmentRollouts
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     GymCheckpointOperationError,
@@ -290,6 +291,9 @@ class GymEnvironmentCheckpoint:
         # Separate from the data-plane barrier: it pauses only Gym /run
         # submissions while a Gym checkpoint is prepared.
         self.admission_gate = DataPlaneCheckpointBarrier()
+        # The Gym checkpoint ID of each snapshot the last release kept, with
+        # the inode and mtime of the manifest it was read from.
+        self._kept_checkpoint_ids: dict[Path, tuple[tuple[int, int], str]] = {}
 
     @property
     def holds_rollout_state(self) -> bool:
@@ -599,3 +603,65 @@ class GymEnvironmentCheckpoint:
                     key for keys in manifest.staging_keys.values() for key in keys
                 ),
             )
+
+    # ── release ───────────────────────────────────────────────────────────
+
+    async def release(self, snapshot_dirs: Iterable[Path]) -> None:
+        """Have Gym delete external state no snapshot in ``snapshot_dirs`` uses.
+
+        Sandbox snapshots live in the sandbox service, not under RL's checkpoint
+        directory, so pruning a rollout snapshot leaves them behind until Gym is
+        told which checkpoints RL still keeps. Skipped when a Gym manifest
+        cannot be read: leaving its checkpoint out would delete state RL can
+        still restore.
+        """
+        try:
+            kept = await asyncio.to_thread(
+                self._gym_checkpoint_ids, list(snapshot_dirs)
+            )
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            warnings.warn(
+                "Skipping the Gym checkpoint release: a rollout snapshot's Gym "
+                f"manifest could not be read: {type(error).__name__}: {error}",
+                stacklevel=2,
+            )
+            return
+        try:
+            failures = await self.coordinator.release(kept)
+        except GymCheckpointOperationError as error:
+            failures = error.failures
+        if failures:
+            warnings.warn(
+                "Gym could not delete external state of checkpoints RL no longer "
+                f"keeps; the next release retries: {failures!r}",
+                stacklevel=2,
+            )
+
+    def _gym_checkpoint_ids(self, snapshot_dirs: list[Path]) -> frozenset[str]:
+        """Return the Gym checkpoint ID each snapshot directory's Gym manifest names.
+
+        A published snapshot never changes, so each manifest is read once and
+        its ID reused while the snapshot stays on disk: a long run would
+        otherwise re-read every retained manifest at every release. Snapshots
+        missing from ``snapshot_dirs`` are forgotten, and a manifest whose
+        inode or mtime changed is read again.
+        """
+        checkpoint_ids: dict[Path, tuple[tuple[int, int], str]] = {}
+        for snapshot_dir in snapshot_dirs:
+            try:
+                manifest = (snapshot_dir / GYM_CHECKPOINT_MANIFEST_FILENAME).stat()
+            except FileNotFoundError:
+                # Taken while Gym held nothing to save.
+                continue
+            identity = (manifest.st_ino, manifest.st_mtime_ns)
+            known = self._kept_checkpoint_ids.get(snapshot_dir)
+            checkpoint_ids[snapshot_dir] = (
+                known
+                if known is not None and known[0] == identity
+                else (
+                    identity,
+                    load_gym_checkpoint_manifest(snapshot_dir).checkpoint_id,
+                )
+            )
+        self._kept_checkpoint_ids = checkpoint_ids
+        return frozenset(checkpoint_id for _, checkpoint_id in checkpoint_ids.values())

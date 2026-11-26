@@ -646,6 +646,19 @@ def commit_snapshot(
         _fsync_directory(root)
 
 
+def published_snapshot_dirs(checkpoint_dir: Path) -> list[Path]:
+    """Return every published rollout snapshot under ``checkpoint_dir``.
+
+    Covers the snapshots of every trainer checkpoint and of the bootstrap
+    anchor: every snapshot a restore could resolve.
+    """
+    return sorted(
+        path
+        for path in checkpoint_dir.glob(f"*/{ROLLOUT_SNAPSHOTS_DIRNAME}/*")
+        if path.is_dir() and _SNAPSHOT_RE.fullmatch(path.name)
+    )
+
+
 def resolve_latest_snapshot(
     anchor: Path,
     *,

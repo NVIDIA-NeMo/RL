@@ -505,7 +505,7 @@ def test_a_resume_that_breaks_an_invariant_is_not_retried() -> None:
     assert [call[0] for call in actor.calls] == ["resume"]
 
 
-@pytest.mark.parametrize("operation", ["commit", "restore", "retire"])
+@pytest.mark.parametrize("operation", ["commit", "restore", "retire", "release"])
 def test_every_control_operation_is_bounded(operation: str, tmp_path: Path) -> None:
     actor = _FakeGymActor(hang=frozenset({operation}))
     coordinator = _fast_coordinator(actor)
@@ -518,12 +518,19 @@ def test_every_control_operation_is_bounded(operation: str, tmp_path: Path) -> N
         restarts=_NO_RESTARTS,
         participants=_NO_PARTICIPANTS,
     )
+
+    async def release() -> dict[str, dict[str, str]]:
+        # A release names the latest checkpoint, so one must have started.
+        await coordinator.prepare("save-1")
+        return await coordinator.release(["save-1"])
+
     calls = {
         "commit": lambda: coordinator.commit(
             "save-1", tmp_path, episodes, restarts=_NO_RESTARTS
         ),
         "restore": lambda: coordinator.restore("restore-1", tmp_path, manifest),
         "retire": lambda: coordinator.retire("save-1", episodes),
+        "release": release,
     }
 
     async def exercise() -> None:
@@ -604,3 +611,51 @@ def test_prepare_gets_its_own_deadline_and_other_calls_keep_the_control_one() ->
     assert 590.0 < deadlines["prepare"] - started < 610.0
     assert 20.0 < deadlines["renew"] - started < 40.0
     assert 20.0 < deadlines["resume"] - started < 40.0
+
+
+def test_release_does_nothing_before_rl_starts_a_checkpoint() -> None:
+    """A release must name a checkpoint, and Gym holds none of this run's yet."""
+    actor = _FakeGymActor()
+    coordinator = _coordinator(actor)
+
+    assert asyncio.run(coordinator.release(["save-0"])) == {}
+    assert actor.calls == []
+
+
+def test_release_names_the_latest_checkpoint_or_restore_rl_started() -> None:
+    """Gym refuses a release as stale once it holds a later checkpoint than the one named."""
+    actor = _FakeGymActor()
+    coordinator = _coordinator(actor)
+
+    async def exercise() -> None:
+        async with coordinator.prepared("save-1"):
+            pass
+        await coordinator.release(["save-1", "save-0", "save-1"])
+        async with coordinator.restored("restore-1", "/unused", _restore_manifest()):
+            pass
+        await coordinator.release(["save-1"])
+
+    _run_guarded(exercise)
+
+    releases = [call for call in actor.calls if call[0] == "release"]
+    # Each kept checkpoint once, in a stable order.
+    assert [call[1] for call in releases] == [
+        ("save-1", ("save-0", "save-1")),
+        ("restore-1", ("save-1",)),
+    ]
+
+
+def test_release_returns_only_the_deployments_whose_participants_failed() -> None:
+    healthy = _FakeGymActor()
+    failing = _FakeGymActor(release_failures={"sandboxes": "snapshot in use"})
+    coordinator = _coordinator(healthy, failing)
+
+    async def exercise() -> dict[str, dict[str, str]]:
+        async with coordinator.prepared("save-1"):
+            pass
+        return await coordinator.release(["save-1"])
+
+    assert asyncio.run(exercise()) == {
+        "tools/replica-1": {"sandboxes": "snapshot in use"}
+    }
+    assert "release" in healthy.operations()

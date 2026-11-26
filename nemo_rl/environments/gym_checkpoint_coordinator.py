@@ -320,6 +320,9 @@ class GymCheckpointCoordinator:
             raise ValueError("Gym checkpoint coordinator requires at least one actor")
         self._control_timeout_s = control_timeout_s
         self._prepare_timeout_s = prepare_timeout_s
+        # The latest checkpoint or restore RL started; Gym requires a release
+        # to name it.
+        self._latest_checkpoint_id: str | None = None
 
     @property
     def instance_ids(self) -> frozenset[str]:
@@ -382,6 +385,7 @@ class GymCheckpointCoordinator:
         self,
         checkpoint_id: str,
     ) -> dict[str, GymCheckpointPrepareSummary]:
+        self._latest_checkpoint_id = checkpoint_id
         # Parking waits for in-flight agent and environment steps to reach a
         # boundary, which can take far longer than one control call.
         deadline_ts = time.time() + self._prepare_timeout_s
@@ -561,6 +565,40 @@ class GymCheckpointCoordinator:
             deadline_ts=deadline_ts,
         )
 
+    async def release(self, kept: Iterable[str]) -> dict[str, dict[str, str]]:
+        """Tell every deployment which Gym checkpoints RL may still restore.
+
+        Each deployment deletes external state, such as sandbox snapshots, that
+        only other checkpoints use. Does nothing before RL's first checkpoint
+        or restore, which the release must name.
+
+        Returns:
+            Gym's failure message by participant, for each deployment where a
+            participant's release failed.
+        """
+        checkpoint_id = self._latest_checkpoint_id
+        if checkpoint_id is None:
+            return {}
+        kept_ids = tuple(sorted(set(kept)))
+        deadline_ts = self._deadline()
+        results = await self._collect(
+            "release",
+            {
+                instance_id: handle.checkpoint_release.remote(
+                    checkpoint_id,
+                    kept_ids,
+                    deadline_ts=deadline_ts,
+                )
+                for instance_id, handle in self._handles.items()
+            },
+            deadline_ts=deadline_ts,
+        )
+        return {
+            instance_id: failures
+            for instance_id, failures in results.items()
+            if failures
+        }
+
     async def retire_restored(
         self,
         restore_id: str,
@@ -582,6 +620,7 @@ class GymCheckpointCoordinator:
         manifest: GymCheckpointManifest,
     ) -> None:
         inventory = self._validate_inventory(manifest.instances)
+        self._latest_checkpoint_id = restore_id
         deadline_ts = self._deadline()
         try:
             await self._collect(

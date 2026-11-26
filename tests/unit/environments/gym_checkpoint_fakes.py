@@ -82,6 +82,7 @@ class FakeGymActor:
         participants: The server names of the participants a commit reports.
         generation_cut_counts: Gym's ``cut``/``cut_failed``/``cut_skipped``
             counts a prepare reports.
+        release_failures: The per-participant failures every release reports.
     """
 
     def __init__(
@@ -103,6 +104,7 @@ class FakeGymActor:
         restart_only_servers: tuple[str, ...] = (),
         participants: tuple[str, ...] = ("tools-agent", "tools-model"),
         generation_cut_counts: Optional[dict[str, int]] = None,
+        release_failures: Optional[dict[str, str]] = None,
     ) -> None:
         self.prepared = prepared
         self.resume_errors = list(resume_errors)
@@ -120,6 +122,7 @@ class FakeGymActor:
         self.forget_errors = list(forget_errors)
         self.restart_only_servers = list(restart_only_servers)
         self.participants = participants
+        self.release_failures = release_failures or {}
         # Between a prepare that parked Gym and the resume that reopens it.
         self.checkpoint_open = False
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -130,6 +133,7 @@ class FakeGymActor:
         self.checkpoint_restore = _RemoteMethod(self._restore)
         self.checkpoint_resume = _RemoteMethod(self._resume)
         self.checkpoint_forget = _RemoteMethod(self._forget)
+        self.checkpoint_release = _RemoteMethod(self._release)
         self.checkpoint_restart_only_servers = _RemoteMethod(self._restart_only_servers)
 
     def operations(self) -> list[str]:
@@ -205,6 +209,10 @@ class FakeGymActor:
         await self._record("forget", args, kwargs)
         if self.forget_errors:
             raise self.forget_errors.pop(0)
+
+    async def _release(self, *args, **kwargs) -> dict[str, str]:
+        await self._record("release", args, kwargs)
+        return dict(self.release_failures)
 
     async def _restore(self, *args, **kwargs) -> None:
         await self._record("restore", args, kwargs)

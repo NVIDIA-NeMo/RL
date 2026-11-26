@@ -1007,6 +1007,11 @@ class SingleControllerActor:
             finally:
                 self._logger.finish()
                 await asyncio.to_thread(self._checkpointer.shutdown)
+                # After shutdown, which waits for old checkpoints to be pruned.
+                try:
+                    await self._rollout_snapshots.release_environment_state()
+                except Exception as e:  # teardown must not mask the original failure
+                    print(f"Error releasing environment state: {e}", flush=True)
 
         return {
             "train_steps": self._train_steps,

@@ -170,6 +170,6 @@ vLLM keeps running calls across a refit, so a call's tokens count under the vers
 
 ## Tests
 
-- `tests/unit/environments/test_gym_environment_checkpoint.py` builds the Gym checkpoint directly: retire, forget, drain, cut validation, startup checks and the builder.
+- `tests/unit/environments/test_gym_environment_checkpoint.py` builds the Gym checkpoint directly: retire, forget, release, drain, cut validation, startup checks and the builder.
 - `tests/unit/single_controller/test_checkpointing.py` and `test_checkpoint_dispatch_races.py` cover saving, restoring and their races with the pumps. Tests that build a controller without `__init__` attach the snapshotter and restorer with `tests/unit/single_controller/_rollout_checkpoints.py`.
 - `tests/unit/single_controller/test_rollout_checkpoint.py` covers manifests, anchors, publication and retention.

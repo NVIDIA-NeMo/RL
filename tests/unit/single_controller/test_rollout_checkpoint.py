@@ -33,6 +33,7 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
+    published_snapshot_dirs,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
@@ -792,6 +793,27 @@ def test_resolver_ignores_unpublished_temporary_snapshot(tmp_path):
 
     assert resolved is not None
     assert resolved.path == published
+
+
+def test_published_snapshot_dirs_lists_only_what_a_restore_could_resolve(
+    tmp_path: Path,
+) -> None:
+    """List every anchor's published snapshots, and no temporary, trash or staged one."""
+    published = [
+        tmp_path / "bootstrap" / "rollout_snapshots" / "snapshot_000001",
+        tmp_path / "step_3" / "rollout_snapshots" / "snapshot_000002",
+        tmp_path / "step_5" / "rollout_snapshots" / "snapshot_000001",
+    ]
+    unpublished = [
+        tmp_path / "step_5" / "rollout_snapshots" / "tmp_snapshot_000002",
+        tmp_path / "step_5" / "rollout_snapshots" / "trash_snapshot_000000",
+        tmp_path / "tmp_rollout_snapshot_step_6",
+    ]
+    for path in published + unpublished:
+        path.mkdir(parents=True)
+
+    assert published_snapshot_dirs(tmp_path) == sorted(published)
+    assert published_snapshot_dirs(tmp_path / "missing") == []
 
 
 def test_resolver_fails_when_no_committed_snapshot_matches_anchor(tmp_path):

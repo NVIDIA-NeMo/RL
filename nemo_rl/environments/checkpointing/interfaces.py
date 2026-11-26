@@ -31,12 +31,16 @@ A rollout snapshot uses the interface in this order::
                 kept = await snapshot.check_against_cut(cut, staging_keys)
             ...  # RL saves TQ, holding the ``kept`` staging rows, and its own state
     # backend resumed
+    ...  # RL publishes the snapshot and prunes old ones
+    await env_checkpoint.release(snapshot_dirs)  # every snapshot still on disk
+
+RL also calls ``release`` once at the end of the run.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Protocol
@@ -171,6 +175,24 @@ class EnvironmentCheckpoint(Protocol):
         """
         ...
 
+    async def release(self, snapshot_dirs: Iterable[Path]) -> None:
+        """Delete backend state outside RL's checkpoints that no kept snapshot needs.
+
+        A backend may keep part of a snapshot outside the snapshot directory,
+        such as a sandbox snapshot, which deleting the directory leaves
+        behind. RL calls this while the backend is not paused, after it
+        publishes a snapshot and prunes old ones, and once at the end of the
+        run.
+
+        Best effort: a failure is reported as a warning, never raised, and the
+        next release deletes what this one left.
+
+        Args:
+            snapshot_dirs: Every rollout snapshot directory still on disk. The
+                backend keeps the state these refer to and deletes the rest.
+        """
+        ...
+
     def is_unavailable(self, error: BaseException) -> bool:
         """Whether a failed snapshot only met a backend that was briefly unreachable.
 
@@ -206,6 +228,9 @@ class NoEnvironmentCheckpoint:
             "state, but this run's environment backend keeps none to restore"
         )
         yield RestoredEnvironmentRollouts()  # pragma: no cover
+
+    async def release(self, snapshot_dirs: Iterable[Path]) -> None:
+        del snapshot_dirs
 
     def is_unavailable(self, error: BaseException) -> bool:
         del error
