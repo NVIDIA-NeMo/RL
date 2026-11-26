@@ -531,6 +531,7 @@ def get_formatted_message_log(
     tools: Optional[list[dict[str, Any]]] = None,
     debug: bool = False,
     chat_template_preapplied: bool = False,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -550,14 +551,23 @@ def get_formatted_message_log(
             from encoding the joined conversation at turn boundaries. Default: False.
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
         debug: Whether to print debug information showing each message turn. Default: False
+        chat_template_kwargs: Optional per-sample chat template variables (e.g.
+            ``{"enable_thinking": False}``). They override the ones set by
+            ``policy.tokenizer.chat_template_kwargs`` for this sample only. Default: None
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
     if chat_template_preapplied:
-        if add_generation_prompt or tools is not None or task_data_spec.prompt:
+        if (
+            add_generation_prompt
+            or tools is not None
+            or chat_template_kwargs
+            or task_data_spec.prompt
+        ):
             raise ValueError(
                 "chat_template_preapplied=True does not support add_generation_prompt, "
-                "tools, or a task_data_spec prompt: the chat template was already applied."
+                "tools, chat_template_kwargs, or a task_data_spec prompt: the chat "
+                "template was already applied."
             )
         return _tokenize_preformatted_message_log(message_log, tokenizer)
 
@@ -629,6 +639,7 @@ def get_formatted_message_log(
 
         # Only pass tools parameter if tools exist
         template_kwargs: dict[str, Any] = {
+            **(chat_template_kwargs or {}),
             "add_generation_prompt": add_generation_prompt
             and message["role"] in ["user", "tool"],
             "tokenize": False,
