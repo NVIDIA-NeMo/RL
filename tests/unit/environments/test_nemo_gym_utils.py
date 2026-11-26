@@ -2824,7 +2824,10 @@ def test_silent_actors_of_a_shard_set_cost_one_timeout_together():
         """Run the check and return its problems and how long it took."""
         loop = asyncio.get_running_loop()
         start = loop.time()
-        problems = await shard_set.check_health(timeout_s=timeout_s)
+        # The outer bound fails the test when the check has no timeout of its own.
+        problems = await asyncio.wait_for(
+            shard_set.check_health(timeout_s=timeout_s), timeout=10.0
+        )
         return problems, loop.time() - start
 
     problems, elapsed = asyncio.run(_timed_check())
