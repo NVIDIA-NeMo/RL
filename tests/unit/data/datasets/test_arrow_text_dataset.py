@@ -173,6 +173,7 @@ class TestPackGenerator:
         assert packs[0]["messages"] == [
             {"role": "assistant", "content": "aaaa\nbbbb\ncccc"}
         ]
+        assert packs[0]["sample_id"] == "legacy-pack:0|1|2"
 
     def test_pack_may_exceed_threshold(self):
         # Two rows of 100 chars each, threshold 10 → first row alone
@@ -254,3 +255,80 @@ class TestPackGenerator:
         rows = [{"text": "hello world"}]
         packs = _packs_from(rows, chars=5, task_name="my-task")
         assert packs[0]["task_name"] == "my-task"
+
+
+def test_sample_id_is_created_before_filtering(mixed_arrow_file):
+    from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import (
+        ArrowTextDataset,
+    )
+    from nemo_rl.data.datasets.response_datasets.response_dataset import (
+        resolve_source_sample_id,
+    )
+
+    ds = ArrowTextDataset(
+        data_files=mixed_arrow_file,
+        text_key="text",
+        characters_per_sample=None,
+    )
+    sample_ids = [row["sample_id"] for row in ds.dataset]
+    # Source ordinals 2 and 4 were invalid and filtered.  The surviving IDs
+    # retain their original ordinals rather than being renumbered 0,1,2.
+    assert sample_ids == [
+        resolve_source_sample_id(
+            {},
+            ordinal,
+            data_path=mixed_arrow_file,
+            subset=None,
+            split="train",
+        )
+        for ordinal in (0, 1, 3)
+    ]
+
+
+def test_arrow_dataset_preserves_upstream_uuid(tmp_path: Path):
+    from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import (
+        ArrowTextDataset,
+    )
+
+    data_path = tmp_path / "uuid.arrow"
+    _write_arrow_file(
+        data_path,
+        [
+            {
+                "text": "hello",
+                "uuid": "550e8400-e29b-41d4-a716-446655440000",
+            }
+        ],
+    )
+
+    dataset = ArrowTextDataset(str(data_path))
+
+    assert dataset.dataset[0]["sample_id"] == ("550e8400-e29b-41d4-a716-446655440000")
+
+
+def test_arrow_namespace_distinguishes_path_subset_and_split(monkeypatch):
+    from nemo_rl.data.datasets.response_datasets import arrow_text_dataset as module
+
+    source = Dataset.from_list([{"text": "hello"}])
+    monkeypatch.setattr(
+        module,
+        "load_dataset_from_path",
+        lambda data_path, subset, split: source,
+    )
+    namespaces = [
+        ("org/corpus", "subset-a", "train"),
+        ("org/corpus", "subset-b", "train"),
+        ("org/corpus", "subset-a", "validation"),
+        ("org/other-corpus", "subset-a", "train"),
+    ]
+
+    sample_ids = {
+        module.ArrowTextDataset(
+            data_files=data_path,
+            subset=subset,
+            split=split,
+        ).dataset[0]["sample_id"]
+        for data_path, subset, split in namespaces
+    }
+
+    assert len(sample_ids) == len(namespaces)
