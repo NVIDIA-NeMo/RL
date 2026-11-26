@@ -147,6 +147,7 @@ class SyncRolloutActor:
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
         carry_keys: Optional[list[str]] = None,
         apply_length_penalty: bool = False,
+        skip_token_capture: bool = False,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -209,6 +210,9 @@ class SyncRolloutActor:
                 NeMo-Gym rollout so training rewards get the per-prompt-group
                 length adjustments. Training passes ``True``; validation
                 keeps the default so val metrics stay on the raw env reward.
+            skip_token_capture: Mark the NeMo-Gym rows so Gym captures none of
+                their model calls. Validation passes ``True``; training keeps
+                the default, which removes any earlier mark.
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -275,6 +279,7 @@ class SyncRolloutActor:
                 mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+                skip_token_capture=skip_token_capture,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
