@@ -581,6 +581,62 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_accepts_dedicated_layout_with_cluster_config(self):
+        mc = _ppo_master_config(megatron_enabled=True)
+        mc.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
+
+        validate_single_controller_config(mc)
+
+    def test_accepts_streamed_value_training_on_dedicated_split_layout(self):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
+        mc.ppo.value_training_mode = "split"
+        mc.ppo.stream_value_training = True
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("mode", "dedicated", "min_groups", "error"),
+        [
+            ("whole_batch", True, 1, "value_training_mode=split"),
+            ("split", False, 1, "dedicated value GPUs"),
+            ("split", True, _NUM_PROMPTS_PER_STEP, "multi-chunk"),
+        ],
+    )
+    def test_rejects_unsupported_streamed_value_training(
+        self, mode, dedicated, min_groups, error
+    ):
+        mc = _ppo_master_config(
+            min_groups_for_streaming_train=min_groups, megatron_enabled=True
+        )
+        mc.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["dedicated"] = dedicated
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=2)
+        mc.ppo.value_training_mode = mode
+        mc.ppo.stream_value_training = True
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        with pytest.raises(ValueError, match=error):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize(
         "sampler_config",
         [WindowedSamplerConfig(), WeightFifoSamplerConfig()],

@@ -423,14 +423,26 @@ class Value(ValueInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_inference(self) -> None:
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         """Prepare the value model for inference (offload gradients, set eval mode)."""
-        futures = self.worker_group.run_all_workers_single_data("prepare_for_inference")
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_for_inference",
+            keep_resident=keep_resident,
+            preserve_train_step=preserve_train_step,
+        )
         ray.get(futures)
 
-    def finish_inference(self) -> None:
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         """Offload value model to CPU after inference."""
-        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_inference",
+            keep_resident=keep_resident,
+            preserve_train_step=preserve_train_step,
+        )
         ray.get(futures)
 
     def finish_training(self) -> None:

@@ -405,6 +405,10 @@ class SingleControllerActor:
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
         self._value_dedicated: bool = dedicated_value_enabled(master_config)
+        self._stream_value_training: bool = (
+            self._is_ppo and self._algo_cfg.stream_value_training
+        )
+        self._value_chunk_task: asyncio.Task[None] | None = None
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2766,6 +2770,28 @@ class SingleControllerActor:
         return target
 
     async def _train_pump(self) -> None:
+        try:
+            await self._train_pump_impl()
+        except BaseException:
+            if getattr(self, "_stream_value_training", False):
+                try:
+                    value_chunk_task = getattr(self, "_value_chunk_task", None)
+                    if value_chunk_task is not None:
+                        try:
+                            await value_chunk_task
+                        except Exception:
+                            log.exception("Streamed value chunk failed before cleanup")
+                    await self._ppo_worker_call(self._value.abort_train_step)
+                    await self._ppo_worker_call(self._value.finish_training)
+                except Exception:
+                    log.exception("Failed to clean up streamed value train step")
+                try:
+                    await self._ppo_worker_call(self._trainer.abort_train_step)
+                except Exception:
+                    log.exception("Failed to clean up streamed policy train step")
+            raise
+
+    async def _train_pump_impl(self) -> None:
         """Per-prompt-group streaming train loop.
 
         Per step, with 1-4 running per streaming chunk and 5-6 once the chunk
@@ -2779,10 +2805,10 @@ class SingleControllerActor:
                 c. Claimed groups retain their _buffer_capacity permits until
                     step cleanup; evicted groups release theirs immediately.
             2. Prepare the batch.
-                a. Value model forward (PPO only), parking policy parameters and
-                    optimizer on CPU where supported. Pending policy gradients
-                    stay on GPU.
-                b. Policy and reference logprobs.
+                a. Value model forward (PPO only) and policy/reference logprobs
+                    run concurrently with dedicated value GPUs, sequentially
+                    when the models share GPUs. Shared-GPU policy state is parked
+                    on CPU for the critic; pending gradients stay on GPU.
                 c. _advantage_stage.
             3. Train on the chunk.
                 a. Policy model: train_microbatches_from_meta accumulates gradients.
@@ -2835,6 +2861,7 @@ class SingleControllerActor:
             evicted_stale_prompt_groups = 0
             sample_lags: list[int] = []
             step_open = False
+            value_step_open = False
             value_inference_prepared = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -3153,62 +3180,35 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.finish_inference
                                         )
-                        with (
-                            self._timer.time("value_inference"),
-                            managed_span(
-                                RLSpanGroup.ADVANTAGE,
-                                "rl.sc.value_inference",
-                                tracer=self._tracer,
-                            ),
+                        if self._value_dedicated and (
+                            policy_logprobs_required
+                            or self._reference_logprobs_required
                         ):
-                            train_meta = await self._value_stage(
+                            train_meta = await self._run_parallel_ppo_inference(
                                 train_meta,
                                 already_prepared=value_inference_prepared,
+                                preserve_train_step=value_step_open,
+                                step_open=step_open,
+                                policy_logprobs_required=policy_logprobs_required,
+                            )
+                        else:
+                            train_meta = await self._run_value_inference(
+                                train_meta,
+                                already_prepared=value_inference_prepared,
+                                preserve_train_step=value_step_open,
+                            )
+                            await self._run_policy_logprobs(
+                                train_meta,
+                                step_open=step_open,
+                                policy_logprobs_required=policy_logprobs_required,
                             )
                         value_inference_prepared = False
-                        if step_open:
-                            with self._timer.time("training_prep"):
-                                await asyncio.to_thread(
-                                    self._trainer.prepare_for_training
-                                )
-
-                    # Compute prev_logprobs / ref_logprobs
-                    if policy_logprobs_required or self._reference_logprobs_required:
-                        with (
-                            self._timer.time("logprob_inference_prep"),
-                            managed_span(
-                                RLSpanGroup.DATA_PROCESSING,
-                                "rl.sc.logprob_inference_prep",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            # Once the step is open, gradients are accumulating
-                            # in the trainer's grad buffers across chunks. The
-                            # Megatron buffer offload frees that storage outright
-                            # and its reload zeroes it, so offloading here would
-                            # discard every chunk but the last while the 1/N
-                            # normalizer still counts all of them.
-                            await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open or self._value_dedicated,
-                            )
-                        with (
-                            self._timer.time("policy_and_reference_logprobs"),
-                            managed_span(
-                                RLSpanGroup.LOGPROB,
-                                "rl.sc.policy_and_reference_logprobs",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            if policy_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_logprobs_from_meta, train_meta
-                                )
-                            if self._reference_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_reference_policy_logprobs_from_meta,
-                                    train_meta,
-                                )
+                    else:
+                        await self._run_policy_logprobs(
+                            train_meta,
+                            step_open=step_open,
+                            policy_logprobs_required=policy_logprobs_required,
+                        )
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -3273,6 +3273,14 @@ class SingleControllerActor:
                     # policy resident until every actor epoch has completed.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
+                    value_chunk_task = None
+                    if getattr(self, "_stream_value_training", False):
+                        value_chunk_task = asyncio.create_task(
+                            self._stream_value_chunk(
+                                train_meta, first_chunk=not value_step_open
+                            )
+                        )
+                        self._value_chunk_task = value_chunk_task
                     if is_policy_training_step:
                         if (
                             self._is_ppo
@@ -3296,8 +3304,9 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            await asyncio.to_thread(self._trainer.prepare_for_training)
-
+                            await self._ppo_worker_call(
+                                self._trainer.prepare_for_training
+                            )
                         if has_valid_training_tokens:
                             for epoch in range(self._ppo_epochs):
                                 with (
@@ -3310,12 +3319,12 @@ class SingleControllerActor:
                                     ),
                                 ):
                                     if not step_open:
-                                        await asyncio.to_thread(
+                                        await self._ppo_worker_call(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
                                         )
                                         step_open = True
-                                    await asyncio.to_thread(
+                                    await self._ppo_worker_call(
                                         self._trainer.train_microbatches_from_meta,
                                         train_meta,
                                         train_fields=self._train_fields,
@@ -3329,10 +3338,25 @@ class SingleControllerActor:
                                         await self._rollout_snapshots.begin_optimizer_commit(
                                             drain_snapshot=True
                                         )
-                                        policy_result = await asyncio.to_thread(
+                                        policy_result = await self._ppo_worker_call(
                                             self._trainer.finish_train_step
                                         )
                                         step_open = False
+
+                    if value_chunk_task is not None:
+                        try:
+                            await asyncio.shield(value_chunk_task)
+                        except BaseException:
+                            if not value_chunk_task.done():
+                                try:
+                                    await value_chunk_task
+                                except Exception:
+                                    log.exception(
+                                        "Streamed value chunk failed during cleanup"
+                                    )
+                            raise
+                        value_step_open = True
+                        self._value_chunk_task = None
 
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
@@ -3415,7 +3439,14 @@ class SingleControllerActor:
                                     await asyncio.to_thread(
                                         self._trainer.offload_to_cpu
                                     )
-                            await asyncio.to_thread(self._value.prepare_for_inference)
+                            resident_kwargs = (
+                                {"keep_resident": True} if self._value_dedicated else {}
+                            )
+                            if value_step_open:
+                                resident_kwargs["preserve_train_step"] = True
+                            await self._ppo_worker_call(
+                                self._value.prepare_for_inference, **resident_kwargs
+                            )
                         value_inference_prepared = True
 
                 # No await separates the final target check from this advance.
@@ -3437,7 +3468,14 @@ class SingleControllerActor:
                     # Release its speculative residency and restore policy
                     # residency before the optimizer update and early refit.
                     with self._timer.time("value_inference_prep"):
-                        await asyncio.to_thread(self._value.finish_inference)
+                        resident_kwargs = (
+                            {"keep_resident": True} if self._value_dedicated else {}
+                        )
+                        if value_step_open:
+                            resident_kwargs["preserve_train_step"] = True
+                        await self._ppo_worker_call(
+                            self._value.finish_inference, **resident_kwargs
+                        )
                     value_inference_prepared = False
                     if step_open:
                         with self._timer.time("training_prep"):
@@ -3476,6 +3514,10 @@ class SingleControllerActor:
                     if step_open:
                         await asyncio.to_thread(self._trainer.abort_train_step)
                         step_open = False
+                    if value_step_open:
+                        await self._ppo_worker_call(self._value.abort_train_step)
+                        await self._ppo_worker_call(self._value.finish_training)
+                        value_step_open = False
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -3502,80 +3544,87 @@ class SingleControllerActor:
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=True
                     )
-                    if is_policy_training_step and self._streaming_ppo:
-                        assert step_open
-                        with (
-                            self._timer.time("policy_training"),
-                            managed_span(
-                                RLSpanGroup.POLICY_UPDATE,
-                                "rl.sc.policy_optimizer_step",
-                                tracer=self._tracer,
-                            ),
-                        ):
-                            policy_result = await asyncio.to_thread(
-                                self._trainer.finish_train_step
-                            )
-                        step_open = False
-                    if is_policy_training_step and not self._gen.blocks_training():
-                        # Publish exactly one policy version before full-batch
-                        # critic training, allowing new rollouts during its epochs.
-                        # A generation engine sharing the training GPUs must
-                        # instead remain asleep until the critic has finished.
-                        self._trainer_version += 1
-                        with (
-                            self._timer.time("weight_sync"),
-                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
-                        ):
-                            calibration_data = (
-                                BatchedDataDict.from_batches(calibration_batches)
-                                if calibration_batches
-                                else None
-                            )
-                            aborted_stale_inflight_groups = await self._sync_weights(
-                                calibration_data=calibration_data,
-                            )
-                        self._retune_lookahead_versions()
-                        self._rollout_manager.set_weight_version(self._trainer_version)
-                        early_refit_done = True
-                        log.info(
-                            "PPO: step %d policy update/refit complete at version %d",
-                            version_during_step,
-                            self._trainer_version,
-                        )
-
-                    with self._timer.time("value_training_prep"):
-                        if self._gen.blocks_training() and is_policy_training_step:
-                            # Gather updated parameters before offload's eval()
-                            # refreshes inference caches. Generation stays asleep
-                            # until critic training finishes.
-                            await asyncio.to_thread(
-                                self._trainer.sync_params_before_refit
-                            )
-                        if not self._value_dedicated:
-                            await asyncio.to_thread(self._trainer.offload_to_cpu)
-                        if self._gen.blocks_training():
-                            await asyncio.to_thread(self._trainer.finish_inference)
-                    # GAE has produced the frozen predictions and targets for
-                    # every row. Critic epochs replay every selected chunk.
-                    log.info(
-                        "PPO: step %d critic train: %d samples, %d epochs",
-                        version_during_step,
-                        sum(meta.size for meta in value_train_metas),
-                        self._critic_ppo_epochs,
+                    overlap_value_finalize = (
+                        self._value_dedicated
+                        and value_step_open
+                        and self._stream_value_training
+                        and not self._gen.blocks_training()
                     )
-                    with (
-                        self._timer.time("value_training"),
-                        managed_span(
-                            RLSpanGroup.POLICY_UPDATE,
-                            "rl.sc.value_training",
-                            tracer=self._tracer,
-                            **{"rl.critic_epochs": self._critic_ppo_epochs},
-                        ),
-                    ):
-                        value_result = await self._value_train_epochs(
-                            value_train_metas,
-                            num_epochs=self._critic_ppo_epochs,
+                    value_finalize_task = (
+                        asyncio.create_task(
+                            self._finish_ppo_value_training(
+                                value_train_metas, value_step_open=True
+                            )
                         )
+                        if overlap_value_finalize
+                        else None
+                    )
+                    try:
+                        if is_policy_training_step and self._streaming_ppo:
+                            assert step_open
+                            with (
+                                self._timer.time("policy_training"),
+                                managed_span(
+                                    RLSpanGroup.POLICY_UPDATE,
+                                    "rl.sc.policy_optimizer_step",
+                                    tracer=self._tracer,
+                                ),
+                            ):
+                                policy_result = await self._ppo_worker_call(
+                                    self._trainer.finish_train_step
+                                )
+                            step_open = False
+                        if is_policy_training_step and not self._gen.blocks_training():
+                            self._trainer_version += 1
+                            with (
+                                self._timer.time("weight_sync"),
+                                efficiency_span(
+                                    "idle/refit_bubble", tracer=self._tracer
+                                ),
+                            ):
+                                calibration_data = (
+                                    BatchedDataDict.from_batches(calibration_batches)
+                                    if calibration_batches
+                                    else None
+                                )
+                                aborted_stale_inflight_groups = (
+                                    await self._sync_weights(
+                                        calibration_data=calibration_data,
+                                    )
+                                )
+                            self._retune_lookahead_versions()
+                            self._rollout_manager.set_weight_version(
+                                self._trainer_version
+                            )
+                            early_refit_done = True
+                            log.info(
+                                "PPO: step %d policy update/refit complete at version %d",
+                                version_during_step,
+                                self._trainer_version,
+                            )
+                    finally:
+                        if value_finalize_task is not None:
+                            try:
+                                value_result = await asyncio.shield(value_finalize_task)
+                            except asyncio.CancelledError:
+                                await value_finalize_task
+                                raise
+                            value_step_open = False
+
+                    if value_finalize_task is None:
+                        with self._timer.time("value_training_prep"):
+                            if self._gen.blocks_training() and is_policy_training_step:
+                                await asyncio.to_thread(
+                                    self._trainer.sync_params_before_refit
+                                )
+                            if not self._value_dedicated:
+                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            if self._gen.blocks_training():
+                                await asyncio.to_thread(self._trainer.finish_inference)
+                        value_result = await self._finish_ppo_value_training(
+                            value_train_metas, value_step_open=value_step_open
+                        )
+                        value_step_open = False
                 else:
                     if not step_open:
                         raise RuntimeError(
@@ -5350,8 +5399,112 @@ class SingleControllerActor:
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
+    async def _run_value_inference(
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool,
+        preserve_train_step: bool,
+    ) -> KVBatchMeta:
+        with (
+            self._timer.time("value_inference"),
+            managed_span(
+                RLSpanGroup.ADVANTAGE,
+                "rl.sc.value_inference",
+                tracer=self._tracer,
+            ),
+        ):
+            return await self._value_stage(
+                meta,
+                already_prepared=already_prepared,
+                preserve_train_step=preserve_train_step,
+            )
+
+    async def _run_policy_logprobs(
+        self,
+        meta: KVBatchMeta,
+        *,
+        step_open: bool,
+        policy_logprobs_required: bool,
+    ) -> None:
+        if step_open and self._is_ppo and not self._value_dedicated:
+            with self._timer.time("training_prep"):
+                await asyncio.to_thread(self._trainer.prepare_for_training)
+        if not (policy_logprobs_required or self._reference_logprobs_required):
+            return
+        with (
+            self._timer.time("logprob_inference_prep"),
+            managed_span(
+                RLSpanGroup.DATA_PROCESSING,
+                "rl.sc.logprob_inference_prep",
+                tracer=self._tracer,
+            ),
+        ):
+            await asyncio.to_thread(
+                self._trainer.prepare_for_lp_inference,
+                keep_train_buffers=step_open or self._value_dedicated,
+            )
+        with (
+            self._timer.time("policy_and_reference_logprobs"),
+            managed_span(
+                RLSpanGroup.LOGPROB,
+                "rl.sc.policy_and_reference_logprobs",
+                tracer=self._tracer,
+            ),
+        ):
+            if policy_logprobs_required:
+                await asyncio.to_thread(self._trainer.get_logprobs_from_meta, meta)
+            if self._reference_logprobs_required:
+                await asyncio.to_thread(
+                    self._trainer.get_reference_policy_logprobs_from_meta, meta
+                )
+
+    async def _run_parallel_ppo_inference(
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool,
+        preserve_train_step: bool,
+        step_open: bool,
+        policy_logprobs_required: bool,
+    ) -> KVBatchMeta:
+        value_task = asyncio.create_task(
+            self._run_value_inference(
+                meta,
+                already_prepared=already_prepared,
+                preserve_train_step=preserve_train_step,
+            )
+        )
+        logprob_task = asyncio.create_task(
+            self._run_policy_logprobs(
+                meta,
+                step_open=step_open,
+                policy_logprobs_required=policy_logprobs_required,
+            )
+        )
+        pending = asyncio.gather(value_task, logprob_task, return_exceptions=True)
+        try:
+            value_result, logprob_result = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            await pending
+            raise
+        errors = [
+            result
+            for result in (value_result, logprob_result)
+            if isinstance(result, BaseException)
+        ]
+        if len(errors) > 1:
+            raise BaseExceptionGroup("Parallel PPO inference failed", errors)
+        if errors:
+            raise errors[0]
+        return cast(KVBatchMeta, value_result)
+
     async def _value_stage(
-        self, meta: KVBatchMeta, *, already_prepared: bool = False
+        self,
+        meta: KVBatchMeta,
+        *,
+        already_prepared: bool = False,
+        preserve_train_step: bool = False,
     ) -> KVBatchMeta:
         """Run the PPO value model's forward pass over the selected chunk.
 
@@ -5369,11 +5522,85 @@ class SingleControllerActor:
         Returns:
             The batch metadata with the ``values`` column recorded on it.
         """
+        resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
+        if preserve_train_step:
+            resident_kwargs["preserve_train_step"] = True
         if not already_prepared:
-            await asyncio.to_thread(self._value.prepare_for_inference)
-        await asyncio.to_thread(self._value.get_values_from_meta, meta)
-        await asyncio.to_thread(self._value.finish_inference)
+            await self._ppo_worker_call(
+                self._value.prepare_for_inference, **resident_kwargs
+            )
+        await self._ppo_worker_call(self._value.get_values_from_meta, meta)
+        await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
         return meta.with_fields([self._advantage_cfg.values_field])
+
+    async def _stream_value_chunk(
+        self, meta: KVBatchMeta, *, first_chunk: bool
+    ) -> None:
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
+        with self._timer.time("value_training_streamed"):
+            if first_chunk:
+                await self._ppo_worker_call(self._value.prepare_for_training)
+                await self._ppo_worker_call(self._value.begin_train_step, value_loss_fn)
+            await self._ppo_worker_call(self._value.train_microbatches_from_meta, meta)
+
+    async def _ppo_worker_call(
+        self, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Drain an in-flight worker call before cancellation can abort/offload it.
+
+        Cancelling to_thread does not stop its thread or the Ray RPC. Shield it
+        so epoch cleanup cannot race with a backward pass or optimizer update.
+        """
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
+    async def _finish_ppo_value_training(
+        self, metas: list[KVBatchMeta], *, value_step_open: bool
+    ) -> dict[str, Any]:
+        with (
+            self._timer.time("value_training"),
+            managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.sc.value_training",
+                tracer=self._tracer,
+                **{"rl.critic_epochs": self._critic_ppo_epochs},
+            ),
+        ):
+            if value_step_open:
+                with umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.sc.value_optimizer_commit",
+                    tracer=self._tracer,
+                    **{"rl.iteration": self._train_steps + 1},
+                ):
+                    value_result = await self._ppo_worker_call(
+                        self._value.finish_train_step
+                    )
+                await self._ppo_worker_call(self._value.finish_training)
+                if self._critic_ppo_epochs > 1:
+                    value_result = await self._value_train_epochs(
+                        metas, num_epochs=self._critic_ppo_epochs - 1
+                    )
+            else:
+                value_result = await self._value_train_epochs(
+                    metas, num_epochs=self._critic_ppo_epochs
+                )
+        with umbrella_span(
+            RLSpanGroup.U_STEP,
+            "rl.sc.critic_release",
+            tracer=self._tracer,
+            **{"rl.iteration": self._train_steps + 1},
+        ):
+            pass
+        return value_result
 
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int

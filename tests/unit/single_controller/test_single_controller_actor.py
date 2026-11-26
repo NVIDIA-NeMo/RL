@@ -4076,7 +4076,9 @@ class _NoOpValue:
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
-    def prepare_for_inference(self) -> None:
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
@@ -4084,11 +4086,13 @@ class _NoOpValue:
         del meta
         self._record("get_values_from_meta")
 
-    def finish_inference(self) -> None:
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
-    def prepare_for_training(self) -> None:
+    def prepare_for_training(self, keep_resident: bool = False) -> None:
         self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
@@ -4287,6 +4291,179 @@ def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
     ]
 
 
+def test_parallel_ppo_inference_overlaps_and_joins_value_metadata() -> None:
+    async def run() -> None:
+        original_meta = object()
+        value_meta = object()
+        value_started = asyncio.Event()
+        logprobs_started = asyncio.Event()
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            assert meta is original_meta
+            assert kwargs == {
+                "already_prepared": True,
+                "preserve_train_step": True,
+            }
+            value_started.set()
+            await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+            return value_meta
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            assert meta is original_meta
+            assert kwargs == {
+                "step_open": True,
+                "policy_logprobs_required": True,
+            }
+            logprobs_started.set()
+            await asyncio.wait_for(value_started.wait(), timeout=1.0)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
+        result = await asyncio.wait_for(
+            controller._run_parallel_ppo_inference(
+                original_meta,
+                already_prepared=True,
+                preserve_train_step=True,
+                step_open=True,
+                policy_logprobs_required=True,
+            ),
+            timeout=1.0,
+        )
+        assert result is value_meta
+
+    asyncio.run(run())
+
+
+def test_dedicated_train_pump_overlaps_value_and_policy_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    controller, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    controller._value_dedicated = True
+    controller._policy_logprobs_required = True
+    trainer = _OrderRecordingTrainer(calls)
+    controller._trainer = trainer
+    value_started = threading.Event()
+    logprobs_started = threading.Event()
+    value_forward = value.get_values_from_meta
+    logprobs_forward = trainer.get_logprobs_from_meta
+
+    def concurrent_value_forward(batch_meta: KVBatchMeta) -> None:
+        value_started.set()
+        assert logprobs_started.wait(timeout=1.0)
+        value_forward(batch_meta)
+
+    def concurrent_logprobs_forward(batch_meta: KVBatchMeta) -> None:
+        logprobs_started.set()
+        assert value_started.wait(timeout=1.0)
+        logprobs_forward(batch_meta)
+
+    value.get_values_from_meta = concurrent_value_forward
+    trainer.get_logprobs_from_meta = concurrent_logprobs_forward
+
+    async def advantage_stage(batch_meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+        assert "values" in batch_meta.fields
+        assert value_started.is_set() and logprobs_started.is_set()
+        return batch_meta, True
+
+    controller._advantage_stage = AsyncMock(side_effect=advantage_stage)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=3.0))
+
+    assert calls.count("critic.get_values_from_meta") == 1
+    assert calls.count("policy.get_logprobs_from_meta") == 1
+
+
+def test_parallel_ppo_inference_drains_peer_after_failure() -> None:
+    async def run() -> None:
+        logprobs_started = asyncio.Event()
+        release_logprobs = asyncio.Event()
+        logprobs_finished = asyncio.Event()
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+            raise RuntimeError("value inference failed")
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            logprobs_started.set()
+            await release_logprobs.wait()
+            logprobs_finished.set()
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
+        task = asyncio.create_task(
+            controller._run_parallel_ppo_inference(
+                object(),
+                already_prepared=False,
+                preserve_train_step=False,
+                step_open=False,
+                policy_logprobs_required=True,
+            )
+        )
+        await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_logprobs.set()
+        with pytest.raises(RuntimeError, match="value inference failed"):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert logprobs_finished.is_set()
+
+    asyncio.run(run())
+
+
+def test_parallel_ppo_inference_drains_both_tasks_on_cancellation() -> None:
+    async def run() -> None:
+        value_started = asyncio.Event()
+        logprobs_started = asyncio.Event()
+        release = asyncio.Event()
+        finished: list[str] = []
+
+        async def value_stage(meta: object, **kwargs: object) -> object:
+            value_started.set()
+            await release.wait()
+            finished.append("value")
+            return meta
+
+        async def logprobs(meta: object, **kwargs: object) -> None:
+            logprobs_started.set()
+            await release.wait()
+            finished.append("logprobs")
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._run_value_inference = value_stage
+        controller._run_policy_logprobs = logprobs
+        task = asyncio.create_task(
+            controller._run_parallel_ppo_inference(
+                object(),
+                already_prepared=False,
+                preserve_train_step=False,
+                step_open=False,
+                policy_logprobs_required=True,
+            )
+        )
+        await asyncio.wait_for(value_started.wait(), timeout=1.0)
+        await asyncio.wait_for(logprobs_started.wait(), timeout=1.0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert set(finished) == {"value", "logprobs"}
+
+    asyncio.run(run())
+
+
 def test_train_pump_parks_the_policy_when_neither_logprob_is_needed(
     monkeypatch,
 ) -> None:
@@ -4454,8 +4631,9 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
 
 
 @pytest.mark.parametrize("warmup", [True, False])
+@pytest.mark.parametrize("dedicated", [True, False])
 def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
-    monkeypatch, warmup
+    monkeypatch, warmup, dedicated
 ) -> None:
     """With in-loss filtering the policy loss decides rejections, but it does not
     run during critic warmup, so those steps take the separate pass instead."""
@@ -4465,6 +4643,7 @@ def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
         policy_training_start_step=1,
     )
     ctrl._warmup_policy_logprobs_required = True
+    ctrl._value_dedicated = dedicated
     if not warmup:
         ctrl._train_steps = 1
         ctrl._trainer_version = 1
@@ -4603,6 +4782,10 @@ class _StreamingPPOTrainer(_EpochRecordingTrainer):
         self.step_open = False
         return super().finish_train_step()
 
+    def abort_train_step(self) -> None:
+        self.step_open = False
+        self.calls.append("policy.abort_train_step")
+
     def pause_train_step_with_offloading(self) -> None:
         assert self.step_open
         assert not self.gradients_offloaded, "pending step was offloaded twice"
@@ -4627,25 +4810,53 @@ class _StreamingPPOValue(_NoOpValue):
         super().__init__(calls=calls, prefix="critic.")
         self.inference_prepared = False
         self.trained_metas: list[KVBatchMeta] = []
+        self.step_open = False
+        self.optimizer_updates = 0
         self.sharding_annotations = SimpleNamespace(get_axis_size=lambda axis: 1)
 
-    def prepare_for_inference(self) -> None:
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         assert not self.inference_prepared, "critic was already prepared"
+        assert preserve_train_step == self.step_open
         self.inference_prepared = True
-        super().prepare_for_inference()
+        super().prepare_for_inference(keep_resident=keep_resident)
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
         assert self.inference_prepared
         super().get_values_from_meta(meta)
 
-    def finish_inference(self) -> None:
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         assert self.inference_prepared
+        assert preserve_train_step == self.step_open
         self.inference_prepared = False
-        super().finish_inference()
+        super().finish_inference(keep_resident=keep_resident)
 
-    def prepare_for_training(self) -> None:
+    def prepare_for_training(self, keep_resident: bool = False) -> None:
         assert not self.inference_prepared
-        super().prepare_for_training()
+        super().prepare_for_training(keep_resident=keep_resident)
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        assert self.step_open
+        self.trained_metas.append(meta)
+        super().train_microbatches_from_meta(meta)
+
+    def begin_train_step(self, loss_fn) -> None:
+        assert not self.step_open
+        self.step_open = True
+        super().begin_train_step(loss_fn)
+
+    def finish_train_step(self) -> dict:
+        assert self.step_open
+        self.step_open = False
+        self.optimizer_updates += 1
+        return super().finish_train_step()
+
+    def abort_train_step(self) -> None:
+        self.step_open = False
+        super().abort_train_step()
 
     def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_metas.append(meta)
@@ -4718,6 +4929,208 @@ def _streaming_ppo_controller(
     ctrl._sync_weights = AsyncMock(side_effect=sync_weights)
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
     return ctrl, metas, calls
+
+
+def test_dedicated_streaming_ppo_keeps_models_resident_and_replays_split_critic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "policy.offload_to_cpu" not in calls
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert calls.count("policy.finish_train_step") == 1
+    assert calls.index("policy.finish_train_step") < calls.index("refit")
+    assert calls.index("refit") < calls.index("critic.begin_train_step")
+    assert calls.count("critic.begin_train_step") == 2
+    assert calls.count("critic.finish_train_step") == 2
+    assert [meta.sample_ids for meta in ctrl._value.trained_metas] == [
+        meta.sample_ids for meta in metas
+    ] * 2
+    assert all(keep_resident for _, keep_resident in ctrl._value.resident_calls)
+    assert ctrl._dp_client.cleared_ids == [
+        sample_id for meta in metas for sample_id in meta.sample_ids
+    ]
+
+
+def test_streamed_critic_epochs_replay_the_same_step_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.begin_train_step") == 2
+    assert calls.count("critic.finish_train_step") == 2
+    assert calls.index("critic.begin_train_step") < calls.index("refit")
+    assert [meta.sample_ids for meta in ctrl._value.trained_metas] == [
+        meta.sample_ids for meta in metas
+    ] * 2
+    assert ctrl._value.optimizer_updates == 2
+    assert not ctrl._value.step_open
+    assert ctrl._dp_client.cleared_ids == [
+        sample_id for meta in metas for sample_id in meta.sample_ids
+    ]
+
+
+def test_dedicated_second_critic_epoch_completes_while_policy_commit_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+    policy_commit_started = threading.Event()
+    release_policy_commit = threading.Event()
+    second_critic_commit = threading.Event()
+    finish_policy = ctrl._trainer.finish_train_step
+    finish_critic = ctrl._value.finish_train_step
+
+    def blocked_policy_commit() -> dict:
+        policy_commit_started.set()
+        assert release_policy_commit.wait(timeout=3.0)
+        return finish_policy()
+
+    def record_critic_commit() -> dict:
+        result = finish_critic()
+        if ctrl._value.optimizer_updates == 2:
+            second_critic_commit.set()
+        return result
+
+    ctrl._trainer.finish_train_step = blocked_policy_commit
+    ctrl._value.finish_train_step = record_critic_commit
+
+    async def run() -> None:
+        task = asyncio.create_task(ctrl._train_pump())
+        try:
+            assert await asyncio.to_thread(policy_commit_started.wait, 3.0)
+            assert await asyncio.to_thread(second_critic_commit.wait, 3.0)
+            assert "refit" not in calls
+        finally:
+            release_policy_commit.set()
+        await asyncio.wait_for(task, timeout=3.0)
+
+    asyncio.run(run())
+
+    assert ctrl._value.optimizer_updates == 2
+    assert [meta.sample_ids for meta in ctrl._value.trained_metas] == [
+        meta.sample_ids for meta in metas
+    ] * 2
+    assert calls.index("critic.finish_training") < calls.index("clear_samples")
+
+
+def test_streamed_critic_failure_aborts_both_open_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, _, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+    ctrl._value.train_microbatches_from_meta = MagicMock(
+        side_effect=RuntimeError("critic backward failed")
+    )
+
+    with pytest.raises(RuntimeError, match="critic backward failed"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "policy.finish_train_step" not in calls
+    assert "critic.finish_train_step" not in calls
+    assert "critic.abort_train_step" in calls
+    assert "policy.abort_train_step" in calls
+    assert not ctrl._value.step_open
+
+
+def test_streamed_critic_aborts_when_short_step_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(
+        monkeypatch, valid_chunks=(True, True)
+    )
+    ctrl._value_dedicated = True
+    ctrl._algo_cfg.value_training_mode = "split"
+    ctrl._stream_value_training = True
+    sampler = _DroppingSampler(metas[0], credit_in_evict=False)
+    sampler.ctrl = ctrl
+    ctrl._sampler = sampler
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.75
+    ctrl._rollout_exhausted.clear()
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert "critic.abort_train_step" in calls
+    assert "critic.finish_train_step" not in calls
+    assert "policy.abort_train_step" in calls
+    assert not ctrl._value.step_open
+
+
+def test_streamed_and_replayed_critic_cover_same_fixed_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = []
+    for stream_value_training in (False, True):
+        ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+        ctrl._value_dedicated = True
+        ctrl._algo_cfg.value_training_mode = "split"
+        ctrl._stream_value_training = stream_value_training
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+        critic_groups = [meta.sample_ids for meta in ctrl._value.trained_metas]
+        policy_groups = [meta.sample_ids for meta in ctrl._trainer.trained_metas]
+        assert critic_groups == [meta.sample_ids for meta in metas] * 2
+        assert policy_groups == [meta.sample_ids for meta in metas]
+        assert ctrl._value.optimizer_updates == 2
+        assert calls.count("critic.finish_train_step") == 2
+        results.append((critic_groups, policy_groups))
+
+    assert results[0] == results[1]
+
+
+def test_dedicated_streaming_and_full_batch_cover_same_fixed_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = []
+    for streaming in (True, False):
+        ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+        ctrl._value_dedicated = True
+        ctrl._algo_cfg.value_training_mode = "split"
+        if not streaming:
+            ctrl._streaming_ppo = False
+            ctrl._async_cfg.min_groups_for_streaming_train = len(metas)
+            full_meta = metas[0].concat(*metas[1:])
+            ctrl._sampler.select = AsyncMock(return_value=(full_meta, len(metas)))
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+        expected_ids = [sample_id for meta in metas for sample_id in meta.sample_ids]
+        policy_ids = [
+            sample_id
+            for meta in ctrl._trainer.trained_metas
+            for sample_id in meta.sample_ids
+        ]
+        critic_ids = [
+            sample_id
+            for meta in ctrl._value.trained_metas
+            for sample_id in meta.sample_ids
+        ]
+        assert policy_ids == expected_ids
+        assert critic_ids == expected_ids * 2
+        assert ctrl._dp_client.cleared_ids == expected_ids
+        assert ctrl._trainer.optimizer_gradient_sums == [
+            sum(meta.sequence_lengths[0] for meta in metas)
+        ]
+        assert calls.count("policy.finish_train_step") == 1
+        assert calls.count("critic.finish_train_step") == 2
+        assert calls.index("refit") < calls.index("critic.begin_train_step")
+        results.append((policy_ids, critic_ids, ctrl._trainer.optimizer_gradient_sums))
+
+    assert results[0] == results[1]
 
 
 def _full_batch_ppo_controller(
