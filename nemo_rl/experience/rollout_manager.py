@@ -727,6 +727,7 @@ class AsyncRolloutImpl:
         task_name = input_sample["task_name"]
 
         total_reward = 0.0
+        reward_components: dict[str, float] = {}
         turn_count = 0
         # token statistics
         total_token_count = 0
@@ -820,10 +821,13 @@ class AsyncRolloutImpl:
                 )
 
             # Update reward and termination statistics
-            # Multi-reward isn't supported in RolloutManager now, see
-            # https://github.com/NVIDIA-NeMo/RL/issues/2625 for more details.
-            assert isinstance(env_output.rewards, torch.Tensor)
-            total_reward += float(env_output.rewards[0].item())
+            if isinstance(env_output.rewards, dict):
+                for name, reward in env_output.rewards.items():
+                    value = float(reward[0].item())
+                    reward_components[name] = reward_components.get(name, 0.0) + value
+                    total_reward += value
+            else:
+                total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
             env_obs_content = env_output.observations[0]["content"]
             tokenized_obs = self._tokenizer(
@@ -875,6 +879,7 @@ class AsyncRolloutImpl:
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            reward_components=reward_components or None,
         )
         sample_metrics = {
             "turn_count": turn_count,

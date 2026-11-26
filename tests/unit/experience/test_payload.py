@@ -14,6 +14,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -402,6 +405,79 @@ def test_record_to_train_batch_broadcasts_prompt_loss_multiplier() -> None:
         prompt_idx=17,
     )
     assert torch.equal(fields["sample_mask"], expected)
+
+
+def test_record_to_train_batch_writes_reward_component_columns() -> None:
+    record = _record(
+        [
+            replace(
+                _completion(route_start=10, reward=1.5),
+                reward_components={"reward/format": 0.5, "reward/correctness": 1.0},
+            ),
+            replace(
+                _completion(route_start=30, reward=0.25),
+                reward_components={"reward/correctness": 0.0, "reward/format": 0.25},
+            ),
+        ]
+    )
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+        prompt_idx=17,
+    )
+
+    assert torch.equal(fields["reward/correctness"], torch.tensor([1.0, 0.0]))
+    assert torch.equal(fields["reward/format"], torch.tensor([0.5, 0.25]))
+    assert torch.equal(fields["total_reward"], torch.tensor([1.5, 0.25]))
+
+
+def test_record_to_train_batch_omits_reward_components_for_single_reward() -> None:
+    train_batch = record_to_train_batch(
+        _record([_completion(route_start=10, reward=1.0)]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert not [key for key in train_batch if key.startswith("reward/")]
+
+
+@pytest.mark.parametrize(
+    ("components", "match"),
+    [
+        (
+            [{"reward/correctness": 1.0}, {"reward/format": 1.0}],
+            "share the same reward components",
+        ),
+        ([{"reward/correctness": 1.0}, None], "share the same reward components"),
+        ([{"correctness": 1.0}, {"correctness": 0.0}], "start with 'reward/'"),
+    ],
+)
+def test_record_to_train_batch_rejects_invalid_reward_components(
+    components: list[dict[str, float] | None], match: str
+) -> None:
+    record = _record(
+        [
+            replace(
+                _completion(route_start=10 + 20 * i, reward=1.0),
+                reward_components=reward_components,
+            )
+            for i, reward_components in enumerate(components)
+        ]
+    )
+
+    with pytest.raises(ValueError, match=match):
+        record_to_train_batch(
+            record,
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+            include_message_violation_fields=False,
+        )
 
 
 def _failed_completion() -> Completion:
