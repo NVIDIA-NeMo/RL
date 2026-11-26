@@ -19,6 +19,7 @@ import asyncio
 import copy
 import itertools
 import json
+import logging
 import statistics
 import uuid
 import warnings
@@ -117,6 +118,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.timer import Timer
 
+logger = logging.getLogger(__name__)
+
 TokenizerType = PreTrainedTokenizerBase
 
 _REWARD_PENALTY_METRICS = {
@@ -152,6 +155,20 @@ _SHARED_GENRM_METRICS = (
     "genrm_output_tokens_total_per_group",
     "genrm_max_output_tokens_hit_rate_per_group",
 )
+
+# Metric keys of the first-prompt diagnostic of a prompt group, reported by
+# both NeMo-Gym rollout paths (``_postprocess_single_nemo_gym_group`` here and
+# ``AsyncNemoGymRolloutImpl._run_rollouts`` in rollout_manager.py).
+BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC = "baseline_groups/distinct_first_prompts"
+BASELINE_GROUPS_LOGICAL_GROUPS_METRIC = "baseline_groups/logical_groups"
+BASELINE_GROUPS_SAMPLES_METRIC = "baseline_groups/samples"
+
+# Attribution keys (the agent of a flat row, the taskset of a materialized task)
+# whose rollouts were already reported, in this process, for not sharing a first
+# prompt within a logical prompt group. Reported the first time only: a harness
+# that renders a per-rollout identifier does so in every group of every step,
+# and the baseline_groups/* keys carry the per-step signal.
+_DISTINCT_FIRST_PROMPT_WARNED: set[str] = set()
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -3228,6 +3245,18 @@ def _nemo_gym_group_metrics(
     return metrics
 
 
+def _first_prompt_token_ids(result: dict) -> tuple[int, ...]:
+    """Return the unpadded token ids of a NeMo-Gym result's first prompt.
+
+    Both NeMo-Gym rollout paths count distinct first prompts by this tuple.
+    """
+    return tuple(
+        token
+        for message in result["input_message_log"]
+        for token in torch.as_tensor(message["token_ids"]).tolist()
+    )
+
+
 # Responses ``incomplete_details.reason`` values that mean the final model call
 # ran out of tokens. NeMo-Gym normalizes every length stop to
 # ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
@@ -3531,6 +3560,40 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+    # Count the distinct first prompts, and warn when the rollouts of one logical
+    # prompt group (one _ng_group_id; rows without the key form one group) differ.
+    prompts_by_group: dict[str | None, set[tuple[int, ...]]] = defaultdict(set)
+    for row, result in zip(nemo_gym_rows, results):
+        prompts_by_group[row.get(NEMO_GYM_GROUP_ID_KEY)].add(
+            _first_prompt_token_ids(result)
+        )
+    distinct_first_prompts = len(set().union(*prompts_by_group.values()))
+    logical_groups = len(prompts_by_group)
+    rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = (
+        distinct_first_prompts
+    )
+    rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = logical_groups
+    rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(results)
+    unreported_keys = sorted(
+        {
+            result["attribution_key"]
+            for row, result in zip(nemo_gym_rows, results)
+            if len(prompts_by_group[row.get(NEMO_GYM_GROUP_ID_KEY)]) > 1
+        }
+        - _DISTINCT_FIRST_PROMPT_WARNED
+    )
+    if unreported_keys:
+        _DISTINCT_FIRST_PROMPT_WARNED.update(unreported_keys)
+        logger.warning(
+            "%d NeMo-Gym rollouts form %d logical prompt group(s) with %d "
+            "distinct first prompts; rollouts within at least one group do not "
+            "share the same first prompt. Check that per-rollout identifiers are not changing "
+            "the agent harness prompt (attribution key(s) %s; reported once per key).",
+            len(results),
+            logical_groups,
+            distinct_first_prompts,
+            unreported_keys,
+        )
 
     final_batch = BatchedDataDict[DatumSpec](
         {

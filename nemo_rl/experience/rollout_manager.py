@@ -106,6 +106,9 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.experience.rollouts import (
     _SHARED_GENRM_METRICS,
+    BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC,
+    BASELINE_GROUPS_LOGICAL_GROUPS_METRIC,
+    BASELINE_GROUPS_SAMPLES_METRIC,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -113,6 +116,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _first_prompt_token_ids,
     _nemo_gym_group_metrics,
     _tensorize_by_key,
     apply_reward_penalties,
@@ -1906,6 +1910,14 @@ class AsyncNemoGymRolloutImpl:
                     sum("receipt" not in result for result in completed_results),
                 )
             )
+            # Receipt results carry no prompt tokens; the finalizer rebuilds them.
+            if not receipt_mode:
+                rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = len(
+                    {_first_prompt_token_ids(result) for result in completed_results}
+                )
+                # One dispatched group is one logical prompt group.
+                rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = 1
+                rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(completed_results)
 
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:

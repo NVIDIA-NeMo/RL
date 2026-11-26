@@ -2963,6 +2963,9 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
     assert metrics["completion_count"] == 2
     assert metrics["agent"] == "agent"
+    assert metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert metrics["baseline_groups/logical_groups"] == 1
+    assert metrics["baseline_groups/samples"] == 2
     assert metrics["remote_time"] == 2.0
     assert metrics["timing/test/routing/group_share/nemo_gym"] == 1
     assert metrics["reward_score_raw/mean"] == pytest.approx(1.5)
@@ -3533,6 +3536,9 @@ def test_run_async_nemo_gym_rollout(
             "timing/rollout/prepare_for_metrics_calculation": 0.0,
             "timing/rollout/aggregate_metrics": 0.0,
             "timing/rollout/per_agent_misc_metrics": 0.0,
+            "baseline_groups/distinct_first_prompts": 2,
+            "baseline_groups/logical_groups": 2,
+            "baseline_groups/samples": 2,
             "mean_gen_tokens_per_sample": None,
             "turns_per_sample/mean": 2.0,
             "turns_per_sample/max": 2,
@@ -3770,3 +3776,185 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
         )
 
     assert selected == [second, second, second]
+
+
+def _postprocess_rollouts(
+    first_prompts, group_ids=None, agent_name="agent", taskset=None, agent_names=None
+):
+    """Postprocess one group whose first prompts are the given token lists.
+
+    ``group_ids`` mirrors what ``_prepare_nemo_gym_rows`` stamps on each row;
+    ``None`` entries leave the key off, as rows from a direct caller arrive.
+    ``taskset`` builds materialized task rows, which carry no ``agent_ref``.
+    ``agent_names`` names the agent of each row; ``agent_name`` names all of them.
+    """
+    if group_ids is None:
+        group_ids = [None] * len(first_prompts)
+    if agent_names is None:
+        agent_names = [agent_name] * len(first_prompts)
+    rows = []
+    for group_id, row_agent_name in zip(group_ids, agent_names):
+        if taskset is None:
+            row = {"agent_ref": {"name": row_agent_name}}
+        else:
+            row = {
+                "task_id": {"taskset": taskset, "task_id": "first"},
+                "task_input": {},
+            }
+        if group_id is not None:
+            row[rollouts_mod.NEMO_GYM_GROUP_ID_KEY] = group_id
+        rows.append(row)
+    results = []
+    for index, prompt in enumerate(first_prompts):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor(prompt),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": float(index + 1)},
+            }
+        )
+    return rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(results))}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+
+def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkeypatch):
+    """Warn only when the rollouts of one logical prompt group do not share a prompt.
+
+    The comparison is within each logical prompt group (``_ng_group_id``),
+    so a validation batch with one rollout per prompt stays
+    silent, and rows without the key form a single group. The warning is
+    reported once per attribution key in a process; the ``baseline_groups/*``
+    keys carry the per-step signal.
+    """
+    monkeypatch.setattr(rollouts_mod, "_DISTINCT_FIRST_PROMPT_WARNED", set())
+
+    def warnings():
+        return [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
+
+    # One logical group, shared prompt: healthy training layout.
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        shared = _postprocess_rollouts([[1, 5, 7], [1, 5, 7]])
+    assert shared.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert shared.rollout_metrics["baseline_groups/logical_groups"] == 1
+    assert shared.rollout_metrics["baseline_groups/samples"] == 2
+    assert not warnings()
+
+    # One logical group whose rollouts carry per-rollout prompt strings: the
+    # layout the diagnostic exists for.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        distinct = _postprocess_rollouts([[1, 5, 7], [1, 5, 9]])
+    assert distinct.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert distinct.rollout_metrics["baseline_groups/logical_groups"] == 1
+    [record] = warnings()
+    assert record.levelname == "WARNING"
+    assert (
+        "2 NeMo-Gym rollouts form 1 logical prompt group(s) with 2 distinct"
+        in record.getMessage()
+    )
+    assert "do not share the same first prompt" in record.getMessage()
+    assert "attribution key(s) ['agent']" in record.getMessage()
+
+    # The same agent's next group still reports the count but warns no more.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        repeated = _postprocess_rollouts([[1, 5, 7], [1, 5, 9]])
+    assert repeated.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert not warnings()
+
+    # Validation layout: one rollout per prompt, one group id per row. Distinct
+    # prompts are expected there and must not warn.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        validation = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9]], group_ids=["g0", "g1"], agent_name="other"
+        )
+    assert validation.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert validation.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert not warnings()
+
+    # Shared text across groups must not hide a split within one of them.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        overlapping = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9], [1, 5, 7], [1, 5, 7]],
+            group_ids=["a", "a", "b", "b"],
+            agent_name="overlapping",
+        )
+    assert overlapping.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert overlapping.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert overlapping.rollout_metrics["baseline_groups/samples"] == 4
+    [record] = warnings()
+    assert "attribution key(s) ['overlapping']" in record.getMessage()
+
+    # A materialized task row carries no agent_ref; its taskset is reported.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        materialized = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9]], taskset="math:train"
+        )
+    assert materialized.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    [record] = warnings()
+    assert "attribution key(s) ['math:train']" in record.getMessage()
+
+    # A one-rollout group is trivially distinct and must stay silent.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        single = _postprocess_rollouts([[1, 5, 7]])
+    assert single.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert single.rollout_metrics["baseline_groups/logical_groups"] == 1
+    assert single.rollout_metrics["baseline_groups/samples"] == 1
+    assert not warnings()
+
+    # A prompt that differs only by a trailing pad id (0) is a distinct prompt.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        padded = _postprocess_rollouts([[1, 5], [1, 5, 0]], agent_name="padded")
+    assert padded.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    [record] = warnings()
+    assert "attribution key(s) ['padded']" in record.getMessage()
+
+    # A batch of two agents reports only the agent whose group is split, so the
+    # other agent's first split still warns.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        mixed = _postprocess_rollouts(
+            [[1, 5], [1, 6], [1, 7], [1, 7]],
+            group_ids=["a", "a", "b", "b"],
+            agent_names=["broken", "broken", "healthy", "healthy"],
+        )
+    assert mixed.rollout_metrics["baseline_groups/distinct_first_prompts"] == 3
+    assert mixed.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert mixed.rollout_metrics["baseline_groups/samples"] == 4
+    [record] = warnings()
+    assert "attribution key(s) ['broken']" in record.getMessage()
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        _postprocess_rollouts([[1, 7], [1, 8]], agent_name="healthy")
+    [record] = warnings()
+    assert "attribution key(s) ['healthy']" in record.getMessage()
