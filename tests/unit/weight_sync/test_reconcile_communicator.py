@@ -31,6 +31,7 @@ from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     ShardState,
 )
+from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -48,6 +49,9 @@ def _minimal_generation(dp_size=2):
     needs a worker group.
     """
     return SimpleNamespace(
+        # A fleet without prefill/decode disaggregation.
+        _disagg_cfg=DisaggConfig(),
+        _assert_shard_restart_allowed=lambda what: None,
         worker_group=SimpleNamespace(
             workers=[object()] * dp_size,
             dp_size=dp_size,
@@ -130,6 +134,9 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         for _ in range(workers_per_shard):
             workers.append(_FakeWorker(len(workers), dead=shard in set(dead_shards)))
     generation = SimpleNamespace(
+        # A fleet without prefill/decode disaggregation.
+        _disagg_cfg=DisaggConfig(),
+        _assert_shard_restart_allowed=lambda what: None,
         cfg={"vllm_cfg": {"async_engine": True}},
         dp_size=dp_size,
         vllm_dp_size=1,
