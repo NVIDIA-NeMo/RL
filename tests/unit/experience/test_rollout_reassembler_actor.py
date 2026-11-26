@@ -191,6 +191,7 @@ def test_actor_forwards_stamp_agent_names_to_the_reassembler(
         top_logprobs=0,
         capture_media=False,
         media_columns=None,
+        forest_penalty_scope="scored_segment",
         stamp_agent_names=stamp_agent_names,
     )
     actor = object.__new__(actor_cls)
