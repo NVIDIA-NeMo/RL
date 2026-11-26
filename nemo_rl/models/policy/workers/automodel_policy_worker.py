@@ -14,10 +14,10 @@
 
 import gc
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Generator, Iterable, Optional, cast
+from typing import Any, Generator, Iterable, Optional, Tuple, cast
 
 import ray
 import torch
@@ -44,6 +44,7 @@ from nemo_rl.models.automodel.checkpoint import (
     build_checkpoint_config,
 )
 from nemo_rl.models.automodel.data import (
+    ProcessedMicrobatch,
     check_sequence_dim,
     get_microbatch_iterator,
     process_global_batch,
@@ -721,6 +722,82 @@ class AutomodelPolicyWorkerImpl(
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("automodel_policy_worker/train")
+    def _make_loss_post_processor(
+        self, loss_fn: LossFunction, *, draft_runtime: Optional[Any]
+    ) -> LossPostProcessor:
+        """Build the loss post-processor shared by ``train`` and the SC step."""
+        return LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+            draft_runtime=draft_runtime,
+            tp_mesh=self.tp_mesh,
+        )
+
+    def _forward_backward(
+        self,
+        data_iterator: Iterator[ProcessedMicrobatch],
+        loss_post_processor: LossPostProcessor,
+        *,
+        forward_only: bool,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        sequence_dim: int,
+        num_global_batches: int,
+        num_valid_microbatches: int,
+        on_microbatch_start: Callable[[int], None],
+    ) -> list[Tuple[Any, dict[str, Any]]]:
+        """Run one global batch's microbatches with this worker's model wiring."""
+        return automodel_forward_backward(
+            model=self.model,
+            data_iterator=data_iterator,
+            post_processing_fn=loss_post_processor,
+            device_mesh=self.device_mesh,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+            autocast_context_factory=self._autocast_context,
+            forward_only=forward_only,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            sampling_params=self.sampling_params,
+            sequence_dim=sequence_dim,
+            dp_size=self.dp_size,
+            cp_size=self.cp_size,
+            num_global_batches=num_global_batches,
+            num_valid_microbatches=num_valid_microbatches,
+            on_microbatch_start=on_microbatch_start,
+            router_replay_gates=self._router_replay_gates,
+        )
+
+    def _clip_policy_grad_norm(self) -> torch.Tensor:
+        """Clip the policy's gradients and return the pre-clip norm on CPU.
+
+        num_label_tokens=None avoids rescaling gradients already normalized by
+        the loss.
+        """
+        grad_norm = scale_grads_and_clip_grad_norm(
+            self.max_grad_norm,
+            [self.model],
+            norm_type=2.0,
+            pp_enabled=self.pipeline is not None,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep"
+            if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
+            else None,
+            pp_axis_name="pp" if self.pipeline is not None else None,
+            foreach=True,
+            num_label_tokens=None,
+            dp_group_size=self.dp_size * self.cp_size,
+        )
+        grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
+        warn_if_inf_grad_norm(grad_norm)
+        return grad_norm
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -763,16 +840,8 @@ class AutomodelPolicyWorkerImpl(
                 self.draft_model.train()
 
         # Create loss post-processor
-        loss_post_processor = LossPostProcessor(
-            loss_fn=loss_fn,
-            cfg=self.cfg,
-            cp_mesh=self.cp_mesh,
-            cp_size=self.cp_size,
-            dp_size=self.dp_size,
-            enable_seq_packing=self.enable_seq_packing,
-            sampling_params=self.sampling_params,
-            draft_runtime=draft_runtime,
-            tp_mesh=self.tp_mesh,
+        loss_post_processor = self._make_loss_post_processor(
+            loss_fn, draft_runtime=draft_runtime
         )
 
         # Setup cache clearing callback if configured
@@ -838,25 +907,16 @@ class AutomodelPolicyWorkerImpl(
                         tokenizer=self.tokenizer,
                     )
 
-                    mb_results = automodel_forward_backward(
-                        model=self.model,
-                        data_iterator=processed_iterator,
-                        post_processing_fn=loss_post_processor,
-                        device_mesh=self.device_mesh,
-                        padding_token_id=self.tokenizer.pad_token_id or 0,
-                        autocast_context_factory=self._autocast_context,
+                    mb_results = self._forward_backward(
+                        processed_iterator,
+                        loss_post_processor,
                         forward_only=eval_mode,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
-                        sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
-                        dp_size=self.dp_size,
-                        cp_size=self.cp_size,
                         num_global_batches=num_global_batches,
                         num_valid_microbatches=iterator_len,
                         on_microbatch_start=on_microbatch_start,
-                        router_replay_gates=self._router_replay_gates,
                     )
 
                 # Extract losses and metrics from results
@@ -886,33 +946,13 @@ class AutomodelPolicyWorkerImpl(
                             mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
-                grad_norm: Optional[float | torch.Tensor] = None
+                grad_norm: Optional[torch.Tensor] = None
                 if not eval_mode:
                     # The policy is clipped on its own (Megatron-path parity):
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
-                    # is clipped separately below. num_label_tokens=None avoids
-                    # rescaling gradients already normalized by the loss.
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=self.pipeline is not None,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name="pp" if self.pipeline is not None else None,
-                        foreach=True,
-                        num_label_tokens=None,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
-                    warn_if_inf_grad_norm(grad_norm)
+                    # is clipped separately below.
+                    grad_norm = self._clip_policy_grad_norm()
 
                     # Independent draft clip with the same max norm; the
                     # returned pre-clip norm doubles as the reported metric.
@@ -1041,16 +1081,8 @@ class AutomodelPolicyWorkerImpl(
         with self.timer.time("train"):
             sequence_dim, _ = check_sequence_dim(data)
             self.model.train()
-            loss_post_processor = LossPostProcessor(
-                loss_fn=state.loss_fn,
-                cfg=self.cfg,
-                cp_mesh=self.cp_mesh,
-                cp_size=self.cp_size,
-                dp_size=self.dp_size,
-                enable_seq_packing=self.enable_seq_packing,
-                sampling_params=self.sampling_params,
-                draft_runtime=None,
-                tp_mesh=self.tp_mesh,
+            loss_post_processor = self._make_loss_post_processor(
+                state.loss_fn, draft_runtime=None
             )
             # The full-batch path runs only with AutoModel enabled, so the
             # disabled variant of the union cannot occur here.
@@ -1077,25 +1109,16 @@ class AutomodelPolicyWorkerImpl(
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
             )
-            mb_results = automodel_forward_backward(
-                model=self.model,
-                data_iterator=processed_iterator,
-                post_processing_fn=loss_post_processor,
-                device_mesh=self.device_mesh,
-                padding_token_id=self.tokenizer.pad_token_id or 0,
-                autocast_context_factory=self._autocast_context,
+            mb_results = self._forward_backward(
+                processed_iterator,
+                loss_post_processor,
                 forward_only=False,
-                allow_flash_attn_args=self.allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
-                sampling_params=self.sampling_params,
                 sequence_dim=sequence_dim,
-                dp_size=self.dp_size,
-                cp_size=self.cp_size,
                 num_global_batches=1,
                 num_valid_microbatches=iterator_len,
                 on_microbatch_start=on_microbatch_start,
-                router_replay_gates=self._router_replay_gates,
             )
             mb_losses = []
             all_mb_metrics = []
@@ -1127,23 +1150,7 @@ class AutomodelPolicyWorkerImpl(
         self._train_step_commit_failed = True
         try:
             self.model.train()
-            grad_norm = scale_grads_and_clip_grad_norm(
-                self.max_grad_norm,
-                [self.model],
-                norm_type=2.0,
-                pp_enabled=False,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                ep_axis_name="ep"
-                if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
-                else None,
-                pp_axis_name=None,
-                foreach=True,
-                num_label_tokens=1,
-                dp_group_size=self.dp_size * self.cp_size,
-            )
-            grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
-            warn_if_inf_grad_norm(grad_norm)
+            grad_norm = self._clip_policy_grad_norm()
             self.optimizer.step()
             self._update_moe_gate_bias_if_supported()
             self.scheduler.step()
