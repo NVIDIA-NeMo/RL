@@ -41,7 +41,7 @@ With `run_as: requester`, the pipeline runs as the commenter. NVIDIA employees m
 
 ## CI Labels
 
-Every PR **must** have exactly one `CI:*` label — the quality-check job stays red until one is attached. A bot sets it (see below). Labels control which test tier runs and whether a new container image is built.
+The PR mirror computes the minimum test tier from the changed paths. A base branch that predates the classifier uses L1. A bot labels PRs to main with the automatic tier. The mirror honors requests for extra coverage from any label setter while the bot reconciles the labels. A label alone cannot reduce the required tier. A `CI:L0` request on an Lfast change runs L1, which includes full unit tests and fast functional tests.
 
 | Label | What runs | Container |
 |-------|-----------|-----------|
@@ -50,7 +50,7 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 | `CI:L0` | Unit tests + docs + lint | Builds new image |
 | `CI:L1` | L0 + functional tests | Builds new image |
 | `CI:L2` | Same as L1 today (plan to add convergence tests) | Builds new image |
-| `Skip CICD` | Nothing (skips all tests) | — |
+| `Skip CICD` | Allows a maintainer to accept a failed mirror run with a review on its exact commit | — |
 
 **Default on merge group / push to main**: L1.
 
@@ -64,7 +64,9 @@ Every PR **must** have exactly one `CI:*` label — the quality-check job stays 
 
 These `.github/` files feed the main CI run, so they still mean `CI:Lfast`: `workflows/cicd-main.yml`, `workflows/_build_container.yml`, `actions/test-template/*`, `scripts/plan-tests.sh`, `scripts/checkout-megatron-lm-commit.sh`, `scripts/install-megatron-lock-artifact.sh` and `scripts/known-flake-patterns.txt`.
 
-Only repo maintainers (admin or maintain role) can change it, for example to `CI:L1` for a broad core change, or add `Skip CICD`. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels on PRs to `main`. Release branches have no label bot, so `cp-to-release` still copies the original PR's label.
+Only repo maintainers (admin or maintain role) can change the automatic label, for example to `CI:L1` for a broad core change. A label anyone else sets is replaced, and the bot says so in one PR comment. A maintainer's label stays until a push changes the bot's own pick. Agents: do not set or change `CI:*` labels on PRs to `main`. Release branches have no label bot, so `cp-to-release` still copies the original PR's label.
+
+For a `Skip CICD` override, apply the label and submit a GitHub PR review on the current head with the entire body `Skip CICD`. A comment review suffices. Re-run failed jobs on the mirror. A new push requires a fresh review. Manual runs and the `CI:megatron` subset publish `CI diagnostics`. The unfiltered mirror and merge-group runs publish `CI quality check`.
 
 ---
 
