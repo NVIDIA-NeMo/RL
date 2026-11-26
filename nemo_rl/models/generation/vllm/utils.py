@@ -1307,7 +1307,7 @@ def resolve_generation_worker_cls(default_cls: str, config: VllmConfig) -> str:
         default_cls,
         config,
         quantized_cls=(
-            GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+            GENERATION_WORKER_OVERRIDES[default_cls]
             if config.get("quant_cfg") is not None
             else None
         ),

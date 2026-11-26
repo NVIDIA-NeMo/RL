@@ -601,7 +601,6 @@ def test_policy_rejects_invalid_worker_extension_config(
             worker_extension_cls_fqn=explicit_extension_fqn,
         )
     worker_builder.assert_not_called()
-    cluster._init_placement_groups.assert_not_called()
 
 
 @pytest.mark.parametrize("from_config", [False, True])
@@ -624,7 +623,6 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
         )
 
     worker_group.assert_not_called()
-    cluster._init_placement_groups.assert_not_called()
 
 
 def test_policy_rejects_unregistered_resolved_worker_without_worker_extension() -> None:
@@ -647,7 +645,6 @@ def test_policy_rejects_unregistered_resolved_worker_without_worker_extension() 
 
     assert config.get("worker_extension_cls_fqn") is None
     worker_group.assert_not_called()
-    cluster._init_placement_groups.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,7 @@ See [Verified Configurations](#verified-configurations) for the workflow + recip
 
 ## Worker Class Selection
 
-`policy.worker_extension_cls_fqn` and `policy.generation.worker_extension_cls_fqn` select the policy and vLLM workers. When `quant_cfg` is set, the FQN must match the ModelOpt worker for the selected backend (Megatron, Automodel, or synchronous/asynchronous vLLM). An incompatible FQN raises an error naming the required class before workers are allocated. Custom subclasses are not accepted with `quant_cfg`.
+`policy.worker_extension_cls_fqn` and `policy.generation.worker_extension_cls_fqn` select the policy and vLLM workers. When `quant_cfg` is set, the FQN must match the ModelOpt worker for the selected backend (Megatron, or synchronous/asynchronous vLLM). An incompatible FQN raises an error naming the required class before workers are allocated. Custom subclasses are not accepted with `quant_cfg`.
 
 Existing recipes can continue to omit the field: initialization fills it into the config and warns with the selected FQN. Set that FQN explicitly to silence the warning; update it if you change backend or `vllm_cfg.async_engine`. Frozen non-colocated teachers clear the student's quantization and worker-extension settings and use the plain Megatron worker.
 

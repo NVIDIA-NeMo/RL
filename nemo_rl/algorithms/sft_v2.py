@@ -572,6 +572,8 @@ def setup_sft_v2(
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
+    if master_config.policy.get("quant_cfg") is not None:
+        raise ValueError("SFTv2 does not support policy.quant_cfg.")
     configured_worker = master_config.policy.get("worker_extension_cls_fqn")
     if configured_worker not in (None, SFT_V2_WORKER):
         raise ValueError(

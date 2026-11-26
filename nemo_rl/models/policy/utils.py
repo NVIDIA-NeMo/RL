@@ -169,7 +169,7 @@ def resolve_policy_worker_cls(default_cls: str, config: "PolicyConfig") -> str:
         default_cls,
         config,
         quantized_cls=(
-            POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+            POLICY_WORKER_OVERRIDES[default_cls]
             if config.get("quant_cfg") is not None
             else None
         ),
