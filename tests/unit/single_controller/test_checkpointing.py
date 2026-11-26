@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -86,6 +87,7 @@ from nemo_rl.algorithms.rollout_checkpointing import snapshots as snapshots_modu
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
     list_staging_keys,
+    validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
@@ -125,7 +127,11 @@ from nemo_rl.algorithms.single_controller_utils.step_assembly import (
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
-from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import (
+    GROUP_ID_TAG,
+    ROUTE_PLAN_TAG,
+    forest_step_padding_id,
+)
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_coordinator import (
@@ -555,6 +561,72 @@ class _FakeDPClient:
         os.makedirs(checkpoint_dir, exist_ok=True)
         with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
             json.dump({"user_metadata": metadata or {}}, f)
+
+
+@pytest.mark.parametrize("step_padding", ["reject", "allow", "clear"])
+def test_replay_inventory_step_padding(step_padding):
+    """forest_padding_scope=step copies are tolerated or cleared, nothing else."""
+    # Built with the controller's helper, so the parser must recognise its IDs.
+    copies = [forest_step_padding_id("g0-0", index) for index in range(2)]
+    dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", *copies, "other_pad0"])
+    replay_metadata = {
+        "groups": [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name="train",
+                    sample_ids=["g0-0", "g0-1"],
+                    sequence_lengths=[16, 16],
+                )
+            }
+        ]
+    }
+
+    # other_pad0 copies no replayed row, so it stays unexpected in every mode.
+    with pytest.raises(RuntimeError, match="unexpected=") as error:
+        asyncio.run(
+            validate_replay_inventory(
+                replay_metadata,
+                dp_client=dp_client,
+                partition_id=_PARTITION_ID,
+                step_padding=step_padding,
+            )
+        )
+    unexpected = [*copies, "other_pad0"] if step_padding == "reject" else ["other_pad0"]
+    assert f"unexpected={unexpected!r}" in str(error.value)
+    assert dp_client.clear_calls == (
+        [(copies, _PARTITION_ID)] if step_padding == "clear" else []
+    )
+
+
+@pytest.mark.parametrize("step_padding", ["allow", "clear"])
+def test_replay_inventory_accepts_only_step_padding_extras(step_padding):
+    dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", "g0-1_pad0"])
+    replay_metadata = {
+        "groups": [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name="train",
+                    sample_ids=["g0-0", "g0-1"],
+                    sequence_lengths=[16, 16],
+                )
+            }
+        ]
+    }
+
+    asyncio.run(
+        validate_replay_inventory(
+            replay_metadata,
+            dp_client=dp_client,
+            partition_id=_PARTITION_ID,
+            step_padding=step_padding,
+        )
+    )
+
+    assert dp_client.sample_ids == (
+        ["g0-0", "g0-1"] if step_padding == "clear" else ["g0-0", "g0-1", "g0-1_pad0"]
+    )
 
 
 class _StagingInventoryDPClient:
@@ -2562,11 +2634,14 @@ class TestPeriodicRolloutCheckpoint:
 
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
+    @pytest.mark.parametrize("step_padding_copy", [False, True])
     def test_forest_snapshot_preserves_buffered_and_training_owned_rows(
-        self, tmp_path: Path, anchor_step: int, claimed: bool
+        self, tmp_path: Path, anchor_step: int, claimed: bool, step_padding_copy: bool
     ) -> None:
         actor = self._actor(tmp_path)
         actor._master_config.token_capture.forest_training = True
+        if step_padding_copy:
+            actor._master_config.token_capture.forest_padding_scope = "step"
         actor._master_config.async_rl.sampler = InOrderSamplerConfig(
             max_lookahead_versions=0
         )
@@ -2603,6 +2678,11 @@ class TestPeriodicRolloutCheckpoint:
                 expected_manifest_digest=state["manifest_digest"],
             )
             actor._dp_client.sample_ids = list(group["meta"].sample_ids)
+            if step_padding_copy:
+                # A streamed step's padding copy; only a snapshot may hold it.
+                actor._dp_client.sample_ids.append(
+                    f"{group['meta'].sample_ids[0]}_pad0"
+                )
             if claimed:
                 assert await actor._buffer.claim_for_training([0]) == 1
             assert await actor._rollout_snapshots.save_snapshot(force=True)
@@ -4571,6 +4651,11 @@ class TestDataPlaneCheckpoint:
                 ["g0-0", "g0-1", "orphan-0"],
                 r"unexpected=\['orphan-0'\]",
             ),
+            # Step padding copies belong only in rollout snapshots.
+            (
+                ["g0-0", "g0-1", "g0-0_pad0"],
+                r"unexpected=\['g0-0_pad0'\]",
+            ),
         ],
     )
     def test_tq_save_rejects_inventory_mismatch(
@@ -4583,6 +4668,10 @@ class TestDataPlaneCheckpoint:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        # Full checkpoints reject step copies even under scope=step. forest_training
+        # stays False (the validator rejects this pairing) so the fake pump needs no
+        # Forest tags.
+        mc.token_capture.forest_padding_scope = "step"
         sample_ids = ["g0-0", "g0-1"]
         replay_metadata = {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
@@ -6020,6 +6109,11 @@ class TestReplayBufferPersistence:
                 ["g0-0", "g0-1", "orphan-0"],
                 r"unexpected=\['orphan-0'\]",
             ),
+            # Step padding copies belong only in rollout snapshots.
+            (
+                ["g0-0", "g0-1", "g0-0_pad0"],
+                r"unexpected=\['g0-0_pad0'\]",
+            ),
         ],
     )
     def test_native_restore_rejects_tq_inventory_mismatch(
@@ -6055,17 +6149,82 @@ class TestReplayBufferPersistence:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        # A full checkpoint restore rejects step copies even under scope=step.
+        # forest_training stays False (the validator rejects this pairing) so the
+        # fake run needs no Forest tags.
+        mc.token_capture.forest_padding_scope = "step"
+        dp_client = _FakeDPClient(sample_ids=actual_sample_ids)
 
         with pytest.raises(RuntimeError, match=error_fragment):
             _run_actor_run(
                 mc,
                 _make_actor_args(
                     tq_buffer=_FakeTQBuffer(load_return=1),
-                    dp_client=_FakeDPClient(sample_ids=actual_sample_ids),
+                    dp_client=dp_client,
                     last_checkpoint_path=str(ckpt_dir),
                     data_plane_checkpoint_metadata=tq_metadata,
                 ),
             )
+        # A full checkpoint never deletes rows it does not expect.
+        assert dp_client.clear_calls == []
+
+    def test_snapshot_restore_clears_step_padding_copies(self, tmp_path):
+        """A Forest resume from a rollout snapshot deletes mid-step padding copies."""
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        envelope = {
+            "groups": [
+                {
+                    "meta": KVBatchMeta(
+                        partition_id=_PARTITION_ID,
+                        task_name=None,
+                        sample_ids=["g0-0", "g0-1"],
+                        sequence_lengths=[16, 16],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
+                    ),
+                    "start_weight": 0,
+                    "end_weight": 0,
+                    "target_step": 0,
+                    "group_id": "g0",
+                }
+            ]
+        }
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        tq_metadata = _data_plane_checkpoint_metadata(group_count=1) | {
+            "forest_training": True,
+            "forest_execution_row_multiple": 1,
+        }
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        mc.token_capture.forest_training = True
+        copy = forest_step_padding_id("g0-0", 0)
+        dp_client = _FakeDPClient(sample_ids=["g0-0", "g0-1", copy])
+        args = dataclasses.replace(
+            _make_actor_args(
+                tq_buffer=_FakeTQBuffer(load_return=1),
+                dp_client=dp_client,
+                last_checkpoint_path=str(ckpt_dir),
+                data_plane_checkpoint_metadata=tq_metadata,
+            ),
+            restored_from_rollout_snapshot=True,
+        )
+
+        async def _restore() -> int:
+            actor = _ACTOR_CLS(mc, args, SetupTimingMetrics())
+            try:
+                return await actor._rollout_restorer._restore_replay_buffer()
+            finally:
+                actor._checkpointer.shutdown()
+
+        assert asyncio.run(_restore()) == 1
+        assert dp_client.clear_calls == [([copy], _PARTITION_ID)]
 
     def test_native_replay_metadata_requires_setup_side_tq_restore(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"

@@ -260,6 +260,8 @@ token_capture:
   forest_training: false
   # returned_history (default) or all_captured, including discarded attempts.
   selection_policy: returned_history
+  # Forest only. Pad each published group (group) or each training batch once (step).
+  forest_padding_scope: group
   staging_partition: rollout_staging
 
 

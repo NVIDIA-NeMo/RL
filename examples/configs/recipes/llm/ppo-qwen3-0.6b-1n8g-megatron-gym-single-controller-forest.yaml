@@ -159,5 +159,6 @@ async_rl:
 token_capture:
   enabled: true
   forest_training: true
+  forest_padding_scope: step
 cluster:
   gpus_per_node: 8

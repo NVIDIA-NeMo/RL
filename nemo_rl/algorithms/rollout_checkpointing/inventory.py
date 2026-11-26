@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     Optional,
 )
 
@@ -36,6 +37,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     ROUTE_PLAN_TAG,
+    forest_step_padding_source,
 )
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
@@ -61,14 +63,33 @@ def capture_reward_settings(
     )
 
 
+def _step_padding_sample_ids(
+    sample_ids: set[str], expected_sample_ids: set[str]
+) -> set[str]:
+    """Return the step padding copies of expected rows among ``sample_ids``."""
+    return {
+        sample_id
+        for sample_id in sample_ids
+        if forest_step_padding_source(sample_id) in expected_sample_ids
+    }
+
+
 async def validate_replay_inventory(
-    replay_metadata: TQReplayMetadataState, *, dp_client: Any, partition_id: str
+    replay_metadata: TQReplayMetadataState,
+    *,
+    dp_client: Any,
+    partition_id: str,
+    step_padding: Literal["reject", "allow", "clear"] = "reject",
 ) -> None:
     """Require the canonical TQ keys to match the SC replay index exactly.
 
     Live checkpoint callers must hold the exclusive data-plane barrier so
     commits and clears cannot race this inventory read. Restore calls are
     also safe before the rollout and train pumps start any live writers.
+
+    With forest_padding_scope=step, a rollout snapshot taken mid-step also
+    holds that step's padding copies, which no replay group lists:
+    ``step_padding="allow"`` accepts them and ``"clear"`` deletes them.
     """
     expected_sample_ids = {
         sample_id
@@ -83,6 +104,19 @@ async def validate_replay_inventory(
             partition_id=partition_id,
         )
     )
+    if step_padding != "reject":
+        padding_ids = _step_padding_sample_ids(
+            actual_sample_ids - expected_sample_ids, expected_sample_ids
+        )
+        if padding_ids and step_padding == "clear":
+            await call_data_plane(
+                dp_client,
+                "clear_samples",
+                offload_sync=True,
+                sample_ids=sorted(padding_ids),
+                partition_id=partition_id,
+            )
+        actual_sample_ids -= padding_ids
     missing_sample_ids = sorted(expected_sample_ids - actual_sample_ids)
     unexpected_sample_ids = sorted(actual_sample_ids - expected_sample_ids)
     if missing_sample_ids or unexpected_sample_ids:

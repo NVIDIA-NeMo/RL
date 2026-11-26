@@ -4197,7 +4197,8 @@ def test_forest_router_is_validated_before_rollout_manager(
         trainer.worker_group.run_all_workers_single_data.assert_not_called()
 
 
-def test_forest_groups_pad_to_the_row_multiple(patched_factories) -> None:
+@pytest.mark.parametrize("scope", ["group", "step"])
+def test_forest_padding_scope_picks_who_pads(patched_factories, scope: str) -> None:
     mc = _make_master_config(megatron_enabled=True)
     mc.policy.update(
         sequence_packing={"enabled": True},
@@ -4212,7 +4213,9 @@ def test_forest_groups_pad_to_the_row_multiple(patched_factories) -> None:
         top_k=None,
         vllm_cfg={"async_engine": True},
     )
-    mc.token_capture = TokenCaptureConfig(enabled=True, forest_training=True)
+    mc.token_capture = TokenCaptureConfig(
+        enabled=True, forest_training=True, forest_padding_scope=scope
+    )
     mc.async_rl.rollout_failure.min_step_batch_fraction = 1
     trainer = patched_factories["fake_policy"]
     trainer.cfg = mc.policy
@@ -4229,8 +4232,11 @@ def test_forest_groups_pad_to_the_row_multiple(patched_factories) -> None:
         ),
         patch.object(sc_setup_mod, "RolloutManager") as rollout_manager,
     ):
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
-    assert rollout_manager.call_args.kwargs["execution_row_multiple"] == 4
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    group_multiple = rollout_manager.call_args.kwargs["execution_row_multiple"]
+    assert (group_multiple, actor_args.forest_step_row_multiple) == (
+        (4, 1) if scope == "group" else (1, 4)
+    )
 
 
 def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(

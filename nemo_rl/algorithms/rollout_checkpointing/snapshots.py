@@ -626,10 +626,19 @@ class RolloutSnapshotter(_UsesRolloutParts):
             )
             phases: dict[str, Awaitable[Any]] = {}
             if replay_metadata is not None:
+                # Only a mid-step snapshot may hold step padding copies;
+                # restore deletes them.
                 phases["replay_inventory"] = validate_replay_inventory(
                     replay_metadata,
                     dp_client=self._dp_client,
                     partition_id=self._partition_id,
+                    step_padding=(
+                        "allow"
+                        if snapshot
+                        and self._master_config.token_capture.forest_padding_scope
+                        == "step"
+                        else "reject"
+                    ),
                 )
             if snapshot or self._records_prompt_groups():
                 runtime = self._rollout_runtime

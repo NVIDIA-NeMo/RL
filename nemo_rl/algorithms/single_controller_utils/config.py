@@ -779,6 +779,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Forest only. Where execution padding brings rows to the policy and critic
+    # row multiple. group: each published group (default). step: once per
+    # training batch, which pads far fewer rows when groups hold few rollouts.
+    forest_padding_scope: Literal["group", "step"] = "group"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -786,6 +790,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
+            )
+        if not self.forest_training and self.forest_padding_scope != "group":
+            raise ValueError(
+                "token_capture.forest_padding_scope requires forest_training=true"
             )
         return self
 
@@ -2001,9 +2009,10 @@ def validate_grpo_chunk_cap_alignment(
     from an unaligned ``min_groups_for_streaming_train``, which no validator
     covers today.
 
-    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
-    producer pads each group to the policy execution row multiple, so the logical
-    group count is not the physical row count.
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt:
+    execution padding (per group, or per training batch under
+    ``token_capture.forest_padding_scope: step``) brings rows to the execution
+    row multiple, so the logical group count is not the physical row count.
 
     Args:
         master_config: The run configuration.

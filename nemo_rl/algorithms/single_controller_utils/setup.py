@@ -224,6 +224,9 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    # Row multiple the controller pads each Forest training batch to under
+    # token_capture.forest_padding_scope=step; 1 when groups pad themselves.
+    forest_step_row_multiple: int = 1
     # warmup_first_pass's arguments when the controller runs the trainer warm-up;
     # None when setup already ran it or it does not run.
     trainer_warmup_kwargs: Optional[dict[str, Any]] = None
@@ -2772,7 +2775,11 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
-        execution_row_multiple=forest_row_multiple,
+        execution_row_multiple=(
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "group"
+            else 1
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
         filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
         # The advantage stage's participation knobs; None on PPO, which has no group baseline.
@@ -2830,5 +2837,10 @@ def setup_single_controller(
         value_loss_fn=value_loss_fn,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
+        forest_step_row_multiple=(
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "step"
+            else 1
+        ),
     )
     return actor_args, setup_timing_metrics
