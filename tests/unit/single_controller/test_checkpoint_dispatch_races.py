@@ -216,7 +216,10 @@ class _PendingLedger:
             for group in self._groups
         ]
 
-    def state_dict(self) -> dict[str, Any]:
+    def state_dict(
+        self, *, exclude_group_ids: set[str] | None = None
+    ) -> dict[str, Any]:
+        excluded = exclude_group_ids or set()
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [
@@ -234,6 +237,7 @@ class _PendingLedger:
                     "phase": ("reserved" if group.target_step is None else "admitted"),
                 }
                 for group in self._groups
+                if group.group_id not in excluded
             ],
         }
 

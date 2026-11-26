@@ -111,6 +111,7 @@ class _Job:
     inventory: Any
     deadline: float | None
     future: Future[Any]
+    held_only: bool
     iterator: CutWrites | None = None
     request: PrefixWrite | None = None
     reservation: int = 0
@@ -161,7 +162,9 @@ class PrefixWritePipeline:
         )
         self._thread.start()
 
-    def submit(self, inventory: Any, *, deadline: float | None) -> Future[Any]:
+    def submit(
+        self, inventory: Any, *, deadline: float | None, held_only: bool = False
+    ) -> Future[Any]:
         key = (inventory.checkpoint_id, inventory.inventory_digest)
         with self._condition:
             if self._closed:
@@ -172,7 +175,7 @@ class PrefixWritePipeline:
                 raise RuntimeError("Prefix pipeline inventory admission limit reached")
             future: Future[Any] = Future()
             future.set_running_or_notify_cancel()
-            job = _Job(inventory, deadline, future)
+            job = _Job(inventory, deadline, future, held_only)
             self._jobs[key] = job
             self._incoming.append(job)
             self._condition.notify_all()
@@ -234,7 +237,9 @@ class PrefixWritePipeline:
         self._reserve(job, self._limits.max_batch_payload_bytes)
         try:
             if job.iterator is None:
-                job.iterator = self._prepare(job.inventory, deadline=job.deadline)
+                job.iterator = self._prepare(
+                    job.inventory, deadline=job.deadline, held_only=job.held_only
+                )
                 self._busy.update(
                     prefix.model_call_id for prefix in job.inventory.active_prefixes
                 )
