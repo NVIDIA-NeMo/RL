@@ -118,6 +118,7 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     OPD_FULL_TEACHER_INDEX_FIELD,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    ROUTER_EXCLUDED_ROWS,
 )
 
 # Core fields the logprob workers require; multimodal extras added by TQPolicy._logprob_dispatch.

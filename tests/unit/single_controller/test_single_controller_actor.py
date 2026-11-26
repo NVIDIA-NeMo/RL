@@ -4096,9 +4096,7 @@ class _NoOpValue:
     def begin_train_step(self, loss_fn, **kwargs) -> None:
         self._record("begin_train_step")
 
-    def train_microbatches_from_meta(
-        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
-    ) -> None:
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         self._record("train_microbatches_from_meta")
 
     def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:

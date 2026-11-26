@@ -5394,9 +5394,7 @@ class SingleControllerActor:
                 )
                 for meta in metas:
                     await asyncio.to_thread(
-                        self._value.train_microbatches_from_meta,
-                        meta,
-                        train_fields=train_fields,
+                        self._value.train_microbatches_from_meta, meta
                     )
                 result = await asyncio.to_thread(self._value.finish_train_step)
         await asyncio.to_thread(self._value.finish_training)

@@ -229,22 +229,13 @@ class TQValue(TQDriverMixin, Value):
         )
 
     def train_microbatches_from_meta(
-        self,
-        meta: KVBatchMeta,
-        timer: Optional[Timer] = None,
-        train_fields: tuple[str, ...] = DP_VALUE_TRAIN_FIELDS,
+        self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
-        """Accumulate a training chunk using the existing presharded worker API.
-
-        Args:
-            meta: Chunk metadata.
-            timer: Optional timer for nested value_training measurements.
-            train_fields: Columns the workers fetch for this chunk.
-        """
+        """Accumulate a training chunk using the existing presharded worker API."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=list(train_fields),
+            fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
             include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )

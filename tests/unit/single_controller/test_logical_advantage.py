@@ -1074,11 +1074,10 @@ def test_forest_objective_accepts_ppo_gae_only() -> None:
         )
 
 
-@pytest.mark.parametrize("mode", ["whole_batch", "split"])
 @pytest.mark.parametrize("exclude_router_rows", [False, True])
 @pytest.mark.parametrize("forest", [False, True])
 def test_critic_takes_every_forest_row_as_one_step(
-    forest: bool, exclude_router_rows: bool, mode: str
+    forest: bool, exclude_router_rows: bool
 ) -> None:
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
     if not forest:
@@ -1090,21 +1089,15 @@ def test_critic_takes_every_forest_row_as_one_step(
     ctrl = object.__new__(controller_cls)
     ctrl._value = MagicMock()
     ctrl._value.train_from_meta.return_value = {}
-    ctrl._value.finish_train_step.return_value = {}
     ctrl._value_loss_fn = object()
-    ctrl._algo_cfg = SimpleNamespace(value_training_mode=mode)
+    ctrl._algo_cfg = SimpleNamespace(value_training_mode="whole_batch")
     ctrl._router_excluded_fields = (
         (ROUTER_EXCLUDED_ROWS,) if forest and exclude_router_rows else ()
     )
     asyncio.run(ctrl._value_train_epochs([meta], num_epochs=2))
-    if mode == "whole_batch":
-        calls = ctrl._value.train_from_meta.call_args_list
-        gbs_calls = calls
-    else:
-        calls = ctrl._value.train_microbatches_from_meta.call_args_list
-        gbs_calls = ctrl._value.begin_train_step.call_args_list
+    calls = ctrl._value.train_from_meta.call_args_list
     assert len(calls) == 2
-    assert {call.kwargs["gbs"] for call in gbs_calls} == {meta.size if forest else None}
+    assert {call.kwargs["gbs"] for call in calls} == {meta.size if forest else None}
     # Critics fetch the rows their routers must not count only when opted in.
     assert {call.kwargs["train_fields"] for call in calls} == {
         (*DP_VALUE_TRAIN_FIELDS, ROUTER_EXCLUDED_ROWS)

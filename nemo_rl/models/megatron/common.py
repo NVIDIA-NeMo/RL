@@ -233,9 +233,10 @@ def validate_forest_routers(model: Any) -> None:
     Padding rows and failed owners' borrowed inputs run through the model, so
     routing must be dropless and per-token.
     """
-    # TODO: Exclude artificial inputs from expert-bias update counts; see
-    # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
-    # meanwhile: dummy rows can affect the counts despite zero policy loss.
+    # By default, padding and borrowed inputs still count toward expert-bias
+    # updates; token_capture.exclude_padding_from_router_stats excludes them.
+    # TODO: Exclude artificial inputs in general; see
+    # https://github.com/NVIDIA-NeMo/RL/pull/4519.
     for chunk in _unwrapped_chunks(model):
         for module in chunk.modules():
             if not isinstance(module, Router):
