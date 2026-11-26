@@ -41,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     replica_width,
+    resolve_disagg_layout,
     resolve_disagg_server_config,
     role_engine_config,
     role_tensor_parallel_size,
