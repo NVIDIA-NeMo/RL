@@ -88,11 +88,7 @@ def test_actor_module_exists(actor_fqn):
 
 @pytest.mark.parametrize("default_cls", sorted(POLICY_WORKER_OVERRIDES))
 def test_policy_worker_override_names_registered_actors(default_cls):
-    """Both sides of each override must be registered actor FQNs.
-
-    resolve_policy_worker_cls falls back to the unquantized worker when the key
-    misses, so a stale key after a rename would silently drop quantization.
-    """
+    """Both sides of each override must be registered actor FQNs."""
     assert default_cls in ACTOR_ENVIRONMENTS
     assert POLICY_WORKER_OVERRIDES[default_cls] in ACTOR_ENVIRONMENTS
 

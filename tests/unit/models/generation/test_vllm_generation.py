@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -325,13 +326,23 @@ def test_prepare_refit_info_uses_live_leaders_and_unions_prequant_names():
 
 
 @pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("custom", [False, True])
 def test_vllm_generation_selects_worker_extension(
-    async_engine,
+    async_engine: bool,
+    custom: bool,
 ) -> None:
     config = deepcopy(basic_vllm_test_config)
     config["vllm_cfg"]["async_engine"] = async_engine
     extension_fqn = "tests.extensions.CustomGenerationWorker"
-    config["worker_extension_cls_fqn"] = extension_fqn
+    if custom:
+        config["worker_extension_cls_fqn"] = extension_fqn
+        expected = extension_fqn
+    elif async_engine:
+        expected = (
+            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+        )
+    else:
+        expected = "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
 
     cluster = MagicMock()
     cluster.world_size.return_value = 1
@@ -356,26 +367,97 @@ def test_vllm_generation_selects_worker_extension(
         worker_group.return_value.dp_size = 1
         VllmGeneration(cluster, config, defer_model_load=True)
 
-    assert worker_builder.call_args.args[:2] == (extension_fqn, config)
+    assert worker_builder.call_args.args[:2] == (expected, config)
     assert worker_builder.call_args.kwargs == (
         {"defer_model_load": True} if async_engine else {}
     )
 
 
-def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+_VLLM_QUANT_WORKERS = {
+    False: "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker",
+    True: "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker",
+}
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_vllm_generation_selects_quant_worker(
+    async_engine: bool, explicit: bool
+) -> None:
     config = deepcopy(basic_vllm_test_config)
-    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+    config["vllm_cfg"]["async_engine"] = async_engine
     config["quant_cfg"] = "NVFP4"
+    expected = _VLLM_QUANT_WORKERS[async_engine]
+    if explicit:
+        config["worker_extension_cls_fqn"] = expected
     cluster = MagicMock()
     cluster.world_size.return_value = 1
     cluster.num_gpus_per_node = 1
 
-    with pytest.raises(
-        ValueError,
-        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder"
+        ) as worker_builder,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+            return_value=[None],
+        ),
+        warnings.catch_warnings(record=True) as recorded,
+    ):
+        warnings.simplefilter("always")
+        worker_group.return_value.dp_size = 1
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    assert worker_builder.call_args.args[0] == expected
+    assert worker_builder.call_args.args[1]["worker_extension_cls_fqn"] == expected
+    assert worker_builder.call_args.kwargs == (
+        {"defer_model_load": True} if async_engine else {}
+    )
+    assert config["worker_extension_cls_fqn"] == expected
+    filled = [
+        w
+        for w in recorded
+        if issubclass(w.category, UserWarning)
+        and "setting it automatically" in str(w.message)
+    ]
+    assert len(filled) == (0 if explicit else 1)
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("configured", ["custom", "other_engine"])
+def test_vllm_generation_rejects_worker_extension_with_quantization(
+    async_engine: bool, configured: str
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    config["quant_cfg"] = "NVFP4"
+    config["worker_extension_cls_fqn"] = (
+        "tests.extensions.CustomGenerationWorker"
+        if configured == "custom"
+        else _VLLM_QUANT_WORKERS[not async_engine]
+    )
+    required = _VLLM_QUANT_WORKERS[async_engine]
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder"
+        ) as worker_builder,
+        pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"quant_cfg requires worker_extension_cls_fqn={required!r}"
+            ),
+        ),
     ):
         VllmGeneration(cluster, config, defer_model_load=True)
 
+    worker_builder.assert_not_called()
     cluster._init_placement_groups.assert_not_called()
 
 
@@ -398,6 +480,30 @@ def test_vllm_generation_rejects_unregistered_worker_extension(
     ):
         VllmGeneration(cluster, config, defer_model_load=True)
 
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
+def test_vllm_rejects_unregistered_resolved_worker_without_worker_extension() -> None:
+    """The resolved worker is checked even when the config names no extension."""
+    config = deepcopy(basic_vllm_test_config)
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.resolve_generation_worker_cls",
+            return_value="tests.extensions.UnregisteredGenerationWorker",
+        ),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    assert config.get("worker_extension_cls_fqn") is None
     worker_group.assert_not_called()
     cluster._init_placement_groups.assert_not_called()
 

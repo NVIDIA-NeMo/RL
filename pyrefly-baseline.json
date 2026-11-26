@@ -5035,13 +5035,6 @@
       "severity": "error"
     },
     {
-      "column": 64,
-      "path": "nemo_rl/models/generation/vllm/vllm_generation.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `VllmConfig` is not assignable to parameter `config` with type `dict[Unknown, Unknown]` in function `nemo_rl.models.generation.vllm.utils.resolve_generation_worker_cls`",
-      "severity": "error"
-    },
-    {
       "column": 50,
       "path": "nemo_rl/models/generation/vllm/vllm_generation.py",
       "name": "bad-argument-type",
@@ -6407,13 +6400,6 @@
       "severity": "error"
     },
     {
-      "column": 17,
-      "path": "nemo_rl/models/policy/lm_policy.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `PolicyConfig` is not assignable to parameter `config` with type `dict[Unknown, Unknown]` in function `nemo_rl.models.policy.utils.resolve_policy_worker_cls`",
-      "severity": "error"
-    },
-    {
       "column": 46,
       "path": "nemo_rl/models/policy/lm_policy.py",
       "name": "bad-typed-dict-key",
@@ -6439,13 +6425,6 @@
       "path": "nemo_rl/models/policy/lm_policy.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `dict.__init__` called with arguments: (dict[str, str] | object)",
-      "severity": "error"
-    },
-    {
-      "column": 17,
-      "path": "nemo_rl/models/policy/lm_policy.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `PolicyConfig` is not assignable to parameter `config` with type `dict[Unknown, Unknown]` in function `nemo_rl.models.policy.utils.resolve_policy_worker_cls`",
       "severity": "error"
     },
     {
