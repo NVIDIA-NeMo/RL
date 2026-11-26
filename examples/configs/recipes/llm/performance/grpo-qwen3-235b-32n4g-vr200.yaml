@@ -1,0 +1,33 @@
+defaults: ./grpo-qwen3-235b-32n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g-vr200
+policy:
+  offload_optimizer_for_refit: false
+  megatron_cfg:
+    # Recompute the attention core and retain other activations.
+    recompute_granularity: selective
+    recompute_modules: [core_attn]
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 16
+      pipeline_parallel_size: 1
+      # K5 reserves six engine positions beyond the 8,192-token request budget.
+      max_model_len: 8198
+    vllm_kwargs:
+      async_scheduling: true
+      max_num_seqs: 128
+      max_num_batched_tokens: 2048
+      compilation_config:
+        # K5 verifies six tokens per request, so 64 requests use the 384-token graph.
+        cudagraph_capture_sizes: [6, 12, 24, 48, 96, 192, 384]
+      speculative_config:
+        method: eagle3
+        model: RedHatAI/Qwen3-235B-A22B-speculator.eagle3
+        revision: 6b3306ff92023cc3b393ec9bb26a168ad88096fe  # pragma: allowlist secret
+        num_speculative_tokens: 5
+        draft_load_config:
+          load_format: safetensors
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n4g-vr200
+  wandb:
+    name: grpo-qwen3-235b-32n4g-vr200

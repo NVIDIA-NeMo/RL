@@ -3,6 +3,7 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off
 policy:
   megatron_cfg:
+    moe_router_dtype: fp32
     # HybridEP settings
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep

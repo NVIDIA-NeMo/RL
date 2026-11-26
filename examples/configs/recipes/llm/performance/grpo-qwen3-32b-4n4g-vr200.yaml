@@ -1,0 +1,31 @@
+defaults: ./grpo-qwen3-32b-4n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-32b-4n4g-vr200
+policy:
+  generation:
+    vllm_cfg:
+      # Leave headroom for KV cache wake-up after each colocated update.
+      gpu_memory_utilization: 0.55
+      # The rollout worker reserves K + 1 positions, so 4,100 leaves 4,096 usable with K=3.
+      max_model_len: 4100
+    vllm_kwargs:
+      speculative_config:
+        method: eagle3
+        model: RedHatAI/Qwen3-32B-Thinking-speculator.eagle3
+        revision: a1403e07b73a66fc9ef561463631c31864616933  # pragma: allowlist secret
+        num_speculative_tokens: 3
+        draft_load_config:
+          load_format: safetensors
+  logprob_chunk_size: 4096
+  megatron_cfg:
+    defer_fp32_logits: true
+    pipeline_model_parallel_size: 2
+    sequence_parallel: false
+    tensor_model_parallel_size: 1
+  sequence_packing:
+    fuse_loss: true
+    train_mb_tokens: 8192
+logger:
+  log_dir: logs/grpo-qwen3-32b-4n4g-vr200
+  wandb:
+    name: grpo-qwen3-32b-4n4g-vr200
