@@ -77,6 +77,16 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointPrepareSummary,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_multi_harness import (
+    HARNESS_RESULT_KEY,
+    MULTI_HARNESS_CONFIG_KEY,
+    EnvironmentServerInfo,
+    MultiHarnessConfig,
+    MultiHarnessRoutes,
+    describe_environment_server,
+    parse_multi_harness,
+    resolve_multi_harness,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -303,6 +313,7 @@ class NemoGymPostprocessConfig(BaseModel):
 def _prepare_materialized_nemo_gym_rows(
     rows: list[dict],
     environment_server_routes: Mapping[str, str],
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> None:
     """Resolve materialized task destinations and episode IDs.
 
@@ -318,7 +329,9 @@ def _prepare_materialized_nemo_gym_rows(
         if not is_nemo_gym_task(row):
             continue
         TaskId.model_validate(row["task_id"])
-        server_name = get_nemo_gym_route_name(row, environment_server_routes)
+        server_name = get_nemo_gym_route_name(
+            row, environment_server_routes, multi_harness
+        )
         row["_ng_environment_server"] = server_name
         if maybe_rollout_id_from_run_body(row) is None:
             # Sync training and validation carry RL group coordinates instead
@@ -1179,6 +1192,9 @@ class NemoGym(EnvironmentInterface):
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         self._environment_server_routes: dict[str, str] | None = None
+        # Installed by set_multi_harness_routes after the driver has matched
+        # env.nemo_gym.multi_harness to the servers of every actor.
+        self._multi_harness: MultiHarnessRoutes | None = None
         # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
@@ -1265,6 +1281,7 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        initial_global_config_dict.pop(MULTI_HARNESS_CONFIG_KEY, None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         # The Gym model server sends this as the bearer token of every request to
@@ -1750,6 +1767,46 @@ Depending on your data shape, you may want to change these values."""
         self._environment_server_routes = dict(routes)
         return dict(self._environment_server_routes)
 
+    def _selected_harness(self, row: Mapping[str, Any]) -> str | None:
+        """Name the agent a multi-harness taskset's row runs on, or None."""
+        if self._multi_harness is None or not is_nemo_gym_task(row):
+            return None
+        taskset = _get_materialized_taskset(row)
+        if not self._multi_harness.covers(taskset):
+            return None
+        return self._multi_harness.select(
+            taskset, row.get(NEMO_GYM_GROUP_ID_KEY)
+        ).harness
+
+    def describe_environment_servers(
+        self, server_names: list[str]
+    ) -> dict[str, EnvironmentServerInfo]:
+        """Describe each named Environment Server this actor's Gym config has.
+
+        The driver matches env.nemo_gym.multi_harness to the servers of every
+        shard, so each actor reports only the servers its own config resolved.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "describe_environment_servers() needs a running Gym stack; "
+                "call _spinup() first."
+            )
+
+        # Gym is installed only in the actor's runtime environment.
+        from nemo_gym.global_config import get_global_config_dict
+
+        resolved = get_global_config_dict()
+        descriptions: dict[str, EnvironmentServerInfo] = {}
+        for name in server_names:
+            description = describe_environment_server(name, resolved)
+            if description is not None:
+                descriptions[name] = description
+        return descriptions
+
+    def set_multi_harness_routes(self, routes: MultiHarnessRoutes) -> None:
+        """Install the multi-harness routes the driver resolved at startup."""
+        self._multi_harness = routes
+
     @accepts_trace_context
     async def run_rollouts(
         self,
@@ -1860,6 +1917,7 @@ Depending on your data shape, you may want to change these values."""
             _prepare_materialized_nemo_gym_rows(
                 nemo_gym_examples,
                 self.list_environment_server_routes(),
+                self._multi_harness,
             )
 
         timer = Timer()
@@ -1941,6 +1999,11 @@ Depending on your data shape, you may want to change these values."""
                     )
                 except (GymTransportError, RolloutDataFailure) as error:
                     return nemo_gym_row, error
+                # Label the result for metrics; the row sent to Gym names only the server.
+                if is_nemo_gym_task(nemo_gym_row):
+                    harness = self._selected_harness(nemo_gym_row)
+                    if harness is not None:
+                        result[HARNESS_RESULT_KEY] = harness
                 return nemo_gym_row, result
             if not isinstance(failure, GymAdmissionClosed):
                 # A refusal is expected while a checkpoint is open; only a real
@@ -3167,6 +3230,9 @@ def _build_gym_actor_config(
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    # The driver resolves the multi-harness routes and sends them to each actor
+    # once it has started (see _install_multi_harness_routes).
+    nemo_gym_dict.pop(MULTI_HARNESS_CONFIG_KEY, None)
     if nemo_gym_dict.pop("dynamo_dialect", False):
         _apply_dynamo_dialect(nemo_gym_dict, frontends=len(base_urls))
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
@@ -3275,10 +3341,20 @@ def _get_materialized_taskset(row: Mapping[str, Any]) -> str:
 def get_nemo_gym_route_name(
     row: Mapping[str, Any],
     environment_server_routes: Mapping[str, str] | None = None,
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> str:
-    """Resolve a materialized task row or flat row to its Gym server entry name."""
+    """Resolve a materialized task row or flat row to its Gym server entry name.
+
+    A taskset in ``multi_harness`` routes by the row's prompt-group ID, so all
+    rows of one group resolve to the same harness's Environment Server. Setup
+    refuses a taskset that is also in ``environment_server_routes``.
+    """
     if is_nemo_gym_task(row):
         taskset = _get_materialized_taskset(row)
+        if multi_harness is not None and multi_harness.covers(taskset):
+            return multi_harness.select(
+                taskset, row.get(NEMO_GYM_GROUP_ID_KEY)
+            ).environment_server
         if (
             environment_server_routes is None
             or taskset not in environment_server_routes
@@ -3320,6 +3396,8 @@ class NemoGymShardSet:
             Empty when unsharded, where every row goes to the only actor.
         environment_server_routes: Taskset names to Environment Server
             names, read from the actors' resolved Gym configuration.
+        multi_harness: Each multi-harness taskset's servers, one chosen per
+            prompt group, or None.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
     """
@@ -3327,6 +3405,7 @@ class NemoGymShardSet:
     handles: Dict[str, List[ray.actor.ActorHandle]]
     route_to_shard: Dict[str, str] = field(default_factory=dict)
     environment_server_routes: Dict[str, str] = field(default_factory=dict)
+    multi_harness: Optional[MultiHarnessRoutes] = None
     placement_group: Optional[PlacementGroup] = None
     _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
     _replica_lock: threading.Lock = field(
@@ -3422,7 +3501,9 @@ class NemoGymShardSet:
             if resolve_in_actor and is_nemo_gym_task(row)
             else (
                 "server",
-                get_nemo_gym_route_name(row, self.environment_server_routes),
+                get_nemo_gym_route_name(
+                    row, self.environment_server_routes, self.multi_harness
+                ),
             )
             for row in rows
         }
@@ -3578,6 +3659,8 @@ def build_nemo_gym_actors(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
+    # Checked before any actor starts; servers are matched to agents after.
+    multi_harness = parse_multi_harness(nemo_gym_dict.get(MULTI_HARNESS_CONFIG_KEY))
 
     if plan is None:
         return _build_single_gym_actor(
@@ -3591,6 +3674,7 @@ def build_nemo_gym_actors(
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            multi_harness=multi_harness,
         )
 
     return _build_sharded_gym_actors(
@@ -3607,6 +3691,7 @@ def build_nemo_gym_actors(
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
+        multi_harness=multi_harness,
     )
 
 
@@ -3622,6 +3707,7 @@ def _build_single_gym_actor(
     generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    multi_harness: MultiHarnessConfig | None = None,
 ) -> NemoGymShardSet:
     """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
@@ -3661,11 +3747,18 @@ def _build_single_gym_actor(
         )
         if turn_checkpointing_enabled:
             ray.get(actor.initialize_checkpoint_adapter.remote())
-        if routes:
-            shard_set.environment_server_routes = build_environment_server_routes(
-                {DEFAULT_SHARD_NAME: routes},
-                {DEFAULT_SHARD_NAME: ray.get(actor.list_entries.remote())},
-            )
+        if routes or multi_harness is not None:
+            entries_by_shard = {
+                DEFAULT_SHARD_NAME: ray.get(actor.list_entries.remote())
+            }
+            if routes:
+                shard_set.environment_server_routes = build_environment_server_routes(
+                    {DEFAULT_SHARD_NAME: routes}, entries_by_shard
+                )
+            if multi_harness is not None:
+                shard_set.multi_harness = _install_multi_harness_routes(
+                    shard_set, multi_harness, entries_by_shard, routes
+                )
     except BaseException:
         shard_set.shutdown(
             timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
@@ -3690,6 +3783,7 @@ def _build_sharded_gym_actors(
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
+    multi_harness: MultiHarnessConfig | None = None,
 ) -> NemoGymShardSet:
     instances = _shard_instances(plan)
 
@@ -3719,6 +3813,14 @@ def _build_sharded_gym_actors(
         shard.name: apply_shard_overlay(base_gym_dict, plan, shard)
         for shard in plan.shards
     }
+    # The driver resolves one set of multi-harness routes for all shards, so a
+    # shard's override of the block would be ignored. Refuse it instead.
+    for shard_name, merged in merged_by_shard.items():
+        if parse_multi_harness(merged.get(MULTI_HARNESS_CONFIG_KEY)) != multi_harness:
+            raise ShardConfigError(
+                f"Shard {shard_name!r} overrides env.nemo_gym.multi_harness; every "
+                "shard must use the shared block."
+            )
 
     # This may create a temporary all-node placement group while materializing
     # the actor venv. Finish it before the shard group reserves those CPUs.
@@ -3791,7 +3893,8 @@ def _build_sharded_gym_actors(
         (
             shard_set.route_to_shard,
             shard_set.environment_server_routes,
-        ) = _discover_shard_routes(shard_set, plan)
+            shard_set.multi_harness,
+        ) = _discover_shard_routes(shard_set, plan, multi_harness)
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
         # half-started stack would keep running with nothing left to stop it.
@@ -3896,16 +3999,19 @@ def _spinup_shards_concurrently(
 
 
 def _discover_shard_routes(
-    shard_set: NemoGymShardSet, plan: ShardPlan
-) -> tuple[Dict[str, str], Dict[str, str]]:
+    shard_set: NemoGymShardSet,
+    plan: ShardPlan,
+    multi_harness: MultiHarnessConfig | None = None,
+) -> tuple[Dict[str, str], Dict[str, str], MultiHarnessRoutes | None]:
     """Ask one replica per shard what it spawned, then build routing metadata.
 
     Replicas of a shard are stamped from one merge, so they host identical
     entries and only the first needs to be asked.
 
     Returns:
-        A pair of mappings: routable Gym entry names to hosting shard names,
-        and taskset names to Environment Server entry names, in that order.
+        Routable Gym entry names to hosting shard names, taskset names to
+        Environment Server entry names, and the resolved multi-harness routes
+        (None without a ``multi_harness`` block), in that order.
     """
     entries_by_shard = {
         shard.name: ray.get(shard_set.handles[shard.name][0].list_entries.remote())
@@ -3920,14 +4026,88 @@ def _discover_shard_routes(
     environment_server_routes = build_environment_server_routes(
         routes_by_shard, entries_by_shard
     )
-    return (
-        build_route_shard_map(
-            entries_by_shard,
-            plan.allowed_duplicate_entries,
-            environment_server_routes=environment_server_routes,
-        ),
-        environment_server_routes,
+    route_to_shard = build_route_shard_map(
+        entries_by_shard,
+        plan.allowed_duplicate_entries,
+        environment_server_routes=environment_server_routes,
+        multi_harness_servers=multi_harness.servers if multi_harness else (),
     )
+    multi_harness_routes = (
+        _install_multi_harness_routes(
+            shard_set, multi_harness, entries_by_shard, environment_server_routes
+        )
+        if multi_harness is not None
+        else None
+    )
+    return route_to_shard, environment_server_routes, multi_harness_routes
+
+
+def _install_multi_harness_routes(
+    shard_set: NemoGymShardSet,
+    multi_harness: MultiHarnessConfig,
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    environment_server_routes: Mapping[str, str],
+) -> MultiHarnessRoutes:
+    """Match each listed server to the agent it runs and send the routes to every actor.
+
+    A taskset is routed by ``environment_server_routes`` or by
+    ``multi_harness.routes``, never both. Each listed server must run in
+    exactly one shard; its replicas are fine. The shard's first actor
+    describes the server from its own Gym config, so the match sees the
+    servers of every shard.
+
+    Raises:
+        ShardConfigError: A taskset is in both route settings.
+        ShardSetupError: A listed server is not running, or runs in several shards.
+        ValueError: A taskset's servers would run or score it inconsistently.
+    """
+    doubly_routed = sorted(multi_harness.tasksets & set(environment_server_routes))
+    if doubly_routed:
+        raise ShardConfigError(
+            f"Tasksets {doubly_routed} are in both environment_server_routes and "
+            "env.nemo_gym.multi_harness.routes. Route each taskset with one of them."
+        )
+    owners = {
+        server: [
+            shard_name
+            for shard_name, entries in entries_by_shard.items()
+            if "environment_servers" in entries.get(server, [])
+        ]
+        for server in sorted(multi_harness.servers)
+    }
+    missing = sorted(server for server, shards in owners.items() if not shards)
+    if missing:
+        raise ShardSetupError(
+            "env.nemo_gym.multi_harness.routes lists names that are not "
+            f"Environment Servers any Gym actor runs: {missing}."
+        )
+    duplicated = {
+        server: shards for server, shards in owners.items() if len(shards) > 1
+    }
+    if duplicated:
+        raise ShardSetupError(
+            "Each Environment Server in env.nemo_gym.multi_harness.routes must run "
+            f"in exactly one shard; found {duplicated}."
+        )
+    descriptions: dict[str, EnvironmentServerInfo] = {}
+    for shard_name in entries_by_shard:
+        hosted = [server for server, shards in owners.items() if shards == [shard_name]]
+        if hosted:
+            descriptions.update(
+                ray.get(
+                    shard_set.handles[shard_name][
+                        0
+                    ].describe_environment_servers.remote(hosted)
+                )
+            )
+    routes = resolve_multi_harness(multi_harness, descriptions)
+    ray.get(
+        [
+            handle.set_multi_harness_routes.remote(routes)
+            for handle in shard_set.all_handles
+        ]
+    )
+    return routes
 
 
 def spinup_nemo_gym_actor(
@@ -4046,6 +4226,9 @@ def validate_dataset_agent_coverage(
             build_route_shard_map(
                 {DEFAULT_SHARD_NAME: entries},
                 environment_server_routes=shard_set.environment_server_routes,
+                multi_harness_servers=(
+                    shard_set.multi_harness.servers if shard_set.multi_harness else ()
+                ),
             )
         )
     for split, dataset in datasets.items():
@@ -4056,6 +4239,7 @@ def validate_dataset_agent_coverage(
                 referenced = _iter_dataset_agent_names(
                     dataset,
                     shard_set.environment_server_routes,
+                    shard_set.multi_harness,
                 )
             except ValueError as error:
                 raise ShardSetupError(
@@ -4072,9 +4256,12 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(
     dataset: Any,
     environment_server_routes: Mapping[str, str] | None = None,
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> set[str]:
     """Collect the Gym entry names a dataset's rows reference.
 
+    A row of a multi-harness taskset references every server its groups can be
+    sent to.
     A stable source file is scanned once and its names cached; a custom or
     changed source falls back to scanning the loaded rows.
     """
@@ -4086,6 +4273,7 @@ def _iter_dataset_agent_names(
                 _iter_dataset_agent_names(
                     nested,
                     environment_server_routes,
+                    multi_harness,
                 )
                 for nested in dataset.values()
             )
@@ -4102,6 +4290,7 @@ def _iter_dataset_agent_names(
             names = _load_agent_names_from_source(
                 source,
                 routes_cache_key,
+                multi_harness,
             )
             if names is None:
                 break
@@ -4117,12 +4306,13 @@ def _iter_dataset_agent_names(
         extra_env_info = row.get("extra_env_info") if hasattr(row, "get") else None
         if isinstance(extra_env_info, str):
             extra_env_info = json.loads(extra_env_info)
-        agent_name = _get_agent_name(
-            extra_env_info,
-            environment_server_routes,
+        names.update(
+            _get_route_names(
+                extra_env_info,
+                environment_server_routes,
+                multi_harness,
+            )
         )
-        if agent_name is not None:
-            names.add(agent_name)
     return names
 
 
@@ -4130,6 +4320,7 @@ def _iter_dataset_agent_names(
 def _load_agent_names_from_source(
     source: NemoGymSourceIdentity,
     environment_server_routes: tuple[tuple[str, str], ...] = (),
+    multi_harness: MultiHarnessRoutes | None = None,
 ) -> frozenset[str] | None:
     """Read a stable Gym source once per route mapping."""
     try:
@@ -4141,12 +4332,13 @@ def _load_agent_names_from_source(
         routes = dict(environment_server_routes)
         with open(source.path) as source_file:
             for raw_row in source_file:
-                agent_name = _get_agent_name(
-                    json.loads(raw_row),
-                    routes,
+                names.update(
+                    _get_route_names(
+                        json.loads(raw_row),
+                        routes,
+                        multi_harness,
+                    )
                 )
-                if agent_name is not None:
-                    names.add(agent_name)
 
         source_stat_after_read = os.stat(source.path)
         if not source.matches(source_stat_after_read):
@@ -4154,6 +4346,20 @@ def _load_agent_names_from_source(
     except (OSError, json.JSONDecodeError):
         return None
     return frozenset(names)
+
+
+def _get_route_names(
+    row: object,
+    environment_server_routes: Mapping[str, str] | None = None,
+    multi_harness: MultiHarnessRoutes | None = None,
+) -> tuple[str, ...]:
+    """Name every Gym entry a dataset row can be dispatched to."""
+    if multi_harness is not None and isinstance(row, dict) and is_nemo_gym_task(row):
+        taskset = _get_materialized_taskset(row)
+        if multi_harness.covers(taskset):
+            return multi_harness.servers_for(taskset)
+    agent_name = _get_agent_name(row, environment_server_routes)
+    return () if agent_name is None else (agent_name,)
 
 
 def _get_agent_name(

@@ -17,6 +17,7 @@ import contextlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import sys
 import threading
@@ -57,13 +58,21 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRITE_LIMITS
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import (
+    VllmConfig,
+    VllmGeneration,
+    generation_cut_route,
+)
 from nemo_rl.models.generation.vllm.config import (
     NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
+from nemo_rl.models.generation.vllm.generation_cut_route import (
+    CUT_REPLY_MARGIN_S,
+    FRONTEND_CUT_ROUTE,
+    GENERATION_CUT_ROUTE,
+)
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -249,6 +258,7 @@ basic_automodel_test_config: PolicyConfig = {
         "activation_checkpointing": False,
         "tensor_parallel_size": 1,
         "context_parallel_size": 1,
+        "pipeline_parallel_size": 1,
         "custom_parallel_plan": None,
     },
     "dynamic_batching": {
@@ -1428,6 +1438,7 @@ def _setup_fake_vllm_app(
 
     worker._capture_registry = CaptureRegistry()
     worker._prefix_recovery = NoPrefixRecovery()
+    worker._generation_cut_peer_urls = []
     worker._capture_top_logprobs = 0
     worker._cut_routes_dtype = None
     worker.token_capture = None
@@ -1779,11 +1790,16 @@ def _generation_cut_route(
     enabled: bool = True,
     token: str | None = "control-token",
     timeout_s: float | None = None,
+    peer_urls: tuple[str, ...] = (),
+    route: str = GENERATION_CUT_ROUTE,
 ):
-    """The generation-cut control route, with the cut it runs stubbed.
+    """A generation-cut control route, with the cut it runs stubbed.
+
+    ``peer_urls`` are the worker's other HTTP frontends.
 
     Returns:
-        The route handler and the ``(inventory, deadline)`` of each cut it ran.
+        The route handler and the ``(inventory, deadline, held_only)`` of each
+        cut it ran.
     """
     from nemo_rl.models.generation.prefix_recovery import (
         NoPrefixRecovery,
@@ -1794,8 +1810,8 @@ def _generation_cut_route(
     worker, _, app = _setup_fake_vllm_app(monkeypatch)
     cuts = []
 
-    def submit(inventory, *, deadline):
-        cuts.append((inventory, deadline))
+    def submit(inventory, *, deadline, held_only):
+        cuts.append((inventory, deadline, held_only))
         receipt: Future = Future()
         receipt.set_result(
             types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
@@ -1828,6 +1844,7 @@ def _generation_cut_route(
         worker._prefix_recovery = recovery
     else:
         worker._prefix_recovery = NoPrefixRecovery()
+    worker._generation_cut_peer_urls = list(peer_urls)
     # nemo_gym is an optional extra; the route only uses it to type the inventory.
     generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
     generation_cut.GenerationCutInventory = types.SimpleNamespace(
@@ -1836,7 +1853,7 @@ def _generation_cut_route(
     monkeypatch.setitem(
         sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
     )
-    return _route_handler(app, GENERATION_CUT_ROUTE), cuts
+    return _route_handler(app, route), cuts
 
 
 @pytest.mark.asyncio
@@ -1883,13 +1900,236 @@ async def test_generation_cut_route_runs_the_cut_against_its_deadline(
     returned = time.monotonic()
 
     assert receipt == {"acked": ("typed", inventory)}
-    ((typed_inventory, deadline),) = cuts
+    # Gym reached the only frontend, so its receipt answers for every call.
+    ((typed_inventory, deadline, held_only),) = cuts
+    assert not held_only
     assert typed_inventory == ("typed", inventory)
     if timeout_s is None:
         assert deadline is None
     else:
         # The deadline counts from the request's arrival.
         assert arrived + timeout_s <= deadline <= returned + timeout_s
+
+
+def _typed_inventory(monkeypatch) -> types.SimpleNamespace:
+    """Make the faked Gym type every inventory as one recognizable object."""
+    typed = types.SimpleNamespace(
+        checkpoint_id="checkpoint-1", model_dump=lambda mode: {"typed": True}
+    )
+    monkeypatch.setattr(
+        sys.modules["nemo_gym._checkpoint.generation_cut"],
+        "GenerationCutInventory",
+        types.SimpleNamespace(model_validate=lambda inventory: typed),
+    )
+    return typed
+
+
+@pytest.mark.asyncio
+async def test_generation_cut_route_fans_out_to_every_http_frontend(monkeypatch):
+    peers = ("http://127.0.0.1:1", "http://127.0.0.1:3")
+    route, cuts = _generation_cut_route(monkeypatch, timeout_s=30.0, peer_urls=peers)
+    typed = _typed_inventory(monkeypatch)
+    peer_requests = []
+
+    async def cut_on_peer(self, url, inventory, deadline):
+        peer_requests.append((url, inventory, deadline))
+        return [f"{url}-ack"]
+
+    merged = []
+
+    def merge_cut_receipts(inventory, prefixes):
+        merged.append((inventory, sorted(map(tuple, prefixes))))
+        return types.SimpleNamespace(model_dump=lambda mode: {"merged": True})
+
+    monkeypatch.setattr(
+        generation_cut_route.FrontendCutFanOut, "_cut_on_peer", cut_on_peer
+    )
+    monkeypatch.setattr(generation_cut_route, "merge_cut_receipts", merge_cut_receipts)
+    monkeypatch.setattr(generation_cut_route, "held_acks", lambda r: ["own"])
+
+    arrived_wall, arrived = time.time(), time.monotonic()
+    receipt = await route(
+        {"checkpoint_id": "checkpoint-1"}, authorization="Bearer control-token"
+    )
+
+    assert receipt == {"merged": True}
+    # Every frontend works to one deadline, counted from the cut's arrival.
+    ((own_inventory, own_deadline, held_only),) = cuts
+    # The merge answers for the calls no frontend holds.
+    assert held_only
+    assert own_inventory is typed
+    assert own_deadline <= time.monotonic() + 30.0 - CUT_REPLY_MARGIN_S
+    assert own_deadline >= arrived + 30.0 - CUT_REPLY_MARGIN_S - 1.0
+    assert [(url, inventory) for url, inventory, _ in peer_requests] == [
+        (url, typed) for url in peers
+    ]
+    assert all(
+        arrived_wall + 30.0 <= deadline <= time.time() + 30.0
+        for _, _, deadline in peer_requests
+    )
+    assert merged == [(typed, sorted([("own",), *((f"{url}-ack",) for url in peers)]))]
+
+
+@pytest.mark.asyncio
+async def test_generation_cut_fan_out_merges_without_a_late_frontend(
+    monkeypatch, caplog
+):
+    route, _ = _generation_cut_route(
+        monkeypatch, timeout_s=0.2, peer_urls=("http://127.0.0.1:1",)
+    )
+    typed = _typed_inventory(monkeypatch)
+
+    async def cut_on_peer(self, url, inventory, deadline):
+        await asyncio.sleep(5)
+        return ["late-ack"]
+
+    merged = []
+
+    def merge_cut_receipts(inventory, prefixes):
+        merged.append((inventory, list(prefixes)))
+        return types.SimpleNamespace(model_dump=lambda mode: {})
+
+    monkeypatch.setattr(
+        generation_cut_route.FrontendCutFanOut, "_cut_on_peer", cut_on_peer
+    )
+    monkeypatch.setattr(generation_cut_route, "merge_cut_receipts", merge_cut_receipts)
+    monkeypatch.setattr(generation_cut_route, "held_acks", lambda r: ["own"])
+
+    started = time.monotonic()
+    await route({}, authorization="Bearer control-token")
+
+    # The late frontend's calls regenerate; the cut still answers in time.
+    assert time.monotonic() - started < 2.0
+    assert merged == [(typed, [["own"]])]
+    assert "['http://127.0.0.1:1'] did not answer in time" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fan_out_cut_merges_in_target_order_and_names_late_targets(
+    monkeypatch, caplog
+):
+    merged = []
+
+    def merge_cut_receipts(inventory, prefixes):
+        merged.append(list(prefixes))
+        return "receipt"
+
+    monkeypatch.setattr(generation_cut_route, "merge_cut_receipts", merge_cut_receipts)
+
+    async def answer(acks, delay):
+        await asyncio.sleep(delay)
+        return acks
+
+    receipt = await generation_cut_route.fan_out_cut(
+        types.SimpleNamespace(checkpoint_id="checkpoint-1"),
+        {
+            "first": answer(["a"], 0.05),
+            "late": answer(["late"], 5),
+            "second": answer(["b"], 0),
+        },
+        deadline=time.time() + 0.3,
+    )
+
+    assert receipt == "receipt"
+    # Target order, not the order they finished in.
+    assert merged == [[["a"], ["b"]]]
+    assert "['late'] did not answer in time" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_frontend_cut_peer_timeout_costs_only_its_calls(monkeypatch):
+    def timed_out(*args, **kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr(generation_cut_route.aiohttp, "ClientSession", timed_out)
+    fan_out = generation_cut_route.FrontendCutFanOut(
+        types.SimpleNamespace(control_token="control-token"), ()
+    )
+    inventory = types.SimpleNamespace(
+        checkpoint_id="checkpoint-1", model_dump=lambda mode: {"calls": []}
+    )
+
+    # Not one of aiohttp's own errors, so only a broad catch keeps the cut alive.
+    assert await fan_out._cut_on_peer("http://127.0.0.1:1", inventory, None) == ()
+
+
+@pytest.mark.asyncio
+async def test_frontend_cut_route_answers_this_frontends_durable_acks(monkeypatch):
+    route, cuts = _generation_cut_route(monkeypatch, route=FRONTEND_CUT_ROUTE)
+    typed = _typed_inventory(monkeypatch)
+    monkeypatch.setattr(generation_cut_route, "held_acks", lambda r: ["ack"])
+    request = {"inventory": {"checkpoint_id": "checkpoint-1"}, "deadline": None}
+
+    with pytest.raises(HTTPException) as error:
+        await route(request, authorization="Bearer wrong-token")
+    assert error.value.status_code == 401
+    answer = await route(
+        {**request, "deadline": time.time() + 30.0},
+        authorization="Bearer control-token",
+    )
+
+    assert answer == {"prefixes": ["ack"]}
+    ((inventory, deadline, held_only),) = cuts
+    assert held_only
+    assert inventory is typed
+    # The coordinator's wall-clock deadline, on this frontend's monotonic clock.
+    assert deadline <= time.monotonic() + 30.0 - CUT_REPLY_MARGIN_S
+
+
+# A peer answers for every call it holds; the log names only the ones it cut.
+_PEER_ACKS = [
+    {"model_call_id": "call-1", "disposition": "durable_prefix"},
+    {"model_call_id": "call-2", "disposition": "durable_failure"},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (200, {"prefixes": _PEER_ACKS}, _PEER_ACKS),
+        (500, {}, ()),
+        (200, {}, ()),
+    ],
+)
+async def test_frontend_cut_peer_request_over_http(status, body, expected, caplog):
+    from aiohttp import web
+
+    seen = []
+
+    async def frontend_cut(request):
+        seen.append((request.headers["authorization"], await request.json()))
+        return web.json_response(body, status=status)
+
+    app = web.Application()
+    app.router.add_post(FRONTEND_CUT_ROUTE, frontend_cut)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    fan_out = generation_cut_route.FrontendCutFanOut(
+        types.SimpleNamespace(control_token="control-token"), ()
+    )
+    inventory = types.SimpleNamespace(
+        checkpoint_id="checkpoint-1", model_dump=lambda mode: {"calls": []}
+    )
+    url = f"http://127.0.0.1:{port}"
+    caplog.set_level(logging.INFO, logger=generation_cut_route.__name__)
+    try:
+        prefixes = await fan_out._cut_on_peer(url, inventory, 123.0)
+    finally:
+        await runner.cleanup()
+
+    assert prefixes == expected
+    assert seen == [
+        ("Bearer control-token", {"inventory": {"calls": []}, "deadline": 123.0})
+    ]
+    # The functional test's snapshot selection reads which calls a peer cut.
+    assert (
+        f"generation cut checkpoint-1: HTTP frontend {url} cut 1 model calls: "
+        "['call-1']" in caplog.text
+    ) == bool(expected)
 
 
 @pytest.mark.asyncio

@@ -142,6 +142,10 @@ class FinalizedRollout:
     # (model call ID, weight version stamped when it began, tokens it generated)
     # for the same owned calls.
     call_versions: tuple[tuple[str, int, int], ...] = ()
+    # The scored terminal call stopped at its output-token cap (Gym's
+    # ``incomplete_reason`` is ``max_output_tokens``), whether or not the row
+    # fills max_seq_len.
+    stopped_at_output_cap: bool = False
 
 
 @dataclass(frozen=True)
@@ -481,6 +485,9 @@ class RolloutReassembler:
         substitutes a placeholder.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.records import (
+            MAX_OUTPUT_TOKENS_INCOMPLETE_REASON,
+        )
         from nemo_gym.token_id_capture.staging.rebuild import (
             RebuildError,
             ReceiptVerificationError,
@@ -732,10 +739,16 @@ class RolloutReassembler:
                     flags.malformed_thinking and call_id not in loss_excluded_call_ids
                 ] * generation_len
                 position = end
+        # Gym's verdict on the rebuilt row: no verdict (None) when token-identical
+        # retries of the terminal call recorded different finish reasons.
+        stopped_at_output_cap = (
+            row.incomplete_reason == MAX_OUTPUT_TOKENS_INCOMPLETE_REASON
+        )
         return FinalizedRollout(
             rollout_id=rollout_id,
             valid=True,
             rejection_reason=None,
+            stopped_at_output_cap=stopped_at_output_cap,
             token_ids=row.token_ids,
             token_mask=token_mask,
             generation_lengths=tuple(
@@ -890,7 +903,8 @@ class RolloutReassembler:
         row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
-        instead, from each row's rebuilt length against ``max_seq_len``.
+        instead, by ``_truncated_flags``: the row fills ``max_seq_len``, or its
+        scored terminal call stopped at its output-token cap.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -1218,12 +1232,18 @@ class RolloutReassembler:
     ) -> list[bool]:
         """Per-row truncation, shared by the TRUNCATED column and termination rates.
 
-        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
-        count as truncated when they fill ``max_seq_len``.
+        Forest rows carry their rollout's Gym-reported truncation. Ordinary rows
+        count as truncated when they fill ``max_seq_len`` or when the scored
+        generation stopped at its output-token cap, as the non-capture NeMo-Gym
+        path (``nemo_gym_rollout_hit_max_tokens``) counts them: an answer cut at
+        ``max_new_tokens`` usually ends well short of ``max_seq_len``.
         """
         if logical is not None:
             return list(logical.truncated)
-        return [len(row.token_ids) == self._max_seq_len for row in rows]
+        return [
+            len(row.token_ids) == self._max_seq_len or row.stopped_at_output_cap
+            for row in rows
+        ]
 
     def _publish_rows(
         self,

@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise logical-owner GRPO through the actual SingleController stage."""
+"""Exercise logical-owner GRPO and PPO through the actual SingleController stage."""
 
 import asyncio
 import math
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -25,12 +26,15 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import AgentOverrideConfig, GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -41,6 +45,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     validate_forest_objective,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
@@ -896,7 +901,6 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
         ({"malformed_thinking_advantage": 0.0}, {}),
-        ({}, {"token_level_loss": False}),
         ({}, {"normalization": "sequence_mean"}),
         ({}, {"sequence_level_importance_ratios": True}),
         ({}, {"truncated_importance_sampling_type": "seq-mask-tis"}),
@@ -913,3 +917,239 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def _ppo_controller(meta, data, **gae):
+    """The GRPO harness above, switched to PPO with per-row GAE."""
+    ctrl = _controller(meta, data)
+    config = PPOConfig(
+        num_generations_per_prompt=ctrl._algo_cfg.num_generations_per_prompt,
+        adv_estimator=GAEConfig(gae_lambda=1.0, gae_gamma=1.0, **gae),
+    )
+    ctrl._algo_cfg = config
+    ctrl._is_ppo = True
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        config.adv_estimator, ClippedPGLossConfig()
+    )
+    ctrl._advantage_stage_config = AdvantageStageConfig(
+        advantage=ctrl._advantage_cfg,
+        algo=config,
+        is_ppo=True,
+        policy_logprobs_required=False,
+        reference_logprobs_required=False,
+        teacher_logprobs_required=False,
+        message_level_advantage_penalties_enabled=False,
+        opd_full_enabled=False,
+        shardable=False,
+        objective_reduction=make_objective_reduction(
+            ctrl._master_config.loss_fn.resolved_normalization
+        ),
+        train_data_dump_dir=None,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    return ctrl
+
+
+def _with_values(data: TensorDict, seed: int = 0) -> TensorDict:
+    generator = torch.Generator().manual_seed(seed)
+    data["values"] = torch.rand(data.batch_size[0], 3, generator=generator)
+    return data
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+def test_forest_ppo_runs_gae_per_row_and_masks_whole_owner(reorder: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 2)])], padding=True)
+    data = _with_values(data)
+    # A flagged segment filters every row of its owner (slot 2).
+    data["mask_sample"][3] = True
+    if reorder:
+        order = [5, 3, 0, 4, 2, 1]
+        meta, data = meta.subset(order), data[order]
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    keep = torch.tensor([float(tag["logical_slot"] in (0, 1)) for tag in meta.tags])
+    torch.testing.assert_close(data["sample_mask"], keep)
+    expected, returns = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=inputs["token_mask"] * keep.unsqueeze(-1),
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected)
+    torch.testing.assert_close(data["returns"], returns)
+    # Segments of one owner keep their own values, so their advantages differ.
+    first = [i for i, tag in enumerate(meta.tags) if tag["logical_slot"] == 0]
+    assert not torch.equal(data["advantages"][first[0]], data["advantages"][first[1]])
+    padding = [i for i, tag in enumerate(meta.tags) if tag["is_execution_padding"]]
+    assert data["advantages"][padding].count_nonzero() == 0
+    # Owner-level reward metrics: two retained owners, padding never votes.
+    assert ctrl._step_log_dict["reward_partials"][0].weight == 2
+
+
+def test_forest_ppo_whitening_excludes_masked_rows_and_execution_padding() -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    data = _with_values(data, seed=1)
+    data["mask_sample"][2] = True
+    # Live padding tokens and a huge reward would dominate any statistic.
+    data["token_mask"][-1] = torch.tensor([0.0, 1.0, 1.0])
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    keep = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    estimator = ctrl._advantage_estimator
+    expected, _ = estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=inputs["token_mask"] * keep.unsqueeze(-1),
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected)
+    assert data["advantages"][2:].count_nonzero() == 0
+
+
+def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
+    """Dataset loss weights reach GAE through the mask; the stage must not reapply them."""
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[17, 42]] * 2),
+            "total_reward": torch.tensor([2.0, 6.0]),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * 2),
+            "sample_mask": torch.tensor([0.5, 1.0]),
+            "mask_sample": torch.zeros(2, dtype=torch.bool),
+            "truncated": torch.zeros(2, dtype=torch.bool),
+            "values": torch.zeros(2, 3),
+        },
+        batch_size=[2],
+    )
+    meta = KVBatchMeta(
+        "train",
+        "train",
+        ["r0", "r1"],
+        fields=list(data.keys()),
+        tags=[{GROUP_ID_TAG: "a"}, {GROUP_ID_TAG: "a"}],
+    )
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data, normalize_advantages=False)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    expected, returns = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"],
+        mask=inputs["token_mask"] * inputs["sample_mask"].unsqueeze(-1),
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected)
+    torch.testing.assert_close(data["returns"], returns)
+
+
+def test_forest_objective_accepts_ppo_gae_only() -> None:
+    validate_forest_objective(PPOConfig(), ClippedPGLossConfig())
+    with pytest.raises(ValueError, match="ppo.adv_estimator.name"):
+        validate_forest_objective(
+            PPOConfig(adv_estimator=GAEConfig(name="raw_reward")), ClippedPGLossConfig()
+        )
+    with pytest.raises(ValueError, match="ppo.use_dynamic_sampling"):
+        validate_forest_objective(
+            PPOConfig(use_dynamic_sampling=True), ClippedPGLossConfig()
+        )
+
+
+@pytest.mark.parametrize("forest", [False, True])
+def test_critic_takes_every_forest_row_as_one_step(forest: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    if not forest:
+        tags = [{GROUP_ID_TAG: "a"} for _ in meta.sample_ids]
+        meta = KVBatchMeta(
+            "train", "train", meta.sample_ids, fields=list(data.keys()), tags=tags
+        )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._value = MagicMock()
+    ctrl._value.train_from_meta.return_value = {}
+    ctrl._value_loss_fn = object()
+    ctrl._algo_cfg = SimpleNamespace(value_training_mode="whole_batch")
+    asyncio.run(ctrl._value_train_epochs([meta], num_epochs=2))
+    calls = ctrl._value.train_from_meta.call_args_list
+    assert len(calls) == 2
+    assert {call.kwargs["gbs"] for call in calls} == {meta.size if forest else None}
+
+
+@pytest.mark.parametrize("filtering", [False, True])
+def test_forest_ppo_overlong_filter_masks_whole_owner(filtering: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    data = _with_values(data, seed=3)
+    data["truncated"][1] = True  # Only slot 0's second segment.
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data)
+    # The stage config holds this same PPOConfig object.
+    ctrl._algo_cfg.overlong_filtering = filtering
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    keep = torch.tensor([0.0, 0.0, 1.0, 0.0] if filtering else [1.0, 1.0, 1.0, 0.0])
+    torch.testing.assert_close(data["sample_mask"], keep)
+    mask = inputs["token_mask"] * keep.unsqueeze(-1)
+    expected, returns = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"].float(),
+        mask=mask,
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected * mask)
+    torch.testing.assert_close(data["returns"], returns)
+    if filtering:
+        assert data["advantages"][:2].count_nonzero() == 0
+        assert ctrl._step_log_dict["reward_partials"][0].weight == 1
+
+
+@pytest.mark.parametrize("failure", ["mask_sample", "placeholder"])
+def test_forest_ppo_all_invalid_owners_report_no_training_tokens(failure) -> None:
+    """The stage writes zeros; the pump then refuses the step (no optimizer step)."""
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
+    data = _with_values(data)
+    if failure == "mask_sample":
+        data["mask_sample"][:] = True
+    else:
+        # Every owner is a failed-owner placeholder: no loss rows, no tokens.
+        data["sample_mask"][:] = 0
+        data["token_mask"][:] = 0
+    ctrl = _ppo_controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert not valid
+    assert data["advantages"].count_nonzero() == 0
+    assert data["returns"].count_nonzero() == 0
+    assert data["sample_mask"].count_nonzero() == 0
+    assert ctrl._step_log_dict["reward_partials"][0].weight == 0
+
+
+def test_gae_advantage_stage_is_never_sharded() -> None:
+    """GAE whitens over the whole batch, so a pool runs it as one call."""
+    master_config = SimpleNamespace(
+        grpo=None,
+        ppo=PPOConfig(),
+        loss_fn=ClippedPGLossConfig(),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        async_rl=SimpleNamespace(
+            log_full_train_data=False, debug_writer=DebugWriterConfig()
+        ),
+        token_capture=TokenCaptureConfig(forest_training=True),
+    )
+    stage_config = AdvantageStageConfig.from_master_config(master_config)
+    assert stage_config.is_ppo and not stage_config.shardable
+    meta, data = _batch([("a", [(0.0, 3), (2.0, 1)]), ("b", [(1.0, 1), (5.0, 4)])])
+    ctrl = _ppo_controller(meta, _with_values(data))
+    actors = [_InlineActor(ctrl._advantage_computer) for _ in range(2)]
+    ctrl._advantage_actors = actors
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    # Two prompt groups and two actors, yet one call over every row.
+    assert sorted(n for actor in actors for n in actor.calls) == [meta.size]
