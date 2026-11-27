@@ -36,6 +36,7 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora_async.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_lora_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo_megatron_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_megatron_lora.sh
 
