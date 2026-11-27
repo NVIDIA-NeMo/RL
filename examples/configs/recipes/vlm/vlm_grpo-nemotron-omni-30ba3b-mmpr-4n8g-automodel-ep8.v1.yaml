@@ -11,7 +11,7 @@ loss_fn:
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
   sequence_level_importance_ratios: true
-  token_level_loss: false
+  normalization: sequence_mean
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr
   keep_top_k: 1000000

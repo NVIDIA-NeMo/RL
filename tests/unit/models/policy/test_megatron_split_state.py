@@ -49,6 +49,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -831,7 +832,7 @@ class TestFinish:
         w.model.finish_grad_sync.assert_not_called()
         w.optimizer.step.assert_not_called()
 
-    def test_picks_global_valid_toks_for_token_level_loss(self, mock_module_symbols):
+    def test_picks_global_valid_toks_for_global_token_mean(self, mock_module_symbols):
         """N selection: TOKEN_LEVEL → N = global_valid_toks (not seqs)."""
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -1153,7 +1154,7 @@ class TestFinish:
         torch.testing.assert_close(grad_seen_by_finalize[0], expected_mtp_grad)
         torch.testing.assert_close(other_param.main_grad, torch.ones(4))
 
-    def test_mtp_grads_need_no_correction_under_token_level_loss(
+    def test_mtp_grads_need_no_correction_under_global_token_mean(
         self, mock_module_symbols
     ):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -1380,7 +1381,7 @@ class TestFinish:
 
         real_loss = ClippedPGLossFn(
             ClippedPGLossConfig(
-                token_level_loss=True,
+                normalization="global_token_mean",
                 use_importance_sampling_correction=True,
                 truncated_importance_sampling_type="seq-mask-tis",
                 truncated_importance_sampling_ratio=2.0,
@@ -1415,7 +1416,7 @@ def _in_loss_seq_filter_loss_fn():
         ClippedPGLossConfig(
             seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
-            token_level_loss=True,
+            normalization="global_token_mean",
             reference_policy_kl_penalty=0,
         ),
         seq_logprob_error_threshold=2.0,
@@ -2303,3 +2304,105 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+
+class TestReplicatedLogprobResult:
+    @staticmethod
+    def _worker():
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.cfg["logprob_batch_size"] = 1
+        w.timer = MagicMock()
+        return w
+
+    @pytest.mark.parametrize(
+        ("is_leader", "keep_on_gpu"), [(True, False), (False, False), (False, True)]
+    )
+    def test_only_replica_leader_copies_logprobs_to_cpu(self, is_leader, keep_on_gpu):
+        w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=is_leader)
+        worker_logprobs = torch.tensor([[1.0, 2.0, 3.0]])
+
+        with (
+            patch(f"{WORKER_MOD}.attach_media_token_validity_mask"),
+            patch(
+                f"{WORKER_MOD}.get_microbatch_iterator",
+                return_value=(iter(()), 1, 1, 4, 4),
+            ),
+            patch(f"{WORKER_MOD}.LogprobsPostProcessor"),
+            patch(f"{WORKER_MOD}._should_use_router_replay", return_value=False),
+            patch(
+                f"{WORKER_MOD}.megatron_forward_backward",
+                return_value=[{"logprobs": worker_logprobs}],
+            ),
+            patch(
+                f"{WORKER_MOD}.parallel_state.is_pipeline_last_stage",
+                return_value=True,
+            ),
+            patch(
+                f"{WORKER_MOD}.broadcast_tensors_from_last_stage",
+                side_effect=lambda tensors: tensors,
+            ) as broadcast,
+            patch(f"{WORKER_MOD}.torch.empty_like") as empty_like,
+        ):
+            cpu_logprobs = MagicMock()
+            empty_like.return_value = cpu_logprobs
+            result = w.get_logprobs(data=MagicMock(), keep_on_gpu=keep_on_gpu)
+
+        broadcast.assert_called_once()
+        if keep_on_gpu:
+            # Warm-up trains on these on every rank, so a non-leader gets them too.
+            torch.testing.assert_close(
+                result["logprobs"], torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+            )
+            empty_like.assert_not_called()
+        elif is_leader:
+            source_logprobs = empty_like.call_args.args[0]
+            torch.testing.assert_close(
+                source_logprobs, torch.tensor([[1.0, 2.0, 3.0, 0.0]])
+            )
+            empty_like.assert_called_once_with(
+                source_logprobs, device="cpu", pin_memory=True
+            )
+            cpu_logprobs.copy_.assert_called_once_with(
+                source_logprobs, non_blocking=False
+            )
+            assert result["logprobs"] is cpu_logprobs
+        else:
+            assert not result
+            empty_like.assert_not_called()
+
+    @pytest.mark.parametrize("is_leader", [False, True])
+    def test_reference_logprobs_follow_the_replica_leader(self, is_leader):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=is_leader)
+        inner = BatchedDataDict()
+        if is_leader:
+            inner["logprobs"] = torch.tensor([[1.0, 2.0]])
+
+        with (
+            patch.object(w, "use_reference_model", return_value=nullcontext()),
+            patch.object(w, "get_logprobs", return_value=inner),
+        ):
+            result = w.get_reference_policy_logprobs(data=MagicMock())
+
+        if is_leader:
+            torch.testing.assert_close(result["reference_logprobs"], inner["logprobs"])
+        else:
+            assert not result
+
+    def test_reference_logprobs_missing_on_leader_raise(self):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        w = self._worker()
+        w._is_replica_leader = MagicMock(return_value=True)
+
+        with (
+            patch.object(w, "use_reference_model", return_value=nullcontext()),
+            patch.object(w, "get_logprobs", return_value=BatchedDataDict()),
+            pytest.raises(KeyError, match="logprobs"),
+        ):
+            w.get_reference_policy_logprobs(data=MagicMock())

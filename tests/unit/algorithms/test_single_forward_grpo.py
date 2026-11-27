@@ -58,7 +58,7 @@ def test_legacy_in_loss_filter_rejects_excluded_reward_statistics() -> None:
     "overrides, message",
     [
         ({"force_on_policy_ratio": False}, "force_on_policy_ratio"),
-        ({"token_level_loss": False}, "token_level_loss"),
+        ({"normalization": "sequence_mean"}, "normalization"),
         ({"positive_example_nll_weight": 0.1}, "NLL"),
     ],
 )
@@ -123,7 +123,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
     data, values = _batch()
     cfg = ClippedPGLossConfig(
         force_on_policy_ratio=True,
-        token_level_loss=True,
+        normalization="global_token_mean",
         reference_policy_kl_penalty=kl_penalty,
         use_importance_sampling_correction=True,
         truncated_importance_sampling_type="seq-mask-tis",
@@ -206,7 +206,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
     data, values = _batch()
     cfg = ClippedPGLossConfig(
         force_on_policy_ratio=True,
-        token_level_loss=True,
+        normalization="global_token_mean",
         reference_policy_kl_penalty=kl_penalty,
         use_importance_sampling_correction=True,
         truncated_importance_sampling_type="seq-mask-tis",
@@ -352,7 +352,7 @@ def test_rejected_nonfinite_logprobs_stay_contained_under_reference_kl(
         ClippedPGLossConfig(
             seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
-            token_level_loss=True,
+            normalization="global_token_mean",
             reference_policy_kl_penalty=0.1,
         ),
         seq_logprob_error_threshold=2.0,
