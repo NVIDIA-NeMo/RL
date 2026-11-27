@@ -530,6 +530,19 @@ class GRPOConfig(BaseModel, extra="allow"):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_success_prioritized_reward(self) -> "GRPOConfig":
+        if (
+            self.reward_shaping.enabled
+            and self.reward_shaping.success_prioritized
+            and (self.reward_scaling.enabled or self.length_penalty is not None)
+        ):
+            raise ValueError(
+                "grpo.reward_shaping.success_prioritized expects unscaled rewards "
+                "in [0, 1]; disable grpo.reward_scaling and unset grpo.length_penalty."
+            )
+        return self
+
     def agent_override_value(
         self, agent_name: Optional[str], field_name: str, default: bool
     ) -> bool:

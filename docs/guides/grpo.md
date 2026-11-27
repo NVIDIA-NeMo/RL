@@ -733,6 +733,22 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Success-Prioritized Reward
+
+For verifiers that return 1 for a pass and a partial-credit fraction otherwise (for example the share of tests passed), partial credit can rival a pass: a rollout that fails one of 32 tests scores nearly as much as one that passes. The success-prioritized reward (SPR) from [Terminal-RSI](https://arxiv.org/abs/2610.22192) maps a pass to `1 + 1 / (1 + c)` and a failure with partial credit `r` to `r / (r + c)`, so every failure ranks below every pass and partial credit still orders the failures. It applies wherever `reward_shaping` does: synchronous GRPO and PPO and the single-controller path, but not `async_grpo_train` or `async_ppo_train`.
+
+```yaml
+grpo:  # or ppo
+  reward_shaping:
+    enabled: true
+    success_prioritized: true
+    spr_partial_divisor: 1.0  # c; a larger value shrinks partial credit further
+  reward_scaling:
+    enabled: false  # SPR expects unscaled rewards in [0, 1]; grpo.length_penalty must also be unset
+```
+
+SPR takes precedence over the other `reward_shaping` options, which are ignored with a warning. The unshaped reward is kept as `unshaped_total_reward`. `baseline_reward/pct_1` and `masked_correct_pct` count rewards equal to 1, so they do not track passes under SPR, where a pass scores above 1.
+
 #### Per-Environment Settings
 
 In a multi-environment NeMo-Gym run, `grpo.agent_overrides` sets `overlong_filtering` and `adv_estimator.normalize_rewards` for one environment's rows. Unset fields inherit the run-wide value, and environments without an entry keep the run-wide values.

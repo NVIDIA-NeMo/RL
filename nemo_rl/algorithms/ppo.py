@@ -266,6 +266,19 @@ class PPOConfig(BaseModel, extra="allow"):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_success_prioritized_reward(self) -> "PPOConfig":
+        if (
+            self.reward_shaping.enabled
+            and self.reward_shaping.success_prioritized
+            and self.reward_scaling.enabled
+        ):
+            raise ValueError(
+                "ppo.reward_shaping.success_prioritized expects unscaled rewards "
+                "in [0, 1]; disable ppo.reward_scaling."
+            )
+        return self
+
 
 class PPOSaveState(TypedDict):
     consumed_samples: int

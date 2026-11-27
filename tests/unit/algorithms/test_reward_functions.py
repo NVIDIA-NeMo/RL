@@ -27,6 +27,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
 
 
@@ -188,6 +189,39 @@ class TestRewardShapingValidation:
             stop_properly_penalty_coef=-1.0,
         )
         assert not recwarn
+
+    @pytest.mark.parametrize("algorithm_type", [GRPOConfig, PPOConfig])
+    @pytest.mark.parametrize("divisor", [0.0, -1.0, math.nan, math.inf])
+    def test_rejects_an_invalid_spr_partial_divisor(
+        self, algorithm_type: type[GRPOConfig] | type[PPOConfig], divisor: float
+    ) -> None:
+        shaping = RewardShapingConfig.model_construct(
+            enabled=True, success_prioritized=True, spr_partial_divisor=divisor
+        )
+        with pytest.raises(ValidationError, match="must be finite and > 0") as error:
+            algorithm_type(reward_shaping=shaping)
+        assert error.value.errors()[0]["loc"] == ("reward_shaping",)
+
+    @pytest.mark.parametrize("algorithm_type", [GRPOConfig, PPOConfig])
+    def test_success_prioritized_rejects_reward_scaling(
+        self, algorithm_type: type[GRPOConfig] | type[PPOConfig]
+    ) -> None:
+        with pytest.raises(ValidationError, match="disable .*reward_scaling"):
+            algorithm_type(
+                reward_shaping=RewardShapingConfig(
+                    enabled=True, success_prioritized=True
+                ),
+                reward_scaling=RewardScalingConfig(enabled=True),
+            )
+
+    def test_success_prioritized_rejects_grpo_length_penalty(self) -> None:
+        with pytest.raises(ValidationError, match="unset grpo.length_penalty"):
+            GRPOConfig(
+                reward_shaping=RewardShapingConfig(
+                    enabled=True, success_prioritized=True
+                ),
+                length_penalty=LengthPenaltyConfig(),
+            )
 
 
 def test_reward_scaling_disabled():
@@ -656,3 +690,23 @@ def test_stop_properly_penalty_error_cases():
     config.stop_properly_penalty_coef = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
+
+
+def test_success_prioritized_reward(capsys):
+    """A pass scores 1 + 1/(1+c) and a failure r/(r+c), so every failure ranks below every pass."""
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[10, 10, 10, 10],
+        initial_rewards=[1.0, 0.96875, 0.5, 0.0],
+    )
+    config = RewardShapingConfig(
+        enabled=True, success_prioritized=True, spr_partial_divisor=1.0
+    )
+    result_batch = apply_reward_shaping(batch, config)
+
+    assert "[WARN]" not in capsys.readouterr().out
+    expected_rewards = torch.tensor([1.5, 0.96875 / 1.96875, 1 / 3, 0.0])
+    assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
+    assert torch.allclose(
+        result_batch["unshaped_total_reward"], torch.tensor([1.0, 0.96875, 0.5, 0.0])
+    )
