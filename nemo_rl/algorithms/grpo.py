@@ -6092,7 +6092,10 @@ def async_grpo_train(
                             f"groups account for {prompt_ids_for_adv.shape[0]}"
                         )
 
-                    if master_config.grpo.reward_shaping.zero_looping_rewards:
+                    if (
+                        master_config.grpo.reward_shaping.enabled
+                        and master_config.grpo.reward_shaping.zero_looping_rewards
+                    ):
                         for key in (
                             "total_reward",
                             *get_gdpo_reward_component_keys(repeated_batch),

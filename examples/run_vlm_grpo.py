@@ -165,7 +165,7 @@ def main() -> None:
             )
         if config.grpo.reward_scaling.enabled:
             raise NotImplementedError("reward_scaling is not supported with async GRPO")
-        if config.grpo.reward_shaping.enabled:
+        if config.grpo.reward_shaping.length_shaping_enabled:
             raise NotImplementedError("reward_shaping is not supported with async GRPO")
         if config.data["use_multiple_dataloader"]:
             raise NotImplementedError(

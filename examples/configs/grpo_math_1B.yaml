@@ -34,7 +34,7 @@ grpo:
   batch_multiplier: 1
   reward_shaping:
     enabled: false
-    zero_looping_rewards: false  # Zero confirmed Gym text loops after other reward adjustments.
+    zero_looping_rewards: false  # Requires enabled=true and Gym assessment.
     overlong_buffer_length: 128
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}

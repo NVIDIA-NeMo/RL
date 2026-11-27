@@ -45,7 +45,7 @@ ppo:
 
   reward_shaping:
     enabled: true
-    zero_looping_rewards: false  # Zero confirmed Gym text loops after other reward adjustments.
+    zero_looping_rewards: false  # Requires enabled=true and Gym assessment.
     overlong_buffer_length: 2048
     overlong_buffer_penalty: 1
     max_response_length: 14336

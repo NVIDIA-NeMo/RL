@@ -52,7 +52,7 @@ For a detailed explanation of the overlong reward shaping mechanism, please refe
 
 ### Severe text looping diagnostics
 
-NeMo Gym can assess severe repetition in assistant and reasoning text before token rebuilding removes the returned response. This diagnostic uses Gym's shared text classifier in one persistent spawned process per Gym actor, within the actor's existing CPU reservation. Enable it independently of result enrichment:
+NeMo Gym can assess severe repetition in assistant and reasoning text before token rebuilding removes the returned response. This diagnostic uses Gym's shared text classifier in one persistent spawned process per Gym actor, within the actor's existing CPU reservation. For loop-only reward shaping, enable assessment and the shaping stage, and leave the existing length settings unset:
 
 ```yaml
 env:
@@ -61,13 +61,21 @@ env:
     assess_looping: true
 grpo:
   reward_shaping:
-    zero_looping_rewards: false
+    enabled: true
+    zero_looping_rewards: true
+    stop_properly_penalty_coef: null
+    overlong_buffer_length: null
+    overlong_buffer_penalty: null
+    max_response_length: null
 ```
 
 | Setting | Type and default | Behavior |
 | --- | --- | --- |
 | `env.nemo_gym.assess_looping` | Boolean, `false` | Assess returned assistant/reasoning text. Disabled runs create no diagnostic worker and do not scan text. |
-| `grpo.reward_shaping.zero_looping_rewards` | Boolean, `false` | Zero the training objective for confirmed loops after other enabled reward adjustments. PPO exposes the same field under `ppo.reward_shaping`. Requires assessment on every Gym shard. |
+| `grpo.reward_shaping.enabled` | Boolean, `false` | Master switch for the configured length penalties and loop zeroing. |
+| `grpo.reward_shaping.zero_looping_rewards` | Boolean, `false` | Zero learning rewards for confirmed loops after other configured reward adjustments. Requires the master switch and assessment on every Gym shard. |
+
+PPO uses the same settings under `ppo.reward_shaping`. For metrics only, enable assessment and leave both reward-shaping switches off. Loop zeroing with either the master switch or assessment off is rejected at startup. When inheriting a recipe, explicitly clear any existing length settings as shown above to select loop-only shaping. Configure either the truncation coefficient or all three DAPO parameters to add a length penalty.
 
 Rows retain `is_looping` and `reasons` through normal results, recovery contexts and metadata tags. Classic training JSONL includes these fields under `metadata` and records the original grades in `verifier_rewards` alongside the training objective's `rewards`. `true` means a severe text witness, `false` means the supported checks completed, and `null` means unassessed, including unreadable text, work-limit exhaustion or unavailable process execution. Incomplete or length-limited responses remain assessable when their text is readable.
 
@@ -75,7 +83,7 @@ Training reports `looping/rate = flagged / assessed` when any output was assesse
 
 SingleController omits looping ratios for restored steps whose complete pre-filter counts were not checkpointed and logs the affected step range. Reporting resumes on the next fully observed step; saved row labels still control objective zeroing throughout recovery.
 
-The safeguard is independent of length shaping's `enabled` flag. It zeroes learning rewards only for known boolean `true` rows; false and unknown labels retain their existing reward adjustments. Raw verifier observations, published validation scores and sample/token masks retain their existing behavior.
+When the shaping stage is enabled, the safeguard zeroes learning rewards only for known boolean `true` rows; false and unknown labels retain their existing reward adjustments. Raw verifier observations, published validation scores and sample/token masks retain their existing behavior.
 
 Dynamic sampling keeps its existing raw/unshaped reward signal, so enabling loop zeroing does not change which groups it retains. Learning baselines and advantage normalization use the adjusted rewards of the retained rows. For example, verifier grades `[1, 0, 1, 0]` with a confirmed loop in the first row produce learning rewards `[0, 0, 1, 0]`, while the verifier grades and DS input remain `[1, 0, 1, 0]`. A raw-uniform group such as `[1, 1, 1, 1]` is still filtered out when dynamic sampling is enabled, even if one row loops.
 

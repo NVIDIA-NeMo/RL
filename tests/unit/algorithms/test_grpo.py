@@ -9539,6 +9539,8 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     ``rollout_to_tq`` and the driver centres it on the policy's population,
     not on every row.
     """
+    with pytest.raises(ValueError, match="reward_shaping.enabled=true"):
+        RewardShapingConfig(zero_looping_rewards=True)
     components = mock_grpo_components
     monkeypatch.setattr(grpo_sync_mod, "MemoryTracker", MagicMock)
     cfg = components["master_config"]
@@ -9550,7 +9552,9 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     cfg.grpo.overlong_filtering = False
     cfg.grpo.seq_logprob_error_threshold = None
     cfg.grpo.use_dynamic_sampling = True
-    cfg.grpo.reward_shaping.zero_looping_rewards = True
+    cfg.grpo.reward_shaping = RewardShapingConfig(
+        enabled=True, zero_looping_rewards=True
+    )
     cfg.loss_fn.use_kl_in_reward = False
     batch = next(iter(components["train_dataloader"])).repeat_interleave(4)
     batch["total_reward"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
@@ -9573,10 +9577,8 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     dropped["reasons"] = [["repeated_text"]] * 4
     dropped_meta = meta.subset(range(4))
     dropped_meta.sample_ids = [f"dropped_{index}" for index in range(4)]
-    dropped_metrics = {
-        **rollout_metrics,
-        **looping_metrics_from_flags(dropped["is_looping"]),
-    }
+    dropped_metrics = rollout_metrics.copy()
+    dropped_metrics.update(looping_metrics_from_flags(dropped["is_looping"]))
     actor_data["prev_logprobs"] = torch.zeros_like(actor_data["generation_logprobs"])
     actor_data["reference_policy_logprobs"] = torch.zeros_like(
         actor_data["generation_logprobs"]

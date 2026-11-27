@@ -78,7 +78,7 @@ def _validate_async_ppo_config(
     unsupported_features = {
         "Dynamic sampling": config.ppo.use_dynamic_sampling,
         "Reward scaling": config.ppo.reward_scaling.enabled,
-        "Reward shaping": config.ppo.reward_shaping.enabled,
+        "Reward shaping": config.ppo.reward_shaping.length_shaping_enabled,
         "Multiple dataloaders": config.data["use_multiple_dataloader"],
         "NeMo Gym rollout": bool(config.env.get("should_use_nemo_gym")),
         "FP8 KV-scale synchronization": bool(
