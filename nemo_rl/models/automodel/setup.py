@@ -502,7 +502,17 @@ def _reference_model_state_items(
 def setup_reference_model_state(
     model: torch.nn.Module, *, lora_enabled: bool = False
 ) -> dict[str, torch.Tensor]:
-    """Copy the reference scoring state to pinned CPU memory."""
+    """Copy the state that reference scoring swaps to pinned CPU memory.
+
+    Args:
+        model: The model to snapshot.
+        lora_enabled: If True, skip frozen parameters, because the policy and the
+            reference share them. Trainable parameters and buffers are still copied.
+
+    Returns:
+        A dict mapping state-dict keys to pinned CPU tensors. With ``lora_enabled`` this
+        is a partial state dict: frozen parameters are absent.
+    """
     return get_cpu_state_dict(
         _reference_model_state_items(model, lora_enabled=lora_enabled),
         pin_memory=True,
