@@ -38,6 +38,7 @@ uv run examples/run_grpo_single_controller.py \
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 # Unlike a throughput benchmark, an incomplete regression run must fail.
+# Reward floor calibrated from two 20-step H100 runs (mean reward 0.10 and 0.13).
 uv run tests/check_metrics.py "$JSON_METRICS" \
     "set(data[\"train/loss\"]) == {str(i) for i in range(1, $MAX_STEPS + 1)}" \
     'all_finite(data["train/loss"])' \
@@ -46,7 +47,8 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
     'max(data["train/max_seq_mult_prob_error"]) < 1000' \
     'mean(data["train/gen_kl_error"]) < 0.002' \
-    'median(data["train/token_mult_prob_error"]) < 1.1'
+    'median(data["train/token_mult_prob_error"]) < 1.1' \
+    'mean(data["train/reward"]) > 0.05'
 test -d "$CKPT_DIR/step_$MAX_STEPS/policy/weights"
 test -d "$CKPT_DIR/step_$MAX_STEPS/policy/optimizer"
 

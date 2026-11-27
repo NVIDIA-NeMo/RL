@@ -21,7 +21,7 @@ NUM_NODES=1
 STEPS_PER_RUN=450
 MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
-NUM_MINUTES=240
+NUM_MINUTES=200
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -38,10 +38,14 @@ uv run examples/run_grpo_single_controller.py \
 
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 # Unlike a throughput benchmark, an incomplete regression run must fail.
+# Reward floor and step-time bound calibrated from a 450-step H100 run (mean reward 0.47,
+# mean step time 11.5 s); the step-time bound matches the sibling Qwen2.5 1n8g recipes.
 uv run tests/check_metrics.py "$JSON_METRICS" \
     "set(data[\"train/loss\"]) == {str(i) for i in range(1, $MAX_STEPS + 1)}" \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
     'max(data["train/weight_version_lag_max"]) == 0' \
     'median(data["train/token_mult_prob_error"]) < 1.1' \
-    "data[\"train/token_mult_prob_error\"][\"$MAX_STEPS\"] < 1.1"
+    "data[\"train/token_mult_prob_error\"][\"$MAX_STEPS\"] < 1.1" \
+    'mean(data["train/reward"]) > 0.3' \
+    'mean(data["timing/train/total_step_time"], 2) < 25'
