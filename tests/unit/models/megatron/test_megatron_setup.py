@@ -3634,7 +3634,6 @@ def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
             model_cfg=MagicMock(),
             checkpoint_config=MagicMock(),
             config=config,
-            hf_model_name="test-model",
             dtype=torch.bfloat16,
         )
 
@@ -3663,7 +3662,6 @@ class TestCreateMegatronConfigGlooProcessGroups:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="mutable-model-id",
                 dtype=torch.bfloat16,
             )
 
@@ -3722,7 +3720,6 @@ class TestCreateMegatronConfigGlooProcessGroups:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
             )
 
@@ -3757,7 +3754,6 @@ class TestCreateMegatronConfigGlooProcessGroups:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
             )
 
@@ -3790,7 +3786,6 @@ class TestCreateMegatronConfigGlooProcessGroups:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
             )
 
@@ -3973,7 +3968,6 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
                 fp8_param_enabled=fp8_param_enabled,
             )
@@ -4063,7 +4057,6 @@ class TestCreateMegatronConfigFP8Buffers:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
                 fp8_param_enabled=True,
             )
@@ -4127,7 +4120,6 @@ class TestCreateMegatronConfigOptimizerOffload:
                 model_cfg=MagicMock(),
                 checkpoint_config=MagicMock(),
                 config=config,
-                hf_model_name="test-model",
                 dtype=torch.bfloat16,
             )
 

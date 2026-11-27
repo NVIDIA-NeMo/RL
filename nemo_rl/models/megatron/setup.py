@@ -1236,7 +1236,7 @@ def setup_model_config(
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
-        model_cfg, checkpoint_config, config, hf_model_name, dtype, fp8_param_enabled
+        model_cfg, checkpoint_config, config, dtype, fp8_param_enabled
     )
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
@@ -2291,7 +2291,6 @@ def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
     config: PolicyConfig,
-    hf_model_name: str,
     dtype: torch.dtype,
     fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
