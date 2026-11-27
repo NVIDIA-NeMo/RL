@@ -809,3 +809,84 @@ def test_kv_cache_aware_relay_can_serve_before_its_hashing_arrives(monkeypatch):
     assert relay.engines_ready and relay.prefill_router.hasher is None
     relay.mark_engines_ready(block_size=16, hash_algo="sha256")
     assert relay.prefill_router.hasher is not None
+
+
+def test_engine_body_that_is_not_a_json_object_becomes_an_error_object():
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    assert frontend._parse_engine_body(b"", 200) == {}
+    assert frontend._parse_engine_body(b'{"id": "x"}', 200) == {"id": "x"}
+    assert frontend._parse_engine_body(b"upstream timed out", 504) == {
+        "error": {"message": "upstream timed out", "code": 504}
+    }
+    assert frontend._parse_engine_body(b"[1, 2]", 200) == {
+        "error": {"message": "non-object JSON from engine", "code": 502}
+    }
+
+
+def test_wait_ready_polls_health_until_it_answers_or_times_out(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    asked = []
+    answers = [
+        frontend.requests.ConnectionError("not up yet"),
+        SimpleNamespace(status_code=503),
+        SimpleNamespace(status_code=200),
+    ]
+
+    def _get(url, timeout):
+        asked.append(url)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(frontend.requests, "get", _get)
+    monkeypatch.setattr(frontend.time, "sleep", lambda _s: None)
+    frontend.wait_ready("http://10.0.0.1:8000/v1")
+    assert asked == ["http://10.0.0.1:8000/health"] * 3
+
+    monkeypatch.setattr(
+        frontend.requests, "get", lambda url, timeout: SimpleNamespace(status_code=503)
+    )
+    with pytest.raises(TimeoutError, match="did not become ready within 0.0s"):
+        frontend.wait_ready("http://10.0.0.1:8000/v1", timeout_s=0.0)
+
+
+def test_is_reconstructed_actor_reads_rays_runtime_context(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_disagg_frontend as frontend
+
+    monkeypatch.setattr(frontend.ray, "is_initialized", lambda: False)
+    assert frontend._is_reconstructed_actor() is False
+
+    context = SimpleNamespace(
+        get_actor_id=lambda: None, was_current_actor_reconstructed=True
+    )
+    monkeypatch.setattr(frontend.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(frontend.ray, "get_runtime_context", lambda: context)
+    # A driver or a task: no actor to have been restarted.
+    assert frontend._is_reconstructed_actor() is False
+
+    context.get_actor_id = lambda: "actor-1"
+    assert frontend._is_reconstructed_actor() is True
+    context.was_current_actor_reconstructed = False
+    assert frontend._is_reconstructed_actor() is False
+
+
+def test_kv_event_subscriber_runs_its_loop_on_a_daemon_thread(monkeypatch):
+    router = KvCacheAwareRouter(1, hasher=_fake_hasher(), table_size=100)
+    sub = KvEventSubscriber(
+        engine_idx=3,
+        endpoint="tcp://x",
+        topic="",
+        index=router.index,
+        lock=router.index_lock,
+    )
+    ran = []
+    monkeypatch.setattr(sub, "_run", lambda: ran.append(sub._stop.is_set()))
+    sub.start()
+    sub._thread.join(timeout=5)
+    assert ran == [False]
+    assert sub._thread.daemon and sub._thread.name == "kv-events-3"
+    sub.stop()
+    assert sub._stop.is_set()
