@@ -100,6 +100,40 @@ def _forward_env_vars_to_ray_workers(extra_env_vars: list[str] | None) -> None:
     os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
 
 
+def _patch_vllm_compile_cache_per_device(logger) -> None:
+    """Add the GPU's device index to vLLM's per-rank compile cache folders.
+
+    The code Inductor generates hard-codes the device index (``cuda:N``,
+    ``torch.cuda._DeviceGuard(N)``), but vLLM names the cache folder after the
+    rank only. Since vllm#61211 (vLLM >= 0.33) the cache key ignores placement,
+    so an engine on GPUs 2-3 finds the folder an engine on GPUs 0-1 wrote, loads
+    code compiled for cuda:0/1 and fails with a CUDA error. With the device index
+    in the name, each placement compiles and caches its own copy; the cache key
+    and the other caches stay shared. Patches the AOT compile cache
+    (compilation/decorators.py) and the torch.compile cache
+    (compilation/backends.py), and raises if either no longer matches.
+
+    Applied by nemo_rl/utils/compile_cache.py on every node an engine runs on,
+    not by _apply_vllm_patches, and only when persistent compile caches are on.
+    Remove once vLLM puts the device index in the folder name or cache key.
+    """
+    old_snippet = 'f"rank_{rank}_{dp_rank}"'
+    new_snippet = 'f"rank_{rank}_{dp_rank}_dev{torch.cuda.current_device()}"'
+    for relative_path in ("compilation/decorators.py", "compilation/backends.py"):
+        file_to_patch = _get_vllm_file(relative_path)
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if new_snippet in content:
+                continue
+            if content.count(old_snippet) != 1 or "\nimport torch\n" not in content:
+                raise RuntimeError(
+                    "Persistent compile caches are on but the per-device cache "
+                    f"folder patch does not match {file_to_patch}; the vLLM version "
+                    "changed. Update _patch_vllm_compile_cache_per_device."
+                )
+            write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched vLLM to keep one compile cache folder per GPU.")
+
+
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
     try:
