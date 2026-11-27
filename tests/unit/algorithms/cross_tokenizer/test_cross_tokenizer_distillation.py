@@ -57,7 +57,7 @@ from nemo_rl.algorithms.cross_tokenizer_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
-    CrossTokenizerDistillationLossFn,
+    XTokenLossFn,
 )
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
@@ -311,7 +311,7 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(
             xt_mod, "CrossTokenizerCollator", wraps=CrossTokenizerCollator
         ) as mock_collator_cls,
-        patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
+        patch.object(xt_mod, "XTokenLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
@@ -497,7 +497,7 @@ def test_setup_val_dataloader_gating(
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
         patch.object(xt_mod, "TokenAligner"),
         patch.object(xt_mod, "CrossTokenizerCollator"),
-        patch.object(xt_mod, "CrossTokenizerDistillationLossFn"),
+        patch.object(xt_mod, "XTokenLossFn"),
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
@@ -923,7 +923,7 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
         patch.object(xt_mod, "TokenAligner") as mock_aligner_cls,
         patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
-        patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
+        patch.object(xt_mod, "XTokenLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
@@ -1056,10 +1056,10 @@ def test_setup_rejects_divisor_not_divisible_by_context_parallel_size(
 
 
 def _bare_averaged_logits_loss_fn(projection_matrix_paths):
-    """A ``CrossTokenizerDistillationLossFn`` carrying only the attrs the
+    """A ``XTokenLossFn`` carrying only the attrs the
     ``averaged_logits`` guard reads, built via ``__new__`` to skip the heavy
     config-driven ``__init__``."""
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.num_teachers = len(projection_matrix_paths)
     fn.projection_matrix_paths = list(projection_matrix_paths)
     fn.teacher_weights = [1.0] * fn.num_teachers
@@ -1089,7 +1089,7 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path(monkeypatch):
 
     fn._compute_teacher_kd = _fallback
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.base.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
 
@@ -1128,7 +1128,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
         return torch.tensor(1.23)
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.same_tokenizer_full_vocab_kl",
+        "nemo_rl.algorithms.loss.cross_tokenizer.base.same_tokenizer_full_vocab_kl",
         _fast_path,
     )
     fn._compute_teacher_kd = MagicMock(
@@ -1138,6 +1138,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
     align, global_valid_toks = MagicMock(), torch.tensor(20.0)
+    align.student_kd_token_mask = None
 
     kd, metrics = fn._averaged_logits_kd(
         logits,
@@ -1164,7 +1165,7 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path(monkeypatch):
 
 
 def _weight_score(
-    fn: CrossTokenizerDistillationLossFn,
+    fn: XTokenLossFn,
     logits: torch.Tensor,
     *,
     ids: torch.Tensor,
@@ -1191,7 +1192,7 @@ def test_teacher_weight_score_uses_only_scored_positions(
 ) -> None:
     # Context and padding remain available to the model but must not affect
     # teacher weights or selection. Only assistant positions count in chat mode.
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.sum_weights_metric = metric
 
     batch, seqlen, vocab = 2, 5, 8
@@ -1237,7 +1238,7 @@ def test_teacher_weight_score_uses_only_scored_positions(
 
 def test_teacher_weight_score_masks_dropped_samples():
     # sample_mask=0 rows must not contribute either.
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.sum_weights_metric = "max_prob"
 
     torch.manual_seed(0)
@@ -1270,7 +1271,7 @@ def test_sum_weights_metric_rejected_outside_sum_mode(mode):
     # reference). Combining sum_weights_metric with another mode used to be
     # silently dropped; it must now fail loudly at construction.
     with pytest.raises(ValueError, match="sum_weights_metric"):
-        CrossTokenizerDistillationLossFn(
+        XTokenLossFn(
             {
                 "xtoken_loss": False,
                 "gold_loss": False,
@@ -1287,7 +1288,7 @@ def test_averaged_logits_rejects_zero_weight_sum(weights):
     # rejected at construction with a clear message instead of failing with a
     # deep ZeroDivisionError mid-step.
     with pytest.raises(ValueError, match="must not sum to zero"):
-        CrossTokenizerDistillationLossFn(
+        XTokenLossFn(
             {
                 "xtoken_loss": False,
                 "gold_loss": False,
@@ -1308,7 +1309,7 @@ def test_dp_global_masked_mean_single_process_is_local_masked_mean():
     # and the result is detached (it gates selection / weighting, never
     # back-propagated). Cross-rank agreement across DP ranks is verified by
     # ``test_dp_global_masked_mean_agrees_across_ranks`` below.
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     values = torch.tensor([[1.0, 2.0, 100.0]], requires_grad=True)
     mask = torch.tensor([[1.0, 1.0, 0.0]])
 
@@ -1327,7 +1328,7 @@ def _dp_global_masked_mean_worker(rank, world_size, init_file, q):
         world_size=world_size,
     )
     try:
-        fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+        fn = XTokenLossFn.__new__(XTokenLossFn)
         # Deliberately uneven shards: rank 1's masked-out 1e9 must not leak,
         # and the mean must combine across ranks (not stay rank-local).
         if rank == 0:
@@ -1377,7 +1378,7 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
     # own tokens. Two same-vocab teachers: the "better" one peaks on the true
     # next token (CE ~ 0); the other is uniform (CE = log V). Parametrized over
     # which index is better so it can't pass by always returning 0.
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.num_teachers = 2
     fn.projection_matrix_paths = [None, None]  # same-vocab: scored on student ids
 
@@ -1394,6 +1395,7 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
     align = SimpleNamespace(
         student_input_ids=input_ids,
         student_token_mask=torch.ones(1, seqlen),
+        student_kd_token_mask=None,
     )
     aligns_by_idx = {0: align, 1: align}
 
@@ -1437,10 +1439,10 @@ def _bare_sum_kd_loss_fn(
     normalize_teacher_by_vocab=False,
     teacher_vocab_sizes=None,
 ):
-    """A ``CrossTokenizerDistillationLossFn`` carrying only the attrs ``_sum_kd``
+    """A ``XTokenLossFn`` carrying only the attrs ``_sum_kd``
     reads, built via ``__new__`` to skip the config-driven ``__init__``.
     Static weights only (``sum_weights_metric=None``)."""
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.num_teachers = num_teachers
     fn.teacher_weights = list(teacher_weights)
     fn.sum_weights_metric = None
@@ -1518,9 +1520,9 @@ def test_sum_kd_normalize_teacher_by_vocab_rescales_by_log_ratio():
 
 
 def _dynamic_weights_fn(alpha, scores):
-    """``CrossTokenizerDistillationLossFn`` stubbed to feed fixed per-teacher
+    """``XTokenLossFn`` stubbed to feed fixed per-teacher
     scores into ``_compute_dynamic_weights`` (isolates the aggregation)."""
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.num_teachers = len(scores)
     fn.alpha = alpha
     fn.normalize_teacher_by_vocab = False
@@ -1672,7 +1674,7 @@ def _run_teacher_scoring_cp(
     try:
         cp_group = dist.new_group(ranks=list(range(world_size)))
         fx = _scoring_fixture()
-        fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+        fn = XTokenLossFn.__new__(XTokenLossFn)
         fn.num_teachers = 2
         fn.alpha = 1.0
         fn.normalize_teacher_by_vocab = False
@@ -1740,7 +1742,7 @@ def test_teacher_scoring_on_cp2_matches_cp1(tmp_path, metric):
 
 
 def test_resolve_gold_xtoken_per_teacher_overrides():
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.gold_loss = False  # global defaults
     fn.xtoken_loss = False
     fn.teacher_gold_loss = [True, None]  # t0 overrides gold; t1 falls back
@@ -1757,7 +1759,7 @@ def test_resolve_gold_xtoken_per_teacher_overrides():
 def test_compute_teacher_kd_rejects_xtoken_without_gold():
     # A cross-tokenizer teacher resolved to xtoken_loss=True but gold_loss=False
     # must fail loud per teacher (xtoken is a modifier inside the gold path).
-    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn = XTokenLossFn.__new__(XTokenLossFn)
     fn.gold_loss = False
     fn.xtoken_loss = False
     fn.projection_matrix_paths = ["t0_proj.pt"]  # non-null => cross-tokenizer

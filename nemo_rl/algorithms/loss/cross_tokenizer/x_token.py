@@ -18,36 +18,31 @@ import torch
 from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
-    ce_label_mask,
     chunk_average_log_probs,
     get_sparse_projection_matrix,
     next_token_accuracy,
     project_student_to_teacher_vocab,
-    same_tokenizer_full_vocab_kl,
-    same_tokenizer_topk_kl,
     select_teacher_topk_indices,
     slice_sparse_projection_cols,
-    student_next_token_ce,
     valid_chunk_mask,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
+from nemo_rl.algorithms.loss.cross_tokenizer.base import (
+    CrossTokenizerDistillationLossFn,
+)
+from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    cp_shift_next,
     group_all_reduce_sum,
-    group_all_reduce_sum_with_grad,
-    to_local_if_dtensor,
     vocab_parallel_full_log_softmax,
     vocab_parallel_log_softmax,
 )
-from nemo_rl.utils.tensor_ops import masked_mean
 
 # =====================================================================
 # Cross-tokenizer distillation
 # =====================================================================
 
 
-class CrossTokenizerDistillationLossConfig(TypedDict):
+class XTokenLossConfig(TypedDict):
     """Config for cross-tokenizer distillation loss.
 
     Attributes:
@@ -136,7 +131,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     teacher_xtoken_loss: NotRequired[list[Optional[bool]]]
 
 
-class CrossTokenizerDistillationLossDataDict(TypedDict):
+class XTokenLossDataDict(TypedDict):
     """Student-side keys are fixed; teacher-side keys are teacher-indexed.
 
     Only the student keys below are static. Each teacher ``i`` contributes a
@@ -163,7 +158,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
 
 
-class CrossTokenizerDistillationLossFn(LossFunction):
+class XTokenLossFn(CrossTokenizerDistillationLossFn):
     """Cross-tokenizer distillation loss.
 
     Mode is selected by the ``(gold_loss, xtoken_loss)`` flags:
@@ -209,7 +204,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             localized chunk alignment; same-tok: thin, student fields only).
 
     Inputs (via ``data: BatchedDataDict``):
-        See :class:`CrossTokenizerDistillationLossDataDict`.
+        See :class:`XTokenLossDataDict`.
 
     Returns:
         ``(loss, metrics)``. Aggregate metrics: ``loss``, ``kl_loss`` (the
@@ -222,7 +217,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
 
-    def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
+    def __init__(self, cfg: XTokenLossConfig):
         if cfg["xtoken_loss"] and not cfg["gold_loss"]:
             raise ValueError(
                 "xtoken_loss=True requires gold_loss=True; xtoken_loss is "
@@ -315,7 +310,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
     def __call__(
         self,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         logits: torch.Tensor,
@@ -454,7 +449,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self,
         i: int,
         student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        data: BatchedDataDict[XTokenLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
@@ -522,373 +517,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "proj_accuracy": proj_acc.item(),
             "num_valid_pairs": int(num_valid_pairs.item()),
         }
-
-    def _compute_same_vocab_kl(
-        self,
-        i: int,
-        student_logits_contig: torch.Tensor,
-        teacher_full_logits: torch.Tensor,
-        align: LocalizedAlignment,
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Direct top-k per-position KL for a same-tokenizer teacher.
-
-        Identical tokenizer => teacher tokens == student tokens (identity
-        position alignment), so no projection / no chunk-averaging. The reduction
-        matches CE: masked next-token mean normalized by ``global_valid_toks``,
-        scaled by ``T**2``.
-        """
-        assert align.student_token_mask is not None
-        kd = same_tokenizer_topk_kl(
-            student_logits_contig,
-            teacher_full_logits,
-            kd_mask=align.student_token_mask,
-            sample_mask=align.sample_mask,
-            num_kd_tokens=global_valid_toks,
-            vocab_size=self.student_vocab_size,
-            vocab_topk=self.vocab_topk,
-            temperature=self.temperature,
-            reverse_kl=self.reverse_kl,
-            tp_group=tp_group,
-            cp_group=cp_group,
-        )
-        return kd, {"kl_loss": kd.item()}
-
-    def _sum_kd(
-        self,
-        student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
-        aligns_by_idx: dict[int, LocalizedAlignment],
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Weighted sum: ``total_kd = Σ_i weight_i · KD_i``.
-
-        Weights are static (config ``weight``) or dynamic (``sum_weights_metric``).
-        When ``normalize_teacher_by_vocab`` is set, each teacher's KD is
-        additionally scaled by ``log(V_t_i) / log(min_j V_t_j)``.
-        """
-        device = student_logits_contig.device
-        if self.sum_weights_metric is not None:
-            weights = self._compute_dynamic_weights(
-                data, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
-            )
-        else:
-            weights = [
-                torch.tensor(
-                    self.teacher_weights[i],
-                    device=device,
-                    dtype=student_logits_contig.dtype,
-                )
-                for i in range(self.num_teachers)
-            ]
-
-        if self.normalize_teacher_by_vocab:
-            temp_weight = torch.log(
-                torch.tensor(float(min(self.teacher_vocab_sizes)), device=device)
-            )
-
-        total_kd: Optional[torch.Tensor] = None
-        per_metrics: dict[str, Any] = {}
-        # Deterministic teacher order: each teacher's KD fires its own
-        # collectives, so the order must match across ranks.
-        for i in range(self.num_teachers):
-            kd_i, m_i = self._compute_teacher_kd(
-                i,
-                student_logits_contig,
-                data,
-                teacher_full_logits_by_idx,
-                aligns_by_idx,
-                global_valid_toks,
-                use_per_teacher_flags=True,
-                tp_group=tp_group,
-                cp_group=cp_group,
-            )
-            weighted = kd_i * weights[i]
-            if self.normalize_teacher_by_vocab:
-                v_scale = (
-                    torch.log(
-                        torch.tensor(float(self.teacher_vocab_sizes[i]), device=device)
-                    )
-                    / temp_weight
-                )
-                weighted = weighted * v_scale
-            total_kd = weighted if total_kd is None else total_kd + weighted
-            for k, v in m_i.items():
-                per_metrics[f"{k}_t{i}"] = v
-            per_metrics[f"weight_t{i}"] = float(weights[i].item())
-        assert total_kd is not None
-        return total_kd, per_metrics
-
-    def _averaged_logits_kd(
-        self,
-        student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
-        aligns_by_idx: dict[int, LocalizedAlignment],
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Convex-weighted average of teacher logits, then one direct KL.
-
-        Valid only when all teachers are same-tokenizer (no projection) and ship
-        full logits of identical shape. Otherwise falls back to a plain
-        static-weight sum (no dynamic weights, no ``normalize_teacher_by_vocab``).
-        """
-        full = [teacher_full_logits_by_idx.get(i) for i in range(self.num_teachers)]
-        # Direct per-position KL is only valid when every teacher shares the
-        # student's tokenizer (no projection matrix) *and* ships full logits of
-        # identical shape. Two cross-tokenizer teachers can have matching shapes
-        # yet still need the projection/alignment path, so the shape check alone
-        # is insufficient.
-        same_tokenizer = all(p is None for p in self.projection_matrix_paths)
-        same_shape = all(f is not None for f in full) and (
-            len({tuple(f.shape) for f in full if f is not None}) == 1
-        )
-        if not (same_tokenizer and same_shape):
-            total_kd: Optional[torch.Tensor] = None
-            per_metrics: dict[str, Any] = {}
-            for i in range(self.num_teachers):
-                kd_i, m_i = self._compute_teacher_kd(
-                    i,
-                    student_logits_contig,
-                    data,
-                    teacher_full_logits_by_idx,
-                    aligns_by_idx,
-                    global_valid_toks,
-                    use_per_teacher_flags=False,
-                    tp_group=tp_group,
-                    cp_group=cp_group,
-                )
-                w = self.teacher_weights[i]
-                weighted = kd_i * w
-                total_kd = weighted if total_kd is None else total_kd + weighted
-                for k, v in m_i.items():
-                    per_metrics[f"{k}_t{i}"] = v
-                per_metrics[f"weight_t{i}"] = float(w)
-            assert total_kd is not None
-            return total_kd, per_metrics
-
-        total_w = sum(self.teacher_weights)
-        avg: Optional[torch.Tensor] = None
-        for i, f in enumerate(full):
-            assert f is not None
-            contrib = f.float() * (self.teacher_weights[i] / total_w)
-            avg = contrib if avg is None else avg + contrib
-        assert avg is not None
-        align = aligns_by_idx[0]
-        assert align.student_token_mask is not None
-        kd = same_tokenizer_full_vocab_kl(
-            student_logits_contig,
-            avg,
-            kd_mask=align.student_token_mask,
-            sample_mask=align.sample_mask,
-            num_kd_tokens=global_valid_toks,
-            vocab_size=self.student_vocab_size,
-            temperature=self.temperature,
-            reverse_kl=self.reverse_kl,
-            tp_group=tp_group,
-            cp_group=cp_group,
-        )
-        return kd, {"kl_loss": kd.item()}
-
-    def _dp_global_masked_mean(
-        self, values: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Masked mean of ``values`` over the *process-global* valid count.
-
-        Teacher selection / dynamic weighting must be identical on every rank: a
-        rank-local mean lets ranks pick a different teacher / different weights,
-        and the per-teacher KD's collectives then see divergent participation
-        (deadlock when one rank's choice fires a collective another's does not).
-        All-reduce the masked sum and the mask count over the full group so every
-        rank gets the same score (mirrors ``_compute_p_kl``'s WORLD-reduced
-        denominator). The result is detached (it gates selection / weighting and
-        is not back-propagated).
-        """
-        num = group_all_reduce_sum(
-            (values * mask).sum(), group=torch.distributed.group.WORLD
-        )
-        den = group_all_reduce_sum(
-            mask.sum(), group=torch.distributed.group.WORLD
-        ).clamp(min=1.0)
-        return num / den
-
-    def _select_teacher_kd(
-        self,
-        student_logits_contig: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
-        aligns_by_idx: dict[int, LocalizedAlignment],
-        global_valid_toks: torch.Tensor,
-        *,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Use only the teacher with the lowest next-token CE on its own tokens."""
-        with torch.no_grad():
-            ces: list[float] = []
-            for i in range(self.num_teachers):
-                t_logits, next_ids, next_mask, _ = self._teacher_score_inputs(
-                    i, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
-                )
-                ce = self._teacher_next_token_ce(
-                    t_logits,
-                    next_ids=next_ids,
-                    next_mask=next_mask,
-                    sample_mask=data["sample_mask"],
-                )
-                ces.append(ce.item())
-            best = int(min(range(self.num_teachers), key=lambda j: ces[j]))
-
-        kd, m = self._compute_teacher_kd(
-            best,
-            student_logits_contig,
-            data,
-            teacher_full_logits_by_idx,
-            aligns_by_idx,
-            global_valid_toks,
-            use_per_teacher_flags=False,
-            tp_group=tp_group,
-            cp_group=cp_group,
-        )
-        per_metrics: dict[str, Any] = {f"{k}_t{best}": v for k, v in m.items()}
-        per_metrics["selected_teacher"] = best
-        return kd, per_metrics
-
-    def _teacher_score_inputs(
-        self,
-        i: int,
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
-        aligns_by_idx: dict[int, LocalizedAlignment],
-        *,
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(logits, next_ids, next_mask, token_mask)`` for teacher ``i``'s scores.
-
-        All four cover this CP rank's contiguous window of the tokenization the
-        score is computed on: the shared student tokens for a same-vocab teacher,
-        teacher ``i``'s own otherwise. ``next_ids`` / ``next_mask`` hold each
-        position's next token: the window's last position takes the first token
-        of the next CP rank's window, and the sequence's last position has none
-        (``next_mask`` is 0). Every teacher ships full logits, so the full
-        distribution is always available.
-        """
-        align = aligns_by_idx[i]
-        if self._teacher_is_same_vocab(i):
-            ids = to_local_if_dtensor(align.student_input_ids)
-            token_mask = to_local_if_dtensor(align.student_token_mask)
-        else:
-            if align.teacher_input_ids is None or align.teacher_token_mask is None:
-                raise ValueError(
-                    f"localized alignment for teacher {i} is missing the teacher "
-                    "input ids or token mask"
-                )
-            ids = to_local_if_dtensor(align.teacher_input_ids)
-            token_mask = to_local_if_dtensor(align.teacher_token_mask)
-        token_mask = token_mask.float()
-        next_ids = cp_shift_next(ids, cp_group, fill=0)
-        next_mask = cp_shift_next(token_mask, cp_group, fill=0.0)
-        return teacher_full_logits_by_idx[i], next_ids, next_mask, token_mask
-
-    def _teacher_next_token_ce(
-        self,
-        t_logits: torch.Tensor,
-        *,
-        next_ids: torch.Tensor,
-        next_mask: torch.Tensor,
-        sample_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Teacher's next-token CE on its own tokens, averaged over every rank's window."""
-        ce_pos = torch.nn.functional.cross_entropy(
-            t_logits.reshape(-1, t_logits.shape[-1]).float(),
-            next_ids.reshape(-1),
-            reduction="none",
-        )
-        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
-        mask = (next_mask * samp).reshape(-1)
-        return self._dp_global_masked_mean(ce_pos, mask)
-
-    def _compute_dynamic_weights(
-        self,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
-        aligns_by_idx: dict[int, LocalizedAlignment],
-        *,
-        cp_group: Optional[torch.distributed.ProcessGroup],
-    ) -> list[torch.Tensor]:
-        """Sequence-level dynamic teacher weights via ``sum_weights_metric``.
-
-        Per teacher computes a scalar score (``ce`` -> -CE, ``entropy`` ->
-        -entropy, ``max_prob`` -> max prob; higher = more trusted), optionally
-        rescaled by ``log(V_t_i)/log(min_j V_t_j)``, then ``softmax(alpha *
-        scores)`` across teachers.
-        """
-        device = data["input_ids"].device
-        if self.normalize_teacher_by_vocab:
-            temp_weight = torch.log(
-                torch.tensor(float(min(self.teacher_vocab_sizes)), device=device)
-            )
-        scores: list[torch.Tensor] = []
-        for i in range(self.num_teachers):
-            t_logits, next_ids, next_mask, token_mask = self._teacher_score_inputs(
-                i, teacher_full_logits_by_idx, aligns_by_idx, cp_group=cp_group
-            )
-            score = self._teacher_weight_score(
-                t_logits,
-                next_ids=next_ids,
-                next_mask=next_mask,
-                token_mask=token_mask,
-                sample_mask=data["sample_mask"],
-            )
-            if self.normalize_teacher_by_vocab:
-                v_log = torch.log(
-                    torch.tensor(float(self.teacher_vocab_sizes[i]), device=device)
-                )
-                score = score * (v_log / temp_weight)
-            scores.append(score)
-        weights = torch.softmax(self.alpha * torch.stack(scores), dim=0)
-        return [weights[i] for i in range(self.num_teachers)]
-
-    def _teacher_weight_score(
-        self,
-        t_logits: torch.Tensor,
-        *,
-        next_ids: torch.Tensor,
-        next_mask: torch.Tensor,
-        token_mask: torch.Tensor,
-        sample_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Scalar weight-metric score for one teacher (higher = more trusted).
-
-        Padded positions and masked-out samples are excluded, so long-padded
-        batches don't let near-uniform padding logits dominate the score.
-        """
-        if self.sum_weights_metric == "ce":
-            return -self._teacher_next_token_ce(
-                t_logits,
-                next_ids=next_ids,
-                next_mask=next_mask,
-                sample_mask=sample_mask,
-            )
-        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
-        mask = token_mask * samp
-        if self.sum_weights_metric == "entropy":
-            probs = torch.softmax(t_logits.float(), dim=-1)
-            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
-            return -self._dp_global_masked_mean(entropy, mask)
-        if self.sum_weights_metric == "max_prob":
-            probs = torch.softmax(t_logits.float(), dim=-1)
-            return self._dp_global_masked_mean(probs.max(dim=-1).values, mask)
-        raise ValueError(f"Unknown sum_weights_metric: {self.sum_weights_metric!r}")
 
     # ------------------------------------------------------------------ #
     # Loss-mode implementations
@@ -1278,45 +906,4 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             l1_uncommon.detach(),
             valid_chunk.sum().detach(),
             top1_acc.detach(),
-        )
-
-    def _compute_ce(
-        self,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        global_valid_toks: torch.Tensor,
-        *,
-        student_next_token_logprobs: Optional[torch.Tensor] = None,
-        student_next_token_mask: Optional[torch.Tensor] = None,
-        cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> torch.Tensor:
-        """Next-token CE on the student side (TP/CP handled by the helpers)."""
-        if student_next_token_logprobs is not None:
-            assert student_next_token_mask is not None
-            label_mask = student_next_token_mask.to(
-                student_next_token_logprobs.dtype
-            ) * to_local_if_dtensor(data["sample_mask"]).to(
-                student_next_token_logprobs.device
-            ).unsqueeze(-1)
-            local_ce = masked_mean(
-                -student_next_token_logprobs,
-                label_mask,
-                global_normalization_factor=global_valid_toks,
-            )
-            # Forward SUM gives every CP rank the same full-sequence CE (and
-            # therefore the same dynamic KD scale). Identity backward keeps the
-            # disjoint rank-local windows at a single gradient fanout.
-            return group_all_reduce_sum_with_grad(local_ce, cp_group)
-
-        per_token_ce = student_next_token_ce(logits, input_ids=data["input_ids"])
-        label_mask = ce_label_mask(
-            token_mask=data["token_mask"],
-            sample_mask=data["sample_mask"],
-            ce_seq_len=per_token_ce.shape[1],
-            dtype=per_token_ce.dtype,
-        )
-        return masked_mean(
-            per_token_ce,
-            label_mask,
-            global_normalization_factor=global_valid_toks,
         )

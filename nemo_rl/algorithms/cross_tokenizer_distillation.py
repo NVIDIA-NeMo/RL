@@ -50,9 +50,12 @@ from nemo_rl.algorithms.cross_tokenizer.utils import (
     assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
-from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
-    CrossTokenizerDistillationLossConfig,
+from nemo_rl.algorithms.loss.cross_tokenizer.base import (
     CrossTokenizerDistillationLossFn,
+)
+from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
+    XTokenLossConfig,
+    XTokenLossFn,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -250,7 +253,7 @@ class TeacherConfig(BaseModel, extra="allow"):
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig  # student
     teachers: list[TeacherConfig] = Field(min_length=1)
-    loss_fn: CrossTokenizerDistillationLossConfig
+    loss_fn: XTokenLossConfig
     data: DataConfig
     collator: CrossTokenizerCollatorConfig = Field(
         default_factory=CrossTokenizerCollatorConfig
@@ -562,7 +565,7 @@ def setup(
         "teacher_gold_loss": [t.gold_loss for t in teachers],
         "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
     }
-    loss_fn = CrossTokenizerDistillationLossFn(loss_config)
+    loss_fn = XTokenLossFn(loss_config)
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")

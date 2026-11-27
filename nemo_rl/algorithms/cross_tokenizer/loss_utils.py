@@ -504,6 +504,10 @@ class LocalizedAlignment:
     # next-token-accuracy metric and the same-tokenizer KD path.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
+    # KD semantic targets may be narrower than the SFT/CE role mask in chat
+    # mode (assistant content plus an explicitly identified EOT token). Text
+    # mode aliases this to ``student_token_mask``.
+    student_kd_token_mask: Optional[torch.Tensor] = None
     # Filled post-construction for a cross-tokenizer teacher: this CP rank's
     # contiguous teacher input ids and token mask. Left ``None`` for a
     # same-tokenizer teacher.

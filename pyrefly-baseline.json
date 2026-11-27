@@ -681,10 +681,10 @@
       "severity": "error"
     },
     {
-      "column": 48,
+      "column": 28,
       "path": "nemo_rl/algorithms/cross_tokenizer_distillation.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `CrossTokenizerDistillationLossConfig` in function `nemo_rl.algorithms.loss.cross_tokenizer.x_token.CrossTokenizerDistillationLossFn.__init__`",
+      "concise_description": "Argument `dict[str, int | list[bool | None] | list[str | None] | list[float] | list[int] | object]` is not assignable to parameter `cfg` with type `XTokenLossConfig` in function `nemo_rl.algorithms.loss.cross_tokenizer.x_token.XTokenLossFn.__init__`",
       "severity": "error"
     },
     {
@@ -1797,7 +1797,7 @@
       "column": 9,
       "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
       "name": "bad-override",
-      "concise_description": "Class member `CrossTokenizerDistillationLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
+      "concise_description": "Class member `XTokenLossFn.__call__` overrides parent class `LossFunction` in an inconsistent manner",
       "severity": "error"
     },
     {
@@ -1819,34 +1819,6 @@
       "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[bool | None, bool | None]` is not assignable to declared return type `tuple[bool, bool]`",
-      "severity": "error"
-    },
-    {
-      "column": 23,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
-      "severity": "error"
-    },
-    {
-      "column": 39,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 46,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Tensor | None` is not assignable to parameter `tensor` with type `DTensor | Tensor` in function `nemo_rl.distributed.model_utils.to_local_if_dtensor`",
-      "severity": "error"
-    },
-    {
-      "column": 42,
-      "path": "nemo_rl/algorithms/loss/cross_tokenizer/x_token.py",
-      "name": "unbound-name",
-      "concise_description": "`temp_weight` may be uninitialized",
       "severity": "error"
     },
     {
