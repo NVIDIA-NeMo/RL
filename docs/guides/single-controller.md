@@ -42,13 +42,12 @@ The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout
 It saves after step 1 and resumes through step 4.
 Append normal config overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
 
-For numerical parity, run the fixed-data test in the AutoModel environment:
+For numerical parity against `train()`, run the two-GPU unit test in the AutoModel environment:
 
 ```bash
-uv run --extra automodel python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  tests/functional/automodel_sc_full_batch_parity.py \
-  --model /path/to/gemma-4-E2B-it --output /path/to/parity-results \
-  --source-sha "$(git rev-parse HEAD)"
+cd tests
+uv run --extra automodel pytest unit/models/policy/test_automodel_split_parity.py \
+  --automodel-only --hf-gated
 ```
 
 See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md) for the lifecycle, numerical primitives, forward-padding contract, and training comparison curves.
