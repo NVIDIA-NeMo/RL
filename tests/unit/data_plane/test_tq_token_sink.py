@@ -942,7 +942,8 @@ def _stage_example_through_megatron(
     """
     stager = TQMegatronTokenStager(TQTokenSink(tq_client, staging_partition=partition))
     preparer = TQMegatronPromptPreparer(
-        TQTokenSource(tq_client, staging_partition=partition)
+        TQTokenSource(tq_client, staging_partition=partition),
+        bridge=False,
     )
 
     def stage(record, prompt, offload_params):
@@ -1443,8 +1444,9 @@ _PREPARER_CASES = {
 
 
 @pytest.mark.parametrize("prefix_source", list(_PREPARER_CASES))
+@pytest.mark.parametrize("bridge", [False, True], ids=["splice", "bridge"])
 def test_megatron_prompt_preparer_splices_resolved_prefix(
-    tq_client, request, prefix_source
+    tq_client, request, prefix_source, bridge
 ):
     (
         root_payload,
@@ -1486,7 +1488,8 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         **admission_kwargs,
     )
     preparer = TQMegatronPromptPreparer(
-        TQTokenSource(tq_client, staging_partition=partition, capture_media=media)
+        TQTokenSource(tq_client, staging_partition=partition, capture_media=media),
+        bridge=bridge,
     )
     offload_params = {
         "ng_capture": admission.model_dump(mode="json"),
@@ -1564,7 +1567,8 @@ def test_megatron_stager_rejects_a_resized_retained_image(tq_client, media_parti
         parent_chain_hash=root_coords["chain_hash"],
     )
     preparer = TQMegatronPromptPreparer(
-        TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True)
+        TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True),
+        bridge=False,
     )
     prepared = preparer.prepare_prompt(
         [80, 99, 81, 13, 2, 20, 99, 21],
@@ -1638,7 +1642,8 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
     if endpoint_media_count is not None:
         offload_params[PREFIX_MEDIA_COUNT_FIELD] = endpoint_media_count
     preparer = TQMegatronPromptPreparer(
-        TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True)
+        TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True),
+        bridge=False,
     )
 
     with pytest.raises(
@@ -1661,7 +1666,7 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
         required_prefix_token_ids=[10, 2],
         parent_chain_hash=_digest("chain:c1"),
     )
-    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource), bridge=False)
 
     with pytest.raises(ValueError, match="no valid EOS token ids"):
         preparer.prepare_prompt(
@@ -1670,6 +1675,49 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
                 "ng_capture": admission.model_dump(mode="json"),
                 PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [9, 2],
                 PREFIX_EOS_TOKEN_ID_FIELD: eos,
+            },
+        )
+
+
+def _tito_append_admission():
+    return nemo_gym.CaptureAdmission(
+        capture_key="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=2,
+        mode="token_in",
+        required_prefix_token_ids=[10, 2],
+        parent_chain_hash=_digest("chain:c1"),
+    )
+
+
+def test_megatron_prompt_preparer_prepends_the_parent_to_appended_tokens():
+    """A token-in/token-out request submits only the tokens after its parent."""
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource), bridge=False)
+
+    result = preparer.prepare_prompt(
+        [20, 21],
+        offload_params={
+            "ng_capture": _tito_append_admission().model_dump(mode="json"),
+            "ng_tito_append": True,
+        },
+    )
+
+    assert result.prompt == [10, 2, 20, 21]
+    assert result.offload_params["ng_capture"]["required_prefix_token_ids"] == [10, 2]
+
+
+def test_megatron_prompt_preparer_rejects_appended_tokens_with_splice_metadata():
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource), bridge=False)
+
+    with pytest.raises(ValueError, match="not a rendered history to splice"):
+        preparer.prepare_prompt(
+            [20, 21],
+            offload_params={
+                "ng_capture": _tito_append_admission().model_dump(mode="json"),
+                "ng_tito_append": True,
+                PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [9, 2],
+                PREFIX_EOS_TOKEN_ID_FIELD: [2],
             },
         )
 
@@ -1701,7 +1749,7 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     if endpoint_reports_count:
         offload_params[PREFIX_MEDIA_COUNT_FIELD] = 1
     original_offload_params = dict(offload_params)
-    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource), bridge=False)
 
     result = preparer.prepare_prompt(prompt, offload_params=offload_params)
 
@@ -1986,7 +2034,7 @@ def test_resolve_admission_prefix_dispatches_on_admission_shape(resolve, wrap):
 
 def test_megatron_preparer_resolves_chains_through_the_shared_cache():
     source = _RecordingSource()
-    preparer = TQMegatronPromptPreparer(source)
+    preparer = TQMegatronPromptPreparer(source, bridge=False)
     assert isinstance(preparer._chain_prefix, ChainPrefixCache)
 
     child = nemo_gym.CaptureAdmission(

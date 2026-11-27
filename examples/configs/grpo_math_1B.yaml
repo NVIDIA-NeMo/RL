@@ -581,8 +581,11 @@ policy:
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
+      tito_interface: false  # Continue captured chat requests with the shared token bridge instead of the prefix splice; see docs/guides/tito-interface.md.
     vllm_cfg:
-      tito_model: null
+      tito_model: null  # Model family (qwen3) whose appended messages are tokenized without rendering the history. Requires tito_interface.
+      tito_interface: false  # Serve /v1/tito/generate and bridge chat continuations onto their parent's tokens. Requires async_engine and expose_http_server; see docs/guides/tito-interface.md.
+      tito_reject_root_reasons: []  # Gym root reasons that fail a call instead of re-rendering its history from text, e.g. [no_prefix_match].
       http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
       http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false

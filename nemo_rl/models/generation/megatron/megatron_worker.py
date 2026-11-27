@@ -77,6 +77,7 @@ from torch.distributed.distributed_c10d import (
     _world,
 )
 
+from nemo_rl.models.generation.tito import qualify_bridge
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1145,6 +1146,18 @@ class MegatronGenerationMixin:
         # generation-only worker. A trainer in this process attached first and
         # keeps its segment: TQ reuses a process's existing client.
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        generation_cfg = self.cfg["generation"]
+        bridge = bool(generation_cfg["mcore_generation_config"].get("tito_interface"))
+        if bridge:
+            qualify_bridge(
+                tokenizer=self.tokenizer,
+                chat_template=None,
+                template_kwargs={},
+                turn_close_token_ids={
+                    self.tokenizer.eos_token_id,
+                    *(generation_cfg["stop_token_ids"] or ()),
+                },
+            )
         # MInf emits float32 pixels and the trainer casts them to the vision
         # encoder's weight dtype before encoding, so the stager casts first and
         # the media column is pinned to that dtype (the rule vLLM follows).
@@ -1154,7 +1167,8 @@ class MegatronGenerationMixin:
                 dp_client,
                 staging_partition=staging_partition,
                 capture_media=capture_media,
-            )
+            ),
+            bridge=bridge,
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer

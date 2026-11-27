@@ -65,8 +65,15 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
-    # Opt-in incremental rendering for source-history capture. None keeps native preprocessing.
+    # Serve the token-in/token-out route and bridge chat continuations onto
+    # their captured parent's tokens. See docs/guides/tito-interface.md.
+    tito_interface: NotRequired[bool]
+    # Model family whose appended messages are tokenized without rendering the
+    # history. Requires tito_interface; None bridges every continuation.
     tito_model: NotRequired[Literal["qwen3"] | None]
+    # Gym root reasons that fail a call instead of re-rendering its history from
+    # text. Requires tito_interface; first_call cannot be rejected.
+    tito_reject_root_reasons: NotRequired[list[str]]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
@@ -363,9 +370,23 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     if tito_model is not None:
         if tito_model != "qwen3":
             raise ValueError("vllm_cfg.tito_model must be null or qwen3")
+        if not vllm_cfg.get("tito_interface"):
+            raise ValueError("vllm_cfg.tito_model requires vllm_cfg.tito_interface")
+    if vllm_cfg.get("tito_interface"):
         if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
             raise ValueError(
-                "vllm_cfg.tito_model requires async_engine and expose_http_server"
+                "vllm_cfg.tito_interface requires async_engine and expose_http_server"
+            )
+    reject_root_reasons = vllm_cfg.get("tito_reject_root_reasons")
+    if reject_root_reasons:
+        if not vllm_cfg.get("tito_interface"):
+            raise ValueError(
+                "vllm_cfg.tito_reject_root_reasons requires vllm_cfg.tito_interface"
+            )
+        if "first_call" in reject_root_reasons:
+            raise ValueError(
+                "vllm_cfg.tito_reject_root_reasons cannot contain first_call: every "
+                "rollout starts with one"
             )
     api_server_count = vllm_cfg.get("http_api_server_count", 1)
     if api_server_count < 1:

@@ -67,6 +67,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     expose_http_server: bool
     http_server_num_replicas: NotRequired[int]
+    # Continue a captured chat request with the shared token bridge instead of
+    # the prefix splice. See docs/guides/tito-interface.md.
+    tito_interface: NotRequired[bool]
     parsers: list[str]
     buffer_size_gb: int
     block_size_tokens: int

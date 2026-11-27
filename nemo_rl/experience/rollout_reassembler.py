@@ -1012,6 +1012,29 @@ class RolloutReassembler:
                 len(manifest_rows) - token_in_calls
             )
             metrics["finalize/token_in_rate"] = token_in_calls / len(manifest_rows)
+            # Which reason started each text root: only first_call is expected
+            # on every rollout. Derived from Gym's type so a new reason gets a
+            # bucket automatically.
+            from typing import get_args
+
+            from nemo_gym.token_id_capture.staging.records import RootReason
+
+            root_reasons = Counter(
+                record.get("root_reason") for record in manifest_rows
+            )
+            for reason in get_args(RootReason):
+                metrics[f"finalize/root_reason_{reason}_count"] = float(
+                    root_reasons[reason]
+                )
+            # A root after the first call re-rendered its whole history from
+            # text, so its length bounds the tokens that could have shifted.
+            metrics["finalize/rerooted_tokens"] = float(
+                sum(
+                    record["delta_len"]
+                    for record in manifest_rows
+                    if record.get("root_reason") not in (None, "first_call")
+                )
+            )
         metrics["finalize/capture_poisoned_rollouts"] = float(
             sum(
                 1

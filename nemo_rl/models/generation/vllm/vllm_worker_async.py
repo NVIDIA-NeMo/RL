@@ -126,6 +126,21 @@ from nemo_rl.models.generation.vllm.generation_cut_route import (
 )
 from nemo_rl.models.generation.vllm.progress_reader import VllmProgressReader
 from nemo_rl.models.generation.capture_context import decide_capture_input
+from nemo_rl.models.generation.tito import (
+    INCREMENTAL_TOKENIZERS,
+    TitoRootRejected,
+    bridge_suffix,
+    qualify_bridge,
+    qualify_incremental_tokenizer,
+)
+from nemo_rl.models.generation.vllm.tito import (
+    REUSED_PROMPT_FIELD,
+    plan_incremental_continuation,
+)
+from nemo_rl.models.generation.vllm.tito_route import (
+    register_tito_route,
+    resolve_tito_parent,
+)
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
@@ -903,6 +918,13 @@ class VllmAsyncGenerationWorkerImpl(
             raise ValueError(
                 "Multiple HTTP API servers do not support generation-prefix cuts"
             )
+        if self.cfg["vllm_cfg"].get("tito_interface") and (
+            capture_media or top_logprobs or generation_prefix_cuts_enabled
+        ):
+            raise ValueError(
+                "vllm_cfg.tito_interface does not support media capture, sampler "
+                "top-k capture or generation-prefix cuts"
+            )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -1639,6 +1661,35 @@ class VllmAsyncGenerationWorkerImpl(
         if isinstance(generation_eos_token_ids, int):
             generation_eos_token_ids = [generation_eos_token_ids]
         model_stop_token_ids |= set(generation_eos_token_ids or ())
+        tito_interface = bool(self.cfg["vllm_cfg"].get("tito_interface"))
+        tito_model = self.cfg["vllm_cfg"].get("tito_model")
+        incremental_tokenizer = (
+            INCREMENTAL_TOKENIZERS[tito_model] if tito_model is not None else None
+        )
+        tito_reject_root_reasons = frozenset(
+            self.cfg["vllm_cfg"].get("tito_reject_root_reasons") or ()
+        )
+        if tito_reject_root_reasons:
+            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+            from typing import get_args
+
+            from nemo_gym.token_id_capture.staging.records import RootReason
+
+            unknown = tito_reject_root_reasons - set(get_args(RootReason))
+            if unknown:
+                raise ValueError(
+                    "vllm_cfg.tito_reject_root_reasons names unknown Gym root "
+                    f"reasons: {sorted(unknown)}"
+                )
+        if tito_interface:
+            if type(engine_client.renderer) is not HfRenderer:
+                raise ValueError(
+                    "vllm_cfg.tito_interface requires vLLM's Hugging Face renderer"
+                )
+            # Every stop token ends a turn, as the prefix splice assumes.
+            turn_close_token_ids = model_stop_token_ids | {
+                engine_client.renderer.get_tokenizer().eos_token_id
+            }
         base_model_paths = [
             BaseModelPath(
                 name=model_config.served_model_name, model_path=model_config.model
@@ -1687,6 +1738,12 @@ class VllmAsyncGenerationWorkerImpl(
                 self, request, request_max_tokens: int, prompt_token_ids: list[int]
             ) -> None:
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = self._remaining_context(prompt_token_ids)
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
+            def _remaining_context(self, prompt_token_ids: list[int]) -> int:
+                """Return the room left for output tokens, rejecting a full context."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
                     # preserve the literal "context length" in this message to match Gym's overflow handling
@@ -1701,8 +1758,7 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="input_tokens",
                         value=len(prompt_token_ids),
                     )
-                max_tokens = min(request_max_tokens, remaining)
-                self._set_max_tokens(request, max_tokens)
+                return remaining
 
             # vLLM 0.25 moved chat preprocessing to
             # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
@@ -1757,52 +1813,22 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 if single_tool_call:
                     request.parallel_tool_calls = None
+                incremental = None
                 try:
-                    if worker_self.cfg["vllm_cfg"].get("tito_model") is not None:
-                        # Optional path: preserve the native renderer when disabled.
-                        from nemo_rl.models.generation.vllm.tito import (
-                            preprocess_captured_tito,
-                        )
-
-                        incremental = await preprocess_captured_tito(
-                            model=worker_self.cfg["vllm_cfg"]["tito_model"],
+                    if incremental_tokenizer is not None:
+                        incremental = await plan_incremental_continuation(
+                            incremental_tokenizer=incremental_tokenizer,
+                            tokenizer=self.renderer.get_tokenizer(),
                             worker=worker_self,
-                            online_renderer=self,
                             request=request,
                             messages=messages_for_replace_prefix_tokens,
-                            default_template=default_template,
-                            default_template_content_format=default_template_content_format,
                             default_template_kwargs=default_template_kwargs,
-                            tool_dicts=tool_dicts,
-                            parser=parser,
-                            skip_mm_cache=skip_mm_cache,
                         )
-                        if incremental.continuation is not None:
-                            res = incremental.preprocessed
-                            continuation = incremental.continuation
-                            prompt_ids = res[1][0]["prompt_token_ids"]
-                            if actual_request_max_tokens is not None:
-                                self._clamp_max_tokens(
-                                    request, actual_request_max_tokens, prompt_ids
-                                )
-                            media = await asyncio.to_thread(
-                                worker_self._capture_request_media,
-                                res[1][0],
-                                admission=continuation.decision.serving,
-                                verify_retained_media=continuation.decision.verify_retained_media,
-                            )
-                            worker_self._enter_request_prefix(
-                                request, continuation.prefix_token_ids
-                            )
-                            worker_self._begin_request_capture(
-                                request,
-                                prompt_ids,
-                                admission=continuation.decision.storage,
-                                prefix_token_ids=continuation.prefix_token_ids,
-                                media=media,
-                            )
-                            return res
-
+                    if incremental is not None:
+                        # vLLM feeds these IDs to the engine instead of rendering.
+                        request.kv_transfer_params = {
+                            REUSED_PROMPT_FIELD: incremental.prompt_token_ids
+                        }
                     res = await super().preprocess_chat(
                         request=request,
                         messages=messages,
@@ -1824,6 +1850,8 @@ class VllmAsyncGenerationWorkerImpl(
                 finally:
                     if single_tool_call:
                         request.parallel_tool_calls = False
+                    if incremental is not None:
+                        request.kv_transfer_params = None
 
                 # Token capture: build the admission once, before branching,
                 # and resolve its prefix from it (staging_chain -> cached TQ
@@ -1837,29 +1865,94 @@ class VllmAsyncGenerationWorkerImpl(
                 admission = worker_self._capture_admission(request)
                 serving_admission = admission
                 verify_retained_media = False
+                requested_admission = admission
                 if admission is not None and (
                     admission.mode == "candidate"
                     or admission.request_replay is not None
                 ):
                     # Inline assistant token fields cannot override RL's decision.
                     request.required_prefix_token_ids = None
-                    decision = decide_capture_input(
-                        admission,
-                        messages=messages_for_replace_prefix_tokens,
-                        # HF/string parsing maps null and empty tool content to
-                        # identical template inputs. Structured content and
-                        # other renderers cannot authorize that equivalence.
-                        allow_empty_tool_content=(
-                            type(self.renderer) is HfRenderer
-                            and bool(res[0])
-                            and all(
-                                isinstance(item.get("content"), str) for item in res[0]
-                            )
-                        ),
+                    decision = (
+                        incremental.decision
+                        if incremental is not None
+                        else decide_capture_input(
+                            admission,
+                            messages=messages_for_replace_prefix_tokens,
+                            # HF/string parsing maps null and empty tool content to
+                            # identical template inputs. Structured content and
+                            # other renderers cannot authorize that equivalence.
+                            allow_empty_tool_content=(
+                                type(self.renderer) is HfRenderer
+                                and bool(res[0])
+                                and all(
+                                    isinstance(item.get("content"), str)
+                                    for item in res[0]
+                                )
+                            ),
+                        )
                     )
                     admission = decision.storage
                     serving_admission = decision.serving
                     verify_retained_media = decision.verify_retained_media
+                if tito_interface:
+                    root_reason = None
+                    if requested_admission is not None:
+                        root_reason = requested_admission.root_reason
+                        if (
+                            requested_admission.mode == "candidate"
+                            and admission.mode == "text"
+                        ):
+                            root_reason = "worker_rooted"
+                    # A measuring request generates nothing, so it is not refused.
+                    if root_reason in tito_reject_root_reasons and not getattr(
+                        request, "ng_measure_only", False
+                    ):
+                        raise TitoRootRejected(root_reason)
+                    engine_prompt = res[1][0]
+                    if engine_prompt.get("mm_placeholders"):
+                        raise VLLMValidationError(
+                            "The token-in/token-out interface does not support "
+                            "multimodal prompts",
+                            parameter="messages",
+                        )
+                    token_ids = engine_prompt["prompt_token_ids"]
+                    if incremental is not None:
+                        parent = incremental.parent_token_ids
+                        prompt_ids = incremental.prompt_token_ids
+                        if token_ids != prompt_ids:
+                            raise RuntimeError(
+                                "vLLM rendered a chat request instead of using "
+                                "the prompt token IDs that vllm_cfg.tito_model "
+                                "built for it; unset vllm_cfg.tito_model"
+                            )
+                        # vLLM checks the context length of rendered prompts only.
+                        self._remaining_context(prompt_ids)
+                    else:
+                        if admission is None:
+                            parent = list(request.required_prefix_token_ids or ())
+                        else:
+                            admission, parent = await resolve_tito_parent(
+                                worker_self, admission
+                            )
+                        if parent:
+                            token_ids = bridge_suffix(
+                                parent_token_ids=parent,
+                                rendered_token_ids=token_ids,
+                                turn_close_token_ids=turn_close_token_ids,
+                            )
+                        prompt_ids = parent + token_ids
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request, actual_request_max_tokens, prompt_ids
+                        )
+                    engine_prompt["prompt_token_ids"] = prompt_ids
+                    worker_self._begin_request_capture(
+                        request,
+                        prompt_ids,
+                        admission=admission,
+                        prefix_token_ids=parent or None,
+                    )
+                    return res
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
                 resumed_generation_token_ids: list[int] = []
@@ -2337,6 +2430,45 @@ class VllmAsyncGenerationWorkerImpl(
         default_chat_template_kwargs: dict[str, Any] = (
             serving_chat_kwargs["default_chat_template_kwargs"] or {}
         )
+        if tito_interface:
+            if self._return_routed_experts_enabled():
+                raise ValueError(
+                    "vllm_cfg.tito_interface does not support returning routed experts"
+                )
+            from vllm.renderers.hf import (
+                resolve_chat_template,
+                resolve_chat_template_content_format,
+            )
+
+            tito_tokenizer = engine_client.renderer.get_tokenizer()
+            tito_template = resolve_chat_template(
+                tito_tokenizer,
+                chat_template=serving_chat_kwargs["chat_template"],
+                tools=None,
+                model_config=engine_client.model_config,
+            )
+            qualify_bridge(
+                tokenizer=tito_tokenizer,
+                chat_template=tito_template,
+                template_kwargs=default_chat_template_kwargs,
+                turn_close_token_ids=turn_close_token_ids,
+            )
+            if tito_model is not None:
+                qualify_incremental_tokenizer(
+                    tito_model, tokenizer=tito_tokenizer, chat_template=tito_template
+                )
+                content_format = resolve_chat_template_content_format(
+                    chat_template=serving_chat_kwargs["chat_template"],
+                    tools=None,
+                    given_format=serving_chat_kwargs["chat_template_content_format"],
+                    tokenizer=tito_tokenizer,
+                    model_config=engine_client.model_config,
+                )
+                if content_format != "string":
+                    raise ValueError(
+                        "vllm_cfg.tito_model requires the chat template to take "
+                        f"message content as a string, not as {content_format} parts"
+                    )
         online_renderer = NeMoRLOnlineRenderer(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
@@ -2386,6 +2518,15 @@ class VllmAsyncGenerationWorkerImpl(
                 asyncio.to_thread(
                     worker_self._abort_request_capture, request, reason=reason
                 )
+            )
+
+        if tito_interface:
+            register_tito_route(
+                app,
+                worker=worker_self,
+                engine_client=engine_client,
+                abort_request_capture=abort_request_capture,
+                reject_root_reasons=tito_reject_root_reasons,
             )
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
@@ -2462,6 +2603,20 @@ class VllmAsyncGenerationWorkerImpl(
                 LOGGER.warning(
                     "Rejected captured call before inference (%s): %s", e.code, e
                 )
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": e.code,
+                        }
+                    },
+                    status_code=400,
+                )
+            except TitoRootRejected as e:
+                # Raised before begin_call, like MediaCaptureRejected above.
+                await abort_request_capture(request, e.code)
                 return JSONResponse(
                     content={
                         "error": {

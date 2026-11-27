@@ -48,6 +48,7 @@ from nemo_rl.experience.route_assembly import (
     boundary_route_rows,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.tito import TITO_APPEND_FIELD, bridge_suffix
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 if TYPE_CHECKING:
@@ -132,9 +133,17 @@ class TQMegatronPromptPreparer:
     ``offload_params``.
     """
 
-    def __init__(self, source: TQTokenSource) -> None:
+    def __init__(self, source: TQTokenSource, *, bridge: bool) -> None:
+        """Resolve prefixes from ``source``.
+
+        Args:
+            source: Reads staged calls.
+            bridge: Continue a chat request with ``bridge_suffix`` instead of
+                ``replace_prefix_tokens``.
+        """
         # Same cached chain resolution as the vLLM worker (see ChainPrefixCache).
         self._chain_prefix = ChainPrefixCache(source)
+        self._bridge = bridge
 
     def prepare_prompt(
         self,
@@ -155,7 +164,10 @@ class TQMegatronPromptPreparer:
         endpoint's re-rendered history with ``replace_prefix_tokens``, using the
         template prefix tokens and EOS ids the endpoint placed in
         ``offload_params``; the splice metadata is skipped only when the
-        endpoint sent none and the admission has no ``staging_chain``.
+        endpoint sent none and the admission has no ``staging_chain``. A
+        token-in/token-out request sets ``ng_tito_append`` instead: its prompt
+        holds only the tokens after the parent, and the resolved prefix is
+        prepended to it.
 
         The returned ``offload_params`` copy is updated with:
 
@@ -249,7 +261,14 @@ class TQMegatronPromptPreparer:
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD
         )
         eos_token_ids = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
-        if template_prefix_token_ids is not None or eos_token_ids is not None:
+        if updated_offload_params.get(TITO_APPEND_FIELD) is True:
+            if template_prefix_token_ids is not None or eos_token_ids is not None:
+                raise ValueError(
+                    "A token-in/token-out request carries the tokens after its "
+                    "parent, not a rendered history to splice"
+                )
+            prompt = prefix_token_ids + prompt
+        elif template_prefix_token_ids is not None or eos_token_ids is not None:
             if not isinstance(template_prefix_token_ids, list) or any(
                 type(token_id) is not int for token_id in template_prefix_token_ids
             ):
@@ -262,13 +281,22 @@ class TQMegatronPromptPreparer:
                 or any(type(token_id) is not int for token_id in eos_token_ids)
             ):
                 raise ValueError("MInf capture request carries no valid EOS token ids")
-            prompt = replace_prefix_tokens(
-                tokenizer=None,
-                model_prefix_token_ids=prefix_token_ids,
-                template_prefix_token_ids=template_prefix_token_ids,
-                template_token_ids=prompt,
-                eos_token_id=eos_token_ids,
-            )
+            if self._bridge:
+                prompt = prefix_token_ids + bridge_suffix(
+                    parent_token_ids=prefix_token_ids,
+                    rendered_token_ids=prompt,
+                    turn_close_token_ids=(
+                        [eos_token_ids] if type(eos_token_ids) is int else eos_token_ids
+                    ),
+                )
+            else:
+                prompt = replace_prefix_tokens(
+                    tokenizer=None,
+                    model_prefix_token_ids=prefix_token_ids,
+                    template_prefix_token_ids=template_prefix_token_ids,
+                    template_token_ids=prompt,
+                    eos_token_id=eos_token_ids,
+                )
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"

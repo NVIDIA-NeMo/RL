@@ -329,8 +329,11 @@ policy:
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
       http_server_num_replicas: 8
+      tito_interface: false
     vllm_cfg:
       tito_model: null
+      tito_interface: false
+      tito_reject_root_reasons: []
       http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
       async_engine: false
       precision: ${policy.precision}
