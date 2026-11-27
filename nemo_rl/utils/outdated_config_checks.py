@@ -331,6 +331,16 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
+def reject_outdated_token_level_loss(loss_config: dict[str, Any]) -> None:
+    """Reject the removed loss selector and explain how to preserve its reduction."""
+    if "token_level_loss" in loss_config:
+        raise ValueError(
+            "loss_fn.token_level_loss was removed. Set loss_fn.normalization="
+            "global_token_mean for true or sequence_mean for false, and remove "
+            "token_level_loss. If its value is null, just remove the key."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -353,3 +363,6 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dynamo_backend(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)
+    loss_config = config.get("loss_fn")
+    if isinstance(loss_config, dict):
+        reject_outdated_token_level_loss(loss_config)

@@ -370,6 +370,28 @@ def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
     assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
 
 
+@pytest.mark.parametrize("forest", [False, True])
+def test_ppo_chunk_alignment_skips_group_counts_under_forest(forest: bool) -> None:
+    """Forest chunks are aligned by execution padding, not by group count."""
+    packed = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True},
+    }
+    config = MasterConfig.model_construct(
+        # Six one-row groups do not split into DP=4 shards by group count.
+        ppo=PPOConfig(num_prompts_per_step=6, num_generations_per_prompt=1),
+        policy=packed,
+        value=packed,
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=4),
+        token_capture=TokenCaptureConfig.model_construct(forest_training=forest),
+    )
+    if forest:
+        assert resolve_ppo_chunk_alignment(config, 4, 4) == (1, 2)
+    else:
+        with pytest.raises(ValueError, match="num_prompts_per_step"):
+            resolve_ppo_chunk_alignment(config, 4, 4)
+
+
 @pytest.mark.parametrize(("min_groups", "expected"), [(32, (2, 0)), (2, (2, 1))])
 def test_ppo_accepts_a_chunk_cap_that_cannot_bind(
     min_groups: int, expected: tuple[int, int]
@@ -4070,13 +4092,13 @@ class _NoOpValue:
         self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
-    def begin_train_step(self, loss_fn) -> None:
+    def begin_train_step(self, loss_fn, **kwargs) -> None:
         self._record("begin_train_step")
 
     def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         self._record("train_microbatches_from_meta")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_sample_ids.append(meta.sample_ids)
         self._record("train_from_meta")
         return {
@@ -4625,9 +4647,9 @@ class _StreamingPPOValue(_NoOpValue):
         assert not self.inference_prepared
         super().prepare_for_training()
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
         self.trained_metas.append(meta)
-        return super().train_from_meta(meta, loss_fn)
+        return super().train_from_meta(meta, loss_fn, **kwargs)
 
 
 class _StreamingPPODataPlane(_NoOpDataPlane):
@@ -5259,6 +5281,7 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
+                token_capture=SimpleNamespace(forest_training=False),
             ),
             policy_dp,
             value_dp,
@@ -5313,6 +5336,7 @@ def test_streaming_ppo_rejects_unshardable_full_batch_during_setup(
                 policy=ctrl._master_config.policy,
                 value=ctrl._master_config.value,
                 async_rl=ctrl._async_cfg,
+                token_capture=SimpleNamespace(forest_training=False),
             ),
             8,
             4,

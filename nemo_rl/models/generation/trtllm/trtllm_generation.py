@@ -31,6 +31,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.disagg_layout import (
+    plan_engines,
+    resolve_disagg_layout,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -40,7 +44,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     replica_width,
-    resolve_disagg_layout,
     resolve_disagg_server_config,
     role_engine_config,
     role_tensor_parallel_size,
@@ -314,57 +317,20 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     def _plan_engines(self, world_size: int) -> tuple[list[str], list[int], int]:
-        r"""Per-engine ``(role, width)``, in engine order.
-
-        Without disaggregation every engine is an aggregated engine of
-        ``tensor_parallel_size`` GPUs. Under disaggregation each replica
-        contributes its prefill engines followed by its decode engines:
-
-            [prefill_width x M, decode_width x K,   prefill_width x M, ...]
-             \_________ replica 0 __________/  \____ replica 1 ...
-
-        The replica *count* is derived, not configured: it follows from the
-        cluster size, the same way the DP-shard count does without
-        disaggregation. Same-role engines stay contiguous so each role's GPUs
-        are adjacent.
-        """
+        """Per-engine ``(role, width)`` and the replica count; see :func:`plan_engines`."""
         disagg = self._disagg_cfg
-        if not disagg.enabled:
-            assert world_size % self.tp_size == 0, (
-                f"Cluster world_size ({world_size}) must be divisible by "
-                f"TP size ({self.tp_size})."
-            )
-            n = world_size // self.tp_size
-            # Without disaggregation a replica *is* an engine: one DP shard,
-            # one URL, nothing below it to front. Reporting n rather than 1
-            # keeps "replica" meaning the same thing on both paths.
-            return ["aggregated"] * n, [self.tp_size] * n, n
-
-        prefill_tp = role_tensor_parallel_size(self.cfg, "prefill")
-        decode_tp = role_tensor_parallel_size(self.cfg, "decode")
-        for role, value in (("prefill", prefill_tp), ("decode", decode_tp)):
-            assert value >= 1, (
-                f"trtllm_cfg.{role}_engine.tensor_parallel_size must be >= 1"
-            )
-
-        num_prefill = disagg.num_prefill_engines
-        num_decode = disagg.num_decode_engines
-        assert num_prefill >= 1 and num_decode >= 1, (
-            f"a replica needs at least one engine of each role, got "
-            f"num_prefill_engines={num_prefill}, num_decode_engines={num_decode}"
+        prefill_tp = decode_tp = self.tp_size
+        if disagg.enabled:
+            prefill_tp = role_tensor_parallel_size(self.cfg, "prefill")
+            decode_tp = role_tensor_parallel_size(self.cfg, "decode")
+        return plan_engines(
+            world_size,
+            layout=disagg,
+            aggregated_width=self.tp_size,
+            prefill_width=prefill_tp,
+            decode_width=decode_tp,
+            backend_cfg_key="trtllm_cfg",
         )
-
-        width = replica_width(self.cfg)
-        assert world_size % width == 0, (
-            f"replica width {width} GPUs ({num_prefill} prefill x "
-            f"TP{prefill_tp} + {num_decode} decode x TP{decode_tp}) does not "
-            f"divide the {world_size} inference GPUs."
-        )
-        num_replicas = world_size // width
-
-        roles = (["prefill"] * num_prefill + ["decode"] * num_decode) * num_replicas
-        tps = ([prefill_tp] * num_prefill + [decode_tp] * num_decode) * num_replicas
-        return roles, tps, num_replicas
 
     def _config_with_engine_roles(
         self, node_bundle_indices: Optional[list[tuple[int, list[int]]]]
