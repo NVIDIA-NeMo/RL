@@ -157,12 +157,37 @@ def test_semantic_roles_precede_shared_spelling_and_missing_roles_are_unmapped()
 
 def test_ambiguous_role_alias_uses_compatible_exact_special_spelling():
     source = _byte_tokenizer([], [])
-    source.add_special_tokens({"eos_token": "<end>", "pad_token": "<end>"})
+    # BOS, EOS and UNK share one token, as in GPT-NeoX-style tokenizers; only the
+    # destination EOS has its spelling, so resolving by role order fails.
+    source.add_special_tokens(
+        {"bos_token": "<end>", "eos_token": "<end>", "unk_token": "<end>"}
+    )
     destination = _byte_tokenizer([], [])
-    destination.add_special_tokens({"eos_token": "<end>", "pad_token": "<pad>"})
-    subtoks, lengths = build_subtoks_table(source, destination, max_subtokens=8)
+    destination.add_special_tokens(
+        {"bos_token": "<begin>", "eos_token": "<end>", "unk_token": "<unk>"}
+    )
+    subtoks, lengths = build_subtoks_table(
+        source=source, destination=destination, max_subtokens=8
+    )
     assert lengths[source.eos_token_id].item() == 1
     assert subtoks[source.eos_token_id, 0].item() == destination.eos_token_id
+
+
+def test_specials_map_only_to_compatible_destination_specials():
+    source = _byte_tokenizer([], [])
+    source.add_special_tokens({"eos_token": "<shared>"})
+    # Special only in the backend, like Llama-3's reserved tokens.
+    source.add_tokens(["<tool>", "<think>"], special_tokens=True)
+    destination = _byte_tokenizer([], [])
+    destination.add_special_tokens({"pad_token": "<shared>"})
+    destination.add_tokens(["<think>"])
+    _, lengths = build_subtoks_table(
+        source=source, destination=destination, max_subtokens=8
+    )
+    # <shared> is EOS here but PAD there, <tool> has no destination special, and
+    # <think> is an ordinary destination token: none of them may be mapped.
+    for token in ("<shared>", "<tool>", "<think>"):
+        assert lengths[source.convert_tokens_to_ids(token)].item() == 0, token
 
 
 def test_ordinary_added_token_cannot_become_a_semantic_special():
