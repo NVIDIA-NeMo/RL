@@ -63,6 +63,13 @@ policy:
     deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
+    # Pipeline parallel size. Values > 1 need the `pipeline` block below and an
+    # explicit defer_fsdp_grad_sync (false is recommended), and do not support
+    # sequence packing, dynamic batching, LoRA, or non-colocated generation.
+    # See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: 1
+    # pipeline:  # 1F1B schedule, one stage per pipeline rank
+    #   microbatches_per_step: 8  # Required. Microbatches per schedule call; >= pipeline_parallel_size
     # HSDP replicate dimension size for Automodel.
     # Typically set to the number of nodes; set to 1 to disable HSDP.
     dp_replicate_size: 1
@@ -124,6 +131,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
@@ -134,6 +142,8 @@ policy:
     manual_gc: false
     manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -181,6 +191,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
     moe_enable_deepep: false

@@ -528,6 +528,28 @@ def test_custom_environment_variables_override_existing(
     worker_group.shutdown(force=True)
 
 
+def test_excluded_driver_environment_variables_are_not_forwarded(
+    register_test_actor, virtual_cluster, monkeypatch
+):
+    """Test that NRL_WORKER_ENV_EXCLUDE drops both driver values and explicit env_vars."""
+    monkeypatch.setenv("DUMMY_DRIVER_ONLY", "driver_value")
+    monkeypatch.setenv("DUMMY_EXPLICIT", "driver_value")
+    monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", "DUMMY_DRIVER_ONLY,DUMMY_EXPLICIT")
+
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=RayWorkerBuilder(register_test_actor),
+        workers_per_node=1,
+        env_vars={"DUMMY_EXPLICIT": "explicit_value"},
+    )
+    worker = worker_group.workers[0]
+
+    assert ray.get(worker.get_env_var.remote("DUMMY_DRIVER_ONLY")) is None
+    assert ray.get(worker.get_env_var.remote("DUMMY_EXPLICIT")) is None
+
+    worker_group.shutdown(force=True)
+
+
 def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     builder = RayWorkerBuilder(actor_fqn)
@@ -1374,3 +1396,28 @@ def test_environment_variable_precedence_full(
                 os.environ[key] = original_env[key]
             else:
                 os.environ.pop(key, None)
+
+
+def test_large_init_args_reach_every_worker_through_the_object_store(
+    register_test_actor, virtual_cluster_4_bundles
+):
+    """Constructor arguments are shared through the object store and still arrive as values."""
+    big_arg = b"a" * (2 << 20)
+    big_kwarg = "k" * (2 << 20)
+    builder = RayWorkerBuilder(register_test_actor, big_arg, small=1, big=big_kwarg)
+    sharding = NamedSharding(layout=[[0, 1], [2, 3]], names=["dp", "tp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster_4_bundles,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    try:
+        assert len(worker_group._initializer_pool) == 2
+        for worker in worker_group.workers:
+            args, kwargs = ray.get(worker.get_init_args_kwargs.remote())
+            assert args == (big_arg,)
+            assert kwargs["big"] == big_kwarg
+            assert kwargs["small"] == 1
+    finally:
+        worker_group.shutdown(force=True)

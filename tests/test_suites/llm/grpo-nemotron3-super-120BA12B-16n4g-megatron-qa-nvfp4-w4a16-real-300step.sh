@@ -39,7 +39,7 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 
 # Real-quant rollout must go through the ModelOpt NVFP4 vLLM kernel path.
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
+grep -q "quantization=nemo_modelopt_" "$RUN_LOG"
 grep -qE "quantization=(nemo_)?modelopt" "$RUN_LOG"  # vLLM 0.25 logs the registered NeMo quant name (e.g. nemo_modelopt_w4a16_nvfp4)
 grep -q "nvfp4_experts_weightonly.yaml" "$RUN_LOG"
 assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
@@ -49,7 +49,7 @@ assert_not_grep "VLLM_QUANT_CFG" "$RUN_LOG" \
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'data["train/num_valid_samples"]["1"] >= 64' \
-    'data["train/reward"]["1"] >= 0.4' \
+    'data["train/unfiltered_reward"]["1"] >= 0.4' \
     'data["train/gen_kl_error"]["1"] < 0.03' \
     'data["train/token_mult_prob_error"]["1"] < 1.05' \
     'data["validation/accuracy"]["1"] >= 0.5'

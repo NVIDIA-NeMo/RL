@@ -18,7 +18,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional, cast
 
 import numpy as np
 import torch
@@ -45,7 +45,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -245,6 +245,30 @@ def _validate_direct_megatron_sft_setup(
         )
 
 
+def _validate_automodel_pipeline_sft_setup(master_config: MasterConfig) -> None:
+    """Reject SFT settings a pipeline-parallel Automodel policy cannot run.
+
+    Pipeline stage buffers are sized for policy.train_micro_batch_size, so
+    validation must run microbatches of the same size.
+    """
+    policy_config = master_config.policy
+    automodel_cfg = policy_config.get("automodel_cfg")
+    if automodel_cfg is None or not automodel_cfg["enabled"]:
+        return
+    if cast(AutomodelConfig, automodel_cfg)["pipeline_parallel_size"] == 1:
+        return
+    if (
+        master_config.sft.val_micro_batch_size
+        != policy_config["train_micro_batch_size"]
+    ):
+        raise ValueError(
+            "policy.automodel_cfg.pipeline_parallel_size > 1 requires "
+            "sft.val_micro_batch_size to equal policy.train_micro_batch_size; got "
+            f"{master_config.sft.val_micro_batch_size} and "
+            f"{policy_config['train_micro_batch_size']}."
+        )
+
+
 def _build_sft_collate_fn(
     policy_config: PolicyConfig,
 ) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
@@ -317,8 +341,9 @@ def setup(
         val_dataset,
         loss_fn,
     )
+    _validate_automodel_pipeline_sft_setup(master_config)
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -662,7 +687,7 @@ def sft_train(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -699,7 +724,7 @@ def sft_train(
 
     policy.prepare_for_training()
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         current_epoch < max_num_epochs and total_steps < master_config.sft.max_num_steps
@@ -805,8 +830,7 @@ def sft_train(
                 timeout.mark_iteration()
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -816,7 +840,7 @@ def sft_train(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     sft_save_state.step = (current_step + 1) % len(train_dataloader)
@@ -824,7 +848,7 @@ def sft_train(
                     sft_save_state.epoch = current_epoch
                     sft_save_state.total_valid_tokens = total_valid_tokens
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics

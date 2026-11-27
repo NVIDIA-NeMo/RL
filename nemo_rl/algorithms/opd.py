@@ -33,6 +33,7 @@ import torch
 from pydantic import BaseModel, Field, model_validator
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -45,6 +46,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_attribution_key
 
 if TYPE_CHECKING:
     # Imported for typing only: teacher_worker_group imports this module's
@@ -276,18 +278,12 @@ def opd_full_teacher_checkpoints_by_index(
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
-    Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass. GRPO can
-    also evaluate that threshold in the training loss without this pass.
+    ``force_on_policy_ratio`` with no ``seq_logprob_error_threshold`` skips the
+    student logprob pass. GRPO can also evaluate that threshold in the training
+    loss without this pass.
     """
-    force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-    seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(
-        force_on_policy_ratio
-        and (
-            seq_logprob_error_threshold is None
-            or master_config.loss_fn.seq_logprob_error_in_loss
-        )
+    return skips_policy_logprob_pass(
+        master_config.loss_fn, master_config.grpo.seq_logprob_error_threshold
     )
 
 
@@ -333,19 +329,20 @@ def assert_trust_region_supported(master_config: Any) -> None:
 
 
 def resolve_reference_aliases(
-    agent_refs: list[dict],
+    agent_refs: list[dict] | list[str],
     teacher_model_by_agent_name: dict[str, str],
     default_teacher_alias: Optional[str] = None,
     strict_agent_name_match: bool = False,
 ) -> list[str]:
-    """Map each agent_ref to a teacher alias.
+    """Map attribution keys or legacy agent references to teacher aliases.
 
-    Unmapped agents fall back to ``default_teacher_alias``; with
-    ``strict_agent_name_match`` an unmapped agent raises instead.
+    Keys are tasksets for materialized tasks and resolved agent names for flat
+    rows. Unmapped keys fall back to ``default_teacher_alias``; with
+    ``strict_agent_name_match`` an unmapped key raises instead.
     """
     aliases: list[str] = []
     for ref in agent_refs:
-        name = ref["name"]
+        name = ref if isinstance(ref, str) else ref["name"]
         if name in teacher_model_by_agent_name:
             aliases.append(name)
         elif strict_agent_name_match:
@@ -448,15 +445,15 @@ class TQTeacherLogprobCoordinator:
     def _resolve_teacher(
         self, extra_env_info: Optional[dict[str, Any]]
     ) -> tuple[str, str]:
-        agent_ref = (
-            extra_env_info.get("agent_ref")
+        attribution_key = (
+            get_nemo_gym_attribution_key(extra_env_info)
             if isinstance(extra_env_info, dict)
             else None
         )
-        if not isinstance(agent_ref, dict):
+        if attribution_key is None:
             raise ValueError(
                 "on_policy_distillation is enabled but this prompt group has no "
-                "extra_env_info['agent_ref'] mapping to route it to a teacher. "
+                "NeMo-Gym attribution key to route it to a teacher. "
                 "SingleController MOPD requires the NeMo-Gym rollout path, and "
                 "regenerating this prompt cannot repair missing routing metadata."
             )
@@ -465,7 +462,7 @@ class TQTeacherLogprobCoordinator:
             self._opd_cfg.get("teacher_model_by_agent_name", {})
         )
         alias = resolve_reference_aliases(
-            [agent_ref],
+            [attribution_key],
             teacher_model_by_agent_name,
             default_teacher_alias=self._opd_cfg.get("default_teacher_alias"),
             strict_agent_name_match=bool(

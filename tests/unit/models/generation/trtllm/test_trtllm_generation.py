@@ -21,14 +21,15 @@ import torch
 from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.models.generation.trtllm import trtllm_generation
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmDisaggServerConfig,
     replica_width,
-    resolve_disagg_layout,
     resolve_disagg_server_config,
     resolve_role_overrides,
+    role_engine_config,
 )
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
@@ -99,9 +100,14 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
 
 
 @pytest.mark.parametrize(
-    ("cluster", "config_update", "error"),
+    ("cluster", "config_update", "exc", "error"),
     [
-        (_Cluster(world_size=3), {"tensor_parallel_size": 2}, "must be divisible"),
+        (
+            _Cluster(world_size=3),
+            {"tensor_parallel_size": 2},
+            ValueError,
+            "must be divisible",
+        ),
         (
             _Cluster(world_size=4),
             {
@@ -109,20 +115,27 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
                 "moe_tensor_parallel_size": 2,
                 "moe_expert_parallel_size": 1,
             },
+            AssertionError,
             "must equal tensor_parallel_size",
         ),
-        (_Cluster(), {"async_engine": False}, "requires trtllm_cfg.async_engine=true"),
+        (
+            _Cluster(),
+            {"async_engine": False},
+            AssertionError,
+            "requires trtllm_cfg.async_engine=true",
+        ),
         (
             _Cluster(world_size=4, gpus_per_node=2),
             {"tensor_parallel_size": 4},
+            AssertionError,
             "only supported for non-colocated",
         ),
     ],
 )
 def test_invalid_async_engine_configuration_fails_before_worker_start(
-    cluster, config_update, error
+    cluster, config_update, exc, error
 ):
-    with pytest.raises(AssertionError, match=error):
+    with pytest.raises(exc, match=error):
         TrtllmGeneration(cluster, _config(**config_update))
 
 
@@ -409,22 +422,10 @@ def test_ipc_refit_and_missing_worker_group():
 def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
     # Absent and present-but-empty must agree: every default lives on the model,
     # so no consumer has to re-derive one per key.
-    for raw in (None, {}):
-        cfg = _config(disaggregation=raw) if raw is not None else _config()
-        layout = resolve_disagg_layout(cfg)
-        assert layout.enabled is False
-        assert layout.num_prefill_engines == 1
-        assert layout.num_decode_engines == 1
-        assert layout.num_frontend_workers == 1
-        assert layout.frontend_tokenize is False
-        assert layout.frontend_base_port == 8300
-
-        server = resolve_disagg_server_config(cfg)
-        assert server.ctx_router == "conversation"
-        assert server.gen_router == "load_balancing"
-        assert server.gen_tokids_ctxbytes is False
-        assert server.gen_strip_message_history is False
-
+    absent, empty = _config(), _config(disaggregation={}, disagg_server={})
+    assert resolve_disagg_layout(absent) == resolve_disagg_layout(empty)
+    assert resolve_disagg_server_config(absent) == resolve_disagg_server_config(empty)
+    for cfg in (absent, empty):
         assert "prefill_engine" not in cfg["trtllm_cfg"]
 
 
@@ -549,7 +550,27 @@ def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
     generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
     generation._disagg_cfg = resolve_disagg_layout(cfg)
 
-    with pytest.raises(AssertionError, match="replica width 3 GPUs"):
+    with pytest.raises(ValueError, match="replica width 3 GPUs"):
+        generation._plan_engines(8)
+
+
+@pytest.mark.parametrize(("num_prefill", "num_decode"), [(0, 1), (1, 0), (0, 0)])
+def test_plan_engines_rejects_a_replica_without_both_roles(num_prefill, num_decode):
+    cfg = resolve_role_overrides(
+        _config(
+            disaggregation={
+                "enabled": True,
+                "num_prefill_engines": num_prefill,
+                "num_decode_engines": num_decode,
+            },
+        )
+    )
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg_cfg = resolve_disagg_layout(cfg)
+
+    with pytest.raises(ValueError, match="at least one engine of each role"):
         generation._plan_engines(8)
 
 
@@ -644,3 +665,46 @@ def test_role_blocks_are_left_as_written_without_disaggregation(disaggregation):
     cfg = _config(disaggregation=disaggregation, prefill_engine={"precision": "x"})
 
     assert resolve_role_overrides(cfg) is cfg
+
+
+class _LoadFormatTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+
+def test_configure_generation_config_selects_trtllm_load_format() -> None:
+    """Training starts on dummy weights; the initial refit supplies the real ones."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    training = configure_generation_config(_config(), _LoadFormatTokenizer())
+    assert training["trtllm_cfg"]["load_format"] == "dummy"
+
+    evaluation = configure_generation_config(
+        _config(), _LoadFormatTokenizer(), is_eval=True
+    )
+    assert evaluation["trtllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_forces_dummy_for_fp8() -> None:
+    """An FP8 engine has no loadable checkpoint: the BF16 refit builds its weights."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    for is_eval in (False, True):
+        configured = configure_generation_config(
+            _config(precision="fp8"), _LoadFormatTokenizer(), is_eval=is_eval
+        )
+        assert configured["trtllm_cfg"]["load_format"] == "dummy"
+
+
+@pytest.mark.parametrize("precision", ["bf16", "fp8"])
+def test_configure_generation_config_load_format_reaches_both_disagg_engines(
+    precision,
+) -> None:
+    """Both role blocks are copied from the shared block, so they must inherit it."""
+    from nemo_rl.models.generation import configure_generation_config
+
+    configured = configure_generation_config(
+        _disagg_config(precision=precision), _LoadFormatTokenizer()
+    )
+    for role in ("prefill", "decode"):
+        assert role_engine_config(configured, role)["load_format"] == "dummy"

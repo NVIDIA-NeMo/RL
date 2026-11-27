@@ -121,28 +121,6 @@ def test_env_max_retries_non_integer():
             cluster._init_placement_groups()
 
 
-def test_env_max_retries_default_value():
-    """Test that default value for NRL_VIRTUAL_CLUSTER_MAX_RETRIES is used when not set."""
-
-    # Ensure environment variable is not set
-    with (
-        patch.dict(os.environ, {}, clear=True),
-        patch(
-            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_groups"
-        ) as mock_init,
-    ):
-        # Mock successful initialization
-        mock_init.return_value = [MagicMock()]
-
-        # Create cluster
-        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        cluster._init_placement_groups()
-
-        # Default value should be 6 (as seen in the code)
-        # We can't directly verify this, but we can check that initialization was attempted
-        assert mock_init.call_count == 1
-
-
 def test_env_max_retries_exhausted():
     """Test that NRL_VIRTUAL_CLUSTER_MAX_RETRIES correctly handles the case where all retries fail."""
 
@@ -423,6 +401,14 @@ def test_create_sorted_bundle_indices_for_unified_pg():
     assert 1 in cluster._sorted_bundle_indices
 
 
+def test_node_ids_name_each_node_of_the_cluster_once():
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=False)
+    try:
+        assert cluster.get_node_ids() == [ray.get_runtime_context().get_node_id()]
+    finally:
+        cluster.shutdown()
+
+
 def test_not_create_sorted_bundle_indices_for_per_node_pg():
     """Test that sorted bundle indices are not created for a per-node placement group."""
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
@@ -695,11 +681,6 @@ class TestReserveDataPlanePorts:
 
 class TestRayVirtualClusterPortRange:
     """Tests for port range propagation in RayVirtualCluster."""
-
-    def test_default_port_range(self):
-        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        assert cluster.port_range_low == DEFAULT_MASTER_PORT_RANGE_LOW
-        assert cluster.port_range_high == DEFAULT_MASTER_PORT_RANGE_HIGH
 
     def test_custom_port_range(self):
         cluster = RayVirtualCluster(

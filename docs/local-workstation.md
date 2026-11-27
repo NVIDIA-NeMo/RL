@@ -22,8 +22,7 @@ To have more precise control over the GPUs Ray uses locally, please use `CUDA_VI
 CUDA_VISIBLE_DEVICES=0,3 uv run examples/run_grpo.py
 ```
 
-We also allow multiple colocated local clusters, which are uniquely identified by the values in
-`CUDA_VISIBLE_DEVICES`. Concretely:
+We also allow multiple colocated local clusters, which are uniquely identified by the values in `CUDA_VISIBLE_DEVICES`. Concretely:
 
 ```sh
 # (1) Start a fresh cluster on GPU=0

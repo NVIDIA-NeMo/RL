@@ -39,6 +39,7 @@ from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
+    driver_env_for_workers,
 )
 
 
@@ -64,6 +65,28 @@ def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
     )
 
 
+def _share_arguments(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Put each top-level argument in the object store once and return ObjectRefs in its place.
+
+    Every initializer then gets a small ObjectRef instead of its own pickled copy (the tokenizer is megabytes and
+    slow to pickle). Ray resolves top-level ObjectRef arguments before an actor's ``__init__`` runs, so the
+    receiving code sees the original values, and it keeps each object alive until those actors are created, so the
+    refs need not be kept. ``ray.put`` pickles inside Ray, so an actor handle in an argument (the ``RayQueue``) is
+    still freed normally.
+    """
+
+    def share(value: Any) -> Any:
+        # ray.put rejects an ObjectRef; pass it as before and Ray resolves it.
+        return value if isinstance(value, ray.ObjectRef) else ray.put(value)
+
+    return (
+        tuple(share(value) for value in args),
+        {key: share(value) for key, value in kwargs.items()},
+    )
+
+
 def _check_dp_leader_worker_indices(
     requested: list[int], tied_group_leaders: list[int]
 ) -> None:
@@ -84,10 +107,11 @@ def _check_dp_leader_worker_indices(
 
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
+    driver_env = driver_env_for_workers()
     initializer_env_vars = {
-        key: env_vars[key] if key in env_vars else os.environ[key]
+        key: env_vars[key] if key in env_vars else driver_env[key]
         for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
-        if key in env_vars or key in os.environ
+        if key in env_vars or key in driver_env
     }
 
     return add_hf_modules_cache_to_pythonpath(initializer_env_vars)
@@ -534,6 +558,10 @@ class RayWorkerGroup:
             if k not in env_vars:
                 env_vars[k] = v
 
+        # Excluded names must retain their worker-local values.
+        for key in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(","):
+            env_vars.pop(key.strip(), None)
+
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
             remote_worker_builder.ray_actor_class_fqn
@@ -593,6 +621,10 @@ class RayWorkerGroup:
         if initializer_env_vars:
             initializer_runtime_env["env_vars"] = initializer_env_vars
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        # Put in the object store once for all initializers instead of pickled once per initializer.
+        initializer_args, initializer_kwargs = _share_arguments(
+            remote_worker_builder.args, remote_worker_builder.kwargs
+        )
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
             # sits idle after creating workers and only exists for GC lifetime.
@@ -602,8 +634,8 @@ class RayWorkerGroup:
                     runtime_env=initializer_runtime_env,
                 ).remote(
                     remote_worker_builder.ray_actor_class_fqn,
-                    *remote_worker_builder.args,
-                    **remote_worker_builder.kwargs,
+                    *initializer_args,
+                    **initializer_kwargs,
                 )
             )
 

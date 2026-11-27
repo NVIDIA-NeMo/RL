@@ -14,7 +14,7 @@ uv run examples/run_ppo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/ppo_math_1B.yaml](../../examples/configs/ppo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for gated models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for gated models.
 
 In this guide, we'll walk through how we handle:
 
@@ -36,13 +36,25 @@ The value model is the key addition in PPO compared to GRPO. It is a language mo
 
 We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that contains everything needed to run a Value model. Similar to the policy, the Value object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes coordinated so it appears like 1 GPU.
 
-The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses an architecture and tokenizer compatible with the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+
+### Multimodal PPO
+
+Multimodal PPO requires `examples/run_grpo_single_controller.py`; the legacy `examples/run_ppo.py` entrypoint does not support it.
+
+The Single-Controller path supports multimodal PPO with vLLM generation and Megatron policy/value workers. The critic must use a compatible VLM architecture and tokenizer so both workers consume the same packed media representation; its checkpoint path may differ from the policy's. Using `value.model_name: ${policy.model_name}` is the simplest compatible configuration.
+
+The validated configuration uses a Qwen2.5-VL-style wrapper with TP=2, PP=1, CP=1, and sequence packing disabled. Wrappers that self-pack inputs or slice context-parallel inputs, such as Qwen3-VL, are not yet supported by this value-worker path. See the [Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml) for a complete configuration.
+
+![CLEVR-CoGenT 100-step and MMPR-Tiny 300-step PPO versus GRPO fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
 
 ### Deployment Architectures
 
 By default, PPO uses a colocated architecture where the **policy**, **value model**, and **generation engine** share one `RayVirtualCluster`. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for the other components.
 
 PPO also supports non-colocated vLLM generation. In this mode, the policy and value model continue to time-share one training `RayVirtualCluster`, while vLLM runs on a separate inference `RayVirtualCluster` in the same Ray cluster. Updated policy weights are transferred to vLLM through the cross-cluster collective refit path.
+
+SingleController PPO can instead keep the value model on separate, resident GPUs by setting `value.dedicated: true` and `value.resources.num_nodes` to the number of full value nodes. The default is shared placement (`dedicated: false`, `num_nodes: null`). This mode requires a Megatron policy, non-colocated generation occupying full nodes, and at least one full policy node after reserving generation and value nodes. The legacy `run_ppo.py` entrypoint does not support dedicated value placement. See the [dedicated value recipe](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-math-3n8g-megatron-dedicated-value.yaml).
 
 ```yaml
 policy:
@@ -190,10 +202,7 @@ ppo:
   critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
-Each pass uses the same returns and advantage estimates computed from the initial
-rollout. Both epoch counts must be at least 1 and can be configured independently;
-the exemplar uses interpolation so the critic follows the actor unless explicitly
-overridden.
+Each pass uses the same returns and advantage estimates computed from the initial rollout. Both epoch counts must be at least 1 and can be configured independently; the exemplar uses interpolation so the critic follows the actor unless explicitly overridden.
 
 ### Critic Warmup
 
@@ -307,7 +316,7 @@ loss_fn:
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-  token_level_loss: true
+  normalization: global_token_mean
   positive_example_nll_weight: 0.0
 
 value_loss_fn:
@@ -318,6 +327,7 @@ value_loss_fn:
 **PPO-specific parameters:**
 - **`ppo.ppo_epochs`**: Number of actor training updates per rollout batch
 - **`ppo.critic_ppo_epochs`**: Number of critic training updates per rollout batch. It can differ from `ppo_epochs`; the exemplar defaults it to `${ppo.ppo_epochs}`.
+- **`ppo.value_training_mode`**: SingleController critic execution: `whole_batch` (default) trains each epoch on the assembled batch; `split` replays its chunks and performs one optimizer update per epoch. Split mode does not currently overlap critic training with policy work.
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.warm_start_value_checkpoint`**: Checkpoint step directory whose `value/` seeds the critic on a fresh run. See [Warm-Starting the Critic](#warm-starting-the-critic)
 - **`ppo.seq_logprob_error_threshold`**: Nullable sequence-level multiplicative probability-error threshold. PPO always logs sequence-level train/generation mismatch metrics; when this is set, sequences above the threshold are excluded from advantage and loss computation.

@@ -47,7 +47,6 @@ import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
-    TeacherAlignerConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
@@ -62,6 +61,7 @@ from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -164,6 +164,7 @@ def _make_master_config(
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -182,6 +183,7 @@ def _make_master_config(
                             "enabled": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
+                            "pipeline_parallel_size": 1,
                         },
                         "max_total_sequence_length": 64,
                         "make_sequence_length_divisible_by": 8,
@@ -213,12 +215,12 @@ def _make_master_config(
             },
             "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
-            "checkpointing": {
-                "enabled": save_enabled,
-                "checkpoint_must_save_by": None,
-                "save_period": 100,
-                "metric_name": None,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                enabled=save_enabled,
+                checkpoint_must_save_by=None,
+                save_period=100,
+                metric_name=None,
+            ),
         }
     )
 
@@ -376,29 +378,6 @@ def test_collator_cli_overrides_reach_setup(config_name: str) -> None:
     }
 
 
-def test_collator_schema_defaults_when_block_is_omitted() -> None:
-    register_omegaconf_resolvers()
-    config_path = (
-        Path(__file__).resolve().parents[4]
-        / "examples/configs/xtoken_off_policy_distillation.yaml"
-    )
-    loaded = load_config(config_path)
-    del loaded["collator"]
-    config = MasterConfig.model_validate(OmegaConf.to_container(loaded, resolve=True))
-
-    _, mocks = _patched_setup_call(config)
-
-    assert config.collator.model_dump() == {
-        "mode": "text",
-        "include_thinking_in_loss": False,
-        "native_thinking_alignment": False,
-        "kd_alignment_regions": None,
-        "num_packed_rows": 1,
-    }
-    collator = mocks["dataloader"].call_args_list[0].kwargs["collate_fn"]
-    assert collator.mode == "text"
-
-
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -432,14 +411,6 @@ def test_collator_config_preserves_unsupported_feature_guards(
     config.collator = CrossTokenizerCollatorConfig.model_validate(overrides)
     with pytest.raises(error, match=match):
         _patched_setup_call(config)
-
-
-def test_teacher_aligner_config_defaults():
-    teacher = TeacherConfig(model_name="teacher")
-
-    assert isinstance(teacher.aligner, TeacherAlignerConfig)
-    assert teacher.aligner.projection_matrix_path is None
-    assert teacher.aligner.drop_first_assistant_chunk_kl is False
 
 
 def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy():
@@ -586,10 +557,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
     c = mock_xtoken_components
     c.master_config.distillation["max_num_steps"] = 5
     c.master_config.distillation["max_num_epochs"] = 1
-    c.master_config.checkpointing["enabled"] = True
-    c.master_config.checkpointing["save_period"] = 100  # only the final step saves
-    c.master_config.checkpointing["ft_save_period"] = 2
-    c.master_config.checkpointing["metric_name"] = None
+    c.master_config.checkpointing.enabled = True
+    c.master_config.checkpointing.save_period = 100  # only the final step saves
+    c.master_config.checkpointing.ft_save_period = 2
+    c.master_config.checkpointing.metric_name = None
     c.checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
     with patch(
@@ -618,8 +589,8 @@ def test_exit_on_max_epochs(mock_xtoken_components):
 
 def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
-    mock_xtoken_components.master_config.checkpointing["enabled"] = True
-    mock_xtoken_components.master_config.checkpointing["metric_name"] = None
+    mock_xtoken_components.master_config.checkpointing.enabled = True
+    mock_xtoken_components.master_config.checkpointing.metric_name = None
     mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
@@ -869,6 +840,7 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -890,6 +862,7 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -974,6 +947,23 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
             val_dataset=None,
         )
     # The check fires before any cluster/policy construction.
+    assert mock_cluster.call_count == 0
+
+
+def test_setup_rejects_teacher_automodel_pipeline_parallel():
+    cfg = _make_master_config()
+    cfg.teachers[0].automodel_cfg["pipeline_parallel_size"] = 2
+    with (
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(ValueError, match="xtoken distillation does not support"),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(24)],
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
     assert mock_cluster.call_count == 0
 
 

@@ -101,6 +101,7 @@ from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
+    backend_health_metrics,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -195,8 +196,8 @@ def _apply_dynamic_sampling(
             (rewards, masks, baseline/std, …).
         pending_meta: Survivors accumulated from prior iterations.
         pending_carry: ``driver_carry`` rows aligned to ``pending_meta``.
-        pending_unfiltered_rewards: All iterations' rewards pre-filter,
-            for legacy reward metric parity.
+        pending_unfiltered_rewards: Pre-filter rewards; only the first
+            ``train_prompts_size`` rows feed the ``unfiltered_reward`` metric.
         train_prompts_size: Target batch size.
         num_gen_batches: Iteration counter (1-based).
         max_gen_batches: Upper bound on iterations before raising.
@@ -206,8 +207,8 @@ def _apply_dynamic_sampling(
         ``(pending_meta, pending_carry, pending_rewards, is_complete,
         ds_metrics, unfiltered_for_log)``.
     """
-    # Cumulative unfiltered total_reward for legacy metrics["reward"]
-    # parity. Reference-only append (no copy) — slice tensors are
+    # Cumulative unfiltered total_reward for metrics["unfiltered_reward"].
+    # Reference-only append (no copy) — slice tensors are
     # produced fresh per iteration, not aliased to TQ-owned bulk.
     pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
@@ -300,19 +301,23 @@ def validate_sync(
 
     timer = Timer()
     total_rewards: list[float] = []
-    total_lengths: list[float] = []
+    total_length_tokens = 0.0  # per-batch mean length x rollouts
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
     capture_extras = should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
             n_prompts = int(val_batch.size)
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
@@ -327,8 +332,11 @@ def validate_sync(
             )
             roles = driver_carry["turn_roles"]
             contents = driver_carry["turn_contents"]
-            total_rewards.extend(driver_carry["total_reward"].tolist())
-            total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = driver_carry["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += rollout_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
             all_message_logs.extend(
                 [{"role": r, "content": c} for r, c in zip(roles[i], contents[i])]
                 for i in range(n_prompts)
@@ -342,7 +350,7 @@ def validate_sync(
             if total_rewards
             else 0.0
         )
-        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
+        avg_length = total_length_tokens / len(total_rewards) if total_rewards else 0.0
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
@@ -418,20 +426,25 @@ def _compute_seq_logprob_error_metrics(
 
 
 def _log_data_plane_metrics(
-    policy: Any, logger: Logger, step: int, total_step_time: float
+    policy: Any, logger: Logger, step: int, total_step_time: float, backend: str
 ) -> None:
     """Log this step's data-plane cost. Never raises.
 
     On by default, so this runs every step of every recipe.
     """
     with metrics_never_fail_the_step(step):
-        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time, backend)
 
 
 def _log_data_plane_metrics_impl(
-    policy: Any, logger: Logger, step: int, total_step_time: float
+    policy: Any, logger: Logger, step: int, total_step_time: float, backend: str
 ) -> None:
-    """Log this step's data-plane cost. No-op unless observability is enabled.
+    """Log this step's data-plane cost.
+
+    The backend's own counters (nixl unit memory and SSD spills, Mooncake
+    memory use and SSD offload) are logged whatever the observability setting,
+    and the first spill or offload of a run logs its warning from there; the
+    per-op cost below needs observability on.
 
     The policy computes both the metrics and the scope they cover, because
     the baselines they are differenced against belong with the client whose
@@ -443,6 +456,10 @@ def _log_data_plane_metrics_impl(
     rollout actor (registered via ``add_data_plane_snapshot_source``), so
     ``kv_first_write`` is in these totals.
     """
+    health = backend_health_metrics(backend)
+    if health:
+        prefix, backend_metrics = health
+        logger.log_metrics(backend_metrics, step, prefix=prefix)
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
         return  # not a data-plane policy
@@ -495,7 +512,7 @@ def grpo_train_sync(
     """
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -638,7 +655,7 @@ def grpo_train_sync(
             "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         max_num_epochs is None or current_epoch < max_num_epochs
@@ -650,9 +667,8 @@ def grpo_train_sync(
         # until we have enough for a full training batch. The TQ
         # payload of pending uids remains alive until either consumed
         # by training (clear_samples at step end) or evicted on overflow.
-        # ``pending_unfiltered_rewards`` is logging-only — preserves
-        # legacy ``metrics["reward"]`` semantics (cumulative unfiltered
-        # total_reward across all contributing iterations).
+        # ``pending_unfiltered_rewards`` is logging-only; only its first
+        # ``train_prompts_size`` rows feed ``metrics["unfiltered_reward"]``.
         pending_meta = None
         pending_carry: Optional[BatchedDataDict] = None
         pending_unfiltered_rewards: list[torch.Tensor] = []
@@ -1269,19 +1285,14 @@ def grpo_train_sync(
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
-                # Cumulative unfiltered total_reward across all DS iterations
-                # (sliced to train_prompts_size). Falls back to filtered
-                # rewards if apply_dynamic_sampling didn't provide it
-                # (mid-step path). Hoisted once for reuse in metrics, jsonl,
-                # and the per-step print below.
+                # Pre-filter total_reward, first train_prompts_size rows of the step.
                 unfiltered_rewards = (
                     unfiltered_rewards_for_logging
                     if unfiltered_rewards_for_logging is not None
                     else rewards
                 )
                 if master_config.grpo.use_dynamic_sampling:
-                    metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"] = unfiltered_rewards.numpy()
+                    metrics["unfiltered_reward"] = unfiltered_rewards.numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -1301,7 +1312,7 @@ def grpo_train_sync(
                         "draft_lr",
                         "wd",
                         "reward",
-                        "filtered_reward",
+                        "unfiltered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -1327,8 +1338,7 @@ def grpo_train_sync(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -1337,7 +1347,7 @@ def grpo_train_sync(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -1353,7 +1363,7 @@ def grpo_train_sync(
                     grpo_save_state.consumed_samples = consumed_samples
                     _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -1427,15 +1437,12 @@ def grpo_train_sync(
             # / KV calibration.
             if not _should_log_nemo_gym_responses(master_config):
                 log_data: dict = {}
-                if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
-                if master_config.grpo.use_dynamic_sampling:
-                    # Legacy semantics: ``rewards`` is unfiltered total_reward,
-                    # ``filtered_rewards`` is the kept slice that's trained on.
-                    log_data["rewards"] = unfiltered_rewards.tolist()
-                    log_data["filtered_rewards"] = rewards.tolist()
-                else:
-                    log_data["rewards"] = rewards.tolist()
+                for key in ("agent_ref", "attribution_key"):
+                    if driver_carry is not None and key in driver_carry:
+                        log_data[key] = driver_carry[key]
+                    elif key in repeated_batch:
+                        log_data[key] = repeated_batch[key]
+                log_data["rewards"] = rewards.tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_loss_mask"] = token_mask.tolist()
                 log_data["sample_loss_mask"] = sample_mask.tolist()
@@ -1504,13 +1511,11 @@ def grpo_train_sync(
                     else "not reported"
                 )
             )
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             if master_config.grpo.use_dynamic_sampling:
-                print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
-                    f"  • Avg Total Reward: {np.mean(unfiltered_rewards.numpy()):.4f}"
+                    f"  • Avg Unfiltered Reward: {np.mean(unfiltered_rewards.numpy()):.4f}"
                 )
-            else:
-                print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
@@ -1556,7 +1561,13 @@ def grpo_train_sync(
             # Before the step_finished=True log below, which commits the step:
             # anything logged against a committed step is dropped by wandb, so
             # these series were computed, printed, and silently discarded.
-            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
+            _log_data_plane_metrics(
+                policy,
+                logger,
+                total_steps + 1,
+                total_time,
+                master_config.data_plane["backend"],
+            )
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,

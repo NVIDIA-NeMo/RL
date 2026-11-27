@@ -34,7 +34,7 @@ uv run examples/run_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"; then echo "ERROR: VllmQuantInternalWorkerExtension not found in real-quant run" >&2; exit 1; fi
-if ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"; then echo "ERROR: 'Detected ModelOpt NVFP4 checkpoint' not found in real-quant run" >&2; exit 1; fi
+if ! grep -q "quantization=nemo_modelopt_" "$RUN_LOG"; then echo "ERROR: 'quantization=nemo_modelopt_' not found in real-quant run" >&2; exit 1; fi
 if grep -q "FakeQuantWorker" "$RUN_LOG"; then echo "ERROR: FakeQuantWorker unexpectedly present in real-quant run" >&2; exit 1; fi
 if grep -q "VLLM_QUANT_CFG" "$RUN_LOG"; then echo "ERROR: VLLM_QUANT_CFG unexpectedly present in real-quant run" >&2; exit 1; fi
 
@@ -47,7 +47,7 @@ fi
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/token_mult_prob_error"]) < 1.1' \
     'max(data["train/gen_kl_error"]) < 0.003' \
-    'max(data["train/reward"]) > -0.9'
+    'max(data["train/unfiltered_reward"]) > -0.9'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"

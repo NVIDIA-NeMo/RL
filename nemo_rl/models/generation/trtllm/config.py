@@ -16,6 +16,11 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel
 
+from nemo_rl.models.generation.disagg_layout import (
+    as_dict,
+    replica_width_from,
+    resolve_disagg_layout,
+)
 from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
@@ -84,6 +89,10 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     model_name: NotRequired[str]
     max_model_len: int
     precision: str
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Defaults to "dummy" for
+    # training and "auto" for evaluation; an explicit value is kept. Shared by
+    # both engine roles, so it is not a per-role override.
+    load_format: NotRequired[str]
     # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
     is_mx: NotRequired[bool]
     expose_http_server: NotRequired[bool]
@@ -94,6 +103,12 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
+    # Jinja template that overrides the tokenizer's own, mirroring vLLM's
+    # http_server_serving_chat_kwargs.chat_template. A recipe that pins a custom
+    # template (the SWE blends keep <think> on every assistant turn, which the
+    # stock Qwen3 template strips) renders identically on both backends only if
+    # TRT-LLM honours it too.
+    chat_template: NotRequired[str]
     # TRT-LLM's registered parser names:
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
     #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
@@ -112,6 +127,8 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
 
 
 class TrtllmConfig(GenerationConfig):
+    # None uses the topology default; nccl_reshard refits routed experts with pure EP.
+    refit_transport: NotRequired[Literal["nccl_reshard"] | None]
     trtllm_cfg: TrtllmSpecificArgs
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
@@ -119,24 +136,6 @@ class TrtllmConfig(GenerationConfig):
     # every engine -- a single engine's are trtllm_cfg.{prefill,decode}_engine.trtllm_kwargs,
     # which are deep-merged over these.
     trtllm_kwargs: NotRequired[dict[str, Any]]
-
-
-def _as_dict(raw: Any) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    if isinstance(raw, BaseModel):
-        return raw.model_dump(exclude_unset=True)
-    return dict(raw)
-
-
-def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
-    """``generation.disaggregation`` as its schema.
-
-    Absent is the same as present-and-disabled: every field carries its default
-    on :class:`DisaggConfig`, so callers read attributes unconditionally
-    instead of re-deriving a default per key at the call site.
-    """
-    return DisaggConfig.model_validate(_as_dict(config.get("disaggregation")))
 
 
 def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -235,9 +234,11 @@ def replica_width(config: TrtllmConfig) -> int:
     layout = resolve_disagg_layout(config)
     if not layout.enabled:
         return int(config["trtllm_cfg"]["tensor_parallel_size"])
-    return layout.num_prefill_engines * role_tensor_parallel_size(
-        config, "prefill"
-    ) + layout.num_decode_engines * role_tensor_parallel_size(config, "decode")
+    return replica_width_from(
+        layout,
+        prefill_width=role_tensor_parallel_size(config, "prefill"),
+        decode_width=role_tensor_parallel_size(config, "decode"),
+    )
 
 
 def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConfig:
@@ -248,7 +249,7 @@ def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConf
     sizes the engine fleet NeMo RL creates, this is forwarded to TRT-LLM's
     ``DisaggServerConfig``.
     """
-    raw = _as_dict(config["trtllm_cfg"].get("disagg_server"))
+    raw = as_dict(config["trtllm_cfg"].get("disagg_server"))
     # Caught ahead of extra="forbid" only to point at where the key belongs.
     misplaced = sorted(set(raw) & set(DisaggConfig.model_fields))
     if misplaced:

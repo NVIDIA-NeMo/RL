@@ -20,9 +20,10 @@ generation:
   stop_token_ids: null
   stop_strings: null
   vllm_cfg:
+    http_api_server_count: 1 # Positive process count; values >1 require async_engine: true and expose_http_server: true.
     async_engine: false
     precision: "bfloat16"
-    fp32_lm_head: false # Compute Nemotron-H logits with an fp32 LM head.
+    fp32_lm_head: false # Compute vLLM logits with an fp32 LM head.
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
@@ -57,6 +58,8 @@ data:
 env:
   math:
     num_workers: 8
+    verifier_type: "math"  # key into the environment's worker classes
+    math_verify_impl: "hf_math_verify"
 
 cluster:
   gpus_per_node: 1

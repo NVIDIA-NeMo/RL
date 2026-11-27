@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
@@ -86,6 +87,8 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
                 ray_namespace=None,
                 initial_global_config_dict=nemo_gym_dict,
                 invalid_tool_call_patterns=None,
+                checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+                turn_checkpointing_enabled=False,
             )
 
             nemo_gym_opts = {

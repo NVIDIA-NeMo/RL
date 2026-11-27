@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import (
@@ -198,13 +198,23 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
+class AutomodelPipelineConfig(BaseModel, extra="forbid"):
+    """1F1B schedule settings, required when pipeline_parallel_size > 1."""
+
+    # Microbatches per schedule call; must be >= pipeline_parallel_size.
+    microbatches_per_step: Annotated[int, Field(gt=0)]
+
+
 class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (tp * cp * ep)
+    # data_parallel_size is derived from world_size / (pp * tp * cp)
     tensor_parallel_size: int
     context_parallel_size: int
+    # See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: int
+    pipeline: NotRequired[AutomodelPipelineConfig]
     expert_parallel_size: NotRequired[int]
     # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
@@ -214,6 +224,13 @@ class AutomodelConfig(TypedDict):
     cpu_offload: bool
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
+    # AutoModel FSDP2 output precision (default float32). Master weights/reductions
+    # remain FP32. BF16 can reduce residual-stream memory; peak savings depend on
+    # the recipe. Unchunked logprobs still materialize full FP32 logits.
+    # Opting out of float32 lowers precision in three places:
+    # value/RM losses (LossInputType.LOGIT is not upcast), in-place temperature
+    # scaling when temperature != 1.0, and moe_parallelizer.lm_head_precision.
+    fsdp_output_dtype: NotRequired[Literal["float32", "bfloat16", "float16"]]
     # MoE parallelizer config
     moe_parallelizer: NotRequired[MoEParallelizerOptions]
     # Model config
@@ -389,6 +406,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Applied by NeMo RL, not passed to Bridge: threads per rank reading torch_dist
+    # checkpoint files on load (nemo_rl/models/megatron/ckpt_parallel_read.py); 1 = off.
+    parallel_read_threads: int
 
 
 class MegatronConfig(TypedDict):
@@ -467,6 +487,8 @@ class MegatronConfig(TypedDict):
     moe_router_dtype: str | None
     moe_router_load_balancing_type: str | list[str]
     moe_router_bias_update_rate: float
+    # Omit to keep the checkpoint's value; true needs a sigmoid or sqrtsoftplus router.
+    moe_router_enable_expert_bias: NotRequired[bool]
     moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
@@ -605,11 +627,19 @@ class MegatronConfig(TypedDict):
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
     mtp_detach_heads: NotRequired[bool]
     # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
-    # routing tensors in offload_before_refit (before weight transfer to the
-    # inference engine). Useful when training and logprob runs use different
+    # routing tensors after training (the policy before refit, the critic in
+    # finish_training). Useful when training and logprob runs use different
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]
+    # When True, the chunked logprob backward on the fused sequence-packing path
+    # writes its grad into the packed logits' storage instead of a new buffer,
+    # saving one logits-sized allocation. Requires sequence_packing.enabled,
+    # sequence_packing.fuse_loss and a positive logprob_chunk_size; default false.
+    # The chunked logprob must be the logits' only consumer: any feature that reads
+    # them again (e.g. loss_fn.score_centering) must be rejected alongside this flag
+    # in the setup checks.
+    reuse_logits_storage: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
     # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so

@@ -71,6 +71,8 @@ CheckpointMutationKind = Literal[
     "advantage_writeback",
     "group_commits",
     "group_removals",
+    # A Gym /run submission, on the barrier that pauses dispatch for a Gym checkpoint.
+    "gym_dispatch",
     "other",
     "prompt_reservations",
     "recovery_restore",
@@ -144,8 +146,53 @@ class DataPlaneCheckpointMetadata(TypedDict):
     rollout_recovery_schema_version: NotRequired[int]
     rollout_recovery_payload_sha256: NotRequired[str]
     rollout_recovery_group_count: NotRequired[int]
+    forest_training: NotRequired[bool]
+    forest_execution_row_multiple: NotRequired[int | None]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
+    # Resolved loss_fn normalization the buffered rows were prepared for.
+    # Absent from checkpoints written before the field existed.
+    loss_normalization: NotRequired[str]
+
+
+def validate_forest_checkpoint_metadata(
+    metadata: DataPlaneCheckpointMetadata,
+    *,
+    forest_training: bool,
+    execution_row_multiple: int | None,
+) -> None:
+    """Reject changes to the interpretation or padding of restored rollout rows."""
+    schema = metadata.get("rollout_recovery_schema_version")
+    if forest_training and type(schema) is int and schema < 5:
+        raise ValueError(
+            "forest_training needs rollout recovery schema >= 5; "
+            f"checkpoint has schema {schema}. Start a fresh run."
+        )
+    if "forest_training" not in metadata:
+        # Before schema 5, only ordinary recovery was supported.
+        if forest_training or (type(schema) is int and schema >= 5):
+            raise ValueError(
+                "Checkpoint is missing forest_training compatibility metadata; "
+                f"schema={schema!r}, current forest_training={forest_training}. "
+                "Start a fresh run."
+            )
+        return
+    saved_mode = metadata["forest_training"]
+    if type(saved_mode) is not bool or saved_mode != forest_training:
+        raise ValueError(
+            "Checkpoint forest_training mismatch: "
+            f"saved={saved_mode!r}, current={forest_training}"
+        )
+    saved_multiple = metadata.get("forest_execution_row_multiple")
+    if (
+        "forest_execution_row_multiple" not in metadata
+        or (forest_training and (type(saved_multiple) is not int or saved_multiple < 1))
+        or saved_multiple != execution_row_multiple
+    ):
+        raise ValueError(
+            "Checkpoint forest execution padding mismatch: "
+            f"saved={saved_multiple!r}, current={execution_row_multiple!r}"
+        )
 
 
 def _canonical_manifest_value(value: Any, *, path: str) -> Any:
@@ -820,6 +867,22 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"trajectory_versions={len(trajectory_versions)}, "
                     f"target_weight_versions={len(target_weight_versions)}"
                 )
+
+            # Checkpoints written before taskset attribution hold only flat rows,
+            # whose attribution is the agent name. Restore the column so these
+            # batches merge with newly collected ones in from_batches.
+            for trajectory in trajectories:
+                batch = (
+                    trajectory.get("batch") if isinstance(trajectory, dict) else None
+                )
+                if (
+                    batch is not None
+                    and "agent_ref" in batch
+                    and "attribution_key" not in batch
+                ):
+                    batch["attribution_key"] = [
+                        ref["name"] for ref in batch["agent_ref"]
+                    ]
 
             if "max_size" in state and state["max_size"] != self.max_size:
                 print(
@@ -1570,13 +1633,14 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before claiming groups for training"
             )
-        claim_idxs = sorted(idxs, reverse=True)
-        if claim_idxs[0] >= len(self.meta_list):
+        if max(idxs) >= len(self.meta_list):
             raise IndexError(
                 "TQReplayBuffer.claim_for_training: indices out of range: "
-                f"{claim_idxs[0]}; size={len(self.meta_list)}"
+                f"{max(idxs)}; size={len(self.meta_list)}"
             )
-        claim_group_ids = [self._group_ids[i] for i in claim_idxs]
+        # Preserve sampler order in the checkpoint-visible training claims.
+        # _remove_groups_unlocked sorts list slots separately for safe deletion.
+        claim_group_ids = [self._group_ids[i] for i in idxs]
         async with self._data_plane_checkpoint_barrier.mutation(
             "group_removals"
         ) as cut:
@@ -1588,7 +1652,7 @@ class TQReplayBuffer:
             )
 
     def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
-        """Return metadata for canonical rows owned by the open train step."""
+        """Return open-step canonical metadata in sampler selection order."""
         return copy.deepcopy(list(self._training_claims.values()))
 
     def training_owned_group_ids(self) -> set[str]:
@@ -1719,7 +1783,7 @@ class TQReplayBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[TQReplayGroupMetadata]] = None,
+        already_claimed_groups: Optional[list[TQReplayGroupMetadata]] = None,
     ) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
 
@@ -1734,17 +1798,41 @@ class TQReplayBuffer:
         not required to originate specifically from :meth:`commit`.
         The advantage stage also takes a mutation slot because the periodic
         checkpoint pump runs concurrently with ``_train_pump``.
-        In-flight reservations are intentionally omitted. ``additional_groups``
+        In-flight reservations are intentionally omitted. ``already_claimed_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
-        streamed optimizer step.
+        streamed optimizer step. These groups are saved first, in selection
+        order, ahead of the waiting ready groups.
         """
         groups: list[TQReplayGroupMetadata] = []
+        existing_group_ids: set[str] = set()
+        existing_sample_ids: set[str] = set()
+
+        def append_group(entry: TQReplayGroupMetadata) -> None:
+            group_id = entry["group_id"]
+            if group_id in existing_group_ids:
+                raise ValueError(f"replay metadata duplicates group_id={group_id!r}")
+            duplicate_sample_ids = existing_sample_ids.intersection(
+                entry["meta"].sample_ids
+            )
+            if duplicate_sample_ids:
+                raise ValueError(
+                    "replay metadata duplicates sample IDs: "
+                    f"{sorted(duplicate_sample_ids)!r}"
+                )
+            groups.append(entry)
+            existing_group_ids.add(group_id)
+            existing_sample_ids.update(entry["meta"].sample_ids)
+
+        # Save the interrupted batch ahead of groups still waiting for training.
+        for group in already_claimed_groups or []:
+            append_group(copy.deepcopy(group))
+
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
             meta = self.meta_list[i]
             assert meta is not None  # commit sets meta before ready=True
-            groups.append(
+            append_group(
                 {
                     "meta": meta,
                     "start_weight": self.start_weight_list[i],
@@ -1753,27 +1841,6 @@ class TQReplayBuffer:
                     "group_id": self._group_ids[i],
                 }
             )
-        existing_group_ids = {group["group_id"] for group in groups}
-        existing_sample_ids = {
-            sample_id for group in groups for sample_id in group["meta"].sample_ids
-        }
-        for group in additional_groups or []:
-            group_id = group["group_id"]
-            if group_id in existing_group_ids:
-                raise ValueError(
-                    f"additional replay metadata duplicates group_id={group_id!r}"
-                )
-            duplicate_sample_ids = existing_sample_ids.intersection(
-                group["meta"].sample_ids
-            )
-            if duplicate_sample_ids:
-                raise ValueError(
-                    "additional replay metadata duplicates sample IDs: "
-                    f"{sorted(duplicate_sample_ids)!r}"
-                )
-            groups.append(copy.deepcopy(group))
-            existing_group_ids.add(group_id)
-            existing_sample_ids.update(group["meta"].sample_ids)
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
@@ -1811,8 +1878,8 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
-                breaks the group-relative baseline).
+                hold exactly this many logical responses. Forest responses may span
+                multiple rows, with additional ownerless execution padding.
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
 
@@ -1825,6 +1892,12 @@ class TQReplayBuffer:
                 sample_ids), disagrees with the native TQ snapshot, or exceeds
                 ``max_groups``.
         """
+        # Defer to avoid the SC setup -> replay buffer import cycle.
+        from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+            has_logical_owners,
+            validate_logical_owner_metadata,
+        )
+
         if self.meta_list or self._group_ids or self._training_claims:
             raise RuntimeError(
                 "Replay-buffer checkpoint loading requires an empty local buffer"
@@ -1888,8 +1961,9 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
-            if not (
-                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+            logical = has_logical_owners(meta)
+            if not (len(meta.sample_ids) == num_tags == num_lengths) or (
+                not logical and len(meta.sample_ids) != expected_group_size
             ):
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "
@@ -1897,6 +1971,15 @@ class TQReplayBuffer:
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )
+            if logical:
+                owners = validate_logical_owner_metadata(
+                    meta, expected_group_size=expected_group_size
+                )
+                if set(owners) != {group["group_id"]}:
+                    raise ValueError(
+                        "Forest replay group_id disagrees with owner metadata: "
+                        f"group_id={group['group_id']!r}, owners={sorted(set(owners))}"
+                    )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(

@@ -19,7 +19,7 @@ import inspect
 import json
 import os
 from functools import partial
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import torch
 from hydra.utils import get_class
@@ -43,6 +43,7 @@ from nemo_automodel.components.distributed.config import (
     MoEParallelizerConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from safetensors import safe_open
@@ -69,19 +70,27 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.pipeline_parallel import (
+    pipeline_loss_fn,
+    pipeline_optimizer_part_ids,
+)
 from nemo_rl.models.automodel.router_replay import (
     enable_routing_replay_in_automodel_kwargs,
     require_automodel_moe_model,
     validate_automodel_router_replay_config,
 )
 from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
+    AutomodelConfig,
+    AutomodelPipelineConfig,
     LoRAConfig,
     PolicyConfig,
     TokenizerConfig,
 )
 from nemo_rl.models.policy.utils import configure_dynamo_cache
+from nemo_rl.models.value.config import ValueConfig
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -281,17 +290,18 @@ def get_tokenizer(
 
 
 def validate_and_prepare_config(
-    config: PolicyConfig,
+    config: PolicyConfig | ValueConfig,
     processor: Optional[AutoProcessor],
     rank: int,
 ) -> RuntimeConfig:
     """Validate configuration and prepare runtime settings.
 
-    This function validates the policy configuration, sets environment variables,
-    determines model configuration, and returns runtime settings as a named tuple.
+    This function validates the shared policy or value-model configuration, sets
+    environment variables, determines model configuration, and returns runtime
+    settings as a named tuple.
 
     Args:
-        config: Policy configuration dictionary
+        config: Policy or PPO value-model configuration dictionary
         processor: Optional processor for multimodal models
         rank: Current process rank
 
@@ -317,6 +327,7 @@ def validate_and_prepare_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
@@ -334,6 +345,9 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
+    if fsdp_output_dtype not in STRING_TO_DTYPE:
+        raise ValueError(f"Unknown FSDP output dtype: {fsdp_output_dtype}")
 
     # Get other configuration values
     cpu_offload = config["automodel_cfg"]["cpu_offload"]
@@ -341,6 +355,10 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
+    # PPO values use the shared token-level regression setup.
+    is_reward_model = (
+        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
+    )
 
     # Validate sequence packing
     if enable_seq_packing:
@@ -348,6 +366,11 @@ def validate_and_prepare_config(
             raise ValueError(
                 "Sequence packing is not supported for VLM models. "
                 "Please set policy.sequence_packing.enabled = False to train VLM models."
+            )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Sequence packing requires precision='float16' or 'bfloat16' "
+                "because FlashAttention does not support float32 inputs."
             )
         print(f"[Rank {rank}] Sequence packing is enabled for model {model_name}")
         print(f"[Rank {rank}] Using FlashAttention2 for sequence packing")
@@ -388,19 +411,20 @@ def validate_and_prepare_config(
     ):
         allow_flash_attn_args = False
 
-    # Determine if reward model
-    is_reward_model = (
-        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
-    )
-
     if is_reward_model:
         # Validate reward model configuration
-        if enable_seq_packing:
+        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        if rm_type == "bradley_terry" and cp_size_cfg > 1:
             raise NotImplementedError(
-                "Sequence packing is not supported for reward models"
+                "Context parallelism is not supported for Bradley-Terry reward "
+                "models. Set context_parallel_size=1."
+            )
+        if enable_seq_packing and rm_type != "regression":
+            raise NotImplementedError(
+                "Sequence packing is only supported for token-level regression "
+                "reward models"
             )
 
-        rm_type = config["reward_model_cfg"]["reward_model_type"]
         if rm_type == "bradley_terry":
             model_class = NeMoAutoModelForSequenceClassification
             if model_config.num_labels != 1:
@@ -503,16 +527,18 @@ def setup_distributed(
     # Extract configuration values
     dtype = runtime_config.dtype
     cpu_offload = runtime_config.cpu_offload
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
 
     # Extract parallelization config
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["automodel_cfg"].get("context_parallel_size", 1)
     ep_size = config["automodel_cfg"].get("expert_parallel_size", 1)
+    pp_size = cast(AutomodelConfig, config["automodel_cfg"])["pipeline_parallel_size"]
     dp_replicate_size = config["automodel_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["automodel_cfg"]["sequence_parallel"]
 
     # HSDP requires the data-parallel axis to evenly contain the replicate dim.
-    model_parallel_size = tp_size * cp_size * ep_size
+    model_parallel_size = pp_size * tp_size * cp_size
     dp_size = world_size // model_parallel_size
     if dp_size % dp_replicate_size != 0:
         raise ValueError(
@@ -531,7 +557,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
@@ -549,13 +575,13 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
+    # Mesh order (pp, dp_replicate, dp_shard, cp, tp) matches the Ray worker layout.
     mesh_context = MeshContext.build(
         fsdp2_config,
         ParallelismSizes(
             dp_replicate_size=dp_replicate_size,
             tp_size=tp_size,
-            pp_size=1,
+            pp_size=pp_size,
             cp_size=cp_size,
             ep_size=ep_size,
         ),
@@ -567,6 +593,7 @@ def setup_distributed(
     resolved_dp_size = device_mesh["dp"].size()
     resolved_tp_size = device_mesh["tp"].size()
     resolved_cp_size = device_mesh["cp"].size()
+    resolved_pp_size = device_mesh["pp"].size()
 
     return DistributedContext(
         device_mesh=device_mesh,
@@ -576,6 +603,7 @@ def setup_distributed(
         dp_size=resolved_dp_size,
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
+        pp_size=resolved_pp_size,
     )
 
 
@@ -878,9 +906,8 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in
-        # `components/distributed/context_parallel/utils.py`, where only flash
-        # and efficient backends are supported.
+        # Match Automodel's CP context: MATH is incompatible with DTensor.
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/b916107a5ce8e77a3f18682f8b0eaa46a4b54389/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L109
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
@@ -927,11 +954,13 @@ def setup_model_and_optimizer(
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
     # (moe_mesh/distributed_config/moe_config/activation_checkpointing/pipeline_config/tp_plan
     # -- see _reject_separate_distributed_kwargs) and requires them via distributed_setup.
-    # pipeline_config=None: PP is not used here.
+    pp_enabled = distributed_context.pp_size > 1
     distributed_setup = DistributedSetup(
         mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
         strategy_config=fsdp2_config,
-        pipeline_config=None,
+        pipeline_config=(
+            build_pipeline_config(config, fsdp2_config) if pp_enabled else None
+        ),
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
     )
@@ -950,11 +979,26 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
+    pipeline = None
+    if pp_enabled:
+        # 1F1B returns one model stage per rank.
+        pipeline = model
+        (model,) = pipeline.parts
+
     print(model)
 
     # Compute model metadata after from_pretrained
     model_state_dict_keys = list(model.state_dict().keys())
     is_moe_model = any(["expert" in key for key in model_state_dict_keys])
+    if pipeline is not None:
+        # Dense-only stages of an MoE model must use the same autocast setting.
+        has_experts = torch.tensor([is_moe_model], device="cuda")
+        torch.distributed.all_reduce(
+            has_experts,
+            op=torch.distributed.ReduceOp.MAX,
+            group=pipeline.pp_mesh.get_group(),
+        )
+        is_moe_model = bool(has_experts.item())
     is_hf_model = (
         model_config.architectures[0] not in ModelRegistry.model_arch_name_to_cls
     )
@@ -1139,6 +1183,7 @@ def setup_model_and_optimizer(
                 optimizer=optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(pipeline),
             )
     elif lora_enabled and lora_cfg.get("restore_from") is not None:
         # Warm start: base weights were already loaded by from_pretrained above;
@@ -1173,4 +1218,28 @@ def setup_model_and_optimizer(
         draft_model=draft_model,
         composite_model=composite_model,
         draft_runtime=draft_runtime,
+        pipeline=pipeline,
+    )
+
+
+def build_pipeline_config(
+    config: PolicyConfig, fsdp2_config: FSDP2Config
+) -> PipelineConfig:
+    """Build a 1F1B schedule with one stage per rank.
+
+    The loss function owns gradient scaling. Stage metadata uses the maximum
+    sequence length and FSDP's output dtype for inter-stage activations.
+    """
+    pipeline_cfg = AutomodelPipelineConfig.model_validate(
+        cast(AutomodelConfig, config["automodel_cfg"])["pipeline"]
+    )
+    micro_batch_size = config["train_micro_batch_size"]
+    return PipelineConfig(
+        pp_schedule="1F1B",
+        pp_microbatch_size=micro_batch_size,
+        pp_batch_size=micro_batch_size * pipeline_cfg.microbatches_per_step,
+        dtype=fsdp2_config.mp_policy.output_dtype,
+        scale_grads_in_schedule=False,
+        loss_fn=pipeline_loss_fn,
+        pp_seq_len=config["max_total_sequence_length"],
     )

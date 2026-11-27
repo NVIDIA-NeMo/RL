@@ -69,7 +69,17 @@ def _seed_partition_with_one_sample(client: NoOpDataPlaneClient) -> KVBatchMeta:
     return meta
 
 
-def test_writeback_only_leader_writes():
+@pytest.mark.parametrize(
+    "sibling_result",
+    [
+        # A non-leader holding real values must not write them.
+        {"logprobs": torch.full((1, 4), 99.0)},
+        # get_logprobs returns an empty result on non-leaders; that must not raise.
+        {},
+    ],
+    ids=["sibling-values", "sibling-empty"],
+)
+def test_writeback_only_leader_writes(sibling_result):
     """Non-leader sibling write must NOT land — that's the -601 bug class."""
     client = NoOpDataPlaneClient()
     meta = _seed_partition_with_one_sample(client)
@@ -85,7 +95,7 @@ def test_writeback_only_leader_writes():
     )
     sibling._write_back_result_field(
         meta,
-        BatchedDataDict({"logprobs": torch.full((1, 4), 99.0)}),
+        BatchedDataDict(sibling_result),
         result_key="logprobs",
         tq_field="prev_logprobs",
     )
@@ -135,3 +145,25 @@ def test_writeback_single_worker_default_is_leader(filtering_on):
     expected_mask = torch.ones(1, 4, dtype=torch.long)
     assert torch.equal(fetched["token_mask"], expected_mask)
     assert fetched["token_mask"].dtype == torch.long
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("keep_on_gpu", [False, True])
+def test_writeback_keeps_a_gpu_result_on_gpu_only_when_asked(keep_on_gpu):
+    """A GDR PUT can read a GPU result directly; every other write copies it to CPU."""
+    client = NoOpDataPlaneClient()
+    meta = _seed_partition_with_one_sample(client)
+    leader = _FakeWorker(client, is_leader=True)
+    written: dict[str, torch.Tensor] = {}
+    leader._write_back = lambda meta, fields: written.update(fields)  # type: ignore[method-assign]
+
+    leader._write_back_result_field(
+        meta,
+        BatchedDataDict({"logprobs": torch.zeros(1, 4, device="cuda")}),
+        result_key="logprobs",
+        tq_field="teacher_reference_logprobs",
+        keep_on_gpu=keep_on_gpu,
+    )
+
+    expected = "cuda" if keep_on_gpu else "cpu"
+    assert written["teacher_reference_logprobs"].device.type == expected

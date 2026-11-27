@@ -46,6 +46,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.algorithms.loss import (
     DraftRuntimeLossWrapper,
@@ -53,6 +54,7 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.loss_input import sampler_support_logprobs
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -97,7 +99,6 @@ def _build_model_batch(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
     *,
-    is_reward_model: bool,
     allow_flash_attn_args: bool,
     clone_model_tensors: bool,
 ) -> dict[str, Any]:
@@ -131,7 +132,7 @@ def _build_model_batch(
                 processed_inputs.input_ids
             )
 
-    if is_reward_model or not allow_flash_attn_args:
+    if not allow_flash_attn_args:
         model_batch.pop("flash_attn_kwargs", None)
 
     drop_explicit_only_kwargs_not_in_forward(model, model_batch)
@@ -159,14 +160,12 @@ def prepare_model_forward(
     device_mesh: Optional[DeviceMesh],
     cp_size: int,
     padding_token_id: int,
-    is_reward_model: bool,
     allow_flash_attn_args: bool,
 ) -> PreparedModelForward:
     """Prepare the model batch and resolve Automodel CP state when active."""
     model_batch = _build_model_batch(
         model,
         processed_inputs,
-        is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
         clone_model_tensors=cp_size > 1,
     )
@@ -179,28 +178,54 @@ def prepare_model_forward(
             model_context_factory=nullcontext,
         )
 
-    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
-    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
-    # NeMo-RL computes its own masked losses from the returned logits, so pass an
-    # all-ignore placeholder purely to satisfy that contract and drop it again
-    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
-    model_batch["labels"] = torch.full_like(processed_inputs.input_ids, -100)
-
-    cp_sharder = ContextParallelSharder(
+    cp_sharder, model_context_factory, model_batch = shard_model_batch_for_cp(
         model,
-        device_mesh,
         model_batch,
+        device_mesh=device_mesh,
         padding_token_id=padding_token_id,
         num_chunks=1,
     )
-    model_context_factory, model_batch = cp_sharder.shard(model_batch)
-    model_batch.pop("labels", None)
     return PreparedModelForward(
         model_batch=model_batch,
         cp_size=cp_size,
         cp_sharder=cp_sharder,
         model_context_factory=model_context_factory,
     )
+
+
+def shard_model_batch_for_cp(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+    *,
+    device_mesh: Optional[DeviceMesh],
+    padding_token_id: int,
+    num_chunks: int,
+) -> tuple[
+    ContextParallelSharder, Callable[[], AbstractContextManager[Any]], dict[str, Any]
+]:
+    """Prepare CP inputs and return their sharder, context factory, and batch.
+
+    Inputs must not share storage with loss-side data: Automodel pads or shards
+    them in place, possibly on context entry. num_chunks is the number of
+    pipeline microbatches, or 1 without PP.
+    """
+    # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
+    # shards it alongside input_ids/position_ids (see ``shard_batch_load_balanced``).
+    # NeMo-RL computes its own masked losses from the returned logits, so pass an
+    # all-ignore placeholder purely to satisfy that contract and drop it again
+    # before the forward. ``pop`` tolerates a strategy that consumed it itself.
+    model_batch["labels"] = torch.full_like(model_batch["input_ids"], -100)
+
+    cp_sharder = ContextParallelSharder(
+        model,
+        device_mesh,
+        model_batch,
+        padding_token_id=padding_token_id,
+        num_chunks=num_chunks,
+    )
+    model_context_factory, model_batch = cp_sharder.shard(model_batch)
+    model_batch.pop("labels", None)
+    return cp_sharder, model_context_factory, model_batch
 
 
 def model_forward(
@@ -343,26 +368,51 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
-    # Extract the processed components
-    data_dict = processed_mb.data_dict
-    processed_inputs = processed_mb.processed_inputs
     cp_sharder = prepared.cp_sharder
     if prepared.cp_size > 1 and cp_sharder is None:
         raise RuntimeError(
             "ContextParallelSharder is required when context_parallel_size > 1"
         )
-    if prepared.cp_size > 1 and isinstance(post_processing_fn, ScorePostProcessor):
-        raise NotImplementedError(
-            "ScorePostProcessor does not support context_parallel_size > 1 "
-            "on the automodel backend. Set context_parallel_size=1."
-        )
-
     # Model forward pass
     outputs = model_forward(model, prepared.model_batch)
 
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+
+    result, metrics = post_process_logits(
+        logits,
+        post_processing_fn,
+        processed_mb,
+        cp_sharder=cp_sharder,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        sampling_params=sampling_params,
+        sequence_dim=sequence_dim,
+    )
+
+    del logits
+    return result, metrics, processed_mb
+
+
+def post_process_logits(
+    logits: torch.Tensor,
+    post_processing_fn: PostProcessingFunction,
+    processed_mb: ProcessedMicrobatch,
+    *,
+    cp_sharder: Optional[ContextParallelSharder],
+    global_valid_seqs: Optional[torch.Tensor],
+    global_valid_toks: Optional[torch.Tensor],
+    sampling_params: Optional[TrainingSamplingParams],
+    sequence_dim: int,
+) -> Tuple[Any, dict[str, Any]]:
+    """Apply sampling parameters and compute (result, metrics) from logits.
+
+    Shared by the regular forward path and the pipeline loss callback.
+    Temperature scaling modifies logits in place.
+    """
+    data_dict = processed_mb.data_dict
+    processed_inputs = processed_mb.processed_inputs
 
     # Draft co-training distills against the policy's raw logits; stash them
     # before the (in-place) temperature scaling below mutates the tensor.
@@ -431,15 +481,46 @@ def forward_with_post_processing_fn(
         )
         metrics = {"full_logits": result}
     elif isinstance(post_processing_fn, ScorePostProcessor):
-        result = post_processing_fn(logits=logits)
+        result = post_processing_fn(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=processed_mb.original_batch_size,
+            original_seq_len=processed_mb.original_seq_len,
+            cp_sharder=cp_sharder,
+            sequence_dim=sequence_dim,
+        )
         metrics = {"scores": result}
     else:
         raise TypeError(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
         )
 
-    del logits
-    return result, metrics, processed_mb
+    return result, metrics
+
+
+def scale_metrics_for_global_batches(
+    metrics: dict[str, Any], num_global_batches: int
+) -> None:
+    """Average additive metrics over global batches in place, leaving min/max unchanged."""
+    for k in metrics.keys():
+        if "_min" in k or "_max" in k:
+            continue
+
+        metrics[k] /= num_global_batches
+
+
+def backward_loss_scale(
+    post_processing_fn: "LossPostProcessor", *, dp_size: int, cp_size: int
+) -> float:
+    """Scale applied to the loss before backward.
+
+    FSDP averages gradients over its DP mesh (dp_size * cp_size), while loss
+    normalization expects their sum, so cancel that average here. Replicated CP
+    losses send each local model contribution to cp_size loss consumers; divide
+    by that fanout to avoid overcounting. Partitioned losses have a fanout of 1.
+    """
+    return dp_size * cp_size / post_processing_fn.cp_gradient_fanout
 
 
 def automodel_forward_backward(
@@ -450,7 +531,6 @@ def automodel_forward_backward(
     padding_token_id: int,
     autocast_context_factory: Callable[[], AbstractContextManager[Any]],
     forward_only: bool = False,
-    is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
@@ -479,7 +559,6 @@ def automodel_forward_backward(
         padding_token_id: Token ID used for Automodel sequence padding.
         autocast_context_factory: Worker-owned precision context factory.
         forward_only: If True, skip backward pass
-        is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
@@ -533,7 +612,6 @@ def automodel_forward_backward(
                 device_mesh=device_mesh,
                 cp_size=cp_size,
                 padding_token_id=padding_token_id,
-                is_reward_model=is_reward_model,
                 allow_flash_attn_args=allow_flash_attn_args,
             )
 
@@ -567,13 +645,7 @@ def automodel_forward_backward(
                 if isinstance(post_processing_fn, LossPostProcessor):
                     # skip the update for dummy batches
                     if not is_dummy:
-                        ## scale by the number of global batches so we get the correct
-                        ## value when summing metrics across all microbatches
-                        for k in metrics.keys():
-                            if "_min" in k or "_max" in k:
-                                continue
-
-                            metrics[k] /= num_global_batches
+                        scale_metrics_for_global_batches(metrics, num_global_batches)
                     else:
                         # Zero out loss for dummy batches
                         result = result * 0
@@ -583,17 +655,8 @@ def automodel_forward_backward(
                         ## NOTE: invalid samples should be multiplied
                         ## by zero in the loss function to prevent them
                         ## from affecting the gradient calculation
-
-                        # FSDP averages gradients over its DP mesh (dp_size * cp_size),
-                        # while loss normalization expects their sum, so cancel that
-                        # average here. Replicated CP losses send each local model
-                        # contribution to cp_size loss consumers; divide by that fanout
-                        # to avoid overcounting. Partitioned losses have a fanout of 1.
-                        loss = (
-                            result
-                            * dp_size
-                            * cp_size
-                            / post_processing_fn.cp_gradient_fanout
+                        loss = result * backward_loss_scale(
+                            post_processing_fn, dp_size=dp_size, cp_size=cp_size
                         )
                         loss.backward()
 
@@ -845,6 +908,34 @@ class LogprobsPostProcessor:
             policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
+
+        if replays_sampler_support(self.sampling_params):
+            # Same support-renormalized log-probs as the actor loss (score
+            # centering runs Automodel with TP=1, CP=1).
+            cu_seqlens = None
+            if self.enable_seq_packing:
+                cu_seqlens = to_cpu_int_tuple(
+                    processed_inputs.flash_attn_kwargs.cu_seqlens_q
+                )
+            token_logprobs, _ = sampler_support_logprobs(
+                logits,
+                data_dict,
+                self.sampling_params,
+                chunk_size=self.logprob_chunk_size,
+                cp_sharder=cp_sharder,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens,
+            )
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+            )
+            positions = torch.arange(token_logprobs.shape[1], device=logits.device)
+            lengths = torch.as_tensor(input_lengths, device=logits.device)
+            token_logprobs = torch.where(
+                positions < lengths.unsqueeze(-1), token_logprobs, 0.0
+            )
+            mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+            return mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
 
         if cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
@@ -1211,29 +1302,71 @@ class ScorePostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
+        enable_seq_packing: bool = False,
     ):
         """Initialize ScorePostProcessor.
 
         Args:
             cfg: Configuration dictionary
+            enable_seq_packing: Whether to unpack scores from packed sequences
         """
         self.cfg = cfg
+        self.enable_seq_packing = enable_seq_packing
 
     def __call__(
         self,
         logits: torch.Tensor,
+        data_dict: Optional[BatchedDataDict[Any]] = None,
+        processed_inputs: Optional[ProcessedInputs] = None,
+        original_batch_size: Optional[int] = None,
+        original_seq_len: Optional[int] = None,
+        *,
+        cp_sharder: Optional[ContextParallelSharder] = None,
+        sequence_dim: int = 1,
     ) -> torch.Tensor:
         """Extract scores from reward model outputs.
 
         Args:
             logits: Model output logits
+            data_dict: Original microbatch data
+            processed_inputs: Inputs after optional sequence packing
+            original_batch_size: Batch size before sequence packing
+            original_seq_len: Sequence length before sequence packing
+            cp_sharder: Per-microbatch CP layout owner, or None when CP is inactive
+            sequence_dim: Sequence dimension in the model output
 
         Returns:
             Scores tensor
         """
         logits = logits.to(torch.float32)
         rm_scores = to_local_if_dtensor(logits)
+        if cp_sharder is not None:
+            rm_scores = cp_sharder.gather_token_tensor(
+                rm_scores,
+                seq_dim=sequence_dim,
+                trim=True,
+                fill=0.0,
+            )
         rm_scores = rm_scores.squeeze(-1)
+
+        if self.enable_seq_packing:
+            assert data_dict is not None
+            assert processed_inputs is not None
+            assert original_batch_size is not None
+            assert original_seq_len is not None
+            unpacked_scores = torch.zeros(
+                (original_batch_size, original_seq_len),
+                dtype=rm_scores.dtype,
+                device=rm_scores.device,
+            )
+            input_lengths = data_dict["input_lengths"]
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            for i in range(original_batch_size):
+                start = cu_seqlens[i].item()
+                end = cu_seqlens[i + 1].item()
+                seq_len_actual = input_lengths[i].item()
+                unpacked_scores[i, :seq_len_actual] = rm_scores[0, start:end]
+            rm_scores = unpacked_scores
 
         return rm_scores
 

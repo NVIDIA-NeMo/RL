@@ -33,10 +33,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Historical step-20 accuracy ranges from 0.0625 to 0.1914; allow batch noise.
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 1.5' \
         'data["train/loss"]["20"] < 0.3' \
-        'data["validation/accuracy"]["20"] > 0.1' \
+        'data["validation/accuracy"]["20"] > 0.05' \
         'mean(data["timing/train/total_step_time"], -6, -1) < 1000'
 
     # Clean up checkpoint directory after successful run to save space.

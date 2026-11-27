@@ -57,6 +57,7 @@ def mock_config():
             "cpu_offload": False,
             "tensor_parallel_size": 1,
             "context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
             "expert_parallel_size": 1,
             "sequence_parallel": False,
             "activation_checkpointing": False,
@@ -149,6 +150,26 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_fsdp_output_dtype_validation_invalid(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        """Test that an invalid fsdp_output_dtype raises ValueError."""
+        mock_config["automodel_cfg"]["fsdp_output_dtype"] = "invalid_dtype"
+
+        with pytest.raises(ValueError, match="Unknown FSDP output dtype"):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_sequence_packing_with_vlm_raises_error(
         self,
         mock_dynamo,
@@ -202,6 +223,42 @@ class TestValidateAndPrepareConfig:
         assert isinstance(result, RuntimeConfig)
         assert result.is_reward_model is True
 
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_bradley_terry_raises_error(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig, cp_size
+    ):
+        """Sequence-level reward heads cannot use token-level CP restoration."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = cp_size
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "bradley_terry",
+        }
+
+        with pytest.raises(NotImplementedError, match="Bradley-Terry reward models"):
+            validate_and_prepare_config(mock_config, None, 0)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_regression_reward_model_is_supported(
+        self, mock_dynamo, mock_autoconfig_class, mock_config, mock_autoconfig
+    ):
+        """The sequence-level guard must not reject token-level PPO values."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.is_reward_model
+        assert result.attn_impl == "sdpa"
+        assert mock_autoconfig.num_labels == 1
+
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
@@ -215,6 +272,7 @@ class TestValidateAndPrepareConfig:
         """Test that CP with sequence packing raises ValueError."""
         mock_config["sequence_packing"]["enabled"] = True
         mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["precision"] = "bfloat16"
 
         with pytest.raises(
             ValueError, match="Context parallel is not supported for sequence packing"
@@ -224,6 +282,34 @@ class TestValidateAndPrepareConfig:
                 processor=None,
                 rank=0,
             )
+
+    @pytest.mark.parametrize("is_reward_model", [False, True])
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_context_parallel_float32_is_supported(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        is_reward_model,
+    ):
+        """Policy and value heads share the same CP precision constraints."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["precision"] = "float32"
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(mock_config, None, 0)
+
+        assert result.dtype == torch.float32
+        assert result.is_reward_model is is_reward_model
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -278,6 +364,7 @@ class TestValidateAndPrepareConfig:
         # Test FA2 for sequence packing with cp=1
         mock_config["sequence_packing"]["enabled"] = True
         mock_config["automodel_cfg"]["context_parallel_size"] = 1
+        mock_config["precision"] = "bfloat16"
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "flash_attention_2"
 
@@ -446,6 +533,7 @@ class TestValidateAndPrepareConfig:
         """Test that sequence packing with reward model raises NotImplementedError."""
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_config["sequence_packing"]["enabled"] = True
+        mock_config["precision"] = "bfloat16"
         mock_config["reward_model_cfg"] = {
             "enabled": True,
             "reward_model_type": "bradley_terry",
@@ -453,13 +541,42 @@ class TestValidateAndPrepareConfig:
 
         with pytest.raises(
             NotImplementedError,
-            match="Sequence packing is not supported for reward models",
+            match="Sequence packing is only supported for token-level regression reward models",
         ):
             validate_and_prepare_config(
                 config=mock_config,
                 processor=None,
                 rank=0,
             )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_sequence_packing_with_regression_reward_model(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Token-level regression models support sequence packing."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_config["sequence_packing"]["enabled"] = True
+        mock_config["precision"] = "bfloat16"
+        mock_config["reward_model_cfg"] = {
+            "enabled": True,
+            "reward_model_type": "regression",
+        }
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+        )
+
+        assert result.enable_seq_packing is True
+        assert result.allow_flash_attn_args is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -541,6 +658,7 @@ class TestValidateAndPrepareConfig:
 
         mock_config["sequence_packing"]["enabled"] = True
         mock_config["automodel_cfg"]["context_parallel_size"] = 1
+        mock_config["precision"] = "bfloat16"
 
         result = validate_and_prepare_config(
             config=mock_config,
@@ -677,11 +795,14 @@ class TestSetupDistributed:
         tp_dim.size.return_value = 1
         cp_dim = MagicMock()
         cp_dim.size.return_value = 1
+        pp_dim = MagicMock()
+        pp_dim.size.return_value = 1
 
         mock_mesh.__getitem__ = lambda self, key: {
             "dp": dp_dim,
             "tp": tp_dim,
             "cp": cp_dim,
+            "pp": pp_dim,
         }[key]
         return mock_mesh
 
@@ -718,6 +839,45 @@ class TestSetupDistributed:
         assert result.moe_mesh == mock_moe_mesh
         assert result.fsdp2_config == mock_fsdp2_config_instance
         assert result.moe_config == mock_moe_config_instance
+
+    @pytest.mark.parametrize(
+        "configured_dtype,expected_output_dtype",
+        [
+            (None, torch.float32),
+            ("float32", torch.float32),
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+        ],
+    )
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_fsdp_output_dtype(
+        self,
+        mock_torch_dist,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+        configured_dtype,
+        expected_output_dtype,
+    ):
+        """fsdp_output_dtype only changes output_dtype; params/reductions are untouched."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        if configured_dtype is not None:
+            mock_config["automodel_cfg"]["fsdp_output_dtype"] = configured_dtype
+
+        result = setup_distributed(mock_config, mock_runtime_config)
+
+        mp_policy = result.fsdp2_config.mp_policy
+        assert mp_policy.param_dtype == torch.bfloat16
+        assert mp_policy.reduce_dtype == torch.float32
+        assert mp_policy.output_dtype == expected_output_dtype
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.MeshContext")
@@ -847,6 +1007,39 @@ class TestSetupDistributed:
     @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_pipeline_parallel_divides_data_parallel(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """PP ranks are not data-parallel replicas: DP = world / (pp * tp * cp)."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        mock_config["automodel_cfg"]["pipeline_parallel_size"] = 2
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 2
+
+        setup_distributed(mock_config, mock_runtime_config)
+        parallelism = mock_mesh_context.build.call_args[0][1]
+        assert parallelism.pp_size == 2
+
+        # DP is 4 with PP=2, which dp_replicate_size=8 cannot divide.
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 8
+        with pytest.raises(ValueError, match="dp_replicate_size"):
+            setup_distributed(mock_config, mock_runtime_config)
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
         self,
         mock_torch_dist,
@@ -864,6 +1057,38 @@ class TestSetupDistributed:
 
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
+
+
+@pytest.mark.automodel
+def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_rl.models.automodel.pipeline_parallel import pipeline_loss_fn
+    from nemo_rl.models.automodel.setup import build_pipeline_config
+
+    fsdp2_config = SimpleNamespace(
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    )
+    config = {
+        "train_micro_batch_size": 2,
+        "max_total_sequence_length": 128,
+        "automodel_cfg": {"pipeline": {"microbatches_per_step": 4}},
+    }
+
+    pipeline_config = build_pipeline_config(config, fsdp2_config)
+
+    assert pipeline_config.pp_schedule == "1F1B"
+    assert pipeline_config.pp_microbatch_size == 2
+    assert pipeline_config.pp_batch_size == 8
+    assert pipeline_config.layers_per_stage is None
+    assert pipeline_config.dtype == torch.float32
+    assert pipeline_config.scale_grads_in_schedule is False
+    assert pipeline_config.pp_seq_len == 128
+    assert pipeline_config.loss_fn is pipeline_loss_fn
 
 
 @pytest.mark.automodel
@@ -902,6 +1127,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=1,
+            pp_size=1,
         )
 
     @pytest.fixture
@@ -1275,6 +1501,8 @@ class TestSetupModelAndOptimizer:
         assert call_kwargs["max_position_embeddings"] == 4096
         assert "config" not in call_kwargs
 
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("is_reward_model", [False, True])
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
     def test_setup_model_and_optimizer_no_optimizer(
@@ -1286,9 +1514,21 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        cp_size,
+        is_reward_model,
     ):
-        """Test model setup without optimizer initialization."""
+        """Policy and value setup share the CP SDPA allowlist."""
+        from torch.nn.attention import SDPBackend
+
         mock_get_rank.return_value = 0
+        mock_distributed_context = mock_distributed_context._replace(cp_size=cp_size)
+        mock_runtime_config = mock_runtime_config._replace(
+            is_reward_model=is_reward_model
+        )
+        mock_config["reward_model_cfg"] = {
+            "enabled": is_reward_model,
+            "reward_model_type": "regression",
+        }
 
         mock_model = MagicMock()
         mock_model.state_dict.return_value = {}
@@ -1310,6 +1550,11 @@ class TestSetupModelAndOptimizer:
         assert result.scheduler is None
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
         assert call_kwargs["torch_dtype"] == mock_runtime_config.dtype
+        assert call_kwargs["sdpa_method"] == (
+            [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            if cp_size > 1
+            else None
+        )
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1601,6 +1846,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1645,6 +1891,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=2,  # TP enabled
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1689,6 +1936,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         # Set model_type to gemma3 to trigger validation
@@ -1730,6 +1978,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,
+            pp_size=1,
         )
 
         mock_runtime_config.model_config.model_type = "gemma4_unified"

@@ -62,7 +62,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Generator, Iterator, cast
 
 import ray
 import torch
@@ -975,7 +975,7 @@ class _CheckpointParticipant:
 
     def _object_payloads(
         self, objects: list[_StoredObject]
-    ) -> Iterator[tuple[_StoredObject, Any, int]]:
+    ) -> Generator[tuple[_StoredObject, Any, int], None, None]:
         """Yield each object's bytes as ``(object, buffer, offset)``, in order."""
         if self._pinned:
             for obj in objects:

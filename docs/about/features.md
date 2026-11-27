@@ -7,7 +7,7 @@
 - **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - **Learning Algorithms** - GRPO/GSPO/DAPO, SFT (with LoRA), DPO, and on-policy distillation.
 - **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, and EP for efficient training (through NeMo AutoModel).
+- **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, EP, and PP for efficient training (through NeMo AutoModel). See [Automodel Pipeline Parallelism](../design-docs/automodel-pipeline-parallel.md) for the supported PP combinations.
 - **Larger Model Support with Longer Sequences** - Performant parallelism with Megatron Core (TP/PP/CP/SP/EP/FSDP) through NeMo Megatron Bridge.
 - **Sequence Packing** - Sequence packing in both Automodel and Megatron Core for large training performance gains.
 - **Fast Generation** - vLLM backend for optimized inference.
@@ -18,14 +18,16 @@
 - **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
 - **NeMo-Gym Integration** - RL environment integration.
 - **GB200** - Container support for GB200.
+- **Muon Optimizer** - Muon optimizer support for SFT/RL. See the [Muon guide](../guides/muon-optimizer.md).
+- **SGLang Inference** - SGLang rollout backend. See the [Generation design doc](../design-docs/generation.md).
+- **Speculative Decoding** - Eagle3 draft models for rollout acceleration. See the [Eagle3 guide](../guides/eagle3-speculative-decoding.md).
+- **GDPO** - See [Multi-reward support (GDPO)](../guides/environments.md#multi-reward-support-gdpo) and `examples/configs/gdpo_math_1B.yaml`.
+- **Nemotron-Super** - See the [Nemotron 3 Super guide](../guides/models/nemotron/nemotron-3-super.md).
 
 ## Planned / In Progress
 
-- **Muon Optimizer** - Emerging optimizer support for SFT/RL.
-- **SGLang Inference** - SGLang rollout support for optimized inference.
 - **Improved Native Performance** - Improved training time for native PyTorch models.
 - **Improved Large MoE Performance** - Improved Megatron Core training and generation performance.
-- **New Models** - Qwen3-Next and Nemotron-Super.
-- **Expanded Algorithms** - GDPO and broader LoRA coverage for GRPO and DPO.
+- **New Models** - Qwen3-Next.
+- **Expanded Algorithms** - Broader LoRA coverage for GRPO and DPO.
 - **Resiliency** - Fault tolerance and auto-scaling support.
-- **Speculative Decoding** - Speculative decoding support for rollout acceleration.

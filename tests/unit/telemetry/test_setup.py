@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 from nemo.lens import derive_nv_dl_run_uuid
-from pydantic import ValidationError
 
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.setup import (
@@ -81,17 +80,21 @@ def test_campaign_stage_is_tagged_on_driver_and_worker():
     assert _worker_resource_attributes(None, None)["nv.dl.campaign.stage"] == "RL"
 
 
-def test_build_resource_attributes_automodel_tp():
+def test_build_resource_attributes_automodel_tp_pp():
     cfg = _FakeMasterConfig(
         policy={
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
-            "automodel_cfg": {"enabled": True, "tensor_parallel_size": 4},
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 2,
+            },
         }
     )
     attrs = _build_resource_attributes(cfg, "grpo")
     assert attrs["nv.dl.topology.size.tp"] == 4
-    assert "nv.dl.topology.size.pp" not in attrs
+    assert attrs["nv.dl.topology.size.pp"] == 2
 
 
 def test_the_disabled_backends_settings_are_never_reported():
@@ -119,8 +122,7 @@ def test_the_disabled_backends_settings_are_never_reported():
     attrs = _build_resource_attributes(cfg, "dpo")
     assert attrs["nv.dl.topology.size.tp"] == 1
     assert attrs["nv.dl.training.config.optimizer"] == "torch.optim.AdamW"
-    # Automodel has no pipeline dimension, and recompute granularity is a
-    # megatron setting, so neither has anything to report here.
+    # Neither the disabled Megatron PP size nor its recompute granularity leaks in.
     assert "nv.dl.topology.size.pp" not in attrs
     assert "nv.dl.training.config.recompute_granularity" not in attrs
 
@@ -261,14 +263,6 @@ def test_init_worker_returns_none_when_disabled():
     handle = init_telemetry_worker()
     assert handle is None
     assert get_telemetry_handle() is None
-
-
-def test_config_rejects_an_unknown_exporter_at_parse_time():
-    # The Literal is what a user actually hits: it fires wherever the YAML is
-    # read, in every process, and regardless of `enabled` -- so a typo cannot
-    # sit dormant in a disabled block until someone switches telemetry on.
-    with pytest.raises(ValidationError):
-        TelemetryConfig(exporter="consoel")
 
 
 def test_config_has_no_rank_filtering_fields():

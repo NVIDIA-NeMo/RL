@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -35,7 +36,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
     replay_manifest_digest,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    ReadyFirstSampler,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -47,6 +51,7 @@ from nemo_rl.experience.route_plan import (
     RouteSpan,
     encode_route_plan,
 )
+from tests.unit.single_controller.test_logical_advantage import _batch as _logical_batch
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -1144,6 +1149,20 @@ def _make_metadata_envelope(
     }
 
 
+def _make_forest_group_entry(
+    group_id: str, segments: list[int], *, padding: bool = True
+) -> dict[str, Any]:
+    meta, _ = _logical_batch(
+        [(group_id, [(float(slot), count) for slot, count in enumerate(segments)])],
+        padding=padding,
+    )
+    group = _make_group_entry(group_id, weight=3, target_step=4)
+    meta.partition_id = "rollout_data"
+    meta.sequence_lengths = [3] * meta.size
+    group["meta"] = meta
+    return group
+
+
 def _load(
     buf: TQReplayBuffer,
     state: dict[str, Any],
@@ -1287,7 +1306,7 @@ class TestTQReplayBufferStateDict:
 
         periodic_state = buf.metadata_state_dict(
             saved_capacity=8,
-            additional_groups=claims,
+            already_claimed_groups=claims,
         )
         assert [group["meta"].sample_ids for group in periodic_state["groups"]] == [
             list(claimed_meta.sample_ids)
@@ -1314,6 +1333,139 @@ class TestTQReplayBufferStateDict:
         assert buf.size() == 1
         assert buf.training_owned_replay_groups() == []
         assert dp.depth() == _N_GENS
+
+    def test_snapshot_preserves_selection_order_across_training_chunks(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=3) for _ in range(6)]
+
+        async def exercise() -> None:
+            await buf.claim_for_training([2, 0])
+            await buf.claim_for_training([1])  # Original slot 3 after removal.
+            claims = buf.training_owned_replay_groups()
+            expected = [metas[i].sample_ids for i in (2, 0, 3, 1, 4, 5)]
+            state = buf.metadata_state_dict(
+                saved_capacity=6, already_claimed_groups=claims
+            )
+            assert [group["meta"].sample_ids for group in state["groups"]] == expected
+            assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
+            assert buf.group_ids == tuple(_group_id_of(metas[i]) for i in (1, 4, 5))
+            # A snapshot must not mutate live ownership or alias claim metadata.
+            state["groups"][0]["meta"].sample_ids[0] = "mutated-copy"
+            assert (
+                buf.training_owned_replay_groups()[0]["meta"].sample_ids
+                == metas[2].sample_ids
+            )
+            assert dp.depth() == 6 * _N_GENS
+
+        asyncio.run(exercise())
+
+    def test_snapshot_digest_binds_training_priority_order(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+        for _ in range(4):
+            _add_group(buf, weight=3)
+        _run(buf.claim_for_training([0, 1]))
+        state = buf.metadata_state_dict(
+            saved_capacity=8, already_claimed_groups=buf.training_owned_replay_groups()
+        )
+        state["groups"].reverse()
+        restored = _make_buffer(FakeDataPlaneClient())
+        with pytest.raises(ValueError, match="digest does not match its contents"):
+            _load(restored, state)
+        assert restored.size() == 0
+
+    @pytest.mark.parametrize("duplicate_id", [True, False])
+    def test_snapshot_rejects_duplicate_already_claimed_groups(self, duplicate_id):
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        duplicate = buf.metadata_state_dict(saved_capacity=8)["groups"][0].copy()
+        if not duplicate_id:
+            duplicate["group_id"] = "different-group-same-samples"
+        with pytest.raises(ValueError, match="duplicates"):
+            buf.metadata_state_dict(
+                saved_capacity=8, already_claimed_groups=[duplicate]
+            )
+        assert buf.size() == 1
+        assert buf.training_owned_replay_groups() == []
+
+    @pytest.mark.parametrize("duplicate_id", [True, False])
+    def test_snapshot_rejects_duplicate_claimed_groups_without_ready_groups(
+        self, duplicate_id: bool
+    ) -> None:
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        _run(buf.claim_for_training([0]))
+        claims = buf.training_owned_replay_groups()
+        duplicate = claims[0].copy()
+        if not duplicate_id:
+            duplicate["group_id"] = "different-group-same-samples"
+
+        with pytest.raises(ValueError, match="duplicates"):
+            buf.metadata_state_dict(
+                saved_capacity=8, already_claimed_groups=[*claims, duplicate]
+            )
+
+        assert buf.size() == 0
+        assert buf.training_owned_replay_groups() == claims
+
+    @pytest.mark.parametrize(
+        "ready_count,claimed_count", [(8, 2), (8, 5), (8, 8), (7, 5)]
+    )
+    def test_restore_prioritizes_claims_without_waiting_for_admission(
+        self, ready_count, claimed_count
+    ):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=3) for _ in range(ready_count)]
+        if ready_count < 8:
+            buf.reserve(weight_version=3, group_id="unfinished")
+
+        async def exercise() -> None:
+            # Full capacity, optionally including one unfinished reservation
+            # omitted from the snapshot. Selection must not wait for admission.
+            await buf.claim_for_training(list(range(claimed_count)))
+            state = buf.metadata_state_dict(
+                saved_capacity=8,
+                already_claimed_groups=buf.training_owned_replay_groups(),
+            )
+            restored = _make_buffer(dp)
+            await restored.load_state_dict(
+                state,
+                max_groups=8,
+                expected_partition_id="rollout_data",
+                expected_group_size=_N_GENS,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            assert restored.training_owned_replay_groups() == []
+            sampler = ReadyFirstSampler(restored, max_staleness_versions=1)
+            sampler.restore_dispatch_index(4)  # Dispatch is gated at weight 3.
+            admitted = asyncio.create_task(sampler.admit(trainer_version_fn=lambda: 3))
+            await asyncio.sleep(0)
+            assert not admitted.done()
+            try:
+                selected, count = await asyncio.wait_for(
+                    sampler.select(
+                        current_train_weight=3,
+                        min_prompt_groups=1,
+                        max_prompt_groups=claimed_count,
+                    ),
+                    timeout=1,
+                )
+                assert selected is not None
+                assert count == claimed_count
+                assert selected.sample_ids == [
+                    sid for meta in metas[:claimed_count] for sid in meta.sample_ids
+                ]
+                assert len(restored.training_owned_replay_groups()) == claimed_count
+                assert restored.size() == ready_count - claimed_count
+                assert len(dp.put_calls) == ready_count  # No restore-time re-put.
+                assert dp.depth() == ready_count * _N_GENS
+            finally:
+                admitted.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await admitted
+
+        asyncio.run(exercise())
 
     def test_training_claim_keeps_stable_selection_while_barrier_waits(self):
         async def exercise() -> None:
@@ -1699,6 +1851,133 @@ class TestTQReplayBufferLoadPreflight:
 
         assert _load(buf, state, max_groups=2) == 2
         assert buf.target_step_list == [1, 2]
+
+
+class TestForestReplayRestore:
+    @pytest.mark.parametrize("segments", [[1], [3], [1, 1], [3, 1], [2, 1, 3]])
+    @pytest.mark.parametrize("padding", [False, True])
+    def test_serialized_round_trip_preserves_physical_rows_and_group_capacity(
+        self, segments: list[int], padding: bool, tmp_path: Path
+    ) -> None:
+        groups = [
+            _make_forest_group_entry(name, segments, padding=padding)
+            for name in ("first", "second")
+        ]
+        # Exercise physical order independently of logical slot/segment order.
+        groups[0]["meta"] = groups[0]["meta"].subset(
+            list(reversed(range(groups[0]["meta"].size)))
+        )
+        state = _make_metadata_envelope(groups, saved_capacity=2)
+        source = _make_buffer(FakeDataPlaneClient())
+        assert (
+            _load(source, state, max_groups=2, expected_group_size=len(segments)) == 2
+        )
+        path = tmp_path / "replay.pt"
+        torch.save(source.metadata_state_dict(saved_capacity=2), path)
+        restored_state = torch.load(path, weights_only=False)  # Trusted test bytes.
+        dp = FakeDataPlaneClient()
+        restored = _make_buffer(dp)
+        assert (
+            _load(
+                restored,
+                restored_state,
+                max_groups=2,
+                expected_group_size=len(segments),
+            )
+            == 2
+        )
+        assert restored.size() == 2  # Not the number of segments/padding rows.
+        assert restored.start_weight_list == [3, 3]
+        assert restored.end_weight_list == [3, 3]
+        assert restored.target_step_list == [4, 4]
+        assert restored.count_for_target_step(4) == 2
+        assert restored.meta_list == [group["meta"] for group in groups]
+        assert restored.metadata_state_dict(saved_capacity=2) == state
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "partial_tags",
+            "missing_owner",
+            "missing_segment",
+            "duplicate_segment",
+            "wrong_owner",
+            "wrong_row_id",
+            "wrong_group_size",
+            "wrong_group_id",
+            "segment_count",
+            "padding_owner",
+            "padding_segment",
+            "padding_count",
+            "padding_only",
+            "boolean_segment",
+            "boolean_group_size",
+            "duplicate_row_id",
+        ],
+    )
+    def test_invalid_metadata_is_rejected_before_index_mutation(
+        self, corruption: str
+    ) -> None:
+        group = _make_forest_group_entry("broken", [2, 1])
+        meta = group["meta"]
+        if corruption == "partial_tags":
+            del meta.tags[0]["segment_count"]
+        elif corruption == "missing_owner":
+            group["meta"] = meta.subset([0, 1, 3])
+        elif corruption == "missing_segment":
+            group["meta"] = meta.subset([0, 2, 3])
+        elif corruption == "duplicate_segment":
+            meta.tags[1]["segment_index"] = 0
+        elif corruption == "wrong_owner":
+            meta.tags[0]["logical_rollout_id"] = "foreign_g0"
+        elif corruption == "wrong_row_id":
+            meta.sample_ids[0] = "foreign_g0_s0"
+        elif corruption == "wrong_group_size":
+            meta.tags[0]["logical_group_size"] = 3
+        elif corruption == "wrong_group_id":
+            group["group_id"] = "foreign"
+        elif corruption == "segment_count":
+            meta.tags[0]["segment_count"] = 3
+        elif corruption == "padding_owner":
+            meta.tags[-1]["logical_rollout_id"] = "broken_g0"
+        elif corruption == "padding_segment":
+            meta.tags[-1]["segment_index"] = 0
+        elif corruption == "padding_count":
+            meta.tags[-1]["segment_count"] = 1
+        elif corruption == "padding_only":
+            group["meta"] = meta.subset([3])
+        elif corruption == "boolean_segment":
+            meta.tags[0]["segment_index"] = False
+        elif corruption == "boolean_group_size":
+            meta.tags[0]["logical_group_size"] = True
+        elif corruption == "duplicate_row_id":
+            meta.sample_ids[1] = meta.sample_ids[0]
+        # Recompute the digest so structural validation, not integrity mismatch,
+        # rejects the bad group, even after an earlier sound group was validated.
+        state = _make_metadata_envelope(
+            [_make_forest_group_entry("sound", [1, 1]), group]
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        with pytest.raises(ValueError, match="Forest"):
+            _load(buf, state)
+        assert buf.size() == 0 and buf.meta_list == []
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    def test_forest_restore_preserves_digest_and_capacity_checks(self) -> None:
+        state = _make_metadata_envelope([_make_forest_group_entry("g", [3, 1])])
+        for kwargs, message in [
+            ({"max_groups": 0}, "more replay groups"),
+            ({"expected_manifest_digest": "wrong"}, "loaded TQ checkpoint"),
+        ]:
+            buf = _make_buffer(FakeDataPlaneClient())
+            with pytest.raises(ValueError, match=message):
+                _load(buf, state, **kwargs)
+            assert buf.size() == 0
+        state["groups"][0]["meta"].sequence_lengths[0] += 1
+        with pytest.raises(ValueError, match="digest does not match its contents"):
+            _load(_make_buffer(FakeDataPlaneClient()), state)
 
 
 class MultiPartitionFakeDataPlaneClient(FakeDataPlaneClient):
