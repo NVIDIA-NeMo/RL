@@ -81,6 +81,9 @@ def test_ledger_growth_and_restart_preserve_segment_chains(
                 lineage_store=ledger,
                 external_staging=True,
                 parent_resolution_mode="source_history",
+                # Parent search stays within one agent instance and model server.
+                agent_instance=manifest.records[-1].agent_instance,
+                model_ref=manifest.records[-1].model_ref,
             )
             token = set_token_sink(context)
             try:
