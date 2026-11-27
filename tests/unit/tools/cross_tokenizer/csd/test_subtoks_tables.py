@@ -174,6 +174,20 @@ def test_ordinary_added_token_cannot_become_a_semantic_special():
     assert lengths[source.convert_tokens_to_ids("<end>")].item() == 0
 
 
+def test_ordinary_added_token_maps_by_its_decoded_text():
+    source = _byte_tokenizer([], [])
+    # An added token that is not special, like Qwen3's <think>.
+    source.add_tokens(["<think>"])
+    destination = _byte_tokenizer([], [])
+    subtoks, lengths = build_subtoks_table(
+        source=source, destination=destination, max_subtokens=8
+    )
+    row = source.convert_tokens_to_ids("<think>")
+    expected = destination.convert_tokens_to_ids(list("<think>"))
+    assert lengths[row].item() == len(expected)
+    assert subtoks[row, : len(expected)].tolist() == expected
+
+
 @pytest.mark.parametrize(
     "corruption", ["event", "range", "padding", "fingerprint", "role"]
 )
