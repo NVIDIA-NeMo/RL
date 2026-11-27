@@ -60,6 +60,27 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 _CODEC_TIMER = ThreadSafeTimer()
 
 
+# torch has almost no kernels for these dtypes (no CPU max/arange/cat), so a
+# consumer that touches one fails far from the producer that wrote it.
+LIMITED_SUPPORT_DTYPES = frozenset({torch.uint16, torch.uint32, torch.uint64})
+
+
+def check_put_dtypes(fields: TensorDictBase) -> None:
+    """Reject a put whose tensor leaf has a dtype torch barely supports.
+
+    Raises:
+        TypeError: naming the field, so the producer casts it to a signed
+            dtype before ``put_samples`` instead of a reader failing later.
+    """
+    for key, value in fields.items(include_nested=True, leaves_only=True):
+        if isinstance(value, torch.Tensor) and value.dtype in LIMITED_SUPPORT_DTYPES:
+            raise TypeError(
+                f"data-plane field {key!r} has dtype {value.dtype}, which torch "
+                "supports only partially; cast it to a signed integer dtype "
+                "before put_samples."
+            )
+
+
 def record_codec_s(phase: str, elapsed_s: float) -> None:
     """Record one pad/unpad measurement, in seconds.
 

@@ -27,7 +27,7 @@ import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.codec import materialize
+from nemo_rl.data_plane.codec import check_put_dtypes, materialize
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     KVBatchMeta,
@@ -361,6 +361,8 @@ class LocalDataPlaneClient(DataPlaneClient):
             )
         if fields is None and tags is None:
             raise ValueError("Local put_samples requires fields or tags.")
+        if fields is not None:
+            check_put_dtypes(fields)
         if tags is not None and len(tags) != len(sample_ids):
             raise ValueError(
                 f"Local tags have {len(tags)} rows, expected {len(sample_ids)}."
