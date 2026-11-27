@@ -2392,10 +2392,7 @@ def _create_megatron_config(
         dataset=None,
         tokenizer=TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
-            # The model source and tokenizer source are intentionally independent.
-            # In particular, qualification jobs may load a converted Megatron
-            # checkpoint by its stable model id while pinning tokenization to an
-            # exact local HuggingFace snapshot.
+            # Use the configured tokenizer, which can differ from model_name.
             tokenizer_model=config["tokenizer"]["name"],
         ),
     )
