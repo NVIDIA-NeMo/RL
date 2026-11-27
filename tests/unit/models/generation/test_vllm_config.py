@@ -22,6 +22,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    enable_vllm_turn_priority,
     resolve_vllm_kv_cache_dtype,
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
@@ -312,3 +313,78 @@ def test_async_actor_settings_accept_supported_options(vllm_cfg: dict) -> None:
 
 def test_async_actor_settings_allow_omitted_vllm_cfg() -> None:
     validate_vllm_async_actor_settings(cast(VllmConfig, {}))
+
+
+@pytest.mark.parametrize(
+    "vllm_kwargs",
+    [
+        {},
+        {"scheduling_policy": "priority"},
+        {"scheduling_policy": "priority", "seed": 3},
+    ],
+)
+def test_turn_priority_serves_the_priority_scheduling_policy(vllm_kwargs: dict) -> None:
+    config = cast(
+        VllmConfig,
+        {"vllm_cfg": {"prioritize_later_turns": True}, "vllm_kwargs": vllm_kwargs},
+    )
+
+    enable_vllm_turn_priority(config)
+
+    assert config["vllm_kwargs"] == {**vllm_kwargs, "scheduling_policy": "priority"}
+    validate_vllm_async_actor_settings(config)
+
+
+def test_turn_priority_creates_the_vllm_kwargs_block() -> None:
+    config = cast(VllmConfig, {"vllm_cfg": {"prioritize_later_turns": True}})
+
+    enable_vllm_turn_priority(config)
+
+    assert config["vllm_kwargs"] == {"scheduling_policy": "priority"}
+
+
+def test_turn_priority_rejects_another_scheduling_policy() -> None:
+    config = cast(
+        VllmConfig,
+        {
+            "vllm_cfg": {"prioritize_later_turns": True},
+            "vllm_kwargs": {"scheduling_policy": "fcfs"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="scheduling_policy is 'fcfs'"):
+        enable_vllm_turn_priority(config)
+    assert config["vllm_kwargs"] == {"scheduling_policy": "fcfs"}
+
+
+def test_turn_priority_rejects_dynamo() -> None:
+    config = cast(
+        VllmConfig, {"dynamo": True, "vllm_cfg": {"prioritize_later_turns": True}}
+    )
+
+    with pytest.raises(ValueError, match="not supported with policy.generation.dynamo"):
+        enable_vllm_turn_priority(config)
+
+
+@pytest.mark.parametrize("vllm_kwargs", [None, {}, {"scheduling_policy": "fcfs"}])
+def test_turn_priority_without_nemo_gym_setup_is_rejected(
+    vllm_kwargs: dict | None,
+) -> None:
+    config: dict = {"vllm_cfg": {"prioritize_later_turns": True}}
+    if vllm_kwargs is not None:
+        config["vllm_kwargs"] = vllm_kwargs
+
+    with pytest.raises(ValueError, match="prioritize_later_turns requires NeMo-Gym"):
+        validate_vllm_async_actor_settings(cast(VllmConfig, config))
+
+
+def test_turn_priority_off_leaves_the_scheduling_policy_alone() -> None:
+    validate_vllm_async_actor_settings(
+        cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"prioritize_later_turns": False},
+                "vllm_kwargs": {"scheduling_policy": "fcfs"},
+            },
+        )
+    )

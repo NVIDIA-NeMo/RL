@@ -268,6 +268,7 @@ policy: &POLICY_BASE
             distributed_executor_backend: null
             flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
             output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
+            prioritize_later_turns: false # NeMo-Gym only. true: serve vLLM with vllm_kwargs.scheduling_policy=priority and have Gym's policy model server send each model call's priority from its turn, so later turns of rollouts in flight are scheduled before the first turns of new ones
         vllm_kwargs: {}
 
         colocated:

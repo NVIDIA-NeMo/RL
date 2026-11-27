@@ -25,7 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -119,6 +119,13 @@ class VllmSpecificArgs(TypedDict):
     # Keeps refit and other control calls responsive. Requires async_engine: true.
     # None (default) disables it.
     output_loop_yield_budget_ms: NotRequired[float | None]
+    # NeMo-Gym only. Schedule the later turns of rollouts already in flight
+    # before the first turns of new ones: vLLM runs with
+    # vllm_kwargs.scheduling_policy="priority", and Gym's policy model server
+    # sends each model call's priority as minus its assistant turns
+    # (vllm_model priority_by_turn). Not supported with policy.generation.dynamo
+    # or another vllm_kwargs.scheduling_policy. Default false.
+    prioritize_later_turns: NotRequired[bool]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -392,6 +399,17 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             "through the async engine's HTTP server; it requires async_engine: true "
             "and expose_http_server: true."
         )
+    if (
+        vllm_cfg.get("prioritize_later_turns")
+        and (config.get("vllm_kwargs") or {}).get("scheduling_policy") != "priority"
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true): Gym's policy model server sends "
+            "each model call's priority, and NeMo RL's own rollouts send none. Set it "
+            "to false. To schedule by priorities another client sends, set "
+            "policy.generation.vllm_kwargs.scheduling_policy=priority instead."
+        )
     budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
     if budget_ms is None:
         return
@@ -405,6 +423,28 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
             f"(or null to disable), got {budget_ms}."
         )
+
+
+def enable_vllm_turn_priority(config: VllmConfig) -> None:
+    """Serve vLLM with the priority scheduling policy for ``prioritize_later_turns``.
+
+    NeMo-Gym setup calls this; Gym's policy model server sends the priorities.
+    """
+    if dynamo_enabled(config):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns is not supported with "
+            "policy.generation.dynamo=true: NeMo RL's chat engine behind the Dynamo "
+            "frontend does not pass a request priority to vLLM."
+        )
+    vllm_kwargs = config.setdefault("vllm_kwargs", {})
+    if vllm_kwargs.get("scheduling_policy") not in (None, "priority"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns runs vLLM with "
+            "scheduling_policy='priority', but policy.generation.vllm_kwargs."
+            f"scheduling_policy is {vllm_kwargs['scheduling_policy']!r}. Remove "
+            "vllm_kwargs.scheduling_policy, or set prioritize_later_turns to false."
+        )
+    vllm_kwargs["scheduling_policy"] = "priority"
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:

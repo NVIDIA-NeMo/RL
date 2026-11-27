@@ -85,6 +85,21 @@ Prefix-level rollout recovery (`rollout_recovery.target_level: prefix`) works wi
 
 See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 
+### Schedule later turns first
+
+Set `policy.generation.vllm_cfg.prioritize_later_turns: true` to schedule the later turns of rollouts already in flight before the first turns of new ones when the engine is saturated. NeMo RL runs vLLM with `vllm_kwargs.scheduling_policy: priority`, and turns on `priority_by_turn` in Gym's `policy_model` vLLM model server, which sends each model call's request `priority` as minus the number of assistant messages in its history. vLLM schedules a smaller priority first and preempts it last.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `policy.generation.vllm_cfg.prioritize_later_turns` | `false` | Serve vLLM with priority scheduling and have Gym send each model call's turn priority. |
+
+The setting is refused at setup:
+
+- without NeMo Gym rollouts, whose model server sends the priorities; to schedule by priorities another client sends, set `policy.generation.vllm_kwargs.scheduling_policy: priority` instead.
+- with a `policy.generation.vllm_kwargs.scheduling_policy` other than `priority`.
+- with `policy.generation.dynamo: true`.
+- when `env.nemo_gym.policy_model` sets `vllm_model.priority_by_turn: false` or `vllm_model.extra_body.priority`.
+
 ### Dataset formats and routing
 
 NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment Server:
