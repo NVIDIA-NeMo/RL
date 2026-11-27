@@ -217,7 +217,7 @@ def test_resolve_disagg_layout_reads_absent_as_disabled():
     assert resolve_disagg_layout({"disaggregation": DisaggConfig(enabled=True)}).enabled
 
 
-@pytest.mark.parametrize("backend", ["megatron", "sglang"])
+@pytest.mark.parametrize("backend", ["megatron", "nonexistent"])
 def test_entrypoint_check_refuses_a_backend_that_would_ignore_the_block(backend):
     cfg = {"backend": backend, "disaggregation": {"enabled": True}}
     with pytest.raises(ValueError, match=f"got '{backend}'"):
@@ -233,6 +233,14 @@ def test_entrypoint_check_requires_nemo_gym(backend):
     validate_disagg_entrypoint(cfg, uses_nemo_gym=True)
     with pytest.raises(ValueError, match="requires NeMo-Gym"):
         validate_disagg_entrypoint(cfg, uses_nemo_gym=False)
+
+
+def test_entrypoint_check_leaves_the_rollout_path_of_sglang_to_its_validator():
+    # SGLang's router serves /generate, not NeMo-Gym; which of the two a config
+    # may use is validate_sglang_disaggregation's call.
+    cfg = {"backend": "sglang", "disaggregation": {"enabled": True}}
+    validate_disagg_entrypoint(cfg, uses_nemo_gym=False)
+    validate_disagg_entrypoint(cfg, uses_nemo_gym=True)
 
 
 # -------------------------------------------------------------------------- #

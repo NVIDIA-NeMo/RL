@@ -80,6 +80,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
+from nemo_rl.models.generation.sglang.config import sglang_refit_peer_env
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -520,14 +521,19 @@ def configure_refit_environment(config) -> None:
         # set it before the training process group. See issue #564.
         backend = generation_cfg["backend"]
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+        # Same communicator, same transport: the engines' NCCL_NET_PLUGIN
+        # (disaggregated NIXL engines run without the plugin) unless
+        # megatron_cfg.env_vars chooses one for the trainer.
         if backend == "vllm":
-            # Same communicator, same transport: the engines' NCCL_NET_PLUGIN
-            # (disaggregated NIXL engines run without the plugin) unless
-            # megatron_cfg.env_vars chooses one for the trainer.
-            trainer_env = (config.get("megatron_cfg") or {}).get("env_vars") or {}
-            for key, value in vllm_refit_peer_env(generation_cfg).items():
-                if key not in trainer_env:
-                    os.environ[key] = value
+            peer_env = vllm_refit_peer_env(generation_cfg)
+        elif backend == "sglang":
+            peer_env = sglang_refit_peer_env(generation_cfg, os.environ)
+        else:
+            peer_env = {}
+        trainer_env = (config.get("megatron_cfg") or {}).get("env_vars") or {}
+        for key, value in peer_env.items():
+            if key not in trainer_env:
+                os.environ[key] = value
 
 
 def _distributed_timeout_minutes(config: PolicyConfig | ValueConfig) -> Optional[float]:

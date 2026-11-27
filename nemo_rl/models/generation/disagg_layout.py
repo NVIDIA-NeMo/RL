@@ -18,11 +18,11 @@ shares (:class:`~nemo_rl.models.generation.interfaces.DisaggConfig`): a replica 
 ``num_prefill_engines`` prefill engines plus ``num_decode_engines`` decode engines
 behind ``num_frontend_workers`` frontends, and the replica count follows from the
 inference cluster's size. How a backend *implements* that layout lives in its own
-block (``trtllm_cfg`` / ``vllm_cfg``): a per-role engine override
+block (``trtllm_cfg`` / ``vllm_cfg`` / ``sglang_cfg``): a per-role engine override
 (``prefill_engine`` / ``decode_engine``) naming only what the two roles may
 disagree on, plus the backend's frontend and KV-transport settings.
 
-This module holds what both backends need and must agree on:
+This module holds what every backend needs and must agree on:
 
 * reading the layout block as its schema,
 * resolving the role blocks into complete per-role engine configs,
@@ -45,8 +45,14 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 
 Role = Literal["prefill", "decode"]
 ROLES: tuple[Role, Role] = ("prefill", "decode")
+# NCCL variables every rank of the refit collective has to agree on: the
+# training ranks adopt the disaggregated engines' value of each.
+REFIT_PEER_ENV_KEYS = ("NCCL_NET_PLUGIN",)
 # Backends whose generation class reads ``generation.disaggregation``.
-DISAGG_BACKENDS: tuple[str, ...] = ("trtllm", "vllm")
+DISAGG_BACKENDS: tuple[str, ...] = ("trtllm", "vllm", "sglang")
+# Of those, the ones whose replicas are reachable only through HTTP frontends.
+# SGLang's router serves the native /generate rollout instead.
+FRONTEND_DISAGG_BACKENDS: tuple[str, ...] = ("trtllm", "vllm")
 
 
 def as_dict(raw: Any) -> dict[str, Any]:
@@ -76,9 +82,10 @@ def validate_disagg_entrypoint(
     Every training entrypoint calls this at setup, before it builds a cluster.
     ``generation.disaggregation`` is written in backend-agnostic terms, but only
     the backends in :data:`DISAGG_BACKENDS` implement it: any other backend
-    would silently ignore the block and serve aggregated. A disaggregated
-    replica is reachable only through its HTTP frontends, so without NeMo-Gym
-    the whole fleet would come up and fail at the first rollout.
+    would silently ignore the block and serve aggregated. A replica of a backend
+    in :data:`FRONTEND_DISAGG_BACKENDS` is reachable only through its HTTP
+    frontends, so without NeMo-Gym the whole fleet would come up and fail at
+    the first rollout.
     """
     if not resolve_disagg_layout(generation_config).enabled:
         return
@@ -93,7 +100,7 @@ def validate_disagg_entrypoint(
             f"backend in {DISAGG_BACKENDS}, got '{backend}'. Set it to false, or "
             "switch the backend."
         )
-    if not uses_nemo_gym:
+    if backend in FRONTEND_DISAGG_BACKENDS and not uses_nemo_gym:
         raise ValueError(
             "policy.generation.disaggregation.enabled requires NeMo-Gym "
             "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "

@@ -339,6 +339,15 @@ def validate_and_prepare_config(
             )
 
             peer_env = vllm_refit_peer_env(cast(VllmConfig, generation_cfg))
+        elif rollout_backend == "sglang":
+            from nemo_rl.models.generation.sglang.config import (
+                SGLangConfig,
+                sglang_refit_peer_env,
+            )
+
+            peer_env = sglang_refit_peer_env(
+                cast(SGLangConfig, generation_cfg), os.environ
+            )
         trainer_env = cast(
             dict[str, str], (config.get("automodel_cfg") or {}).get("env_vars") or {}
         )

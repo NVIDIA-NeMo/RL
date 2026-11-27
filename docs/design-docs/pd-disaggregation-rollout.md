@@ -1,8 +1,8 @@
 # NemoRL Disaggregation Rollout (Experimental)
 
-> **Experimental**: PD disaggregation is wired for the TensorRT-LLM and vLLM backends on the NeMo-Gym rollout path only.
+> **Experimental**: PD disaggregation is wired for the TensorRT-LLM and vLLM backends on the NeMo-Gym rollout path only, and for the SGLang backend on its native (non-Gym) rollout path.
 
-NeMo RL owns the *replica* (which engines exist, how they are placed, and their lifecycle) and the *refit safety* (what happens when weights change mid-request). It delegates both the *KV handshake* and the *routing inside a replica* to the inference backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`) over vLLM's `KVTransferConfig` connector (NixlConnector by default). The layout is the shared `generation.disaggregation` block for both backends; the vLLM specifics live under `vllm_cfg.prefill_engine`, `vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer` (see Configuration below).
+NeMo RL owns the *replica* (which engines exist, how they are placed, and their lifecycle) and the *refit safety* (what happens when weights change mid-request). It delegates both the *KV handshake* and the *routing inside a replica* to the inference backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`) over vLLM's `KVTransferConfig` connector (NixlConnector by default); for SGLang, the sglang router in PD mode. The layout is the shared `generation.disaggregation` block for all three backends; the vLLM specifics live under `vllm_cfg.prefill_engine`, `vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer`, and the SGLang ones under `sglang_cfg.prefill_engine`, `sglang_cfg.decode_engine` and `sglang_cfg.disagg` (see Configuration below).
 
 ## Design
 
@@ -132,7 +132,7 @@ policy:
         backend: NIXL                 # DEFAULT | UCX | NIXL | MOONCAKE | MPI
 ```
 
-The `disaggregation` block is checked when the config loads: the three counts must be at least 1, and `frontend_base_port` must be a valid port. At setup, every training entrypoint (GRPO, PPO, distillation, SingleController) refuses the block on a backend that does not implement it, and without NeMo-Gym rollouts (`env.should_use_nemo_gym`), since a replica is reachable only through its frontends.
+The `disaggregation` block is checked when the config loads: the three counts must be at least 1, and `frontend_base_port` must be a valid port. At setup, every training entrypoint (GRPO, PPO, distillation, SingleController) refuses the block on a backend that does not implement it, and, on TRT-LLM and vLLM, without NeMo-Gym rollouts (`env.should_use_nemo_gym`), since their replicas are reachable only through the frontends (SGLang serves its native `/generate` rollout instead; see below).
 
 With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the RDMA HCAs instead of the image's management NIC (see `tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
 
@@ -181,6 +181,37 @@ A leg that carries prompt ids is not rendered by its engine, and the ids hold th
 
 Colocated generation is not supported yet; set `colocated.enabled: false`.
 
+### SGLang
+
+SGLang needs no frontend of NeMo RL's: the sglang router's PD mode is the disagg server. It pairs every `/generate` request with one prefill and one decode engine, stamps the prefill engine's bootstrap host/port/room on it (the KV handshake), and relays the decode output. The rollout therefore keeps posting token ids to `/generate` exactly as without disaggregation, which is why the SGLang path needs no NeMo-Gym and is in fact refused with it (`env.should_use_nemo_gym` must be false).
+
+```yaml
+policy:
+  generation:
+    backend: sglang
+    disaggregation:                   # the shared layout; frontend_* keys stay default
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+    sglang_cfg:
+      tp_size: 2
+      sglang_server_config:
+        pause_generation_mode: abort  # required: SGLang refuses retract in PD mode
+      prefill_engine: {}              # per-role overrides: SGLangRoleEngineArgs
+      decode_engine: {}
+      disagg:                         # defaults on SGLangDisaggConfig
+        router_scope: replica         # replica | global
+        transfer_backend: mooncake    # mooncake | nixl | mooncake_tcp
+        prefill_router: cache_aware   # random | round_robin | cache_aware
+        decode_router: round_robin
+```
+
+Engines are laid out per replica as on the other backends (`nemo_rl/models/generation/sglang/utils/layout.py`); widths may differ per role. With `router_scope: replica` every replica gets its own router, so a request's KV never leaves the replica's placement domain, and NeMo RL spreads prompts over the routers: the samples of one prompt share a router, and so a replica, and a new prompt goes to the usable router with the fewest requests in flight; a router whose replica has lost an engine is skipped (`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`). Inside a router, `cache_aware` does not pick the prefill engine by prefix: NeMo RL sends token ids only, so the policy has no text to match and takes the least-loaded engine. `global` pools every engine behind one router, which balances decode fleet-wide at the price of cross-replica KV transfers. Routers start with empty pools and the engines register with their role and, for prefill, their bootstrap port; `power_of_two` is refused because sglang-router 0.3.2 validates it against the workers configured at startup.
+
+`abort` is the pause mode SGLang allows in PD mode, and it is safe only when no rollout is in flight at refit: GRPO refits between steps (async GRPO does not support SGLang), and `SGLangGeneration.validate_settings` refuses the SingleController entrypoint, which refits with rollouts in flight. Prefill engines pause before decode engines and resume after them. Checked at setup: `colocated.enabled: false`, no external router, `pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys, and `needs_offload: false` under `transfer_backend: nixl` (the memory saver cannot re-acquire the KV cache it released for a refit there; the engines exit at the first refit). A runnable recipe is `examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg.yaml`.
+
+Engines get the environment their KV transport needs (`disagg_transport_env`), with values already in the environment taking precedence: with `nixl`, `NCCL_NET_PLUGIN=none` as on the vLLM path, which the training workers adopt for the same reason as there (one refit process group, one NCCL transport); with `mooncake`, `WITH_NVIDIA_PEERMEM=0` when the nvidia-peermem kernel module is not loaded, so Mooncake registers GPU memory through DMA-BUF instead of `ibv_reg_mr` (without it every engine logs "Failed to register memory ...: Bad address" and every KV transfer fails; GB200 containers are the known case).
+
 GPU budget:
 
 ```
@@ -190,7 +221,7 @@ inference GPUs = num_replicas * replica width
 
 `num_frontend_workers` does not appear here: frontends are CPU-only actors (`num_cpus=1, num_gpus=0`), so F never changes the GPU budget or the engine layout.
 
-`disagg_layout.plan_engines()`, which both backends call, turns this into a per-engine `(role, width)` list — the single source of truth everything else derives from:
+`disagg_layout.plan_engines()`, which every backend calls, turns this into a per-engine `(role, width)` list — the single source of truth everything else derives from:
 
 ```
 [prefill_width × M, decode_width × K,   prefill_width × M, ...]
