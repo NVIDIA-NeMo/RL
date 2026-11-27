@@ -75,7 +75,9 @@ Training reports `looping/rate = flagged / assessed` when any output was assesse
 
 SingleController omits looping ratios for restored steps whose complete pre-filter counts were not checkpointed and logs the affected step range. Reporting resumes on the next fully observed step; saved row labels still control objective zeroing throughout recovery.
 
-The safeguard is independent of length shaping's `enabled` flag. It changes only known boolean `true` rows, including the separate reward input used for dynamic-sampling standard deviation; other rows retain their configured reward variants. Raw verifier observations, published validation scores and sample/token masks retain their existing behavior. For four correct outputs with one confirmed loop, the training reward group is `[0, 1, 1, 1]` while verifier observations remain `[1, 1, 1, 1]`.
+The safeguard is independent of length shaping's `enabled` flag. It zeroes learning rewards only for known boolean `true` rows; false and unknown labels retain their existing reward adjustments. Raw verifier observations, published validation scores and sample/token masks retain their existing behavior.
+
+Dynamic sampling keeps its existing raw/unshaped reward signal, so enabling loop zeroing does not change which groups it retains. Learning baselines and advantage normalization use the adjusted rewards of the retained rows. For example, verifier grades `[1, 0, 1, 0]` with a confirmed loop in the first row produce learning rewards `[0, 0, 1, 0]`, while the verifier grades and DS input remain `[1, 0, 1, 0]`. A raw-uniform group such as `[1, 1, 1, 1]` is still filtered out when dynamic sampling is enabled, even if one row loops.
 
 ## Configuration
 

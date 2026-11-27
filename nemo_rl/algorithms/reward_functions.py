@@ -130,13 +130,13 @@ def zero_looping_rewards(
 def apply_reward_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
 ) -> BatchedDataDict:
-    """Apply length adjustments, then the optional confirmed-loop safeguard."""
+    """Apply length adjustments, then zero confirmed loops in learning rewards."""
     batch = _apply_length_shaping(batch, cfg)
     if cfg.zero_looping_rewards:
+        if "unshaped_total_reward" not in batch:
+            batch["unshaped_total_reward"] = batch["total_reward"].clone()
         for key in batch:
-            if key in ("total_reward", "unshaped_total_reward") or key.startswith(
-                "reward/"
-            ):
+            if key == "total_reward" or key.startswith("reward/"):
                 batch[key] = zero_looping_rewards(batch[key], batch.get("is_looping"))
     return batch
 

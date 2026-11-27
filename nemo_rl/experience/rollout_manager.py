@@ -44,7 +44,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     PostWriteEnrichmentError,
     TQReplayBuffer,
 )
-from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
@@ -2354,14 +2353,12 @@ class RolloutManager:
         masked_reward_policy: Optional[str] = None,
         overlong_filtering: bool = False,
         length_penalty_config: LengthPenaltyConfig | None = None,
-        reward_shaping: RewardShapingConfig | None = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
         # DAPO: drop a group whose voting generations all scored the same.
         self._filter_zero_variance_groups = filter_zero_variance_groups
-        self._reward_shaping = reward_shaping
         self._masked_reward_policy = masked_reward_policy
         self._overlong_filtering = overlong_filtering
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
@@ -2653,7 +2650,6 @@ class RolloutManager:
             record,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
-            reward_shaping=self._reward_shaping,
         )
 
     def _is_zero_variance_finalized(self, finalized: "FinalizedGroup") -> bool:
@@ -2663,7 +2659,6 @@ class RolloutManager:
                 finalized,
                 masked_reward_policy=self._masked_reward_policy,
                 overlong_filtering=self._overlong_filtering,
-                reward_shaping=self._reward_shaping,
             )
         )
 

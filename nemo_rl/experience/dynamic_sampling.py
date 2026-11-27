@@ -18,12 +18,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-import torch
-
-from nemo_rl.algorithms.reward_functions import (
-    RewardShapingConfig,
-    zero_looping_rewards,
-)
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.metric_utils import looping_metrics
@@ -111,7 +105,6 @@ def voting_rewards_from_record(
     *,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
-    reward_shaping: RewardShapingConfig | None = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from its ``Completion`` rows."""
     rewards = [
@@ -120,14 +113,6 @@ def voting_rewards_from_record(
         else completion.reward_original
         for completion in record.completions
     ]
-    if reward_shaping is not None and reward_shaping.zero_looping_rewards:
-        rewards = zero_looping_rewards(
-            torch.tensor(rewards, dtype=torch.float64),
-            [
-                (completion.env_extras or {}).get("is_looping")
-                for completion in record.completions
-            ],
-        ).tolist()
     return voting_rewards(
         rewards,
         mask_sample=[
@@ -146,18 +131,9 @@ def voting_rewards_from_finalized(
     *,
     masked_reward_policy: Optional[str],
     overlong_filtering: bool,
-    reward_shaping: RewardShapingConfig | None = None,
 ) -> list[float]:
     """The rewards that vote in a group's baseline, read from a finalized capture group."""
     rewards = finalized.reward_original
-    if reward_shaping is not None and reward_shaping.zero_looping_rewards:
-        rewards = zero_looping_rewards(
-            torch.tensor(rewards, dtype=torch.float64),
-            [
-                row.log_context.is_looping if row.log_context is not None else None
-                for row in finalized.reward_observations
-            ],
-        ).tolist()
     return voting_rewards(
         rewards,
         mask_sample=finalized.reward_mask_sample,

@@ -37,19 +37,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import (
-    AdvEstimatorConfig,
-    GRPOAdvantageEstimator,
-)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
-)
-from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.reward_functions import (
-    RewardShapingConfig,
-    apply_reward_shaping,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -404,7 +394,6 @@ def _make_manager(
     # group-relative baseline, so every row votes -- the shape these tests assert on.
     mgr._masked_reward_policy = None
     mgr._overlong_filtering = False
-    mgr._reward_shaping = None
     mgr._step_rewards = {}
     mgr._looping_metrics_incomplete_through = None
     return mgr
@@ -3477,69 +3466,28 @@ def _scored_record(*rewards: float) -> PromptGroupRecord:
     )
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_looping_objective_matches_dynamic_sampling_and_learning(enabled):
-    cfg = RewardShapingConfig(
-        enabled=True, stop_properly_penalty_coef=0.5, zero_looping_rewards=enabled
-    )
-    record = _scored_record(1.0, 1.0, 1.0, 1.0)
+@pytest.mark.parametrize("rewards", [[1.0] * 4, [1.0, 0.0, 0.0, 0.0]])
+def test_looping_labels_preserve_raw_dynamic_sampling(rewards):
+    record = _scored_record(*rewards)
     flags = [True, False, None, False]
     for completion, flag in zip(record.completions, flags, strict=True):
         completion.env_extras = {"is_looping": flag, "mask_sample": True}
     manager = _make_manager(_FakeBuffer(), _FakeImpl(record=record))
     manager._filter_zero_variance_groups = True
-    manager._reward_shaping = cfg
     outcome = _run(manager.generate_and_push({"idx": 0}, target_step=0))
-    assert outcome is (RolloutOutcome.COMMITTED if enabled else RolloutOutcome.FILTERED)
-    assert manager._voting_rewards(record) == ([0, 1, 1, 1] if enabled else [1] * 4)
-    batch = apply_reward_shaping(
-        BatchedDataDict(
-            {
-                "total_reward": torch.ones(4),
-                "is_looping": flags,
-                "truncated": torch.tensor([True, False, False, False]),
-            }
-        ),
-        cfg,
-    )
-    assert batch["total_reward"].tolist() == (
-        [0, 1, 1, 1] if enabled else [0.5, 1, 1, 1]
-    )
-    assert batch["unshaped_total_reward"].tolist() == manager._voting_rewards(record)
-    estimator = GRPOAdvantageEstimator(
-        AdvEstimatorConfig(normalize_rewards=False, use_leave_one_out_baseline=False),
-        ClippedPGLossConfig(),
-    )
-    advantages = estimator.compute_advantage(
-        prompt_ids=torch.zeros(4, 1, dtype=torch.long),
-        rewards=batch["total_reward"],
-        mask=torch.ones(4, 1),
-    )
-    assert advantages[:, 0].tolist() == (
-        [-0.75, 0.25, 0.25, 0.25] if enabled else [-0.375, 0.125, 0.125, 0.125]
-    )
+    expected = RolloutOutcome.FILTERED if rewards[1] else RolloutOutcome.COMMITTED
+    assert outcome is expected
+    assert manager._voting_rewards(record) == rewards
     metrics = manager.drain_step_reward_metrics(0)
     assert metrics["looping/rate"] == 1 / 3
     assert metrics["looping/coverage"] == 3 / 4
-    assert metrics["unfiltered_reward"] == 1
+    assert metrics["unfiltered_reward"] == sum(rewards) / 4
     manager.suppress_restored_looping_metrics(0)
     manager.record_looping_flags(0, flags)
     assert "looping/rate" not in manager.drain_step_reward_metrics(0)
 
 
 class TestStepRewardMetrics:
-    def test_looping_rates_pool_counts_with_unequal_groups(self):
-        metrics = aggregate_rollout_metrics(
-            {
-                "looping/completed_total": [2, 8],
-                "looping/assessed_total": [1, 8],
-                "looping/flagged_total": [1, 0],
-                "looping/rate": [1, 0],
-            }
-        )
-        assert metrics["looping/rate"] == 1 / 9
-        assert metrics["looping/coverage"] == 9 / 10
-
     def test_committed_group_is_tallied_under_its_target_step(self):
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0)))

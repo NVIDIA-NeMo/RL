@@ -63,6 +63,7 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _update_adaptive_loss_state,
     _validation_early_stop_message,
+    aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -109,6 +110,7 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.rollouts import nemo_gym_logging_metadata
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -673,6 +675,7 @@ def grpo_train_sync(
         pending_carry: Optional[BatchedDataDict] = None
         pending_unfiltered_rewards: list[torch.Tensor] = []
         dynamic_sampling_num_gen_batches = 0
+        looping_batches: dict[str, list] = {}
 
         for batch in wrapped_dataloader:
             metrics_logging_data: dict = {}
@@ -808,6 +811,10 @@ def grpo_train_sync(
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
+                    for key, value in rollout_metrics.items():
+                        if key.startswith("looping/") and key.endswith("_total"):
+                            looping_batches.setdefault(key, []).append(value)
+                    rollout_metrics.update(aggregate_rollout_metrics(looping_batches))
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 # ── Per-sample driver compute on slice ────────────────
@@ -822,11 +829,10 @@ def grpo_train_sync(
                         driver_carry,
                         master_config.grpo.reward_scaling,
                     )
-                    if master_config.grpo.reward_shaping.enabled:
-                        driver_carry = apply_reward_shaping(
-                            driver_carry,
-                            master_config.grpo.reward_shaping,
-                        )
+                    driver_carry = apply_reward_shaping(
+                        driver_carry,
+                        master_config.grpo.reward_shaping,
+                    )
                     std_rewards = (
                         driver_carry["unshaped_total_reward"]
                         if master_config.grpo.use_dynamic_sampling
@@ -1443,6 +1449,8 @@ def grpo_train_sync(
                     elif key in repeated_batch:
                         log_data[key] = repeated_batch[key]
                 log_data["rewards"] = rewards.tolist()
+                if driver_carry is not None:
+                    log_data.update(nemo_gym_logging_metadata(driver_carry))
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_loss_mask"] = token_mask.tolist()
                 log_data["sample_loss_mask"] = sample_mask.tolist()
@@ -1576,6 +1584,7 @@ def grpo_train_sync(
             )
 
             dynamic_sampling_num_gen_batches = 0
+            looping_batches.clear()
 
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
