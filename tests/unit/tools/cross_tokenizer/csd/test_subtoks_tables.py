@@ -195,7 +195,9 @@ def test_validator_rejects_invalid_tables(tmp_path: Path, corruption: str):
     elif corruption == "fingerprint":
         table["source_fingerprint"] = "wrong-tokenizer"
     elif corruption == "role":
-        table["subtoks"][source.eos_token_id, 0] = 0
+        # Unmap EOS. Only the role check sees this: the event check skips unmapped rows.
+        table["lengths"][source.eos_token_id] = 0
+        table["subtoks"][source.eos_token_id, 0] = -1
     torch.save(table, path)
     with pytest.raises(ValueError):
         validate_table(path, source=source, destination=destination)
