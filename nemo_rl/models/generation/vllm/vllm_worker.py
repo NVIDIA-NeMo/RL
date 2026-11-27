@@ -1631,7 +1631,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
-    def _reset_prefix_cache_with_no_batch_in_flight(self) -> None:
+    def _reset_prefix_cache_with_no_batch_in_flight(self) -> bool:
         """Finish the engine's queued batches, then reset the prefix cache.
 
         ``LLM.generate`` returns once every request has its final output. With
@@ -1640,14 +1640,23 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         prefix cache reset when routed experts are returned, so the next
         ``generate`` would fail with "auxiliary output generation changed with
         output in flight".
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
         """
         engine_client = self.llm.llm_engine.engine_core
         while engine_client.engine_core.batch_queue:
             engine_client.get_output()
-        self.llm.llm_engine.reset_prefix_cache()
+        return self.llm.llm_engine.reset_prefix_cache()
 
-    def reset_prefix_cache(self):
-        """Reset the prefix cache of vLLM engine."""
+    def reset_prefix_cache(self) -> bool:
+        """Reset the prefix cache of vLLM engine.
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -1657,9 +1666,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self._reset_prefix_cache_with_no_batch_in_flight()
+        result = self._reset_prefix_cache_with_no_batch_in_flight()
         gc.collect()
         torch.cuda.empty_cache()
+        return result
 
     def sleep(self):
         """Put the vLLM engine to sleep."""
