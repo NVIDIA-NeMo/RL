@@ -428,3 +428,29 @@ def clear_transient_megatron_caches(model: torch.nn.Module) -> None:
                     setattr(dispatcher, attr, None)
     except Exception:
         pass
+
+
+def move_optimizer_main_params(optimizer: Any, device: str) -> None:
+    """Move the optimizer's FP32 master copies of BF16/FP16 params to ``device``.
+
+    Megatron keeps them as the inner optimizer's params, not in its ``state``, so
+    offloading the state alone leaves them on the GPU. Swapping ``.data`` keeps
+    every reference to them valid.
+
+    Args:
+        optimizer: A Megatron optimizer, possibly a ``ChainedOptimizer``.
+        device: ``"cpu"`` or ``"cuda"``.
+    """
+    for opt in getattr(optimizer, "chained_optimizers", [optimizer]):
+        groups = (
+            getattr(opt, "shard_fp32_from_float16_groups", None)
+            or getattr(opt, "fp32_from_float16_groups", None)
+            or []
+        )
+        for group in groups:
+            for param in group:
+                if param is None or param.is_cuda == (device == "cuda"):
+                    continue
+                # The grad is re-set from the grad buffer before each step.
+                param.grad = None
+                param.data = param.data.to(device)
