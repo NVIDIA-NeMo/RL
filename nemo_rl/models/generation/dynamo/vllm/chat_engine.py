@@ -379,6 +379,9 @@ class NemoRLChatEngine:
             )
         request_fields: set[str] = set(GymRequestFields.model_fields)
         body.update(extras.model_dump(include=request_fields))
+        if extras.priority is not None:
+            # The adapter hands the rendered request's priority to vLLM.
+            body["priority"] = extras.priority
         first_call, self._first_call = self._first_call, False
         steps = _StepTimes()
         info = await self._pool.info()

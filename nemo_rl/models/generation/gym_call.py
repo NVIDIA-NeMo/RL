@@ -57,6 +57,9 @@ class GymCallExtras(GymRequestFields):
     # Gym's x-ng-sampling value, a header natively, which Dynamo's frontend does
     # not forward. "null" marks an untrained caller's call.
     ng_sampling: Optional[str] = None
+    # vLLM's request priority, a top-level request field natively, which
+    # Dynamo's frontend refuses as an unknown field.
+    priority: Optional[int] = None
 
     @classmethod
     def from_annotations(cls, annotations: Iterable[str]) -> "GymCallExtras | None":

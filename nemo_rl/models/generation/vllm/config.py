@@ -25,7 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_enabled
+from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -123,8 +123,8 @@ class VllmSpecificArgs(TypedDict):
     # before the first turns of new ones: vLLM runs with
     # vllm_kwargs.scheduling_policy="priority", and Gym's policy model server
     # sends each model call's priority as minus its assistant turns
-    # (vllm_model priority_by_turn). Not supported with policy.generation.dynamo
-    # or another vllm_kwargs.scheduling_policy. Default false.
+    # (vllm_model priority_by_turn), also through the Dynamo frontend. Not
+    # supported with another vllm_kwargs.scheduling_policy. Default false.
     prioritize_later_turns: NotRequired[bool]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
@@ -430,12 +430,6 @@ def enable_vllm_turn_priority(config: VllmConfig) -> None:
 
     NeMo-Gym setup calls this; Gym's policy model server sends the priorities.
     """
-    if dynamo_enabled(config):
-        raise ValueError(
-            "policy.generation.vllm_cfg.prioritize_later_turns is not supported with "
-            "policy.generation.dynamo=true: NeMo RL's chat engine behind the Dynamo "
-            "frontend does not pass a request priority to vLLM."
-        )
     vllm_kwargs = config.setdefault("vllm_kwargs", {})
     if vllm_kwargs.get("scheduling_policy") not in (None, "priority"):
         raise ValueError(

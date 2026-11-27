@@ -60,7 +60,7 @@ A rollout through the frontend has the same `GenerationOutputSpec` as the native
 
 ## NeMo-Gym
 
-NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect (`dynamo_frontend` in Gym's [`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model) config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native request's extra fields (`ng_capture`, `required_prefix_token_ids`), and `ng_measure` for the measure call it makes in place of `/tokenize`, in one `nemo_rl:gym:` annotation, and reads the call's token fields (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`, `routed_experts`, `ng_commit_coords`) from `nvext.nemo_rl`.
+NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect (`dynamo_frontend` in Gym's [`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model) config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native request's extra fields (`ng_capture`, `required_prefix_token_ids`), vLLM's `priority` (`policy.generation.vllm_cfg.prioritize_later_turns`), and `ng_measure` for the measure call it makes in place of `/tokenize`, in one `nemo_rl:gym:` annotation, and reads the call's token fields (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`, `routed_experts`, `ng_commit_coords`) from `nvext.nemo_rl`.
 
 The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own renderer and parsers (it is the frontend's custom chat processor). Each call takes the native server's steps, with the native server's code:
 
@@ -73,7 +73,7 @@ The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own rend
 
 Where the behavior differs from the native endpoint:
 
-- The frontend refuses more than 32 `stop` strings or 32 `stop_token_ids`, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
+- The frontend refuses more than 32 `stop` strings or 32 `stop_token_ids`, and vLLM request fields its own request type lacks (for example `structured_outputs`, `return_token_ids`, `truncate_prompt_tokens`, `chat_template`, and a top-level `priority`, which NeMo-Gym sends in its annotation), with HTTP 400.
 - gpt-oss (Harmony) chat calls are refused with HTTP 400.
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.

@@ -461,6 +461,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             context.id(),
             reasoning_ended=wire["reasoning_ended"],
             reasoning_parser_kwargs=wire["reasoning_parser_kwargs"],
+            priority=chat.priority,
             # As the native server does with the call's traceparent, so vLLM's
             # span joins the caller's trace.
             trace_headers=context.trace_headers(),

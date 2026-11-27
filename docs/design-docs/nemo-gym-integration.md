@@ -93,11 +93,12 @@ Set `policy.generation.vllm_cfg.prioritize_later_turns: true` to schedule the la
 |---|---|---|
 | `policy.generation.vllm_cfg.prioritize_later_turns` | `false` | Serve vLLM with priority scheduling and have Gym send each model call's turn priority. |
 
+With `policy.generation.dynamo: true`, the Dynamo frontend refuses an unknown top-level `priority`, so Gym sends it in its `nemo_rl:gym:` annotation. NeMo RL's chat engine renders it as the request's `priority`, and the engine's adapter hands it to vLLM. Only the engine's vLLM queue is ordered by it. Dynamo's router, which queues requests before an engine only when its frontend gets `--router-queue-threshold` (through `policy.generation.dynamo_cfg.frontend_args.extra_cli_args`), does not read it.
+
 The setting is refused at setup:
 
 - without NeMo Gym rollouts, whose model server sends the priorities; to schedule by priorities another client sends, set `policy.generation.vllm_kwargs.scheduling_policy: priority` instead.
 - with a `policy.generation.vllm_kwargs.scheduling_policy` other than `priority`.
-- with `policy.generation.dynamo: true`.
 - when `env.nemo_gym.policy_model` sets `vllm_model.priority_by_turn: false` or `vllm_model.extra_body.priority`.
 
 ### Dataset formats and routing

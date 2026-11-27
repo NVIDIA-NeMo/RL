@@ -1532,6 +1532,22 @@ def test_prioritize_later_turns_rejects_a_conflicting_policy_model(
         _build_policy_model(config)
 
 
+def test_prioritize_later_turns_reaches_gym_through_the_dynamo_frontend(
+    detected_uv_dirs,
+):
+    config = _turn_priority_config({"nemo_gym": {}}, dynamo=True)
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    # Dynamo's engines are the worker's own AsyncLLM, built from vllm_kwargs.
+    assert config.policy["generation"]["vllm_kwargs"] == {
+        "scheduling_policy": "priority"
+    }
+    vllm_model = _build_policy_model(config)
+    assert vllm_model["dynamo_frontend"] is True
+    assert vllm_model["priority_by_turn"] is True
+
+
 def test_prioritize_later_turns_rejects_another_scheduling_policy() -> None:
     config = _turn_priority_config(
         {"nemo_gym": {}}, vllm_kwargs={"scheduling_policy": "fcfs"}

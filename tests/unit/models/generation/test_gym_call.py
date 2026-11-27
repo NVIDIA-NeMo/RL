@@ -61,6 +61,8 @@ def test_gyms_extras_are_the_ones_nemo_rl_reads() -> None:
             },
         ],
         "nvext": {"annotations": ["other"]},
+        # priority_by_turn's, which the frontend would refuse at the top level.
+        "priority": -1,
     }
     VLLMModel._prepare_dynamo_request(
         SimpleNamespace(_external_capture_handler=None), body
@@ -76,7 +78,9 @@ def test_gyms_extras_are_the_ones_nemo_rl_reads() -> None:
         ng_capture={"capture_key": "r"},
         required_prefix_token_ids=[1, 2, 3],
         ng_measure=True,
+        priority=-1,
     )
+    assert "priority" not in body
     assert body["nvext"]["annotations"][0] == "other"
     assert "prompt_token_ids" not in body["messages"][1]
 

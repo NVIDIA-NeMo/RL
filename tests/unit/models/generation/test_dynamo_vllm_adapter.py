@@ -551,6 +551,7 @@ def test_gym_calls_generate_with_the_native_servers_sampling_params(
     assert kwargs == {
         "reasoning_ended": False,
         "reasoning_parser_kwargs": reasoning,
+        "priority": 0,
         "trace_headers": None,
     }
     # The output the frontend builds the reply from, and the call's result.
@@ -581,6 +582,17 @@ def test_a_gym_call_that_carries_a_trace_hands_it_to_vllm() -> None:
     ((_, _, _, kwargs),) = llm.calls
     # vLLM starts its span under the caller's trace, as on the native path.
     assert kwargs["trace_headers"] == trace
+
+
+def test_a_gym_call_hands_its_priority_to_vllm() -> None:
+    llm = _FakeLLM([_output([1, 3, 4], _completion([10, 11], "stop"))])
+    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+
+    _collect(engine, _gym_call([1, 3, 4], request=_chat(priority=-2)))
+
+    ((_, _, _, kwargs),) = llm.calls
+    # As vLLM's chat serving does with the request's priority.
+    assert kwargs["priority"] == -2
 
 
 def test_an_uncaptured_gym_call_carries_its_routes() -> None:

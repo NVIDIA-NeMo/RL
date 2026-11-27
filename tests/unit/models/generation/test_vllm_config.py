@@ -357,13 +357,15 @@ def test_turn_priority_rejects_another_scheduling_policy() -> None:
     assert config["vllm_kwargs"] == {"scheduling_policy": "fcfs"}
 
 
-def test_turn_priority_rejects_dynamo() -> None:
+def test_turn_priority_serves_dynamos_engines_the_priority_scheduling_policy() -> None:
     config = cast(
         VllmConfig, {"dynamo": True, "vllm_cfg": {"prioritize_later_turns": True}}
     )
 
-    with pytest.raises(ValueError, match="not supported with policy.generation.dynamo"):
-        enable_vllm_turn_priority(config)
+    enable_vllm_turn_priority(config)
+
+    assert config["vllm_kwargs"] == {"scheduling_policy": "priority"}
+    validate_vllm_async_actor_settings(config)
 
 
 @pytest.mark.parametrize("vllm_kwargs", [None, {}, {"scheduling_policy": "fcfs"}])

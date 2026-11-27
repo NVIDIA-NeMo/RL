@@ -327,6 +327,18 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
     assert chunk["usage"]["prompt_tokens"] == 6
 
 
+@pytest.mark.parametrize("priority", [None, 0, -2])
+def test_gyms_turn_priority_is_rendered_as_the_requests_priority(priority) -> None:
+    pool = _Pool(_rendered())
+    # The frontend refuses a top-level priority, so Gym's rides in the annotation.
+    extras = {} if priority is None else {"priority": priority}
+
+    _serve(pool, _Router(), _call(extras))
+
+    (body,) = pool.bodies
+    assert body.get("priority") == priority
+
+
 def test_a_token_in_call_splices_the_prefix_staged_in_tq() -> None:
     pool = _Pool(
         _rendered(
