@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import ray
@@ -546,6 +547,22 @@ class SGLangGenerationWorker:
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
+
+        extra_kwargs = self.sglang_cfg.get("sglang_kwargs")
+        if extra_kwargs is not None:
+            if extra_kwargs.get("quantization") is not None:
+                raise ValueError(
+                    "Configure SGLang weight precision through "
+                    "sglang_cfg.quantization, not sglang_kwargs.quantization."
+                )
+            for key, value in extra_kwargs.items():
+                if key in kwargs and kwargs[key] != value:
+                    raise ValueError(
+                        f"sglang_kwargs.{key} conflicts with the NeMo-RL "
+                        "server configuration. Set it through sglang_cfg "
+                        "or the generation resource configuration instead."
+                    )
+            kwargs.update(deepcopy(extra_kwargs))
 
         return kwargs
 
