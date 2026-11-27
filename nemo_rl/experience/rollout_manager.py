@@ -509,9 +509,20 @@ class AsyncNemoGymRolloutImpl:
         )
 
         # Calculate truncation.
-        truncated = (
+        length_truncated = (
             sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
         )
+        # [CUSTOM-ENV-MASK-SAMPLE 2026-11-27] Some NeMo-Gym environments (e.g. swe_agents)
+        # report their own `mask_sample` signal for failure modes `truncated`'s token-count
+        # check can't see (agent-internal max-iteration caps, eval/agent timeouts, a
+        # subprocess crash that produces zero messages) -- none of these necessarily
+        # exhaust max_seq_len. Folded into the same `truncated` flag rather than adding a
+        # parallel mechanism, since `truncated` is what the loss functions already zero out
+        # (see ppo.py's `loss_multiplier[truncated] = 0`, grpo.py's overlong filtering).
+        # `.get(...)`: most environments (e.g. harbor_agent today) don't set this field at
+        # all, so this is a no-op for them.
+        env_mask_sample = bool(result["full_result"].get("mask_sample"))
+        truncated = length_truncated or env_mask_sample
 
         return Completion(
             message_log=result["message_log"],
