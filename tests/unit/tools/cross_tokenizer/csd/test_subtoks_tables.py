@@ -113,9 +113,8 @@ def test_context_dependent_decoders_are_rejected_before_table_io(
     tmp_path: Path, unsupported_side: str, decoder_family: str
 ):
     if decoder_family == "metaspace":
-        backend = Tokenizer(
-            models.Unigram([("x", 0.0), ("▁the", -1.0), ("the", -2.0)], unk_id=0)
-        )
+        # BPE, so only the ByteLevel-decoder check can reject this tokenizer.
+        backend = Tokenizer(models.BPE({"x": 0, "▁the": 1, "the": 2}, merges=[]))
         backend.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
     else:
         backend = Tokenizer(models.WordPiece({"[UNK]": 0, "x": 1, "##the": 2}))
