@@ -40,14 +40,14 @@ The first two are rates over the driver-side `policy_training` timer, so they in
 
 `rl.flops.utilization` is the model FLOP utilization: achieved TFLOPS over `get_theoretical_tflops()` for the device and dtype. TF32 and the various reduced precisions have different peaks, so the denominator follows the run's dtype.
 
-`rl.flops.per_step` is the last optimizer epoch's count rather than the step's total. Multi-epoch PPO overwrites the policy result each epoch, so the series undercounts by about `ppo_epochs` — see the `TODO(#2625)` in `nemo_rl/algorithms/single_controller.py`. It is exact at `ppo_epochs = 1`, which covers GRPO and every single-epoch recipe.
+`rl.flops.per_step` is the last optimizer epoch's count rather than the step's total. Under the Single-Controller, multi-epoch PPO overwrites the policy result each epoch, so the series undercounts by about `ppo_epochs` — see the `TODO(#2625)` in `nemo_rl/algorithms/single_controller.py`. It is exact at `ppo_epochs = 1`, which covers GRPO and every single-epoch recipe.
 
 ### Gaps are expected, and are not zeros
 
 None of the three is a counter, and a step that produced no number reports nothing rather than zero. Three reasons a step is absent:
 
 - The tracker does not support the model's architecture. On Megatron, GRPO, PPO, SFT, DPO and distillation then fall back to the worker's own estimate for `rl.flops.per_gpu` and `rl.flops.utilization`. GRPO-sync, SFT v2 and the Single-Controller train through `TQPolicy`, which has no fallback, so they report none of the three series for such a model.
-- Sequence packing is on **and** the loop is GRPO, GRPO-sync or PPO, which drop the block on `print_performance_metrics`' `not packing_enabled` gate. SFT, DPO and distillation still report a rate with packing on.
+- Sequence packing is on **and** the loop is GRPO, GRPO-sync or PPO, which drop the block on `print_performance_metrics`' `not packing_enabled` gate. SFT, DPO and distillation still report a rate with packing on, unless the model needs the Megatron fallback, which packing turns off.
 - The device's theoretical peak is unknown, which drops `rl.flops.utilization` but keeps `rl.flops.per_gpu`.
 
 Treat a gap as "not measured". A dashboard that fills forward or sums across the gap is reading something the run did not claim.

@@ -92,7 +92,7 @@ TRAINING_TEED_METRICS = (
 register_teed_metrics(TRAINING_TEED_METRICS)
 
 
-# FLOP tracker output keys. Six modules write them, so they live here.
+# FLOP tracker output keys. Several modules write them, so they live here.
 TRAIN_FLOPS_PER_GPU_KEY = "train_flops_per_gpu"
 TRAIN_FP_UTILIZATION_KEY = "train_fp_utilization"
 TOTAL_FLOPS_KEY = "total_flops"
