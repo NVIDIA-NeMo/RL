@@ -86,6 +86,10 @@ ENV NRL_CONTAINER=1
 
 # It is more convenient for users to run as root
 USER root
+# The Open MPI in the CUDA 13.4 base image refuses to spawn processes as root without these.
+# TensorRT-LLM spawns its engine workers through MPI.
+ENV PRTE_ALLOW_RUN_AS_ROOT=1
+ENV PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 RUN <<"EOF" bash -exu -o pipefail
 export DEBIAN_FRONTEND=noninteractive
