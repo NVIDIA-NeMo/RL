@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, Sequence, TypedDict
 
 import mlflow
 import numpy as np
@@ -43,7 +43,6 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from torch.utils.tensorboard import SummaryWriter
 
-from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
@@ -1791,7 +1790,7 @@ def configure_rich_logging(
 
 
 def print_message_log_samples(
-    message_logs: list[LLMMessageLogType],
+    message_logs: Sequence[Sequence[Mapping[str, object]]],
     rewards: list[float],
     num_samples: int = 5,
     step: int = 0,
@@ -1931,8 +1930,8 @@ def print_message_log_samples(
         return f"[{role_color}]{content}[/]"
 
     # Extract messages from a message log
-    def extract_messages(message_log):
-        def format_message(role, content):
+    def extract_messages(message_log: Sequence[Mapping[str, object]]) -> list[str]:
+        def format_message(role: str, content: str) -> str:
             role = role.upper()
             if role == "SYSTEM":
                 return f"[bold #8A2BE2]{role}:[/] {safe_render(content, '#8A2BE2')}"
@@ -1945,8 +1944,9 @@ def print_message_log_samples(
 
         messages = []
         for msg in message_log:
-            if isinstance(msg, dict) and "role" in msg and "content" in msg:
-                messages.append(format_message(msg["role"], msg["content"]))
+            role, content = msg.get("role"), msg.get("content")
+            if isinstance(role, str) and isinstance(content, str):
+                messages.append(format_message(role, content))
         return messages
 
     for i, idx in enumerate(indices):

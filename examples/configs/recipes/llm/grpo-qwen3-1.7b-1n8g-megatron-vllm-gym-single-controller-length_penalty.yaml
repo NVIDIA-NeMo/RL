@@ -1,5 +1,6 @@
 defaults: ../../grpo_math_1B_megatron_single_controller.yaml
 grpo:
+  val_period: 0
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_num_steps: 100

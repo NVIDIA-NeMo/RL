@@ -4,6 +4,8 @@
 # so the engine owns its memory and no offload runs around the refit.
 # SGLang fault tolerance is not supported on the SingleController (setup rejects it).
 defaults: grpo_math_1B_megatron_single_controller.yaml
+grpo:
+  val_period: 0
 
 async_rl:
   generation_fleet_health:
