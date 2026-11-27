@@ -410,6 +410,7 @@ design-docs/nixl-data-plane.md
 design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/automodel-pipeline-parallel.md
 design-docs/token-capture-ledger.md
 design-docs/dflash-draft-body.md
 design-docs/dspark-objectives.md

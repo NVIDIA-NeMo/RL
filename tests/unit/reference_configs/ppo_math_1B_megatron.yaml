@@ -146,6 +146,7 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1
     custom_parallel_plan: null
     lora_cfg:
       enabled: False
@@ -370,6 +371,7 @@ value:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1
     custom_parallel_plan: null
     lora_cfg:
       enabled: false

@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -45,6 +45,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
+    AutomodelConfig,
     PolicyConfig,
 )
 from nemo_rl.models.policy.draft_config import coerce_draft_config
@@ -59,6 +60,7 @@ from nemo_rl.models.policy.utils import (
     DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
+    validate_automodel_pipeline_config,
     validate_fp32_lm_head_config,
     validate_lora_refit_policy_config,
 )
@@ -345,6 +347,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
             cp_size = config["automodel_cfg"]["context_parallel_size"]
+            pp_size = cast(AutomodelConfig, config["automodel_cfg"])[
+                "pipeline_parallel_size"
+            ]
+            if pp_size != 1:
+                validate_automodel_pipeline_config(
+                    config,
+                    is_vlm=processor is not None,
+                    model_config=get_hf_config(
+                        config["model_name"],
+                        **(config.get("hf_config_overrides") or {}),
+                    ),
+                )
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
             if config["automodel_cfg"].get("deterministic"):
