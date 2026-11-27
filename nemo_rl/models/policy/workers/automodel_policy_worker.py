@@ -62,6 +62,7 @@ from nemo_rl.models.automodel.router_replay import (
     router_replay_gates,
 )
 from nemo_rl.models.automodel.setup import (
+    _reference_model_state_items,
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
@@ -646,7 +647,9 @@ class AutomodelPolicyWorkerImpl(
         # reference stays anchored to the same policy across resumes.
         self.reference_model_state_dict = None
         if init_reference_model:
-            self.reference_model_state_dict = setup_reference_model_state(self.model)
+            self.reference_model_state_dict = setup_reference_model_state(
+                self.model, lora_enabled=self.lora_enabled
+            )
 
         self._weight_exporter = (
             PipelineWeightExporter(
@@ -1421,21 +1424,24 @@ class AutomodelPolicyWorkerImpl(
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
-        """Context manager that temporarily swaps the reference model and active model.
+        """Temporarily load reference state and disable top-k/top-p filtering.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
-                  Also disables top-k/top-p filtering since the reference policy's distribution
-                  is different from the current policy, making filtered logprobs incompatible.
-        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        LoRA shares frozen base parameters. Restore policy state and sampling
+        parameters after successful scoring.
         """
         with torch.no_grad():
             # Save train model state_dict
             curr_state_dict = get_cpu_state_dict(
-                self.model.state_dict().items(), pin_memory=True
+                _reference_model_state_items(
+                    self.model, lora_enabled=self.lora_enabled
+                ),
+                pin_memory=True,
             )
 
             # Swap reference model state_dict to self.model
-            for k, v in self.model.state_dict().items():
+            for k, v in _reference_model_state_items(
+                self.model, lora_enabled=self.lora_enabled
+            ):
                 val = to_local_if_dtensor(v)
                 val.copy_(self.reference_model_state_dict[k])
 
@@ -1454,15 +1460,15 @@ class AutomodelPolicyWorkerImpl(
             else:
                 self.sampling_params = None
 
-            # - self.model is the original reference_model, now on CUDA
-            # - curr_state_dict is the train model, now on CPU
             yield
 
             # Restore sampling_params
             self.sampling_params = saved_sampling_params
 
             # Restore train model state_dict
-            for k, v in self.model.state_dict().items():
+            for k, v in _reference_model_state_items(
+                self.model, lora_enabled=self.lora_enabled
+            ):
                 val = to_local_if_dtensor(v)
                 val.copy_(curr_state_dict[k])
 
