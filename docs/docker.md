@@ -78,11 +78,11 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 ## Overriding Packages in the vLLM Worker Venvs
 
-`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. It is empty by default. Use it to run a newer vLLM than the one `uv.lock` pins, on a torch built for a newer CUDA toolkit, which the lock cannot express for a single extra:
+`VLLM_VENV_PACKAGE_OVERRIDES` installs the listed packages over the locked ones in every worker venv that carries the `vllm` extra. By default it installs torch 2.15.0 built for CUDA 13.4 (with torchvision, torchaudio, Triton and cuBLAS to match), so the vLLM workers also run on Rubin (sm_107). `uv.lock` cannot express a torch for a single extra. The default is equivalent to:
 
 ```sh
 docker buildx build -f docker/Dockerfile \
-    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
+    --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
@@ -98,10 +98,10 @@ The list may include `vllm` itself and nightly wheels. The listed requirements a
 
 When the overridden venv has a Triton wheel with its own `ptxas-blackwell`, the build also sets `TRITON_PTXAS_BLACKWELL_PATH` to it for that venv (through a `.pth` file, unless the variable is already set). Otherwise flashinfer points Triton at the base image's `ptxas`, which can be too old for the GPU the overridden torch targets.
 
-`MCORE_VENV_PACKAGE_OVERRIDES` does the same for the worker venvs that carry the `mcore` extra, with the same index list. It is also empty by default. The compiled training extensions are built against the locked torch, so use it for packages that do not link to torch, such as a Triton whose compiler knows a newer GPU:
+`MCORE_VENV_PACKAGE_OVERRIDES` does the same for the worker venvs that carry the `mcore` extra, with the same index list. By default it installs Triton 3.9.0, whose compiler knows Rubin (sm_107), and flash-linear-attention 0.6.0, whose kernels pass the `autotune` key validation Triton 3.9 added. The compiled training extensions are built against the locked torch, so use it for packages that do not link to torch. The default is equivalent to:
 
 ```sh
---build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
+--build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0,flash-linear-attention==0.6.0,fla-core==0.6.0
 ```
 
 The overridden venvs no longer match `uv.lock`. Anything that rebuilds them from the lock restores the locked packages: `uv sync`, `uv run --extra vllm`, `NRL_FORCE_REBUILD_VENVS=true`, or a `NEMO_RL_VENV_DIR` that points away from the prebuilt venvs.

@@ -28,9 +28,9 @@
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
 # Optional: install packages over the locked ones in the worker venvs that carry the vllm extra:
-#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
 # can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
 # safe to reuse for a multi-node build, so this must be part of the cache identity,
@@ -86,6 +86,10 @@ ENV NRL_CONTAINER=1
 
 # It is more convenient for users to run as root
 USER root
+# The Open MPI in the CUDA 13.4 base image refuses to spawn processes as root without these.
+# TensorRT-LLM spawns its engine workers through MPI.
+ENV PRTE_ALLOW_RUN_AS_ROOT=1
+ENV PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 RUN <<"EOF" bash -exu -o pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -101,6 +105,7 @@ apt-get install -y --no-install-recommends \
     less \
     vim \
     ccache \
+    pkg-config \
     protobuf-compiler \
     libzmq3-dev \
 
@@ -615,7 +620,7 @@ TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
     | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
-TRTLLM_SYNC_STATUS=$?
+TRTLLM_SYNC_STATUS=${PIPESTATUS[0]}
 set -e
 if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
     echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
@@ -747,10 +752,10 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-# Opt-in, off by default: packages to install over the locked ones in every worker venv
+# Packages to install over the locked ones in every worker venv
 # that carries the vllm extra, e.g. to run the vLLM wheel on a torch built for a newer CUDA
 # toolkit than the one uv.lock pins:
-#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=vllm==0.34.0,torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
+#   --build-arg VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
 # Comma-separated requirements, so the value survives build systems that pass it unquoted.
 # VLLM_VENV_PACKAGE_OVERRIDES_INDEX is a comma-separated list of extra indexes. Nightly
 # wheels work too: a requirement that names a pre-release (torch==2.16.0.dev20261116+cu135,
@@ -763,11 +768,11 @@ RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallo
 # vLLM engines (see nemo_rl/distributed/actor_environments.py).
 # Override every torch companion package together: torchaudio refuses to import next to
 # a torch built for a different CUDA version, and the workers import it through transformers.
-ARG VLLM_VENV_PACKAGE_OVERRIDES=
-# The same for the worker venvs that carry the mcore extra (same index list), e.g. a Triton
-# whose compiler knows a GPU newer than the one the locked torch's Triton targets:
-#   --build-arg MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0
-ARG MCORE_VENV_PACKAGE_OVERRIDES=
+ARG VLLM_VENV_PACKAGE_OVERRIDES=torch==2.15.0+cu134,torchvision==0.29.2+cu134,torchaudio==2.11.1+cu134,triton==3.9.0,nvidia-cublas==13.7.0.27
+# The same for the worker venvs that carry the mcore extra (same index list): a Triton
+# whose compiler knows sm_107, which the Triton 3.7.1 pinned by the locked torch does not,
+# and the fla release whose kernels pass the autotune key validation of that Triton.
+ARG MCORE_VENV_PACKAGE_OVERRIDES=triton==3.9.0,flash-linear-attention==0.6.0,fla-core==0.6.0
 ARG VLLM_VENV_PACKAGE_OVERRIDES_INDEX=https://download.pytorch.org/whl/cu134
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu

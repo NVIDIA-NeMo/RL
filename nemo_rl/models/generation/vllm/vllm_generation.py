@@ -449,6 +449,10 @@ class VllmGeneration(GenerationInterface):
         if not self.cfg["colocated"]["enabled"]:
             env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
+        # torch 2.15 made the eager NCCL backend the default. It picks its GPU from LOCAL_RANK,
+        # which every worker of one engine inherits from the actor, so they all pick the same GPU.
+        env_vars.setdefault("TORCH_DIST_USE_NCCL2", "0")
+
         if needs_cross_node_parallelism:
             # When using cross-node model parallelism with non-colocated inference,
             # we are disabling NCCL_NVLS_ENABLE to avoid the NCCL error.
