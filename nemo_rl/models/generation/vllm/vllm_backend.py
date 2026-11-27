@@ -38,13 +38,15 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     _is_full_draft_stream,
     _validate_draft_refit_info,
     disable_draft_module_sharing,
-    load_draft_weights_with_stable_kv_buffers,
 )
 from nemo_rl.models.generation.vllm.lora_utils import (
     NATIVE_LORA_ADAPTER_ID,
     NativeLoraRefitSettings,
     collect_native_lora,
     native_lora_refit_settings,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    load_draft_weights_with_stable_kv_buffers,
 )
 from nemo_rl.models.generation.vllm.speculator_runtime import (
     DRAFTER_OWNER_ATTRS,
@@ -1267,7 +1269,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             _assert_drafter_owns_modules(self.model_runner, draft_model, draft_weights)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         if self._speculative_method() in ("dspark", "dflash"):
-            load_draft_weights_with_stable_kv_buffers(draft_model, draft_weights)
+            load_draft_weights_with_stable_kv_buffers(
+                draft_model, draft_weights, vllm_version=vllm.__version__
+            )
         else:
             draft_model.load_weights(weights=draft_weights)
         return True

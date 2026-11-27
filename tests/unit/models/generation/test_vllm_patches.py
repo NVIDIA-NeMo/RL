@@ -67,6 +67,102 @@ _CAPTURER_MARKER = (
 )
 
 
+def test_draft_refit_preserves_captured_context_kv_storage():
+    class Draft:
+        def __init__(self):
+            with torch.inference_mode():
+                self.model = SimpleNamespace(
+                    _fused_kv_weight=torch.zeros(2, 3),
+                    _fused_kv_bias=None,
+                    _k_norm_weights=torch.zeros(2, 3),
+                )
+
+        def load_weights(self, weights):
+            self.model._fused_kv_weight = dict(weights)["kv"].clone()
+            self.model._k_norm_weights = dict(weights)["norm"].clone()
+
+    draft = Draft()
+    captured_kv = draft.model._fused_kv_weight
+    captured_norm = draft.model._k_norm_weights
+    for refit_value in (1, 2):
+        kv = torch.full_like(captured_kv, refit_value)
+        norm = torch.full_like(captured_norm, refit_value + 2)
+        patches.load_draft_weights_with_stable_kv_buffers(
+            draft, [("kv", kv), ("norm", norm)], vllm_version="0.33.0"
+        )
+        assert draft.model._fused_kv_weight is captured_kv
+        assert draft.model._k_norm_weights is captured_norm
+        torch.testing.assert_close(captured_kv, kv)
+        torch.testing.assert_close(captured_norm, norm)
+
+
+def test_draft_refit_rejects_unsupported_vllm_version():
+    def load_weights(weights):
+        pytest.fail("Draft weights were loaded with an unsupported vLLM version")
+
+    draft = SimpleNamespace(load_weights=load_weights)
+    with pytest.raises(RuntimeError, match=r"requires vLLM 0\.33\.0.*found 0\.34\.0"):
+        patches.load_draft_weights_with_stable_kv_buffers(
+            draft, [], vllm_version="0.34.0"
+        )
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_stable_refit_tracks_actual_vllm_producer(has_bias, quantized):
+    import vllm
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    attention = SimpleNamespace(
+        q_size=4,
+        qkv_proj=SimpleNamespace(
+            weight=torch.zeros(12, 4),
+            bias=torch.zeros(12) if has_bias else None,
+            quant_method=object() if quantized else UnquantizedLinearMethod(),
+        ),
+        k_norm=torch.nn.LayerNorm(2),
+    )
+    backbone = SimpleNamespace(hidden_norm=torch.nn.LayerNorm(4))
+
+    class Draft:
+        model = backbone
+
+        def load_weights(self, weights):
+            value = dict(weights)["value"].item()
+            attention.qkv_proj.weight.fill_(value)
+            if has_bias:
+                attention.qkv_proj.bias.fill_(value)
+            with torch.no_grad():
+                attention.k_norm.weight.fill_(value)
+            DFlashQwen3Model._build_context_kv_buffers(backbone, [attention], has_bias)
+            # Discover tensor outputs from the owner rather than copying names.
+            self.produced = {
+                name: tensor.clone()
+                for name, tensor in vars(backbone).items()
+                if isinstance(tensor, torch.Tensor)
+            }
+
+    draft = Draft()
+    draft.load_weights([("value", torch.tensor(0))])
+    captured = {
+        name: tensor
+        for name, tensor in vars(backbone).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    assert captured
+    for value in (1, 2):
+        patches.load_draft_weights_with_stable_kv_buffers(
+            draft, [("value", torch.tensor(value))], vllm_version=vllm.__version__
+        )
+        assert draft.produced.keys() == captured.keys()
+        for name, tensor in captured.items():
+            actual = getattr(backbone, name)
+            assert actual.data_ptr() == tensor.data_ptr(), name
+            torch.testing.assert_close(actual, draft.produced[name])
+
+
 @pytest.fixture
 def modelopt_moe_model() -> torch.nn.Module:
     model = torch.nn.Module()

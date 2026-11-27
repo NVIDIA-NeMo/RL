@@ -16,8 +16,6 @@
 import os
 from typing import Any, Optional
 
-import torch
-
 from nemo_rl.models.generation.vllm.speculator_runtime import SPECULATOR_TYPES
 
 # Speculative methods whose drafter is co-trained by the trainer and refit
@@ -30,28 +28,6 @@ COTRAINED_SPECULATIVE_METHODS = SPECULATOR_TYPES
 # spawned vLLM executor workers, which import it for worker_extension_cls
 # before loading the model).
 DRAFT_DISABLE_MODULE_SHARING_ENV = "NRL_DRAFT_DISABLE_MODULE_SHARING"
-
-
-def load_draft_weights_with_stable_kv_buffers(
-    draft_model: Any, weights: list[tuple[str, torch.Tensor]]
-) -> None:
-    """Refresh the draft while retaining the KV buffer addresses CUDA graphs use."""
-    backbone = getattr(draft_model, "model", None)
-    # The Qwen3 DSpark and DFlash loaders rebuild these context KV tensors.
-    buffer_names = ("_fused_kv_weight", "_fused_kv_bias", "_k_norm_weights")
-    buffers = {name: getattr(backbone, name, None) for name in buffer_names}
-    draft_model.load_weights(weights=weights)
-    for name, captured in buffers.items():
-        if captured is None:
-            continue
-        updated = getattr(backbone, name)
-        if updated is captured:
-            continue
-        if updated is None or updated.shape != captured.shape:
-            raise RuntimeError(f"Draft refit changed the layout of {name}.")
-        with torch.inference_mode():
-            captured.copy_(updated)
-        setattr(backbone, name, captured)
 
 
 def draft_module_sharing_disable_required(config: dict[str, Any]) -> bool:
