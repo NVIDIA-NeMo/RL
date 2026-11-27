@@ -35,7 +35,7 @@ During policy training, per-token activation scaling gives each token its own ac
 
 Megatron-Bridge exports the updated policy weights with Hugging Face parameter names and reconstructs tensors across the training TP, PP, and EP topology, sending plain BF16. This is the same transport representation used by a BF16-only run.
 
-Each vLLM engine receives the BF16 stream over CUDA IPC. NeMo RL converts each transport batch into owned checkpoint-format tensors and supplies one lazy iterator to vLLM's native `reload_weights` API. Routed-expert projections are quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. NeMo RL resolves the destination `RoutedExperts` container and classifies W1/W2/W3 from that container's vLLM checkpoint mapping; it does not maintain model-family projection names. W1 and W3 (often gate and up) share one per-expert global scale, while W2 (often down) is quantized independently. BF16 boundary layers pass through unchanged.
+Each vLLM engine receives the BF16 stream over CUDA IPC. NeMo RL converts each transport batch into owned checkpoint-format tensors and supplies one lazy iterator to vLLM's native `reload_weights` API. Routed-expert projections are quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. NeMo RL resolves the destination `RoutedExperts` container and classifies W1/W2/W3 from that container's vLLM checkpoint mapping; it does not maintain model-family projection names. For gated experts, W1 and W3 (often gate and up) share one per-expert global scale, while W2 (often down) is quantized independently. For non-gated experts, vLLM's `moe_config.is_act_and_mul` is false and the checkpoint mapping contains only W1 (up) and W2 (down); both are quantized independently. BF16 boundary layers pass through unchanged.
 
 The IPC allocation is acknowledged only after quantization and passthrough copies no longer depend on it. The final COMPLETE message is acknowledged only after `reload_weights` consumes the entire stream, performs layerwise post-processing, and completes the final device fence. If preparation or load fails, NeMo RL drains and acknowledges the remaining IPC messages so the sender cannot deadlock, and the rollout worker raises instead of serving stale weights.
 
@@ -86,7 +86,11 @@ policy:
 ```
 
 The rollout BF16 exclusions are derived from the effective `first_last_layers_bf16`, `num_layers_at_start_in_bf16`, and `num_layers_at_end_in_bf16` settings, so recipes do not duplicate layer paths.
-For migration, an explicit `additional_ignore` is accepted only when it uses complete `*.layers.<index>.mlp.experts*` patterns and exactly matches that derived boundary.
+For migration, an explicit `additional_ignore` is accepted only when it uses complete `*.layers.<index>.mlp.experts*` patterns and exactly matches that derived boundary. At method selection, these patterns encode decoder-layer indices rather than literal module paths, so `mixer.experts` and `mlp.experts` honor the same training precision boundary.
+
+## Nemotron 3.5 Lightning
+
+Lightning (30B-A3B) has non-gated ReLU² routed experts. Only the routed experts are quantized; Mamba, attention and shared experts stay BF16. Two recipes use 8 nodes × 4 GPUs (TP=2, EP=8): `grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken.yaml` and a 20-step `-quick` variant for nightly coverage. Both set `vllm_kwargs.async_scheduling: false`. At this head only the 20-step `-quick` recipe and the two-step manual check of the full recipe have been run on vLLM 0.33; the full recipe has no convergence run yet, and the 250-step comparison in #4785 used a 48K response budget, CP=2 with sequence packing, and no BF16 boundary layers.
 
 ## Validated Configuration
 
@@ -114,7 +118,7 @@ The end-to-end contract is intended to support additional W4A4 per-token MoE mod
 
 | Area | Current limitation |
 |---|---|
-| Model layout | Requires a vLLM `RoutedExperts` container with an unambiguous W1/W2/W3 checkpoint mapping; dense-only models are rejected |
+| Model layout | Requires a vLLM `RoutedExperts` container with an unambiguous W1/W2/W3 (gated) or W1/W2 (non-gated) checkpoint mapping; dense-only models are rejected |
 | Quantized modules | Routed-expert MLP projections only; dense MLPs, attention, routers, and shared experts remain BF16 |
 | Shared-expert fusion | A layout that fuses shared experts into the selected `RoutedExperts` container is rejected |
 | Hardware and kernel | NVIDIA Blackwell with the FlashInfer TRT-LLM NVFP4 fused-MoE backend; GB200 is validated |

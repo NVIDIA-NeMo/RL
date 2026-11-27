@@ -534,11 +534,6 @@ class BaseVllmGenerationWorker:
                 *(extra_env_vars or []),
                 *compile_cache.env_overrides("vllm"),
             ],
-            require_moe_routed_experts_capture=bool(
-                (self.cfg.get("vllm_kwargs") or {}).get(
-                    "enable_return_routed_experts", False
-                )
-            ),
         )
 
         # Skip model loading if we're not the model owner
