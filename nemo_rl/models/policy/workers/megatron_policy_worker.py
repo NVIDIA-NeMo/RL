@@ -167,6 +167,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    is_shared_frozen_lora_param,
     make_empty_cache_best_effort_under_expandable_segments,
     send_hf_buckets_via_ipc_actor_impl,
 )
@@ -3324,16 +3325,21 @@ class MegatronPolicyWorkerImpl(
 
         Args:
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
-            raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
+            raise_if_key_missing: If True, raise when a selected model state key is missing
                 from source_state_dict; if False, skip such keys.
             non_blocking: Passed to the in-place copies; callers staging from
                 pinned CPU memory must synchronize afterwards.
         """
-        for state_dict_key, param_or_buf in self.model.state_dict().items():
+        peft_enabled = self.cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+        for state_dict_key, param_or_buf in self.model.state_dict(
+            keep_vars=True
+        ).items():
             if (
                 not isinstance(param_or_buf, torch.Tensor)
                 or "draft_model." in state_dict_key
             ):
+                continue
+            if is_shared_frozen_lora_param(param_or_buf, peft_enabled):
                 continue
             if state_dict_key not in source_state_dict:
                 if raise_if_key_missing:
@@ -3367,12 +3373,11 @@ class MegatronPolicyWorkerImpl(
 
     @contextmanager
     def use_reference_model(self):
-        """Context manager that temporarily swaps the reference model and active model.
+        """Temporarily load reference state and disable top-k/top-p filtering.
 
-        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
-                  Also disables top-k/top-p filtering since the reference policy's distribution
-                  is different from the current policy, making filtered logprobs incompatible.
-        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        PEFT swaps trainable parameters and persistent state while retaining frozen
+        base parameters on the GPU. Restore policy state, sampling parameters,
+        and forward hooks after successful scoring.
         """
         ## disable overlap param gather when swapping weights
         reenable_forward_pre_hook = (
@@ -3382,16 +3387,20 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
-            # Save original references
+            peft_enabled = (
+                self.cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+            )
             model_state_dict = {}
-            for name, item in self.model.state_dict().items():
+            for name, item in self.model.state_dict(keep_vars=True).items():
+                if is_shared_frozen_lora_param(item, peft_enabled):
+                    continue
                 if isinstance(item, torch.Tensor):
                     item = item.detach().to(device="cpu", non_blocking=True, copy=True)
                 model_state_dict[name] = item
 
-            # Swap reference state into self.model. Use _apply_state_dict_to_model
-            # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
-            # is routed through set_extra_state() correctly.
+            saved_sampling_params = self.sampling_params
+
+            # set_extra_state() handles FP8 metadata with mismatched shapes.
             self._apply_state_dict_to_model(
                 self.reference_state_dict,
                 raise_if_key_missing=True,
@@ -3401,12 +3410,7 @@ class MegatronPolicyWorkerImpl(
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
-            # The reference policy has different weights, so its top-k/top-p set is
-            # inherently different from the current policy. Using filtered logprobs
-            # would cause -inf mismatches that cannot be resolved by masking.
-            # Note: We keep temperature scaling since it was applied to prev_logprobs.
-            saved_sampling_params = self.sampling_params
+            # Reference top-k/top-p sets differ; keep the policy temperature.
             if saved_sampling_params is not None:
                 self.sampling_params = TrainingSamplingParams(
                     top_k=None,
@@ -3416,14 +3420,9 @@ class MegatronPolicyWorkerImpl(
             else:
                 self.sampling_params = None
 
-            # - self.model is the original reference_model, now on CUDA
-            # - self.reference_model is the original model, now on CPU
             yield
 
-            # Restore sampling_params
             self.sampling_params = saved_sampling_params
-
-            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
             self._apply_state_dict_to_model(
                 model_state_dict,
                 raise_if_key_missing=True,

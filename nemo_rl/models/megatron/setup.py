@@ -356,6 +356,7 @@ from nemo_rl.models.policy import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
+    is_shared_frozen_lora_param,
 )
 from nemo_rl.models.value.config import ValueConfig
 
@@ -3118,7 +3119,9 @@ def setup_reference_model_state(
             reference_model = reference_model[0]
             reference_model.eval()
             # Store reference state dict on CPU
-            for name, item in reference_model.state_dict().items():
+            for name, item in reference_model.state_dict(keep_vars=True).items():
+                if is_shared_frozen_lora_param(item, use_peft):
+                    continue
                 if isinstance(item, torch.Tensor):
                     cpu_item = item.detach().to(
                         device="cpu", non_blocking=True, copy=True

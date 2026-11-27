@@ -89,6 +89,13 @@ def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
     )
 
 
+def is_shared_frozen_lora_param(item: object, lora_enabled: bool) -> bool:
+    """Return whether LoRA shares a frozen base parameter between policy and reference."""
+    return (
+        lora_enabled and isinstance(item, torch.nn.Parameter) and not item.requires_grad
+    )
+
+
 def validate_lora_refit_policy_config(
     policy_config: "PolicyConfig",
 ) -> LoraRefitMode | None:
