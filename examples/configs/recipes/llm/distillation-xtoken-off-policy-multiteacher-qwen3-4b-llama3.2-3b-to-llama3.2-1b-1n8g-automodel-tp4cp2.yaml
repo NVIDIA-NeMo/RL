@@ -65,6 +65,7 @@ teachers:
       activation_checkpointing: true
       tensor_parallel_size: 2
       context_parallel_size: 2
+      pipeline_parallel_size: 1
       custom_parallel_plan: null
     max_grad_norm: 1.0
     dynamic_batching:
@@ -112,6 +113,7 @@ teachers:
       activation_checkpointing: true
       tensor_parallel_size: 2
       context_parallel_size: 2
+      pipeline_parallel_size: 1
       custom_parallel_plan: null
     max_grad_norm: 1.0
     dynamic_batching:

@@ -125,6 +125,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
+from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -133,13 +134,13 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
-from nemo_rl.models.generation.trtllm.config import (
-    replica_width,
-    resolve_disagg_layout,
-)
+from nemo_rl.models.generation.trtllm.config import replica_width
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -720,7 +721,7 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
     ):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
-            "and normalization=global_token_mean (legacy token_level_loss=true)"
+            "and normalization=global_token_mean"
         )
     # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
     if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
@@ -892,6 +893,8 @@ def setup(
             "SingleController token-capture path"
         )
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
@@ -4592,8 +4595,9 @@ def _grpo_train_impl(
                         "draft_grad_norm"
                     ].numpy()
                 if master_config.grpo.use_dynamic_sampling:
-                    metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"] = repeated_batch["total_reward"].numpy()
+                    metrics["unfiltered_reward"] = repeated_batch[
+                        "total_reward"
+                    ].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -4614,7 +4618,7 @@ def _grpo_train_impl(
                         "draft_lr",
                         "wd",
                         "reward",
-                        "filtered_reward",
+                        "unfiltered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -4770,9 +4774,6 @@ def _grpo_train_impl(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo.use_dynamic_sampling:
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
@@ -4841,13 +4842,11 @@ def _grpo_train_impl(
                     else "not reported"
                 )
             )
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             if master_config.grpo.use_dynamic_sampling:
-                print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
-                    f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
+                    f"  • Avg Unfiltered Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
                 )
-            else:
-                print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
@@ -5226,7 +5225,7 @@ def aggregate_rollout_metrics(
     - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
-    - "total_turns": summed
+    - "total_turns" and metrics ending with "/num_groups": summed
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -5250,7 +5249,8 @@ def aggregate_rollout_metrics(
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or k.endswith("/num_groups"):
+            # Counts add up across groups; averaging would always give 1.
             aggregated[k] = sum(v)
         elif k == "trajectory_duration_s":
             sorted_v = sorted(v)
@@ -6752,10 +6752,6 @@ def async_grpo_train(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo.use_dynamic_sampling:
-                    # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()

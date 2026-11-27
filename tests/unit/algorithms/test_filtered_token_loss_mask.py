@@ -42,7 +42,7 @@ def test_invalid_policy_tokens_match_explicit_actor_exclusion(
             reference_policy_kl_penalty=0.0,
             metrics_level=metrics_level,
             sequence_level_importance_ratios=sequence_level,
-            token_level_loss=not sequence_level,
+            normalization="sequence_mean" if sequence_level else "global_token_mean",
             use_importance_sampling_correction=True,
         )
     )
@@ -120,7 +120,7 @@ def test_actor_support_exclusion_preserves_unfiltered_reference_kl(
             metrics_level=metrics_level,
             use_on_policy_kl_approximation=on_policy_kl,
             sequence_level_importance_ratios=sequence_level,
-            token_level_loss=not sequence_level,
+            normalization="sequence_mean" if sequence_level else "global_token_mean",
         )
     )
 
@@ -168,7 +168,7 @@ def test_packed_support_mismatch_retains_valid_token_gradient(tmp_path):
             ClippedPGLossConfig(
                 reference_policy_kl_penalty=0.0,
                 sequence_level_importance_ratios=True,
-                token_level_loss=False,
+                normalization="sequence_mean",
             )
         )
         logits = torch.tensor(
@@ -545,7 +545,7 @@ def test_fully_unsupported_response_matches_explicit_sample_exclusion(
         ClippedPGLossConfig(
             reference_policy_kl_penalty=0.0,
             sequence_level_importance_ratios=sequence_level,
-            token_level_loss=not sequence_level,
+            normalization="sequence_mean" if sequence_level else "global_token_mean",
             metrics_level=metrics_level,
         )
     )
