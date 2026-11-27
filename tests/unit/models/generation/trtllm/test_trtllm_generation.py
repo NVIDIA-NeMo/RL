@@ -556,23 +556,18 @@ def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
 
 @pytest.mark.parametrize(("num_prefill", "num_decode"), [(0, 1), (1, 0), (0, 0)])
 def test_plan_engines_rejects_a_replica_without_both_roles(num_prefill, num_decode):
-    cfg = resolve_role_overrides(
-        _config(
-            disaggregation={
-                "enabled": True,
-                "num_prefill_engines": num_prefill,
-                "num_decode_engines": num_decode,
-            },
-        )
-    )
-    generation = TrtllmGeneration.__new__(TrtllmGeneration)
-    generation.cfg = cfg
-    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
-
-    # The layout schema refuses a zero count before any engine is planned.
+    # The layout schema refuses a zero count when the block is read, before any
+    # engine is planned.
     with pytest.raises(ValueError, match="Input should be greater than 0"):
-        generation._disagg_cfg = resolve_disagg_layout(cfg)
-        generation._plan_engines(8)
+        resolve_role_overrides(
+            _config(
+                disaggregation={
+                    "enabled": True,
+                    "num_prefill_engines": num_prefill,
+                    "num_decode_engines": num_decode,
+                },
+            )
+        )
 
 
 # -------------------------------------------------------------------------- #
