@@ -285,7 +285,7 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
         ),
         pytest.param(
             _set("disaggregation", "num_decode_engines", value=0),
-            "at least one prefill and one decode",
+            "num_decode_engines\\n  Input should be greater than 0",
             id="zero_decode",
         ),
         pytest.param(
@@ -332,7 +332,7 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
         ),
         pytest.param(
             _set("disaggregation", "num_prefill_engines", value=0),
-            "at least one prefill and one decode",
+            "num_prefill_engines\\n  Input should be greater than 0",
             id="zero_prefill",
         ),
         pytest.param(
