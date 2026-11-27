@@ -5050,6 +5050,7 @@ def validate(
         # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
         total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
+        additional_metrics_to_report: dict[str, Any] = {}
 
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
@@ -5065,7 +5066,6 @@ def validate(
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
 
-            additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.

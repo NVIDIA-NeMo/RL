@@ -2307,7 +2307,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "SingleController validation requires GRPO with native environments "
                 "and direct, non-colocated vLLM generation"
             )
-        if algo_cfg.val_batch_size < 1 or algo_cfg.val_num_generations_per_prompt < 1:
+        if (
+            algo_cfg.val_batch_size is None
+            or algo_cfg.val_batch_size < 1
+            or algo_cfg.val_num_generations_per_prompt < 1
+        ):
             raise ValueError(
                 "Validation batch size and generations per prompt must be positive"
             )
