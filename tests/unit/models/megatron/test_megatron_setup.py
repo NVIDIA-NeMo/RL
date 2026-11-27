@@ -3838,6 +3838,32 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
 
         assert optimizer.fp8_recipe == "mxfp8"
 
+    def test_enabled_mxfp8_without_fp8_param_keeps_precision_aware_master_weights(
+        self,
+    ) -> None:
+        config = self._config(
+            {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            }
+        )
+        config["megatron_cfg"]["optimizer"].update(
+            {
+                "use_precision_aware_optimizer": True,
+                "main_params_dtype": torch.float32,
+                "exp_avg_dtype": torch.bfloat16,
+                "exp_avg_sq_dtype": torch.bfloat16,
+            }
+        )
+        optimizer = self._optimizer_passed_to_container(
+            config, fp8_param_enabled=False
+        )
+
+        assert optimizer.fp8_recipe is None
+        assert optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
     @pytest.mark.parametrize(
         "fp8_cfg",
         [

@@ -2263,12 +2263,17 @@ def _create_megatron_config(
         fp8_cfg.get("fp8_recipe") if fp8_cfg and fp8_cfg.get("enabled", False) else None
     )
     reuse_grad_buf_for_mxfp8_param_ag = fp8_param_enabled and fp8_recipe == "mxfp8"
+    # The distributed optimizer reads its fp8_recipe as the format of the parameters
+    # it steps. Without fp8_param they stay in the model dtype; a recipe there would
+    # turn the precision-aware optimizer's master weights into fp32 main params that
+    # stay on the GPU between steps.
+    optimizer_fp8_recipe = fp8_recipe if fp8_param_enabled else None
     overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
         **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
-        "fp8_recipe": fp8_recipe,
+        "fp8_recipe": optimizer_fp8_recipe,
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
