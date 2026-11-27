@@ -1548,6 +1548,21 @@ def test_prioritize_later_turns_reaches_gym_through_the_dynamo_frontend(
     assert vllm_model["priority_by_turn"] is True
 
 
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("dynamo", [False, True])
+def test_prioritize_later_turns_writes_only_gym_fields(detected_uv_dirs, dynamo):
+    """Gym ignores unknown config keys, so a renamed field would leave every call at priority 0."""
+    # Deferred: Gym's model servers ship with the optional nemo_gym extra.
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
+    config = _turn_priority_config({"nemo_gym": {}}, dynamo=dynamo)
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    vllm_model = _build_policy_model(config)
+    assert vllm_model["priority_by_turn"] is True
+    assert set(vllm_model) - set(VLLMModelConfig.model_fields) == set()
+
+
 def test_prioritize_later_turns_rejects_another_scheduling_policy() -> None:
     config = _turn_priority_config(
         {"nemo_gym": {}}, vllm_kwargs={"scheduling_policy": "fcfs"}
