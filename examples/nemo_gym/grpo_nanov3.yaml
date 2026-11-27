@@ -53,7 +53,7 @@ loss_fn:
   use_on_policy_kl_approximation: True
   use_importance_sampling_correction: True
   sequence_level_importance_ratios: False
-  token_level_loss: True
+  normalization: global_token_mean
   truncated_importance_sampling_ratio: null
 
 checkpointing:
@@ -85,6 +85,7 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1
     custom_parallel_plan: null
 
   megatron_cfg:

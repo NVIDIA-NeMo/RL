@@ -614,7 +614,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             if snapshot or self._sampler.supports_buffer_checkpoint:
                 replay_metadata = self._buffer.metadata_state_dict(
                     saved_capacity=self._async_cfg.max_buffered_rollouts,
-                    additional_groups=training_owned_groups,
+                    already_claimed_groups=training_owned_groups,
                 )
             data_plane_metadata: dict[str, Any] = dict(
                 self._data_plane_checkpoint_metadata(
@@ -650,6 +650,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                         for group_id, rewards in runtime.finalizer_rewards_by_group.items()
                     },
                     reward_settings=capture_reward_settings(self._master_config),
+                    multi_harness_routes=self._rollout_manager.multi_harness_routes_state(),
                     canonical_group_ids={
                         group["group_id"] for group in replay_metadata["groups"]
                     }

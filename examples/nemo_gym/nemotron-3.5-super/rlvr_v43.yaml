@@ -633,7 +633,7 @@ loss_fn:
   reference_policy_kl_penalty: 0
   reference_policy_kl_type: k3
   sequence_level_importance_ratios: false
-  token_level_loss: true
+  normalization: global_token_mean
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: tis

@@ -68,6 +68,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
         "finalizer_rewards_by_group",
         "reward_settings",
         "sampler_stamps_target_steps",
+        "multi_harness_routes",
     }
 )
 _GROUP_STATE_FIELDS = frozenset(
@@ -111,6 +112,78 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         *_ATTEMPT_STATE_KEYS.values(),
     }
 )
+
+_IMMUTABLE_RECEIPT_TYPES = frozenset(
+    {str, bytes, int, float, bool, complex, type(None)}
+)
+
+
+def _copy_checkpoint_value(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Detach receipt containers while sharing immutable scalar leaves.
+
+    Preserve shared containers and cycles within a receipt. Other types,
+    including container subclasses, retain their custom deepcopy behavior.
+    """
+    value_type = type(value)
+    if value_type in _IMMUTABLE_RECEIPT_TYPES:
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if value_type is dict:
+        copied_dict: dict[Any, Any] = {}
+        memo[identity] = copied_dict
+        for key, item in value.items():
+            copied_dict[_copy_checkpoint_value(key, memo)] = _copy_checkpoint_value(
+                item, memo
+            )
+        return copied_dict
+    if value_type is list:
+        copied_list: list[Any] = []
+        memo[identity] = copied_list
+        copied_list.extend(_copy_checkpoint_value(item, memo) for item in value)
+        return copied_list
+    return copy.deepcopy(value, memo)
+
+
+def _reward_checks_state(checks: RewardChecks) -> dict[str, Any]:
+    """Project reward checks into an owned checkpoint dictionary."""
+    if type(checks) is not RewardChecks:
+        return dataclasses.asdict(checks)
+    return {
+        "duplicated_reasoning": _copy_checkpoint_value(checks.duplicated_reasoning),
+        "empty_final_answer": _copy_checkpoint_value(checks.empty_final_answer),
+        "low_effort": _copy_checkpoint_value(checks.low_effort),
+        "length_penalty": dataclasses.asdict(checks.length_penalty)
+        if checks.length_penalty is not None
+        else None,
+    }
+
+
+def _reward_log_context_state(context: RewardLogContext) -> dict[str, Any]:
+    """Copy the reward-log envelope while sharing immutable strings."""
+    if type(context) is not RewardLogContext:
+        return dataclasses.asdict(context)
+    return {
+        "agent_name": _copy_checkpoint_value(context.agent_name),
+        "full_result_json": _copy_checkpoint_value(context.full_result_json),
+    }
+
+
+def _finalized_reward_state(reward: FinalizedReward) -> dict[str, Any]:
+    """Project finalized rewards into the checkpoint schema."""
+    if type(reward) is not FinalizedReward:
+        return dataclasses.asdict(reward)
+    return {
+        "sample_id": _copy_checkpoint_value(reward.sample_id),
+        "rollout_id": _copy_checkpoint_value(reward.rollout_id),
+        "reward": _copy_checkpoint_value(reward.reward),
+        "log_context": _reward_log_context_state(reward.log_context)
+        if reward.log_context is not None
+        else None,
+    }
 
 
 def _reject_unknown_fields(
@@ -446,6 +519,8 @@ class ParsedRolloutRecoveryState:
     finalizer_metrics_by_group: dict[str, dict[str, float]]
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]]
     reward_settings: CaptureRewardSettings | None
+    # The env.nemo_gym.multi_harness routes the run resolved, or None without them.
+    multi_harness_routes: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1705,14 +1780,31 @@ class RolloutRecoveryLedger:
     def get_group(self, group_id: str) -> PromptGroupRecoveryRecord:
         return self._copy_group(self._require_group(group_id))
 
+    def current_gate_rollout_id(self, group_id: str, generation_index: int) -> str:
+        """Read the current physical sibling identity without copying its group."""
+        record = self._require_group(group_id)
+        self._require_sibling(record, generation_index)
+        return record.gate_rollout_id(generation_index)
+
+    def finalization_routing(self, group_id: str) -> tuple[str | None, str | None]:
+        """Return immutable agent/task attribution without copying sibling receipts."""
+        record = self._require_group(group_id)
+        return record.resolved_agent_name, record.attribution_key
+
     def __len__(self) -> int:
         return len(self._groups)
 
     def __contains__(self, group_id: object) -> bool:
         return isinstance(group_id, str) and group_id in self._groups
 
-    def state_dict(self) -> dict[str, Any]:
-        """Return the versioned metadata persisted in ``rollout_recovery.pt``."""
+    def state_dict(
+        self, *, exclude_group_ids: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Detach versioned metadata, omitting canonically owned groups.
+
+        Excluded groups still undergo checkpoint-safety and prompt-identity
+        checks, but their nested attempt metadata is not copied.
+        """
         self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
@@ -1727,6 +1819,8 @@ class RolloutRecoveryLedger:
                 prompt_payload,
                 group_id=record.group_id,
             )
+            if exclude_group_ids is not None and record.group_id in exclude_group_ids:
+                continue
             groups.append(
                 {
                     "group_id": record.group_id,
@@ -1752,7 +1846,7 @@ class RolloutRecoveryLedger:
                                 {
                                     "attempt_uuid": attempt.attempt_uuid.bytes,
                                     "status": attempt.status.value,
-                                    "receipt": copy.deepcopy(attempt.receipt),
+                                    "receipt": _copy_checkpoint_value(attempt.receipt),
                                     "logical_selection": (
                                         dataclasses.asdict(attempt.logical_selection)
                                         if attempt.logical_selection is not None
@@ -1760,12 +1854,12 @@ class RolloutRecoveryLedger:
                                     ),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
-                                    "reward_checks": dataclasses.asdict(
+                                    "reward_checks": _reward_checks_state(
                                         attempt.reward_checks
                                     )
                                     if attempt.reward_checks is not None
                                     else None,
-                                    "reward_log_context": dataclasses.asdict(
+                                    "reward_log_context": _reward_log_context_state(
                                         attempt.reward_log_context
                                     )
                                     if attempt.reward_log_context is not None
@@ -2272,6 +2366,7 @@ def build_rollout_recovery_state(
     finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]] | None = None,
     reward_settings: CaptureRewardSettings | None = None,
+    multi_harness_routes: dict[str, Any] | None = None,
     canonical_group_ids: set[str] | None = None,
 ) -> RolloutRecoveryState:
     """Build the complete versioned sidecar from ledger and controller state."""
@@ -2279,7 +2374,7 @@ def build_rollout_recovery_state(
         raise TypeError(
             "rollout recovery sampler_stamps_target_steps must be a boolean"
         )
-    state = ledger.state_dict()
+    state = ledger.state_dict(exclude_group_ids=canonical_group_ids)
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["steps_allowed_short"] = sorted(
         _validate_steps_allowed_short(list(steps_allowed_short))
@@ -2291,25 +2386,59 @@ def build_rollout_recovery_state(
     state["reward_settings"] = (
         reward_settings.to_state() if reward_settings is not None else None
     )
+    state["multi_harness_routes"] = _validate_multi_harness_routes(multi_harness_routes)
     state["finalizer_rewards_by_group"] = {
-        group_id: [dataclasses.asdict(row) for row in rows]
+        group_id: [_finalized_reward_state(row) for row in rows]
         for group_id, rows in (finalizer_rewards_by_group or {}).items()
+        if canonical_group_ids is None or group_id in canonical_group_ids
     }
     if canonical_group_ids is not None:
-        state["groups"] = [
-            group
-            for group in state["groups"]
-            if group["group_id"] not in canonical_group_ids
-        ]
-        for key in ("finalizer_metrics_by_group", "finalizer_rewards_by_group"):
-            state[key] = {
-                group_id: value
-                for group_id, value in state[key].items()
-                if group_id in canonical_group_ids
-            }
+        state["finalizer_metrics_by_group"] = {
+            group_id: metrics
+            for group_id, metrics in state["finalizer_metrics_by_group"].items()
+            if group_id in canonical_group_ids
+        }
     # Run the same validation seam used by readers before writing a sidecar.
     parse_rollout_recovery_state(state)
     return state
+
+
+def _validate_multi_harness_routes(value: object) -> dict[str, Any] | None:
+    """Check the multi-harness routes a sidecar records; None when it has none.
+
+    The value is ``MultiHarnessRoutes.to_state()``: the selection rule and each
+    taskset's ``[agent, environment_server, weight]`` candidates.
+    """
+    if value is None:
+        return None
+    candidates = value.get("candidates") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"selection", "candidates"}
+        or not isinstance(value["selection"], str)
+        or not isinstance(candidates, list)
+        or not all(
+            isinstance(entry, list)
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], list)
+            and all(
+                isinstance(pair, list)
+                and len(pair) == 3
+                and isinstance(pair[0], str)
+                and isinstance(pair[1], str)
+                and isinstance(pair[2], (int, float))
+                and not isinstance(pair[2], bool)
+                for pair in entry[1]
+            )
+            for entry in candidates
+        )
+    ):
+        raise TypeError(
+            "rollout recovery multi_harness_routes must hold the selection rule "
+            "and each taskset's [agent, server, weight] candidates"
+        )
+    return value
 
 
 def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
@@ -2389,4 +2518,8 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         finalizer_metrics_by_group=finalizer_metrics,
         finalizer_rewards_by_group=finalizer_rewards,
         reward_settings=reward_settings,
+        # Sidecars saved before multi-harness routing lack the key: no routes.
+        multi_harness_routes=_validate_multi_harness_routes(
+            state.get("multi_harness_routes")
+        ),
     )
