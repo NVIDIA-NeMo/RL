@@ -40,22 +40,26 @@ def _bare_actor() -> Any:
     ctrl._master_config = SimpleNamespace(
         rollout_checkpointing=SimpleNamespace(
             snapshot_attempt_interval_s=None, telemetry_interval_s=None
-        )
+        ),
+        rollout_recovery=SimpleNamespace(turn_checkpointing_enabled=False),
     )
-    ctrl._rollout_checkpoint_stop_requested = asyncio.Event()
+    ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
+    ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    ctrl._rollout_snapshots = SimpleNamespace(run=_blocked, stop_requested=False)
+    ctrl._rollout_trace = SimpleNamespace(close=Mock())
+    ctrl._gen = SimpleNamespace(snapshot_step_metrics=Mock())
+    ctrl._trainer_warmup_kwargs = None
+    ctrl._trainer_warmup_task = None
     ctrl._weight_synchronizer = SimpleNamespace(is_stale=False, shutdown=Mock())
     ctrl._logger = SimpleNamespace(finish=Mock())
     ctrl._checkpointer = SimpleNamespace(shutdown=Mock())
     ctrl._finalizer_actors = []
     ctrl._storage_units = []
     ctrl._train_data_dump = None
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=Mock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=Mock(), set_tally_step_provider=Mock()
+    )
     ctrl._sync_weights = AsyncMock()
-    ctrl._maybe_restore_replay_buffer = AsyncMock(return_value=0)
-    ctrl._maybe_restore_rollout_recovery = AsyncMock()
-    ctrl._maybe_restore_replacement_reserve = AsyncMock()
-    ctrl._validate_restored_sampler_cursor = Mock()
-    ctrl._log_rollout_restore_metrics = Mock()
     ctrl._log_rollout_throughput_metrics = AsyncMock()
     ctrl._finish_pending_save = AsyncMock()
     ctrl._rollout_pump = _blocked
@@ -65,16 +69,19 @@ def _bare_actor() -> Any:
 
 
 async def _start_run(ctrl: Any, *, draining: bool) -> asyncio.Task:
-    exhausted = asyncio.Event()
-    if draining:
+    # _run_pumps awaits thread calls before it creates the pumps, so wait until
+    # the rollout pump has started rather than counting event-loop yields.
+    started = asyncio.Event()
+    rollout_pump = ctrl._rollout_pump
 
-        async def _exhaust() -> None:
-            exhausted.set()
+    async def _rollout() -> None:
+        started.set()
+        if not draining:
+            await rollout_pump()
 
-        ctrl._rollout_pump = _exhaust
+    ctrl._rollout_pump = _rollout
     task = asyncio.create_task(ctrl._run_pumps())
-    if draining:
-        await asyncio.wait_for(exhausted.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=2)
     # Let normal rollout completion reach the supervisor before releasing a
     # failure. Event-loop yields avoid depending on a wall-clock sleep delay.
     await asyncio.sleep(0)
@@ -84,6 +91,7 @@ async def _start_run(ctrl: Any, *, draining: bool) -> asyncio.Task:
 
 def _assert_cleanup(ctrl: Any) -> None:
     ctrl._finish_pending_save.assert_awaited_once_with(blocking=True)
+    ctrl._rollout_trace.close.assert_called_once_with()
     ctrl._weight_synchronizer.shutdown.assert_called_once_with()
     ctrl._logger.finish.assert_called_once_with()
     ctrl._checkpointer.shutdown.assert_called_once_with()
@@ -121,7 +129,7 @@ def test_monitor_failure_reaches_caller(
             ctrl._rollout_telemetry_pump = _fail
         else:
             ctrl._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 1.0
-            ctrl._rollout_checkpoint_pump = _fail
+            ctrl._rollout_snapshots.run = _fail
 
         run_task = await _start_run(ctrl, draining=draining)
         release.set()
@@ -171,9 +179,9 @@ def test_checkpoint_completion_requires_stop_request(
         async def _checkpoint() -> None:
             await release.wait()
             if requested_stop:
-                ctrl._rollout_checkpoint_stop_requested.set()
+                ctrl._rollout_snapshots.stop_requested = True
 
-        ctrl._rollout_checkpoint_pump = _checkpoint
+        ctrl._rollout_snapshots.run = _checkpoint
         run_task = await _start_run(ctrl, draining=draining)
         release.set()
         if requested_stop:
@@ -220,7 +228,7 @@ def test_normal_completion_does_not_hide_simultaneous_watchdog_failure(
 
         async def _checkpoint() -> None:
             await release.wait()
-            ctrl._rollout_checkpoint_stop_requested.set()
+            ctrl._rollout_snapshots.stop_requested = True
 
         async def _fail() -> None:
             await release.wait()
@@ -228,7 +236,7 @@ def test_normal_completion_does_not_hide_simultaneous_watchdog_failure(
 
         if completion == "checkpoint-stop":
             ctrl._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 1.0
-            ctrl._rollout_checkpoint_pump = _checkpoint
+            ctrl._rollout_snapshots.run = _checkpoint
         else:
             ctrl._train_pump = release.wait
         ctrl._stall_watchdog_pump = _fail
