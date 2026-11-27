@@ -69,7 +69,17 @@ def _seed_partition_with_one_sample(client: NoOpDataPlaneClient) -> KVBatchMeta:
     return meta
 
 
-def test_writeback_only_leader_writes():
+@pytest.mark.parametrize(
+    "sibling_result",
+    [
+        # A non-leader holding real values must not write them.
+        {"logprobs": torch.full((1, 4), 99.0)},
+        # get_logprobs returns an empty result on non-leaders; that must not raise.
+        {},
+    ],
+    ids=["sibling-values", "sibling-empty"],
+)
+def test_writeback_only_leader_writes(sibling_result):
     """Non-leader sibling write must NOT land — that's the -601 bug class."""
     client = NoOpDataPlaneClient()
     meta = _seed_partition_with_one_sample(client)
@@ -85,7 +95,7 @@ def test_writeback_only_leader_writes():
     )
     sibling._write_back_result_field(
         meta,
-        BatchedDataDict({"logprobs": torch.full((1, 4), 99.0)}),
+        BatchedDataDict(sibling_result),
         result_key="logprobs",
         tq_field="prev_logprobs",
     )

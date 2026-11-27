@@ -124,6 +124,7 @@ def create_automodel_config(
             "activation_checkpointing": False,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
+            "pipeline_parallel_size": pp,
         },
         "dynamic_batching": {
             "enabled": True,
@@ -583,7 +584,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
-        # Valid cases - Automodel backend (PP is always 1 for Automodel)
+        # Valid cases - Automodel backend (all cases here use PP=1)
         (8, 8, 1, True, None, "Valid: DP=1, TP=8, PP=1, CP=1"),
         (16, 8, 1, True, None, "Valid: DP=2, TP=8, PP=1, CP=1"),
         (8, 4, 2, True, None, "Valid: DP=1, TP=4, PP=1, CP=2"),
@@ -612,14 +613,12 @@ def test_world_size_validation_automodel(
 ):
     """Test world_size validation with Automodel backend.
 
-    Note: Automodel backend always uses PP=1 (no pipeline parallelism support).
+    Note: all cases here use PP=1.
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
-    config = create_automodel_config(
-        tiny_llama_model_path, tp, pp=1, cp=cp
-    )  # Automodel always has PP=1
+    config = create_automodel_config(tiny_llama_model_path, tp, pp=1, cp=cp)
 
     # Mock RayWorkerGroup to prevent actual worker creation
     mock_worker_group_instance = MagicMock()
@@ -630,7 +629,7 @@ def test_world_size_validation_automodel(
         try:
             policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
             # Verify the calculated DP makes sense
-            expected_dp = world_size // (1 * cp * tp)  # PP=1 for Automodel
+            expected_dp = world_size // (1 * cp * tp)  # PP=1
             assert expected_dp >= 1, f"Expected DP should be >= 1, got {expected_dp}"
             # Verify that worker group was created (validation passed)
             mock_ray_worker_group.assert_called_once()
@@ -791,7 +790,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
+    Megatron backend supports pipeline parallelism (PP > 1).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

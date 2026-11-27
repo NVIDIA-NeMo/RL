@@ -40,6 +40,19 @@ Tests are organized into levels of increasing scope and cost:
    - If you are an external contributor, you will need an internal NVIDIA developer to comment this on your PR to trigger CI.
 3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group). Only repo maintainers can set it.
 
+## Nightly CI with `/nightly-ci`
+
+Members of the `automation` or `rl_autobot_approvers` GitHub teams can comment `/nightly-ci test-case=<test name>` on a PR to run NVIDIA's nightly CI on the PR head. The pipeline builds the RL image from the PR head. For example:
+
+```text
+/nightly-ci test-case=llm_grpo_llama3_2_1b_instruct_1n8g_megatron
+```
+
+- **Enroll once (NVIDIA employees only):** `run_as: requester` runs the pipeline as the commenter. Enroll once as described in the internal Autobot `/nightly-ci` docs. Without enrollment, Autobot refuses the command with a neutral check explaining what to do.
+- **Fork PRs:** first have the PR head vetted with `/ok to test <full-sha>` and wait for the copy-pr-bot mirror to match that head.
+- **Settings:** `test-suites` defaults to `nightly`; the default cluster is configured in [`.github/autobot/nightly-ci.yml`](https://github.com/NVIDIA-NeMo/RL/blob/main/.github/autobot/nightly-ci.yml). A command may override `test-cluster` (`h100-2`, the default, or `gb200-1`) and `test-suites`.
+- **Results:** the **`Autobot nightly CI`** check shows the applied settings, including `run as | requester`, and the pipeline result. A new push supersedes the run; the running pipeline is not cancelled.
+
 ## Required Checks
 
 All PRs must pass these checks before merging:
@@ -86,7 +99,7 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 - **VM health checks** (`healthcheck_vms.yml`): daily GPU health checks (07:00 UTC) on self-hosted runners. Auto-reboots degraded VMs and alerts via Slack on persistent failures.
 - **Merge queue retry** (`merge-queue-retry.yml`): auto-retries PRs dequeued due to CI timeout (max 3 retries before alerting).
 - **Stale cleanup** (`close-inactive-issue-pr.yml`): daily auto-close of inactive issues and PRs.
-- **Cherry-pick** (`cherry-pick-release-commit.yml`): auto-creates cherry-pick PRs from release branches back to main.
+- **Backports**: comment `/cherrypick to=<branch>` on the source PR; Autobot opens the backport PR (not a workflow in this repo).
 - **Community bot** (`community-bot.yml`): syncs issues and comments to a GitHub Project board for tracking.
 
 ## Workflow Reference
@@ -106,7 +119,6 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
 | `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
-| `cherry-pick-release-commit.yml` | push main | Release cherry-picks |
 | `close-inactive-issue-pr.yml` | schedule (01:30 UTC) | Stale issue/PR cleanup |
 | `community-bot.yml` | issues, comments | Project board sync |
 | `pr-checks-comment.yml` | PR | Post submodule check results |

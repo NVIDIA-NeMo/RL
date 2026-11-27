@@ -38,6 +38,10 @@ GENERATION_TOKEN_COUNTERS = ("vllm:generation_tokens",)
 PROMPT_LENGTH_HISTOGRAMS = ("vllm:request_prompt_tokens",)
 GENERATION_LENGTH_HISTOGRAMS = ("vllm:request_generation_tokens",)
 REQUEST_SUCCESS_COUNTERS = ("vllm:request_success",)
+# Prefix-cache counters are in tokens (queried and served from cache).
+PREFIX_CACHE_QUERY_COUNTERS = ("vllm:prefix_cache_queries",)
+PREFIX_CACHE_HIT_COUNTERS = ("vllm:prefix_cache_hits",)
+PREEMPTION_COUNTERS = ("vllm:num_preemptions",)
 
 # vLLM's FinishReason vocabulary: stop, length, abort, error, repetition. Only
 # the first two leave a usable sample behind -- ``length`` is a normal outcome in
@@ -54,6 +58,10 @@ PROMPT_LENGTH_MEAN_KEY = "vllm/prompt_length_mean"
 GENERATION_LENGTH_MEAN_KEY = "vllm/generation_length_mean"
 GENERATIONS_OK_KEY = "vllm/generations_ok"
 GENERATIONS_FAILED_KEY = "vllm/generations_failed"
+PREFIX_CACHE_QUERIES_KEY = "vllm/prefix_cache_queries"
+PREFIX_CACHE_HITS_KEY = "vllm/prefix_cache_hits"
+PREFIX_CACHE_HIT_RATE_KEY = "vllm/prefix_cache_hit_rate"
+PREEMPTIONS_KEY = "vllm/preemptions"
 
 # Distinct from the driver-side ``gen_ai.*`` series, which are derived from the
 # tensors a generate() call returns: these are the engine's own accounting, and
@@ -100,6 +108,32 @@ VLLM_TEED_METRICS = (
         kind="counter",
         unit="{generation}",
         description="Generations the engine aborted rather than finished.",
+    ),
+    TeedMetric(
+        PREFIX_CACHE_QUERIES_KEY,
+        "rl.vllm.prefix_cache.queries",
+        kind="counter",
+        unit="{token}",
+        description="Prompt tokens looked up in the vLLM prefix cache.",
+    ),
+    TeedMetric(
+        PREFIX_CACHE_HITS_KEY,
+        "rl.vllm.prefix_cache.hits",
+        kind="counter",
+        unit="{token}",
+        description="Prompt tokens served from the vLLM prefix cache.",
+    ),
+    TeedMetric(
+        PREFIX_CACHE_HIT_RATE_KEY,
+        "rl.vllm.prefix_cache.hit_rate",
+        description="Fraction of prefix-cache queried tokens that hit over the step.",
+    ),
+    TeedMetric(
+        PREEMPTIONS_KEY,
+        "rl.vllm.preemptions",
+        kind="counter",
+        unit="{preemption}",
+        description="Preemption events in the vLLM scheduler.",
     ),
 )
 

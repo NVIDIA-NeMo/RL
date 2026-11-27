@@ -390,6 +390,71 @@ def test_moe_routed_experts_patch_anchor_still_matches_installed_vllm(
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize(
+    "relative_source", ["compilation/decorators.py", "compilation/backends.py"]
+)
+def test_compile_cache_per_device_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch, relative_source
+):
+    """If vLLM renames its per-rank cache folders, the patch must fail here, not in a job."""
+    copied = write_unpatched_copy(
+        relative_source, "_patch_vllm_compile_cache_per_device", tmp_path / "src.py"
+    )
+    # The patch visits both files; the second visit sees the copy already patched.
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_compile_cache_per_device(logging.getLogger(__name__))
+    content = copied.read_text()
+    assert "_dev{torch.cuda.current_device()}" in content
+    ast.parse(content)
+
+
+def test_compile_cache_per_device_patch_edits_each_file_once(tmp_path, monkeypatch):
+    # One stand-in per vLLM file, so dropping either path from the patch fails here.
+    source = '"""vLLM stand-in."""\nimport torch\n\nfolder = f"rank_{rank}_{dp_rank}"\n'
+    files = {}
+
+    def stand_in(relative):
+        if relative not in files:
+            files[relative] = tmp_path / relative.replace("/", "_")
+            files[relative].write_text(source)
+        return str(files[relative])
+
+    monkeypatch.setattr(patches, "_get_vllm_file", stand_in)
+    patches._patch_vllm_compile_cache_per_device(logging.getLogger(__name__))
+    assert sorted(files) == ["compilation/backends.py", "compilation/decorators.py"]
+    patched = {rel: path.read_text() for rel, path in files.items()}
+    for content in patched.values():
+        assert 'f"rank_{rank}_{dp_rank}_dev{torch.cuda.current_device()}"' in content
+
+    patches._patch_vllm_compile_cache_per_device(logging.getLogger(__name__))
+    assert {rel: path.read_text() for rel, path in files.items()} == patched
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # vLLM renamed the folder
+        '"""x"""\nimport torch\n\nfolder = f"rank_{rank}"\n',
+        # no module-level torch import for the new f-string to use
+        'folder = f"rank_{rank}_{dp_rank}"\n',
+        # two matches: the patch cannot tell which one names the folder
+        '"""x"""\nimport torch\n\na = f"rank_{rank}_{dp_rank}"\nb = f"rank_{rank}_{dp_rank}"\n',
+    ],
+)
+def test_compile_cache_per_device_patch_fails_closed_when_vllm_changed(
+    monkeypatch, tmp_path, source
+):
+    path = tmp_path / "decorators.py"
+    path.write_text(source)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(path))
+    with pytest.raises(
+        RuntimeError, match="per-device cache folder patch does not match"
+    ):
+        patches._patch_vllm_compile_cache_per_device(logging.getLogger(__name__))
+    assert path.read_text() == source
+
+
+@pytest.mark.vllm
 def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
     before = patched_glm_dsa_source.read_text()
     monkeypatch.setattr(

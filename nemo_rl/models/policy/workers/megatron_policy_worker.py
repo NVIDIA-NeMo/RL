@@ -53,7 +53,6 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
-from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -105,6 +104,7 @@ from nemo_rl.models.megatron.common import (
     model_media_placeholder_token_id,
     model_slices_context_parallel_inputs,
     move_optimizer_main_params,
+    validate_forest_routers,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -658,8 +658,8 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     """Return HF names whose Bridge tasks expose safe direct local views.
 
     Every task contributing to a grouped HF tensor must provide local specs.
-    Mappings that need transpose, interleave, or other grouped-export transforms
-    return no specs and therefore stay on the normal Bridge conversion path.
+    Canonical local views do not include grouped destination transposition;
+    those mappings must stay on the normal Bridge conversion path.
 
     The result is expert-parallel invariant. Bridge conversion tasks are
     EP-local -- each EP rank only enumerates its own ``experts.N.*`` -- while the
@@ -671,7 +671,9 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     for task in conversion_tasks:
         if task is None:
             continue
-        has_local_views = bool(task.local_hf_param_specs())
+        has_local_views = bool(task.local_hf_param_specs()) and not getattr(
+            task.mapping, "transpose_on_export", False
+        )
         for name in task.hf_param_names:
             support_by_name[name] = support_by_name.get(name, True) and has_local_views
 
@@ -834,27 +836,7 @@ class MegatronPolicyWorkerImpl(
         inference swaps weights only). Inspect nested routers, not just the outer
         VLM config, after checkpoint settings and provider overrides resolve.
         """
-        # TODO: Exclude artificial inputs from expert-bias update counts; see
-        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
-        # meanwhile: dummy rows can affect the counts despite zero policy loss.
-        for chunk in _unwrapped_chunks(self.model):
-            for module in chunk.modules():
-                if not isinstance(module, Router):
-                    continue
-                config = module.config
-                if (
-                    not isinstance(module, TopKRouter)
-                    or module.routing_type in ("sinkhorn", "quantile_balancing")
-                    or config.moe_expert_capacity_factor is not None
-                    or config.moe_expert_rank_capacity_factor is not None
-                    or config.moe_pad_experts_for_cuda_graph_inference
-                    or config.moe_token_dropping
-                    or get_aux_loss_track_names(config)
-                ):
-                    raise ValueError(
-                        "Forest execution padding requires dropless per-token MoE routing "
-                        "without auxiliary losses"
-                    )
+        validate_forest_routers(self.model)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -1922,6 +1904,9 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        # get_logprobs returns logprobs only on the model-parallel replica leader.
+        if not self._is_replica_leader():
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2847,9 +2832,11 @@ class MegatronPolicyWorkerImpl(
             if run_logprobs:
                 t = time.perf_counter()
                 self.prepare_for_lp_inference()
-                logprobs = self.get_logprobs(data=data, require_router_replay=False)[
-                    "logprobs"
-                ]
+                # Every rank trains on these logprobs; the host-copy path returns
+                # them only on the model-parallel replica leader.
+                logprobs = self.get_logprobs(
+                    data=data, require_router_replay=False, keep_on_gpu=True
+                )["logprobs"].to(data["input_ids"].device)
                 # As in a real step: the ratio to these logprobs starts at one.
                 if logprobs.shape == data["input_ids"].shape:
                     for name in (
@@ -2908,6 +2895,8 @@ class MegatronPolicyWorkerImpl(
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          Without ``keep_on_gpu``, only the model-parallel replica leader gets it;
+          other ranks get an empty BatchedDataDict.
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
@@ -2997,6 +2986,10 @@ class MegatronPolicyWorkerImpl(
 
         if keep_on_gpu:
             return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        # Only the model-parallel replica leader is consumed by the driver.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
+
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
@@ -3383,7 +3376,10 @@ class MegatronPolicyWorkerImpl(
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        reenable_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if reenable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
@@ -3439,7 +3435,7 @@ class MegatronPolicyWorkerImpl(
                 torch.cuda.empty_cache()
 
             ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
@@ -5430,7 +5426,11 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.eval()
 
-            if self.should_disable_forward_pre_hook:
+            reenable_forward_pre_hook = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             if self.scheduler is not None:
                 # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
@@ -5461,7 +5461,7 @@ class MegatronPolicyWorkerImpl(
                     ckpt_cfg=self.mcore_state.cfg.checkpoint,
                     blocking=True,
                 )
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             if not is_training:
