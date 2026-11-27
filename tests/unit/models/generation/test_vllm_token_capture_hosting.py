@@ -141,6 +141,7 @@ pytestmark = pytest.mark.nemo_gym
 _PREFIX_BATCH_LIMITS = {
     "prefix_write_max_rows": 256,
     "prefix_write_max_tokens": 4_194_304,
+    "prefix_writers": 1,
     "prefix_read_max_rows": 256,
 }
 
@@ -429,6 +430,7 @@ def test_owner_sends_child_frontends_every_capture_setting(monkeypatch):
         "generation_cut_control_timeout_s": 7.0,
         "prefix_write_max_rows": 11,
         "prefix_write_max_tokens": 13,
+        "prefix_writers": 19,
         "prefix_read_max_rows": 17,
     }
 
@@ -2078,7 +2080,9 @@ def _record_cut_constraints(state, sampling_params) -> None:
             prefix_row_extras=lambda state: None,
             router_replay=False,
             sampler_top_k=0,
-            **_PREFIX_BATCH_LIMITS,
+            prefix_write_max_rows=256,
+            prefix_write_max_tokens=4_194_304,
+            prefix_read_max_rows=256,
             write_limits=PREFIX_WRITE_LIMITS,
         )
     ).on_sampling_params(object(), sampling_params)

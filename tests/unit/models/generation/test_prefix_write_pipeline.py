@@ -27,6 +27,7 @@ import torch
 
 from nemo_rl.data.captured_media import MEDIA_TENSOR_DIGESTS_FIELD, CapturedMediaItem
 from nemo_rl.data_plane.prefix_writer_actor import (
+    PrefixWriterPool,
     PrefixWriterService,
     RayPrefixWriterClient,
 )
@@ -117,7 +118,9 @@ def _media_cut_rows(
                 remote=service.stage_generation_cut_rows
             ),
         )
-        sink.set_prefix_writer(RayPrefixWriterClient(actor, writer_pid=1))
+        sink.set_prefix_writer(
+            PrefixWriterPool([RayPrefixWriterClient(actor, writer_pid=1)])
+        )
     recovery = PrefixRecovery(
         replace(
             recovery._parts,

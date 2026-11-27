@@ -219,10 +219,10 @@ class RayPrefixWriterClient:
             )
         )
 
-    def stage_generation_cut_rows(
+    def submit_generation_cut_rows(
         self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
-    ) -> list[StagedGenerationCut]:
-        """Have the actor build and write one batch of cut rows."""
+    ) -> Any:
+        """Start the actor building and writing one batch; ``result`` waits for it."""
         self._require_open()
         attachments = [
             None
@@ -230,13 +230,15 @@ class RayPrefixWriterClient:
             else {name: to_bytes(tensor) for name, tensor in row.attachments.items()}
             for row in rows
         ]
-        return self._get(
-            self._actor.stage_generation_cut_rows.remote(
-                [replace(row, attachments=None) for row in rows],
-                checkpoint_id=checkpoint_id,
-                attachments=attachments,
-            )
+        return self._actor.stage_generation_cut_rows.remote(
+            [replace(row, attachments=None) for row in rows],
+            checkpoint_id=checkpoint_id,
+            attachments=attachments,
         )
+
+    def result(self, reference: Any) -> list[StagedGenerationCut]:
+        """The written rows of a batch ``submit_generation_cut_rows`` started."""
+        return self._get(reference)
 
     async def get_data_plane_snapshot(self) -> dict[str, Any] | None:
         """The writer client's data-plane counters.
@@ -262,6 +264,130 @@ class RayPrefixWriterClient:
             self._closed = True
         ray.kill(self._actor, no_restart=True)
         G_LOGGER.info("prefix_writer event=closed writer_pid=%d", self._writer_pid)
+
+
+def _build_cost(row: GenerationCutRow) -> int:
+    """Building a row's records is linear in its call's prompt and generated tokens."""
+    return len(row.prompt_token_ids) + len(row.generated_token_ids)
+
+
+def split_generation_cut_rows(
+    rows: Sequence[GenerationCutRow], count: int
+) -> list[list[int]]:
+    """The indices of each of ``count`` writers' share of ``rows``.
+
+    Largest row first, each to the writer with the least work so far; a share
+    keeps the rows' order.
+    """
+    shares: list[list[int]] = [[] for _ in range(count)]
+    loads = [0] * count
+    for index in sorted(range(len(rows)), key=lambda i: -_build_cost(rows[i])):
+        writer = loads.index(min(loads))
+        shares[writer].append(index)
+        loads[writer] += _build_cost(rows[index])
+    return [sorted(share) for share in shares]
+
+
+class PrefixWriterPool:
+    """The sink's writer actors; each batch of cut rows is split across them.
+
+    Every writer builds and writes its share at the same time. A batch returns
+    only after every share is acknowledged. If any share fails, every started
+    share is still awaited and the batch raises, so the caller can discard all
+    of its keys with nothing left writing.
+    """
+
+    def __init__(self, writers: Sequence[RayPrefixWriterClient]) -> None:
+        if not writers:
+            raise ValueError("A prefix writer pool needs at least one writer")
+        self._writers = list(writers)
+
+    def configure_generation_cut_sink(
+        self,
+        *,
+        staging_partition: str,
+        capture_media: bool,
+        media_pixel_dtype: torch.dtype | None,
+    ) -> None:
+        """Give every writer a sink with the worker sink's settings."""
+        for writer in self._writers:
+            writer.configure_generation_cut_sink(
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=media_pixel_dtype,
+            )
+
+    def stage_generation_cut_rows(
+        self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
+    ) -> list[StagedGenerationCut]:
+        """Build and write one batch across the writers; return its rows in order.
+
+        Raises:
+            PrefixWriterDiedError: a writer is gone; reported before any other
+                share's failure, since it fails every later cut too.
+            Exception: another share failed.
+        """
+        started = []
+        errors: list[Exception] = []
+        for writer, share in zip(
+            self._writers,
+            split_generation_cut_rows(rows, len(self._writers)),
+            strict=True,
+        ):
+            if not share:
+                continue
+            try:
+                reference = writer.submit_generation_cut_rows(
+                    [rows[index] for index in share], checkpoint_id=checkpoint_id
+                )
+            except Exception as error:
+                errors.append(error)
+            else:
+                started.append((writer, share, reference))
+        staged: list[Any] = [None] * len(rows)
+        for writer, share, reference in started:
+            try:
+                for index, row in zip(share, writer.result(reference), strict=True):
+                    staged[index] = row
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise next(
+                (error for error in errors if isinstance(error, PrefixWriterDiedError)),
+                errors[0],
+            )
+        return staged
+
+    async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Each live writer's data-plane counters, with observability on."""
+        snapshots = await asyncio.gather(
+            *(writer.get_data_plane_snapshot() for writer in self._writers)
+        )
+        return [snapshot for snapshot in snapshots if snapshot is not None]
+
+    def close(self) -> None:
+        for writer in self._writers:
+            writer.close()
+
+
+async def create_prefix_writer_pool(
+    config: DataPlaneConfig, *, count: int
+) -> PrefixWriterPool:
+    """Create ``count`` writers on this node; on any failure, close the rest."""
+    results = await asyncio.gather(
+        *(create_prefix_writer(config) for _ in range(count)), return_exceptions=True
+    )
+    writers = [
+        result for result in results if isinstance(result, RayPrefixWriterClient)
+    ]
+    failure = next(
+        (result for result in results if isinstance(result, BaseException)), None
+    )
+    if failure is not None:
+        for writer in writers:
+            writer.close()
+        raise failure
+    return PrefixWriterPool(writers)
 
 
 async def create_prefix_writer(config: DataPlaneConfig) -> RayPrefixWriterClient:

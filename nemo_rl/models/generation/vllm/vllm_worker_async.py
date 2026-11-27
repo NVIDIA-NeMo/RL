@@ -49,8 +49,8 @@ from nemo_rl.data.captured_media import (
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.prefix_writer_actor import (
-    RayPrefixWriterClient,
-    create_prefix_writer,
+    PrefixWriterPool,
+    create_prefix_writer_pool,
 )
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -365,7 +365,7 @@ class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin,
     BaseVllmGenerationWorker,
 ):
-    _prefix_writer: RayPrefixWriterClient | None
+    _prefix_writer: PrefixWriterPool | None
 
     def __init__(
         self,
@@ -485,7 +485,7 @@ class VllmAsyncGenerationWorkerImpl(
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
         self._capture_dp_client: Any | None = None
-        self._prefix_writer: RayPrefixWriterClient | None = None
+        self._prefix_writer: PrefixWriterPool | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -897,6 +897,7 @@ class VllmAsyncGenerationWorkerImpl(
         generation_cut_control_timeout_s: float | None = None,
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
+        prefix_writers: int,
         prefix_read_max_rows: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
@@ -1050,11 +1051,11 @@ class VllmAsyncGenerationWorkerImpl(
                     write_limits=PREFIX_WRITE_LIMITS,
                 ),
             )
-        # Cut rows are built and written by a CPU writer actor on this node. A
+        # Cut rows are built and written by CPU writer actors on this node. A
         # local data plane lives inside each process, so there the worker does it.
         if generation_prefix_cuts_enabled and dp_cfg["impl"] == "transfer_queue":
             try:
-                writer = await create_prefix_writer(dp_cfg)
+                writer = await create_prefix_writer_pool(dp_cfg, count=prefix_writers)
             except BaseException:
                 self._prefix_recovery.shutdown()
                 raise
@@ -1080,6 +1081,7 @@ class VllmAsyncGenerationWorkerImpl(
                     ),
                     "prefix_write_max_rows": prefix_write_max_rows,
                     "prefix_write_max_tokens": prefix_write_max_tokens,
+                    "prefix_writers": prefix_writers,
                     "prefix_read_max_rows": prefix_read_max_rows,
                 },
             )
@@ -1117,7 +1119,7 @@ class VllmAsyncGenerationWorkerImpl(
         """Collect each frontend's capture counters and reset its step window.
 
         Returns:
-            One snapshot per frontend, plus the prefix writer actor's, with
+            One snapshot per frontend, plus each prefix writer actor's, with
             data-plane observability enabled.
         """
         snapshots = []
@@ -1125,10 +1127,8 @@ class VllmAsyncGenerationWorkerImpl(
         if local_snapshot is not None:
             snapshots.append(local_snapshot)
         if self._prefix_writer is not None:
-            # The writer actor owns its own client; prefix PUTs count there.
-            writer_snapshot = await self._prefix_writer.get_data_plane_snapshot()
-            if writer_snapshot is not None:
-                snapshots.append(writer_snapshot)
+            # Each writer actor owns its own client; prefix PUTs count there.
+            snapshots.extend(await self._prefix_writer.get_data_plane_snapshots())
         if self._api_server_pool is not None:
             snapshots.extend(
                 snapshot

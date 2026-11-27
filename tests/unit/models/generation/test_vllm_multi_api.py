@@ -236,6 +236,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                             "generation_cut_control_timeout_s": 30.0,
                             "prefix_write_max_rows": 256,
                             "prefix_write_max_tokens": 4_194_304,
+                            "prefix_writers": 1,
                             "prefix_read_max_rows": 1,
                         },
                     ),
@@ -319,6 +320,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 generation_cut_control_timeout_s=30.0,
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4_194_304,
+                prefix_writers=1,
                 prefix_read_max_rows=1,
             )
             hosts[0].flush_obsolete_generation_cut_rows_async.assert_awaited_once_with(
@@ -342,6 +344,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                         generation_cut_control_timeout_s=30.0,
                         prefix_write_max_rows=256,
                         prefix_write_max_tokens=4_194_304,
+                        prefix_writers=1,
                         prefix_read_max_rows=1,
                     )
                 ),

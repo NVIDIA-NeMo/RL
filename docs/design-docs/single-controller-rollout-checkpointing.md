@@ -90,7 +90,10 @@ transfer_queue` (any backend), that is a colocated CPU writer actor on the
 generation node, which builds, encodes and writes the rows; it needs one free
 Ray CPU there, and on `mooncake_cpu` its client owns no memory segment, like the
 worker's capture client. A local data plane lives inside each process, so there
-the worker builds and writes the rows itself. The step metrics
+the worker builds and writes the rows itself. `rollout_recovery.prefix_writers`
+(default 1) starts that many writer actors per generation owner, each needing
+one free CPU; every write is split across them by row size and they build their
+shares at the same time. The step metrics
 `generation_prefix/pipeline_prepare_us`, `pipeline_prepare_cpu_us`,
 `pipeline_write_us` and `pipeline_write_cpu_us` give each pipeline thread's wall
 and CPU time on cuts.

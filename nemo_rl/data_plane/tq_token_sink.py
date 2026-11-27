@@ -67,10 +67,7 @@ from nemo_rl.data_plane.generation_cut_rows import (
     StagedGenerationCut,
     stage_generation_cut_rows,
 )
-from nemo_rl.data_plane.prefix_writer_actor import (
-    PrefixWriterDiedError,
-    RayPrefixWriterClient,
-)
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterPool
 from nemo_rl.data_plane.schema import (
     CAPTURE_CODE_TO_MODE,
     CAPTURE_MODE_TO_CODE,
@@ -513,17 +510,17 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
-        self._prefix_writer: RayPrefixWriterClient | None = None
+        self._prefix_writer: PrefixWriterPool | None = None
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
 
-    def set_prefix_writer(self, writer: RayPrefixWriterClient) -> None:
-        """Build and write generation-cut rows in the prefix writer actor.
+    def set_prefix_writer(self, writer: PrefixWriterPool) -> None:
+        """Build and write generation-cut rows in the prefix writer actors.
 
-        Install once, before accepting cuts. The actor gets its own sink with
+        Install once, before accepting cuts. Each actor gets its own sink with
         this one's partition and media settings. Terminal writes, restore
         reads, and cleanup keep this sink's client.
         """
@@ -780,12 +777,12 @@ class TQTokenSink:
     def stage_generation_cut_rows(
         self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
     ) -> list[StagedGenerationCut]:
-        """Build and write one batch of generation-cut rows, in the writer actor if any.
+        """Build and write one batch of generation-cut rows, in the writer actors if any.
 
         Raises:
-            PrefixWriterDiedError: the writer actor is gone; this sink has
-                discarded whatever the batch may have written.
-            Exception: the batch failed; nothing of it remains written.
+            PrefixWriterDiedError: a writer actor is gone.
+            Exception: the batch failed. Either way this sink has discarded
+                whatever the batch may have written.
         """
         if self._prefix_writer is None:
             return stage_generation_cut_rows(self, rows, checkpoint_id=checkpoint_id)
@@ -793,8 +790,9 @@ class TQTokenSink:
             return self._prefix_writer.stage_generation_cut_rows(
                 rows, checkpoint_id=checkpoint_id
             )
-        except PrefixWriterDiedError:
-            # A dead writer cannot discard its own partial write; this client can.
+        except Exception:
+            # Other writers' shares may have landed, and a dead writer cannot
+            # discard its own partial write; this client clears them all.
             self._discard_failed_writes(
                 [
                     generation_cut_staging_key(

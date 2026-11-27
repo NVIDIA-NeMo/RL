@@ -2140,6 +2140,11 @@ class TestSetup:
                 "defer_routed_experts_to_policy requires",
             ),
             (
+                "prefix_writers_without_prefix_recovery",
+                ValueError,
+                "prefix_writers > 1 applies only",
+            ),
+            (
                 "deferred_routes_on_automodel_policy",
                 NotImplementedError,
                 "only wired for the Megatron",
@@ -2181,6 +2186,9 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "prefix_writers_without_prefix_recovery":
+            mc = _make_master_config()
+            mc.rollout_recovery.prefix_writers = 2
         elif invalid_case == "deferred_routes_on_automodel_policy":
             mc = _make_master_config()
             mc.token_capture.enabled = True
@@ -3422,6 +3430,7 @@ class TestSetup:
         )
         assert setup_kwargs["prefix_write_max_rows"] == 17
         assert setup_kwargs["prefix_write_max_tokens"] == 4096
+        assert setup_kwargs["prefix_writers"] == 1
         assert setup_kwargs["prefix_read_max_rows"] == 5
 
     @pytest.mark.parametrize("with_overrides", [False, True])
