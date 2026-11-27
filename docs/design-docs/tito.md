@@ -171,6 +171,8 @@ This uses the unmodified template, so it works for any model family whose turns 
 
 The existing splice locates the same turn close by rendering the history a second time without the appended messages. The bridge needs one rendering per call.
 
+**Incremental tokenization (continuation calls, optional).** For a model family that has an incremental tokenizer, write the appended user and tool messages directly in the template's format and tokenize only them. The history is neither rendered nor tokenized. A request the incremental tokenizer cannot build is bridged, and both give the engine the same tokens. [Incremental tokenization](#incremental-tokenization) compares the two.
+
 **Parse.** Convert generated tokens into a chat message with vLLM's reasoning and tool-call parsers, as the existing path does.
 
 **Parent matching (stateful).** The Gym capture ledger stays the owner of which earlier call a request continues. It is unchanged except for the root-policy refinements below.
@@ -228,7 +230,7 @@ A chat template is qualified once, at server startup, by replaying a fixed set o
 2. do not depend on what the parent generated, and
 3. start with the template's turn close when the parent ended without one.
 
-A template that fails qualification stops the server from starting with the TITO path enabled. This replaces boundary detection by convention with a checked property. The fixed conversations are shared with the startup qualification written for PR #5128.
+A template that fails qualification stops the server from starting with the TITO path enabled. This replaces boundary detection by convention with a checked property. The incremental tokenizer's qualification replays the same conversations and requires its suffix to equal the tail of the template's rendering, token for token.
 
 A fourth property, that rendering a message and parsing it back returns the original message, is not checked yet.
 
@@ -272,9 +274,36 @@ A threshold on the root rate, excluding `first_call`, is the acceptance signal f
 
 The core contract is the same in both cases, so this choice can change later without touching the backends.
 
-### Relation to PR #5128
+### Incremental tokenization
 
-PR #5128 adds an incremental renderer for Qwen3 inside the existing chat handler. In this design it becomes an optional optimization of the bridge step: it avoids the full render per turn for families that have a qualified suffix renderer. It is not required for correctness and should not be merged in its current position. Until it is folded into the bridge, `vllm_cfg.tito_model` and `vllm_cfg.tito_interface` cannot both be set.
+PR #5128 added an incremental renderer for Qwen3 inside the existing chat handler. It is now a step of the adapter, selected by `vllm_cfg.tito_model`, which requires `vllm_cfg.tito_interface`. The bridge is the general path; incremental tokenization is a faster way to build the same tokens for a family that has been qualified.
+
+| | Splice (existing) | Bridge | Incremental tokenization |
+| --- | --- | --- | --- |
+| History rendered through the template | Twice | Once | Not at all |
+| History tokenized | Twice | Once | Not at all |
+| Chat templates | Any | Any template that passes qualification | One hand-written format per family; Qwen3 today |
+| How the appended tokens are found | Second rendering | Turn-close count in the parent's tokens | Written from the appended messages |
+| Prompt construction, 20517-token prefix, relative to the splice | 1 | 1.9 times as fast | 317 times as fast |
+
+Incremental tokenization has two costs that the bridge does not:
+
+- **It is tied to a model family.** The suffix format repeats, by hand, what the chat template does for user and tool turns. A new family needs a new `IncrementalTokenizer`, and a template that differs from the qualified one by a single character is refused at startup.
+- **It relies on one vLLM behavior.** See the next section.
+
+### What depends on the vLLM version
+
+Tying prompt construction to vLLM internals was the main concern with PR #3581, which keeps vLLM's parsing and rendering and changes the prompt inside them. The table lists what each part of this design uses from vLLM.
+
+| Part | What it uses from vLLM | If vLLM changes it |
+| --- | --- | --- |
+| `bridge_suffix`, `qualify_bridge`, the incremental tokenizers and their qualification, the request and response schema | Nothing. `nemo_rl/models/generation/tito.py` does not import vLLM, and the Megatron backend uses the same code. | Not affected |
+| Chat adapter, bridge | The result of `OnlineRenderer.preprocess_chat`, called once as a whole, as the existing splice does | The bridge follows the new rendering; startup qualification rejects a template it can no longer cut |
+| Chat adapter, incremental tokenization | The same call, with the finished prompt passed in the request field `kv_transfer_params.prompt_token_ids`, which makes vLLM skip rendering and tokenization | Every incremental call compares the prompt vLLM returns with the one it was given and fails if they differ |
+| Startup qualification | `resolve_chat_template` and `resolve_chat_template_content_format` from `vllm.renderers.hf` | The server fails to start |
+| Core route | `engine_client.generate`, `SamplingParams`, `render_cmpl_async` for a token prompt | The route fails on its first call |
+
+The incremental tokenizer reads the messages as the client sent them and requires string content, so it does not depend on how vLLM parses messages. The first version in PR #5128 replaced vLLM's renderer inside `preprocess_chat` and called its message parser and template resolver per request; that code and its check for an exact vLLM version are removed.
 
 ## What changes and what does not
 
@@ -351,7 +380,9 @@ The value of the design is therefore: a contract where there was a side effect, 
 | Request and response schema, bridge, qualification | `nemo_rl/models/generation/tito.py` |
 | Core route `POST /v1/tito/generate` and parent resolution | `nemo_rl/models/generation/vllm/tito_route.py` |
 | Chat adapter, startup qualification, route registration | `nemo_rl/models/generation/vllm/vllm_worker_async.py` |
-| Configuration key `vllm_cfg.tito_interface` and its checks | `nemo_rl/models/generation/vllm/config.py` |
+| Incremental tokenizer and its qualification | `nemo_rl/models/generation/tito.py` |
+| Incremental continuation planning for chat requests | `nemo_rl/models/generation/vllm/tito.py` |
+| Configuration keys `vllm_cfg.tito_interface`, `vllm_cfg.tito_model` and their checks | `nemo_rl/models/generation/vllm/config.py` |
 | `finalize/rerooted_tokens` | `nemo_rl/experience/rollout_reassembler.py` |
 
 What has been verified:
@@ -422,7 +453,7 @@ What the first implementation leaves out:
 
 - Media prompts, routed experts, sampler top-k capture, and generation-prefix cuts. Enabling the interface together with any of them fails at startup.
 - The parse round-trip qualification property.
-- The incremental suffix renderer of PR #5128 as a bridge optimization.
+- Incremental tokenization on the Megatron backend. Its server renders the chat request before NeMo RL sees it, so there is no render to skip without a change in Megatron-LM.
 - Streaming on the core route.
 
 ## Open decisions

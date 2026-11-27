@@ -28,8 +28,7 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
-from nemo_rl.models.generation.tito import bridge_suffix
-from nemo_rl.models.generation.vllm.tito import Qwen3IncrementalTokenizer
+from nemo_rl.models.generation.tito import Qwen3IncrementalTokenizer, bridge_suffix
 
 
 def benchmark(

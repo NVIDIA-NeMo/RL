@@ -1,6 +1,6 @@
 # Two-GPU compatibility smoke: one learner and one vLLM rollout worker.
 # Prepare Gym SWE-bench Verified rows and sandbox infrastructure as documented
-# in docs/guides/captured-tito.md. This is not a benchmark-quality model recipe.
+# in docs/guides/tito-interface.md. This is not a benchmark-quality model recipe.
 defaults: grpo_qwen3_0_6b_megatron_generation_single_controller.yaml
 
 grpo:
@@ -28,6 +28,7 @@ policy:
     refit_transport: null
     max_new_tokens: 1024
     vllm_cfg:
+      tito_interface: true
       tito_model: qwen3
       async_engine: true
       expose_http_server: true

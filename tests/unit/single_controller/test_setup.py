@@ -4742,6 +4742,7 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
 @pytest.mark.parametrize("missing", ["enabled", "forest_training"])
 def test_tito_requires_source_history_capture(missing: str) -> None:
     config = _make_forest_master_config()
+    config.policy["generation"]["vllm_cfg"]["tito_interface"] = True
     config.policy["generation"]["vllm_cfg"]["tito_model"] = "qwen3"
     setattr(config.token_capture, missing, False)
     with pytest.raises(ValueError, match="tito_model requires"):

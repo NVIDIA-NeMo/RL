@@ -1248,6 +1248,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.renderers.hf",
         HfRenderer=type("HfRenderer", (), {}),
         resolve_chat_template=MagicMock(return_value="chat-template"),
+        resolve_chat_template_content_format=lambda **kwargs: (
+            "string" if kwargs["given_format"] == "auto" else kwargs["given_format"]
+        ),
     )
 
     def with_cancellation(handler):
@@ -4335,6 +4338,14 @@ def test_vllm_http_server_tito_interface(cluster, tokenizer):
     )
     assert generated["call_id"] is None
 
+    # Incremental tokenization hands vLLM its finished prompt in this field.
+    reused = chat(
+        [{"role": "user", "content": "not rendered"}],
+        kv_transfer_params={"prompt_token_ids": prompt},
+    )
+    assert reused["prompt_token_ids"] == prompt
+    assert reused["generation_token_ids"] == second["generation_token_ids"]
+
     response = requests.post(
         url=f"{base_url}/tito/generate",
         json=dict(token_ids=[1] * 1024, **sampling),
@@ -5786,12 +5797,13 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
 _WORKER_MODULE = "nemo_rl.models.generation.vllm.vllm_worker_async"
 
 
-def _setup_tito_interface(monkeypatch, *, reject_root_reasons=()):
+def _setup_tito_interface(monkeypatch, *, reject_root_reasons=(), vllm_cfg=None):
     """Build the HTTP server with the token-in/token-out interface enabled.
 
     Args:
         monkeypatch: The pytest fixture used to install the fake module tree.
         reject_root_reasons: The worker's ``tito_reject_root_reasons``.
+        vllm_cfg: Further ``vllm_cfg`` keys.
 
     Returns:
         The worker, its online renderer, and the qualification and route
@@ -5806,6 +5818,7 @@ def _setup_tito_interface(monkeypatch, *, reject_root_reasons=()):
         vllm_cfg={
             "tito_interface": True,
             "tito_reject_root_reasons": list(reject_root_reasons),
+            **(vllm_cfg or {}),
         },
         hf_tokenizer=types.SimpleNamespace(eos_token_id=9),
     )
@@ -6000,96 +6013,164 @@ def test_tito_chat_rejects_multimodal_prompts(monkeypatch):
         _tito_preprocess(monkeypatch, online, request, engine_prompt)
 
 
-def test_captured_tito_rejects_unsupported_renderer_at_server_setup(monkeypatch):
-    with pytest.raises(ValueError, match="requires vLLM's Hugging Face renderer"):
-        _setup_fake_vllm_app(monkeypatch, vllm_cfg={"tito_model": "qwen3"})
+def test_tito_model_qualifies_the_incremental_tokenizer_at_server_setup(monkeypatch):
+    qualify = MagicMock()
+    monkeypatch.setattr(f"{_WORKER_MODULE}.qualify_incremental_tokenizer", qualify)
+
+    _setup_tito_interface(monkeypatch, vllm_cfg={"tito_model": "qwen3"})
+
+    assert qualify.call_args.args == ("qwen3",)
+    assert qualify.call_args.kwargs["chat_template"] == "chat-template"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["disabled", "fallback", "incremental"])
-@pytest.mark.parametrize("parallel_tool_calls", [None, False, True])
-async def test_captured_tito_preserves_worker_capture_lifecycle(
-    monkeypatch, mode, parallel_tool_calls
-):
-    from nemo_rl.models.generation.vllm import tito
+def test_tito_model_rejects_a_template_that_takes_content_parts(monkeypatch):
+    monkeypatch.setattr(f"{_WORKER_MODULE}.qualify_incremental_tokenizer", MagicMock())
 
-    worker, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
-    worker._capture_media = False
-    worker._capture_admission = MagicMock(return_value=None)
-    worker._capture_request_media = MagicMock(return_value=None)
-    worker._begin_request_capture = MagicMock()
-    worker._enter_request_prefix = MagicMock()
-    if mode != "disabled":
-        worker.cfg["vllm_cfg"]["tito_model"] = "qwen3"
-    online = serving_chat.kwargs["online_renderer"]
-    native_result = ([{"role": "user", "content": "new"}], [{"prompt_token_ids": [9]}])
-    incremental_result = (native_result[0], [{"prompt_token_ids": [1, 2, 3]}])
-    adapter = types.SimpleNamespace(
-        prefix_token_ids=[1, 2],
+    with pytest.raises(ValueError, match="message content as a string"):
+        _setup_tito_interface(
+            monkeypatch,
+            vllm_cfg={
+                "tito_model": "qwen3",
+                "http_server_serving_chat_kwargs": {
+                    "chat_template_content_format": "openai"
+                },
+            },
+        )
+
+
+def _setup_tito_model(monkeypatch, continuation):
+    """Build the server with an incremental tokenizer that plans ``continuation``."""
+    monkeypatch.setattr(f"{_WORKER_MODULE}.qualify_incremental_tokenizer", MagicMock())
+    plan = AsyncMock(return_value=continuation)
+    monkeypatch.setattr(f"{_WORKER_MODULE}.plan_incremental_continuation", plan)
+    worker, online, _, _ = _setup_tito_interface(
+        monkeypatch, vllm_cfg={"tito_model": "qwen3"}
+    )
+    return worker, online, plan
+
+
+def _incremental_continuation(admission):
+    from nemo_rl.models.generation.vllm.tito import IncrementalContinuation
+
+    return IncrementalContinuation(
         decision=types.SimpleNamespace(
-            storage="storage", serving="serving", verify_retained_media=True
+            storage=admission, serving=admission, verify_retained_media=True
         ),
+        parent_token_ids=[1, 2, 9],
+        suffix_token_ids=[7, 8],
     )
-    helper = AsyncMock(
-        return_value=tito.TitoPreprocessResult(incremental_result, adapter)
-        if mode == "incremental"
-        else tito.TitoPreprocessResult(None, None)
+
+
+@pytest.mark.parametrize("parallel_tool_calls", [None, False, True])
+def test_tito_model_submits_incremental_tokens_without_a_render(
+    monkeypatch, parallel_tool_calls
+):
+    admission = types.SimpleNamespace(
+        mode="candidate", request_replay=object(), root_reason=None
     )
-    monkeypatch.setattr(tito, "preprocess_captured_tito", helper)
-    native = AsyncMock(return_value=native_result)
+    worker, online, plan = _setup_tito_model(
+        monkeypatch, _incremental_continuation(admission)
+    )
+    worker._capture_admission = MagicMock(return_value=admission)
+    online.model_config = types.SimpleNamespace(max_model_len=64)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None,
+        parallel_tool_calls=parallel_tool_calls,
+        kv_transfer_params=None,
+    )
+    forwarded = []
+
+    async def native(self, *, request, **kwargs):
+        assert request.parallel_tool_calls is not False
+        forwarded.append(request.kv_transfer_params.pop("prompt_token_ids"))
+        return [], [{"prompt_token_ids": forwarded[-1]}]
+
     monkeypatch.setattr(
         sys.modules["vllm.renderers.online_renderer"].OnlineRenderer,
         "preprocess_chat",
         native,
         raising=False,
     )
-    request = types.SimpleNamespace(
-        required_prefix_token_ids=None, parallel_tool_calls=parallel_tool_calls
-    )
 
-    async def check_tool_sampling(*args, **kwargs):
-        assert request.parallel_tool_calls is not False
-        return (
-            tito.TitoPreprocessResult(incremental_result, adapter)
-            if mode == "incremental"
-            else tito.TitoPreprocessResult(None, None)
+    _, (engine_prompt,) = asyncio.run(
+        online.preprocess_chat(
+            request, [{"role": "user", "content": "new"}], None, "string", None
         )
-
-    helper.side_effect = check_tool_sampling
-    result = await online.preprocess_chat(
-        request,
-        native_result[0],
-        None,
-        "string",
-        None,
     )
+
+    assert forwarded == [[1, 2, 9, 7, 8]]
+    assert engine_prompt["prompt_token_ids"] == [1, 2, 9, 7, 8]
+    assert request.kv_transfer_params is None
     assert request.parallel_tool_calls is parallel_tool_calls
-    if mode == "incremental":
-        assert result == incremental_result
-        native.assert_not_called()
-        worker._begin_request_capture.assert_called_once_with(
-            request,
-            [1, 2, 3],
-            admission="storage",
-            prefix_token_ids=[1, 2],
-            media=None,
+    assert plan.call_args.kwargs["messages"] == [{"role": "user", "content": "new"}]
+    worker._begin_request_capture.assert_called_once_with(
+        request, [1, 2, 9, 7, 8], admission=admission, prefix_token_ids=[1, 2, 9]
+    )
+
+
+def test_tito_model_fails_when_vllm_renders_instead_of_reusing_tokens(monkeypatch):
+    admission = types.SimpleNamespace(
+        mode="candidate", request_replay=object(), root_reason=None
+    )
+    worker, online, _ = _setup_tito_model(
+        monkeypatch, _incremental_continuation(admission)
+    )
+    worker._capture_admission = MagicMock(return_value=admission)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None,
+        parallel_tool_calls=None,
+        kv_transfer_params=None,
+    )
+
+    with pytest.raises(RuntimeError, match="rendered a chat request"):
+        _tito_preprocess(
+            monkeypatch, online, request, {"prompt_token_ids": [1, 5, 6, 9, 7, 8]}
         )
-        worker._enter_request_prefix.assert_called_once_with(request, [1, 2])
-    else:
-        assert result == native_result
-        native.assert_awaited_once()
-        worker._begin_request_capture.assert_called_once_with(
-            request,
-            [9],
-            admission=None,
-            prefix_token_ids=None,
-            media=None,
-            generation_cut=None,
-            resumed_generation_token_ids=[],
+
+    worker._begin_request_capture.assert_not_called()
+
+
+def test_tito_model_rejects_an_incremental_prompt_that_fills_the_context(monkeypatch):
+    admission = types.SimpleNamespace(
+        mode="candidate", request_replay=object(), root_reason=None
+    )
+    worker, online, _ = _setup_tito_model(
+        monkeypatch, _incremental_continuation(admission)
+    )
+    worker._capture_admission = MagicMock(return_value=admission)
+    online.model_config = types.SimpleNamespace(max_model_len=5)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=None,
+        parallel_tool_calls=None,
+        kv_transfer_params=None,
+    )
+
+    with pytest.raises(
+        sys.modules["vllm.exceptions"].VLLMValidationError,
+        match="maximum context length",
+    ):
+        _tito_preprocess(
+            monkeypatch, online, request, {"prompt_token_ids": [1, 2, 9, 7, 8]}
         )
-        worker._enter_request_prefix.assert_not_called()
-        if mode == "disabled":
-            helper.assert_not_called()
+
+    worker._begin_request_capture.assert_not_called()
+
+
+def test_tito_model_bridges_a_continuation_it_cannot_build(monkeypatch):
+    worker, online, plan = _setup_tito_model(monkeypatch, None)
+    worker._capture_admission = MagicMock(return_value=None)
+    request = types.SimpleNamespace(
+        required_prefix_token_ids=[1, 2, 9], parallel_tool_calls=None
+    )
+    engine_prompt = {"prompt_token_ids": [1, 5, 6, 9, 7, 8]}
+
+    _tito_preprocess(monkeypatch, online, request, engine_prompt)
+
+    plan.assert_awaited_once()
+    assert engine_prompt["prompt_token_ids"] == [1, 2, 9, 7, 8]
+    worker._begin_request_capture.assert_called_once_with(
+        request, [1, 2, 9, 7, 8], admission=None, prefix_token_ids=[1, 2, 9]
+    )
 
 
 def test_sync_worker_finishes_queued_batches_before_resetting_the_prefix_cache():

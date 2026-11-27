@@ -317,12 +317,12 @@ def test_async_actor_settings_allow_omitted_vllm_cfg() -> None:
 @pytest.mark.parametrize(
     "fields",
     [
-        {"tito_model": "unknown", "async_engine": True, "expose_http_server": True},
-        {"tito_model": "qwen3", "async_engine": False, "expose_http_server": True},
-        {"tito_model": "qwen3", "async_engine": True, "expose_http_server": False},
+        {"tito_model": "unknown", "tito_interface": True},
+        {"tito_model": "qwen3", "tito_interface": False},
+        {"tito_model": "qwen3"},
     ],
 )
-def test_tito_rejects_settings_that_cannot_serve_captured_chat(fields) -> None:
+def test_tito_model_rejects_settings_that_cannot_serve_it(fields) -> None:
     with pytest.raises(ValueError, match="tito_model"):
         validate_vllm_async_actor_settings({"vllm_cfg": fields})
 
@@ -332,7 +332,6 @@ def test_tito_rejects_settings_that_cannot_serve_captured_chat(fields) -> None:
     [
         {"async_engine": False, "expose_http_server": True},
         {"async_engine": True, "expose_http_server": False},
-        {"async_engine": True, "expose_http_server": True, "tito_model": "qwen3"},
     ],
 )
 def test_tito_interface_rejects_settings_that_cannot_serve_it(fields) -> None:

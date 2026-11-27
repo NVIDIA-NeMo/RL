@@ -14,12 +14,17 @@
 """Token-in/token-out inference contract shared by generation backends.
 
 The core accepts token IDs and returns token IDs. A chat adapter in front of it
-renders messages, bridges a continuation onto its captured parent and parses the
-reply. See ``docs/design-docs/tito.md``.
+renders messages, continues a captured parent with the tokens of the appended
+messages and parses the reply. Those tokens come from :func:`bridge_suffix`, or
+from an :class:`IncrementalTokenizer` for a model family that has one. See
+``docs/design-docs/tito.md``.
 """
 
+import hashlib
 from collections.abc import Collection
-from typing import Any
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
 
@@ -282,3 +287,134 @@ def qualify_bridge(
                 f"Bridging appended {roles} after an unfinished turn does not "
                 "add the chat template's turn close"
             )
+
+
+# Official Qwen/Qwen3-0.6B tokenizer_config.json chat_template. An exact
+# template contract prevents custom templates from silently changing the suffix.
+QWEN3_TEMPLATE_SHA256 = "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"  # pragma: allowlist secret
+
+
+class TitoNotApplicable(ValueError):
+    """The incremental tokenizer cannot build this continuation; bridge it."""
+
+
+def qwen3_suffix_text(messages: list[dict[str, Any]], *, enable_thinking: bool) -> str:
+    """Render appended observations using the verified Qwen3 template contract."""
+    if not messages or any(
+        message.get("role") not in ("user", "tool")
+        or not isinstance(message.get("content"), str)
+        for message in messages
+    ):
+        raise TitoNotApplicable("unsupported_observation")
+    # Generation stops at im_end; its following template newline is context.
+    parts = ["\n"]
+    for index, message in enumerate(messages):
+        role, content = message["role"], message["content"]
+        if role == "user":
+            parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+        else:
+            if index == 0 or messages[index - 1]["role"] != "tool":
+                parts.append("<|im_start|>user")
+            parts.append(f"\n<tool_response>\n{content}\n</tool_response>")
+            if index == len(messages) - 1 or messages[index + 1]["role"] != "tool":
+                parts.append("<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    if not enable_thinking:
+        parts.append("<think>\n\n</think>\n\n")
+    return "".join(parts)
+
+
+@lru_cache(maxsize=16)
+def _template_digest(template: str) -> str:
+    return hashlib.sha256(template.encode()).hexdigest()
+
+
+class IncrementalTokenizer(Protocol):
+    """Model-specific qualification and suffix encoding for captured histories."""
+
+    def qualify_template(self, template: str | None) -> None: ...
+
+    def validate_prefix(self, tokenizer: Any, prefix: list[int]) -> None: ...
+
+    def encode_suffix(
+        self, tokenizer: Any, messages: list[dict[str, Any]], *, enable_thinking: bool
+    ) -> list[int]: ...
+
+
+@dataclass(frozen=True)
+class Qwen3IncrementalTokenizer:
+    """Incremental observations for the qualified Qwen3 chat template."""
+
+    def qualify_template(self, template: str | None) -> None:
+        if template is None or _template_digest(template) != QWEN3_TEMPLATE_SHA256:
+            raise TitoNotApplicable("unqualified_template")
+
+    def validate_prefix(self, tokenizer: Any, prefix: list[int]) -> None:
+        end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if not prefix or prefix[-1] != end_id or end_id != tokenizer.eos_token_id:
+            raise TitoNotApplicable("unfinished_generation")
+
+    def encode_suffix(
+        self, tokenizer: Any, messages: list[dict[str, Any]], *, enable_thinking: bool
+    ) -> list[int]:
+        suffix = qwen3_suffix_text(messages, enable_thinking=enable_thinking)
+        return tokenizer.encode(suffix, add_special_tokens=False)
+
+
+INCREMENTAL_TOKENIZERS: dict[str, IncrementalTokenizer] = {
+    "qwen3": Qwen3IncrementalTokenizer(),
+}
+
+
+def qualify_incremental_tokenizer(
+    model: str, *, tokenizer: Any, chat_template: str | None
+) -> None:
+    """Reject a server whose incremental prompts would differ from its chat template.
+
+    Replays fixed conversations and requires each incremental suffix to equal the
+    tail of the full chat-template rendering, token for token.
+
+    Args:
+        model: The configured ``vllm_cfg.tito_model``.
+        tokenizer: The server's Hugging Face tokenizer.
+        chat_template: The server's resolved default chat template.
+
+    Raises:
+        ValueError: The chat template or the tokenizer cannot serve incremental
+            prompts for ``model``.
+    """
+    incremental_tokenizer = INCREMENTAL_TOKENIZERS[model]
+    try:
+        incremental_tokenizer.qualify_template(chat_template)
+    except TitoNotApplicable as error:
+        raise ValueError(
+            f"vllm_cfg.tito_model={model} does not support this server's chat "
+            "template; serve the model's official template or unset tito_model"
+        ) from error
+    for observations in QUALIFICATION_OBSERVATIONS:
+        for enable_thinking in (True, False):
+            rendered_ids = _render(
+                tokenizer,
+                QUALIFICATION_HISTORY + observations,
+                chat_template=chat_template,
+                template_kwargs={"enable_thinking": enable_thinking},
+                add_generation_prompt=True,
+            )
+            suffix_ids = incremental_tokenizer.encode_suffix(
+                tokenizer, observations, enable_thinking=enable_thinking
+            )
+            cut = len(rendered_ids) - len(suffix_ids)
+            roles = [message["role"] for message in observations]
+            if cut < 1 or rendered_ids[cut:] != suffix_ids:
+                raise ValueError(
+                    f"vllm_cfg.tito_model={model}: the incremental suffix for "
+                    f"{roles} (enable_thinking={enable_thinking}) differs from "
+                    "the chat template rendering"
+                )
+            try:
+                incremental_tokenizer.validate_prefix(tokenizer, rendered_ids[:cut])
+            except TitoNotApplicable as error:
+                raise ValueError(
+                    f"vllm_cfg.tito_model={model}: the chat template does not end "
+                    f"the assistant turn before {roles} on the expected token"
+                ) from error

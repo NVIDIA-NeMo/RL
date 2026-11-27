@@ -65,11 +65,12 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
-    # Opt-in incremental rendering for source-history capture. None keeps native preprocessing.
-    tito_model: NotRequired[Literal["qwen3"] | None]
     # Serve the token-in/token-out route and bridge chat continuations onto
     # their captured parent's tokens. See docs/design-docs/tito.md.
     tito_interface: NotRequired[bool]
+    # Model family whose appended messages are tokenized without rendering the
+    # history. Requires tito_interface; None bridges every continuation.
+    tito_model: NotRequired[Literal["qwen3"] | None]
     # Gym root reasons that fail a call instead of re-rendering its history from
     # text. Requires tito_interface; first_call cannot be rejected.
     tito_reject_root_reasons: NotRequired[list[str]]
@@ -369,19 +370,12 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     if tito_model is not None:
         if tito_model != "qwen3":
             raise ValueError("vllm_cfg.tito_model must be null or qwen3")
-        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
-            raise ValueError(
-                "vllm_cfg.tito_model requires async_engine and expose_http_server"
-            )
+        if not vllm_cfg.get("tito_interface"):
+            raise ValueError("vllm_cfg.tito_model requires vllm_cfg.tito_interface")
     if vllm_cfg.get("tito_interface"):
         if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
             raise ValueError(
                 "vllm_cfg.tito_interface requires async_engine and expose_http_server"
-            )
-        if tito_model is not None:
-            raise ValueError(
-                "vllm_cfg.tito_interface and vllm_cfg.tito_model select different "
-                "prompt construction paths; set only one"
             )
     reject_root_reasons = vllm_cfg.get("tito_reject_root_reasons")
     if reject_root_reasons:
