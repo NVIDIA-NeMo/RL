@@ -92,8 +92,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     NoOpTrainer,
-    NoOpWeightSynchronizer,
     SimulatorConfig,
+    build_simulated_weight_synchronizer,
     validate_simulator_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -1403,7 +1403,8 @@ def setup_single_controller(
             (examples/run_single_controller_simulator.py), or None for a
             training run. With the ``cpu`` train backend no trainer is built:
             every node is an inference node, a ``NoOpTrainer`` bootstraps the
-            data plane, and the refit is a ``NoOpWeightSynchronizer``.
+            data plane, and the refit is the backend's
+            ``NoOpWeightSynchronizer`` (see ``build_simulated_weight_synchronizer``).
 
     Returns:
         A tuple of (pre-built SC actor args, driver-side per-phase timings
@@ -2409,8 +2410,10 @@ def setup_single_controller(
             # The engine loads the checkpoint itself, so refit only holds for
             # the simulated transfer time.
             assert simulator is not None
-            new_synchronizer = NoOpWeightSynchronizer(
-                refit_time_s=simulator.refit_time_s
+            new_synchronizer = build_simulated_weight_synchronizer(
+                generation_backend=generation_config["backend"],
+                generation=generation,
+                refit_time_s=simulator.refit_time_s,
             )
         else:
             new_synchronizer = create_weight_synchronizer(

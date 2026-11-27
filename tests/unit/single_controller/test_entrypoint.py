@@ -485,6 +485,16 @@ def test_simulator_main_configures_generation_as_training_without_refit_weights(
     )
 
 
+def test_simulator_main_skips_the_vllm_checkpoint_rule_for_sglang(
+    main_context: SimpleNamespace,
+) -> None:
+    main_context.generation_config["backend"] = "sglang"
+
+    run_single_controller_simulator.main()
+
+    main_context.reject_dummy_weights_only_checkpoint.assert_not_called()
+
+
 def test_simulator_main_rejects_an_unknown_simulator_key(
     main_context: SimpleNamespace,
 ) -> None:

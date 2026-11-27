@@ -199,7 +199,9 @@ def _configure_generation(
     else:
         # First: configure_generation_config's nvfp4 check rejects such a recipe without saying why.
         reject_online_quantization(config.policy["generation"])
-        reject_dummy_weights_only_checkpoint(config.policy["model_name"])
+        if config.policy["generation"]["backend"] == "vllm":
+            # The dummy-weights rule is the vLLM worker's.
+            reject_dummy_weights_only_checkpoint(config.policy["model_name"])
         # No refit follows, so the engine expects no draft or MTP weights from one.
         has_refit_draft_weights = trains_mtp = draft_full_refit = False
     config.policy["generation"] = configure_generation_config(
