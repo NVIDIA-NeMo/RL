@@ -40,6 +40,11 @@ from nemo_rl.distributed.model_utils import cp_shift_next
 GOLDEN_PATH = Path(__file__).parent / "data" / "xtoken_loss_goldens.json"
 GOLDENS = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 GOLDEN_CASES = {case["name"]: case for case in GOLDENS["cases"]}
+# 0.7 / 0.3 sum to 1, so no recorded case checks the division by sum(weights);
+# 7 / 3 normalize to the same weights, so the recorded goldens still apply.
+_UNNORMALIZED = copy.deepcopy(GOLDEN_CASES["averaged_logits_same_vocab"])
+_UNNORMALIZED["config"]["teacher_weights"] = [7.0, 3.0]
+GOLDEN_CASES["averaged_logits_same_vocab_unnormalized_weights"] = _UNNORMALIZED
 # Metrics added with the shared base class; the goldens predate them.
 NEW_METRICS = {"teacher_0/weighted_kl", "teacher_1/weighted_kl"}
 
