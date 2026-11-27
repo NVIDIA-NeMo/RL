@@ -34,7 +34,8 @@ if fabric_is_roce_only():
 PYDEVICE
     )
     if [[ -n "$UCX_DEVICE" ]]; then
-        ibv_devinfo -d "${UCX_DEVICE%:*}" -i "${UCX_DEVICE##*:}"
+        ibv_devinfo -d "${UCX_DEVICE%:*}" -i "${UCX_DEVICE##*:}" \
+            || echo "[WARN] ibv_devinfo failed for $UCX_DEVICE" >&2
         export UCX_NET_DEVICES="$UCX_DEVICE"
         echo "NIXL recovery test: UCX_NET_DEVICES=$UCX_NET_DEVICES"
     fi

@@ -1,7 +1,7 @@
 ---
 name: cicd
-description: CI/CD reference for NeMo-RL. Covers GitHub Actions pipeline structure, CI triggering via /ok to test, and CI failure investigation.
-when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; re-running CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot', 're-run', 'rerun', 'retry CI', 'flaky test'.
+description: CI/CD reference for NeMo-RL. Covers GitHub Actions pipeline structure, CI triggering via /ok to test and /nightly-ci, and CI failure investigation.
+when_to_use: Investigating a CI failure; understanding the pipeline structure; triggering CI; re-running CI; 'CI is red', 'how do I trigger CI', '/ok to test', 'nightly CI', '/nightly-ci', 'PR workflow', 'where are the logs', 'CI did not run', 'copy-pr-bot', 're-run', 'rerun', 'retry CI', 'flaky test'.
 ---
 
 # CI/CD Guide
@@ -30,6 +30,12 @@ After pushing a new commit to your PR, trigger CI with:
 Use `git rev-parse HEAD` (not the short form) to get the full SHA.
 
 > **Re-triggering after new commits**: each `/ok to test <sha>` is specific to that SHA. After pushing additional commits, post a new comment with the updated SHA.
+
+### Nightly CI with `/nightly-ci`
+
+Members of the `automation` or `rl_autobot_approvers` GitHub teams can comment `/nightly-ci test-case=<test>` to run NVIDIA's nightly CI and build the RL image from the PR head. Fork PRs first need `/ok to test <full-sha>` vetting and a copy-pr-bot mirror matching that head.
+
+With `run_as: requester`, the pipeline runs as the commenter. NVIDIA employees must enroll once as described in the internal Autobot `/nightly-ci` docs; unenrolled requests receive a neutral check. See [the CI/CD guide](../../docs/ci-cd.md#nightly-ci-with-nightly-ci) for settings and the `Autobot nightly CI` check. A new push supersedes the run without cancelling the running pipeline.
 
 ---
 

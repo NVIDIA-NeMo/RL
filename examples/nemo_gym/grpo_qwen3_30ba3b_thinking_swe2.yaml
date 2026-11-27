@@ -41,7 +41,7 @@ loss_fn:
   truncated_importance_sampling_ratio_min: null
   truncated_importance_sampling_type: tis
   sequence_level_importance_ratios: false
-  token_level_loss: true
+  normalization: global_token_mean
   force_on_policy_ratio: true
   use_kl_in_reward: false
 policy:
@@ -64,9 +64,7 @@ policy:
     pipeline_model_parallel_size: 2
     context_parallel_size: 4
     freeze_moe_router: true
-    moe_router_bias_update_rate: 0.001
     moe_aux_loss_coeff: 0.0
-    moe_router_enable_expert_bias: true
     bias_activation_fusion: false
     optimizer:
       lr: 1.0e-06
