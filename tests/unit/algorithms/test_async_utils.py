@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest.mock as mock
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -531,25 +532,36 @@ class TestReplayBufferImplCheckpointing:
             torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
         )
 
-    def test_local_restore_merges_pre_taskset_batches_with_new_batches(self, tmp_path):
+    @pytest.mark.parametrize("old_checkpoint", [True, False])
+    def test_local_restore_merges_pre_taskset_batches_with_new_batches(
+        self, tmp_path: Path, old_checkpoint: bool
+    ) -> None:
         def flat_group(agent_name: str, *, with_attribution_key: bool) -> dict:
             batch = BatchedDataDict(
                 {
                     "agent_ref": [{"name": agent_name}] * 2,
                     "total_reward": torch.tensor([1.0, 0.0]),
+                    "is_looping": [None, None],
+                    "reasons": [[], []],
+                    "verifier_reward": torch.tensor([2.0, 0.0], dtype=torch.float64),
                 }
             )
             if with_attribution_key:
                 batch["attribution_key"] = [agent_name] * 2
             return {"batch": batch, "rollout_metrics": {}}
 
-        # A checkpoint written before taskset attribution has no
-        # attribution_key column in its buffered batches.
+        saved_group = flat_group("math_agent", with_attribution_key=False)
+        if old_checkpoint:
+            for key in ("is_looping", "reasons", "verifier_reward"):
+                saved_group["batch"].pop(key)
+        else:
+            saved_group["batch"]["is_looping"] = [True, False]
+            saved_group["batch"]["reasons"] = [["repeated_text"], []]
         checkpoint_path = tmp_path / "replay_buffer.pt"
         source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         assert (
             source.add(
-                flat_group("math_agent", with_attribution_key=False),
+                saved_group,
                 weight_version=1,
                 target_weight_version=2,
             )
@@ -583,6 +595,18 @@ class TestReplayBufferImplCheckpointing:
             train_batch["agent_ref"]
             == [{"name": "math_agent"}] * 2 + [{"name": "code_agent"}] * 2
         )
+        assert train_batch["total_reward"].tolist() == [1, 0, 1, 0]
+        assert train_batch["is_looping"] == (
+            [None, None] if old_checkpoint else [True, False]
+        ) + [None, None]
+        assert train_batch["reasons"] == (
+            [[], []] if old_checkpoint else [["repeated_text"], []]
+        ) + [[], []]
+        assert train_batch["verifier_reward"][2:].tolist() == [2, 0]
+        if old_checkpoint:
+            assert torch.isnan(train_batch["verifier_reward"][:2]).all()
+        else:
+            assert train_batch["verifier_reward"][:2].tolist() == [2, 0]
 
 
 class TestReplayBuffer:

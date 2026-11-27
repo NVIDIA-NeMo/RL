@@ -41,6 +41,7 @@ from typing import (
 )
 
 import ray
+import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
@@ -868,21 +869,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"target_weight_versions={len(target_weight_versions)}"
                 )
 
-            # Checkpoints written before taskset attribution hold only flat rows,
-            # whose attribution is the agent name. Restore the column so these
-            # batches merge with newly collected ones in from_batches.
+            # Restored Gym groups need the columns that newly collected groups add.
+            # Missing verifier grades cannot be recovered from shaped rewards.
             for trajectory in trajectories:
                 batch = (
                     trajectory.get("batch") if isinstance(trajectory, dict) else None
                 )
-                if (
-                    batch is not None
-                    and "agent_ref" in batch
-                    and "attribution_key" not in batch
-                ):
+                if batch is None or "agent_ref" not in batch:
+                    continue
+                if "attribution_key" not in batch:
                     batch["attribution_key"] = [
                         ref["name"] for ref in batch["agent_ref"]
                     ]
+                num_rows = len(batch["agent_ref"])
+                batch.setdefault("is_looping", [None] * num_rows)
+                batch.setdefault("reasons", [[] for _ in range(num_rows)])
+                if "verifier_reward" not in batch:
+                    batch["verifier_reward"] = torch.full_like(
+                        batch["total_reward"], float("nan"), dtype=torch.float64
+                    )
 
             if "max_size" in state and state["max_size"] != self.max_size:
                 print(

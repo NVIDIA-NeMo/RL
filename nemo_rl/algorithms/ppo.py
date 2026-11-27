@@ -87,7 +87,6 @@ from nemo_rl.environments.nemo_gym import (
     validate_looping_reward_safeguard,
 )
 from nemo_rl.experience.rollouts import (
-    nemo_gym_logging_metadata,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
@@ -3138,7 +3137,6 @@ def async_ppo_train(
                 "generation_logprobs": train_data["generation_logprobs"].tolist(),
                 "prev_logprobs": train_data["prev_logprobs"].tolist(),
             }
-            log_data.update(nemo_gym_logging_metadata(repeated_batch))
             logger.log_batched_dict_as_jsonl(
                 log_data, f"train_data_step{step + 1}.jsonl"
             )
