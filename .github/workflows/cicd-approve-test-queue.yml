@@ -30,7 +30,11 @@ concurrency:
 jobs:
   approve-test-queue:
     if: github.repository == 'NVIDIA-NeMo/RL'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_test_approval_queue.yml@7a39dff97817b673465972a0e1a1c3c9dbc25372 # v1.3.0
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_test_approval_queue.yml@main
     with:
       workflow_name: CICD NeMo RL
       max_concurrency_internal: ${{ fromJSON(vars.MAX_CONCURRENCY || '3') }}
