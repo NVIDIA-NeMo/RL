@@ -1484,6 +1484,101 @@ def test_reference_model_swap_copies_selected_state(
     torch.testing.assert_close(model.e_score_correction_bias, torch.tensor([13.0]))
 
 
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_reference_model_swap_with_fsdp2_lora(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The LoRA swap must load and restore real FSDP2 DTensor adapters."""
+    import torch.distributed as dist
+    from nemo_automodel.components._peft.lora import (
+        PeftConfig,
+        apply_lora_to_linear_modules,
+    )
+    from nemo_automodel.components.distributed.tensor_utils import (
+        get_cpu_state_dict,
+    )
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(8, 6, bias=False)
+            self.lm_head = nn.Linear(6, 4, bias=False)
+            self.register_buffer("e_score_correction_bias", torch.zeros(4))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.lm_head(self.proj(x)) + self.e_score_correction_bias
+
+    def copy_to_cpu(
+        state_items: Iterable[tuple[str, torch.Tensor]], *, pin_memory: bool
+    ) -> dict[str, torch.Tensor]:
+        # Pinned memory and the CUDA sync need a GPU; the DTensor copy is the real one.
+        return get_cpu_state_dict(state_items, pin_memory=False)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.automodel.setup.get_cpu_state_dict", copy_to_cpu
+    )
+    monkeypatch.setattr(worker_mod, "get_cpu_state_dict", copy_to_cpu)
+
+    assert not dist.is_initialized()
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        torch.manual_seed(0)
+        model = TinyModel()
+        apply_lora_to_linear_modules(
+            model,
+            PeftConfig(target_modules=["*proj", "*lm_head"], dim=2, alpha=4),
+        )
+        with torch.no_grad():
+            # The reference can contain nonzero donor adapters.
+            nn.init.normal_(model.proj.lora_B.weight)
+            nn.init.normal_(model.lm_head.lora_B.weight)
+        # Same layout as Automodel: each block is its own group, and the root group
+        # (here lm_head) stays unsharded after a forward.
+        mesh = init_device_mesh("cpu", (1,))
+        fully_shard(model.proj, mesh=mesh)
+        fully_shard(model, mesh=mesh, reshard_after_forward=False)
+
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = model
+        worker.lora_enabled = True
+        worker.sampling_params = None
+        worker.reference_model_state_dict = worker_mod.setup_reference_model_state(
+            model, lora_enabled=True
+        )
+        assert set(worker.reference_model_state_dict) == {
+            "proj.lora_A.weight",
+            "proj.lora_B.weight",
+            "lm_head.lora_A.weight",
+            "lm_head.lora_B.weight",
+            "e_score_correction_bias",
+        }
+
+        x = torch.randn(3, 8)
+        with torch.no_grad():
+            reference_out = model(x).clone()
+            # Move the adapters and the buffer, as training would.
+            for name, value in model.state_dict(keep_vars=True).items():
+                if name in worker.reference_model_state_dict:
+                    local = value.to_local() if isinstance(value, DTensor) else value
+                    local.detach().add_(0.5)
+            policy_out = model(x).clone()
+        assert not torch.allclose(reference_out, policy_out)
+
+        with worker.use_reference_model():
+            torch.testing.assert_close(model(x), reference_out)
+        with torch.no_grad():
+            torch.testing.assert_close(model(x), policy_out)
+    finally:
+        dist.destroy_process_group()
+
+
 def _check_tq_coordinates(rank: int, world_size: int) -> None:
     from torch.distributed.device_mesh import init_device_mesh
 
