@@ -228,7 +228,7 @@ def main() -> None:
         if actor_args is not None:
             # Drain env actors before generation to avoid in-flight requests
             # during shutdown.
-            shutdown_environments(actor_args.env_handles)
+            shutdown_environments(actor_args.env_handles, actor_args.val_env_handles)
 
             teacher_worker_groups = (
                 getattr(actor_args, "teacher_worker_groups", None) or {}

@@ -9,6 +9,7 @@
 #     --config examples/configs/recipes/llm/dapo-qwen2.5-1.5b-instruct-1n8g-windowed-single-controller-token_capture.yaml
 defaults: ../../grpo_math_1B_megatron_single_controller.yaml
 grpo:
+  val_period: 0
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
   max_num_steps: 100

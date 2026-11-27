@@ -34,6 +34,7 @@ from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
     GenerationOutputSpec,
+    GenerationSamplingParams,
     get_num_routed_experts,
     resolve_routed_experts_dtype,
     verify_right_padding,
@@ -887,11 +888,17 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        sampling_params: GenerationSamplingParams | None = None,
     ):
-        top_k_cfg = self.cfg["top_k"]
+        profile = (
+            GenerationSamplingParams.from_generation_config(self.cfg)
+            if sampling_params is None
+            else sampling_params
+        )
+        top_k_cfg = profile.top_k
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
 
-        temperature = 0.0 if greedy else self.cfg["temperature"]
+        temperature = 0.0 if greedy else profile.temperature
 
         max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
@@ -899,7 +906,7 @@ class BaseVllmGenerationWorker:
 
         return self.SamplingParams(
             temperature=temperature,
-            top_p=self.cfg["top_p"],
+            top_p=profile.top_p,
             top_k=top_k_val,
             max_tokens=max_tokens,
             logprobs=0,

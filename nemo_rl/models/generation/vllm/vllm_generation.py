@@ -1700,6 +1700,10 @@ class VllmGeneration(GenerationInterface):
             return True
 
         if self._dynamo_serves(data):
+            if "sampling_params" in data:
+                raise ValueError(
+                    "Per-request sampling is unavailable with Dynamo generation"
+                )
             if validate_generate_data(data):
                 yield await self._generate_through_dynamo(data, greedy)
             return

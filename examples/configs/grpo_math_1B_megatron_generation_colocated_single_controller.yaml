@@ -1,4 +1,6 @@
 defaults: grpo_math_1B_megatron_single_controller.yaml
+grpo:
+  val_period: 0
 policy:
   generation:
     backend: megatron

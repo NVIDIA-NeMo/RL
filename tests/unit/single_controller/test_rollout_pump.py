@@ -613,6 +613,40 @@ def _pump_controller(
     return ctrl
 
 
+def test_validation_drain_allows_admitted_replacement() -> None:
+    async def run():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        seen = []
+
+        class Manager:
+            async def generate_and_push(self, prompt, **kwargs):
+                name = prompt["message_log"][0]["content"]
+                seen.append(name)
+                if name == "ahead":
+                    entered.set()
+                    await release.wait()
+                    return RolloutOutcome.SKIPPED
+                return RolloutOutcome.COMMITTED
+
+        ctrl = _pump_controller(Manager(), [_batch("ahead"), _batch("spare")])
+        ctrl._sampler.restore_dispatch_index(0)
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            ctrl._trainer_version = 1
+            drain = asyncio.create_task(ctrl._drain_training_rollouts_for_validation())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(drain, 2)
+            assert seen == ["ahead", "spare"]
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_filtered_group_can_draw_from_the_next_epoch() -> None:
     manager = _ScriptedRolloutManager(
         [RolloutOutcome.FILTERED, RolloutOutcome.COMMITTED]

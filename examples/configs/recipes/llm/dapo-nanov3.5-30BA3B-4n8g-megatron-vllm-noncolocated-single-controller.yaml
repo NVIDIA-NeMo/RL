@@ -14,9 +14,6 @@ grpo:
   num_prompts_per_step: 8
   max_num_steps: 10
   num_generations_per_prompt: 8
-  # SC does not support validation yet.
-  val_period: 0
-  val_at_start: false
   # SC reads async_rl instead of the legacy async_grpo block.
   async_grpo: null
   # SC samples replacement groups itself.

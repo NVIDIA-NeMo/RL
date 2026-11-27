@@ -7,6 +7,8 @@
 # dynamo_cfg is optional. The values below are its defaults
 # (nemo_rl/models/generation/dynamo/config.py).
 defaults: grpo_math_1B_megatron_single_controller.yaml
+grpo:
+  val_period: 0
 
 policy:
   generation:

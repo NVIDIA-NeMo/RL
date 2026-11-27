@@ -51,6 +51,9 @@ from nemo_rl.algorithms.metric_utils import (
     MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
     REWARD_KEY,
     SETUP_TIMING_PREFIX,
+    VALIDATION_ACCURACY_KEY,
+    VALIDATION_AVG_LENGTH_KEY,
+    VALIDATION_PASS_K_KEY,
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
@@ -4987,6 +4990,33 @@ def grpo_train(
         shutdown_environments(task_to_env, val_task_to_env)
 
 
+def aggregate_validation_metrics(
+    rewards: list[float], total_length_tokens: float, generations_per_prompt: int
+) -> dict[str, float]:
+    """Compute rollout-weighted means and the fraction of prompts solved at K."""
+    num_samples = len(rewards)
+    if num_samples == 0:
+        return {VALIDATION_ACCURACY_KEY: 0.0, VALIDATION_AVG_LENGTH_KEY: 0.0}
+
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    metrics = {
+        VALIDATION_ACCURACY_KEY: rewards_tensor.mean().item(),
+        VALIDATION_AVG_LENGTH_KEY: total_length_tokens / num_samples,
+    }
+    if generations_per_prompt > 1:
+        assert num_samples % generations_per_prompt == 0, (
+            "Validation rewards must be divisible by grpo.val_num_generations_per_prompt"
+        )
+        metrics[VALIDATION_PASS_K_KEY] = (
+            (rewards_tensor.view(-1, generations_per_prompt) > 0)
+            .any(dim=1)
+            .float()
+            .mean()
+            .item()
+        )
+    return metrics
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -5020,6 +5050,7 @@ def validate(
         # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
         total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
+        additional_metrics_to_report: dict[str, Any] = {}
 
         max_val_samples = master_config.grpo.max_val_samples
         val_batch_size = master_config.grpo.val_batch_size
@@ -5035,7 +5066,6 @@ def validate(
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
 
-            additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -5132,38 +5162,15 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics. accuracy is the mean reward over all
-        # rollouts; grouped validation (val_num_generations_per_prompt > 1)
-        # additionally reports pass@k over each prompt's k rollouts as pass_k.
-        num_samples = len(total_rewards)
-        pass_k = None
-        if num_samples > 0:
-            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            accuracy = rewards_t.mean().item()
-            if val_num_generations_per_prompt > 1:
-                assert num_samples % val_num_generations_per_prompt == 0, (
-                    "Validation rewards must be divisible by "
-                    "grpo.val_num_generations_per_prompt"
-                )
-                pass_k = (
-                    (rewards_t.view(-1, val_num_generations_per_prompt) > 0)
-                    .any(dim=1)
-                    .float()
-                    .mean()
-                    .item()
-                )
-        else:
-            accuracy = 0.0
-
-        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
-
-        val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
-            **additional_metrics_to_report,
-        }
+        val_metrics = aggregate_validation_metrics(
+            total_rewards, total_length_tokens, val_num_generations_per_prompt
+        )
+        accuracy = val_metrics[VALIDATION_ACCURACY_KEY]
+        avg_length = val_metrics[VALIDATION_AVG_LENGTH_KEY]
+        pass_k = val_metrics.get(VALIDATION_PASS_K_KEY)
+        val_metrics.update(additional_metrics_to_report)
         if pass_k is not None:
-            val_metrics["pass_k"] = pass_k
+            val_metrics[VALIDATION_PASS_K_KEY] = pass_k
 
         # Print sample conversations only once at the end of validation
         try:

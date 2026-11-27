@@ -148,17 +148,17 @@ def message_log_to_flat_messages(
     return output
 
 
-def get_keys_from_message_log(
-    message_log: LLMMessageLogType, keys: list[str]
-) -> LLMMessageLogType:
-    """Return a new LLMMessageLogType containing only the specified keys from each message.
+def get_keys_from_message_log[MessageValue](
+    message_log: Sequence[Mapping[str, MessageValue]], keys: list[str]
+) -> list[dict[str, MessageValue]]:
+    """Return a new message log containing only the specified keys from each message.
 
     Args:
         message_log: Original message log to extract keys from
         keys: List of keys to keep in each message
 
     Returns:
-        LLMMessageLogType: New list with only specified keys
+        New list with only specified keys
     """
     return [{k: msg[k] for k in keys if k in msg} for msg in message_log]
 

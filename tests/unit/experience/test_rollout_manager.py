@@ -87,6 +87,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.models.generation.interfaces import GenerationSamplingParams
 from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
@@ -119,7 +120,13 @@ def _with_cut(buffer, callback):
     return _run(apply())
 
 
-def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
+@pytest.mark.parametrize(
+    "sampling_params",
+    [None, GenerationSamplingParams(temperature=0.0, top_p=0.9, top_k=17)],
+)
+def test_generate_response_forwards_vllm_inputs(
+    sampling_params: GenerationSamplingParams | None,
+) -> None:
     captured: dict[str, BatchedDataDict] = {}
 
     class _Generation:
@@ -173,10 +180,15 @@ def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
                 "vllm_content": "rendered prompt",
                 "vllm_multi_modal_data": {"image": native_image},
             },
+            sampling_params=sampling_params,
         )
     )
 
     generation_data = captured["data"]
+    if sampling_params is None:
+        assert "sampling_params" not in generation_data
+    else:
+        assert generation_data["sampling_params"] == [sampling_params]
     assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]

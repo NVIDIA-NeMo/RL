@@ -127,11 +127,12 @@ bash docker/dynamo/install.sh
 
 ## Run
 
-Use any non-colocated SingleController vLLM recipe and add the switch:
+Enable Dynamo on a non-colocated SingleController vLLM recipe with validation disabled:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \
   --config examples/configs/grpo_math_1B_megatron_single_controller.yaml \
+  grpo.val_period=0 \
   ++policy.generation.dynamo=true
 ```
 

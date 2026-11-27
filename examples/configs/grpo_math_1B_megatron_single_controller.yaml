@@ -1,12 +1,10 @@
 # SingleController variant of grpo_math_1B.yaml.
 defaults: grpo_math_1B.yaml
 
-# SC does not support validation yet.
 grpo:
   # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
   # SC reads async_rl instead, and the entrypoint raises if this block is set.
   async_grpo: null
-  val_period: 0
   # Optional NeMo-Gym message-level penalties. Values overwrite computed
   # advantages on tokens belonging to the corresponding assistant message.
   invalid_tool_call_advantage: null

@@ -54,6 +54,12 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
+from nemo_rl.algorithms.metric_utils import (
+    VALIDATION_ACCURACY_KEY,
+    VALIDATION_AVG_LENGTH_KEY,
+    VALIDATION_NUM_SAMPLES_KEY,
+    VALIDATION_PASS_K_KEY,
+)
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -984,11 +990,9 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     runtime-only dotpaths. ``*`` matches one mapping or list level and ``**``
     matches any number of levels.
 
-    SingleController has no validation loop, so checkpoint selection must use
-    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
-    ``val:<name>`` settings are rejected during setup. Unknown keys are
-    forbidden because a misspelled interval, retention, or restore option can
-    silently disable the durability behavior the operator intended.
+    Unknown keys are forbidden because a misspelled interval, retention, or
+    restore option can silently disable the durability behavior the operator
+    intended.
 
     ``telemetry_interval_s=None`` disables the independent wall-clock sampler
     for rollout/checkpoint benchmark metrics. It does not enable checkpointing
@@ -2259,21 +2263,72 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         # TIS corrects generation staleness; a forced ratio stays exact with one
         # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
-    # Top-k retention keys off checkpointing.metric_name, but SC has no
-    # validation loop yet (see _save_checkpoint), so a "val:" metric would
-    # never be collected and top-k would silently degrade to a no-op.
-    metric_name = master_config.checkpointing.metric_name
-    if (
-        master_config.checkpointing.enabled
-        and metric_name is not None
-        and not metric_name.startswith("train:")
+    validation_enabled = (
+        algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end
+    )
+    rank_metric = (
+        master_config.checkpointing.metric_name
+        if master_config.checkpointing.enabled
+        else None
+    )
+    if rank_metric is not None and not (
+        rank_metric.startswith(("train:", "val:")) and rank_metric.split(":", 1)[1]
     ):
         raise ValueError(
-            f"checkpointing.metric_name={metric_name!r} is not usable on the "
-            "SingleController path: it has no validation loop yet, so only "
-            "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
-            "'train:loss') or set checkpointing.metric_name=null."
+            "checkpointing.metric_name requires train:<name> or val:<name>"
         )
+    val_rank_metric = (
+        rank_metric.removeprefix("val:")
+        if rank_metric and rank_metric.startswith("val:")
+        else None
+    )
+    stop_metric = None
+    if isinstance(algo_cfg, GRPOConfig):
+        stop_metric = algo_cfg.stop_at_validation_metric
+        if (stop_metric is None) != (algo_cfg.stop_at_validation_threshold is None):
+            raise ValueError(
+                "Set both stop_at_validation_metric and stop_at_validation_threshold"
+            )
+    if not validation_enabled and (
+        val_rank_metric is not None or stop_metric is not None
+    ):
+        raise ValueError(
+            "Validation checkpoint ranking and early stopping require validation to be enabled"
+        )
+    if validation_enabled:
+        if (
+            not isinstance(algo_cfg, GRPOConfig)
+            or master_config.env.get("should_use_nemo_gym")
+            or generation_cfg["backend"] != "vllm"
+            or generation_cfg["colocated"]["enabled"]
+            or generation_cfg.get("dynamo")
+        ):
+            raise NotImplementedError(
+                "SingleController validation requires GRPO with native environments "
+                "and direct, non-colocated vLLM generation"
+            )
+        if (
+            algo_cfg.val_batch_size is None
+            or algo_cfg.val_batch_size < 1
+            or algo_cfg.val_num_generations_per_prompt < 1
+        ):
+            raise ValueError(
+                "Validation batch size and generations per prompt must be positive"
+            )
+        if algo_cfg.max_val_samples is not None and algo_cfg.max_val_samples < 1:
+            raise ValueError("max_val_samples must be positive or null")
+        allowed_metrics = {
+            VALIDATION_ACCURACY_KEY,
+            VALIDATION_AVG_LENGTH_KEY,
+            VALIDATION_NUM_SAMPLES_KEY,
+        }
+        if algo_cfg.val_num_generations_per_prompt > 1:
+            allowed_metrics.add(VALIDATION_PASS_K_KEY)
+        for metric in (val_rank_metric, stop_metric):
+            if metric is not None and metric not in allowed_metrics:
+                raise ValueError(
+                    f"Validation metric {metric!r} requires one of {sorted(allowed_metrics)}"
+                )
 
     token_capture_config = master_config.token_capture
     recovery_config = master_config.rollout_recovery

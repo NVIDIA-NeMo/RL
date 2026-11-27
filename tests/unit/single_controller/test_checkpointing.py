@@ -988,6 +988,7 @@ def _actor_master_config(
             max_num_epochs=max_num_epochs,
             num_prompts_per_step=num_prompts_per_step,
             num_generations_per_prompt=2,
+            val_period=0,
             seed=42,
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
@@ -2832,8 +2833,8 @@ class TestPeriodicRolloutCheckpoint:
                 clock_now[0] += 3.0
 
         actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
-        actor._dp_client.capture_checkpoint = (
-            lambda checkpoint_dir, *, metadata: Capture()
+        actor._dp_client.capture_checkpoint = lambda checkpoint_dir, *, metadata: (
+            Capture()
         )
         attach_rollout_checkpointing(actor)
         try:
@@ -5159,16 +5160,57 @@ class TestPPOWarmupCheckpoint:
 
 class TestMetricName:
     def test_val_metric_rejected_at_validation(self, tmp_path):
-        # SC has no validation loop, so a "val:" metric would never be
-        # collected and top-k retention would silently no-op. The config
-        # validation (run by setup before the actor exists) rejects it up
-        # front instead of warning at every save.
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="val:accuracy"
         )
 
-        with pytest.raises(ValueError, match="no validation loop yet"):
+        with pytest.raises(ValueError, match="require validation to be enabled"):
             validate_single_controller_config(mc)
+
+    def test_val_ranking_uses_same_step_and_top_k(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=1, metric_name="val:accuracy"
+        )
+        mc.grpo.val_period = 2
+        mc.checkpointing.keep_top_k = 1
+        mc.checkpointing.ft_keep_latest_k = 2
+        validate_single_controller_config(mc)
+        validation_steps = []
+
+        def seed(actor):
+            async def validate():
+                assert actor._validation_drain_complete is not None
+                validation_steps.append(actor._train_steps)
+                return {"accuracy": {2: 0.75, 4: 0.25}[actor._train_steps]}
+
+            actor._run_validation = validate
+
+        actor = _run_train_pump(mc, _make_actor_args(trainer=_FakeTrainer()), seed=seed)
+        checkpoint_dir = tmp_path / "checkpoints"
+        assert validation_steps == [2, 4]
+        assert _training_info(checkpoint_dir, 2)["val:accuracy"] == 0.75
+        assert "val:accuracy" not in _training_info(checkpoint_dir, 3)
+        assert "val_reward" not in _training_info(checkpoint_dir, 3)
+        assert _training_info(checkpoint_dir, 4)["val:accuracy"] == 0.25
+        assert actor._checkpointer.get_best_checkpoint_path() == str(
+            checkpoint_dir / "step_2"
+        )
+
+    def test_validation_early_stop_publishes_current_step(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=4, metric_name="val:accuracy"
+        )
+        mc.grpo.val_period = 2
+        mc.grpo.stop_at_validation_metric = "accuracy"
+        mc.grpo.stop_at_validation_threshold = 0.75
+        validate_single_controller_config(mc)
+
+        def seed(actor):
+            actor._run_validation = AsyncMock(return_value={"accuracy": 0.75})
+
+        actor = _run_train_pump(mc, _make_actor_args(trainer=_FakeTrainer()), seed=seed)
+        assert actor._train_steps == 2
+        assert _training_info(tmp_path / "checkpoints", 2)["val:accuracy"] == 0.75
 
     def test_train_metric_lands_in_training_info(self, tmp_path):
         mc = _actor_master_config(
@@ -5223,12 +5265,12 @@ class TestMetricName:
         with pytest.raises(ValueError, match="not found in train metrics"):
             _run_train_pump(mc, _make_actor_args())
 
-    def test_metric_name_requires_train_prefix(self, tmp_path):
+    def test_metric_name_requires_source_prefix(self, tmp_path):
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="reward"
         )
 
-        with pytest.raises(ValueError, match="is not usable on the SingleController"):
+        with pytest.raises(ValueError, match="requires train:<name> or val:<name>"):
             validate_single_controller_config(mc)
 
 
