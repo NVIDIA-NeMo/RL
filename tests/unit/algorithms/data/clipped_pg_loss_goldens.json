@@ -601,7 +601,7 @@
         "reference_policy_kl_penalty": 0.0,
         "use_importance_sampling_correction": true,
         "sequence_level_importance_ratios": true,
-        "token_level_loss": false
+        "normalization": "sequence_mean"
       },
       "input_overrides": {},
       "expected": {

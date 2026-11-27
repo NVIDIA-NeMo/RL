@@ -166,6 +166,7 @@ def _make_master_config(
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -184,6 +185,7 @@ def _make_master_config(
                             "enabled": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
+                            "pipeline_parallel_size": 1,
                         },
                         "max_total_sequence_length": 64,
                         "make_sequence_length_divisible_by": 8,
@@ -836,6 +838,7 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -857,6 +860,7 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
@@ -941,6 +945,23 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
             val_dataset=None,
         )
     # The check fires before any cluster/policy construction.
+    assert mock_cluster.call_count == 0
+
+
+def test_setup_rejects_teacher_automodel_pipeline_parallel():
+    cfg = _make_master_config()
+    cfg.teachers[0].automodel_cfg["pipeline_parallel_size"] = 2
+    with (
+        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(ValueError, match="xtoken distillation does not support"),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(24)],
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
     assert mock_cluster.call_count == 0
 
 

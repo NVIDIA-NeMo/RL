@@ -63,7 +63,7 @@ from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
@@ -274,6 +274,12 @@ def setup(
         assert (tc.get("automodel_cfg") or {}).get("enabled"), (
             f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
+        # The teacher's get_full_logits_ipc has no pipeline-parallel implementation.
+        if cast(AutomodelConfig, tc["automodel_cfg"])["pipeline_parallel_size"] > 1:
+            raise ValueError(
+                "xtoken distillation does not support "
+                f"teachers.{i}.automodel_cfg.pipeline_parallel_size > 1."
+            )
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's
