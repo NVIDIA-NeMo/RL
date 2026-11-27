@@ -37,6 +37,11 @@ from typing import Any, Literal
 
 import torch
 
+from nemo_rl.data_plane.generation_cut_rows import (
+    GenerationCutRow,
+    StagedGenerationCut,
+    generation_cut_prefix_record,
+)
 from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
@@ -61,7 +66,6 @@ from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
     PrefixWrite,
     PrefixWritePipeline,
     WriteSettled,
-    estimate_prefix_row_bytes,
 )
 from nemo_rl.models.generation.score_centering import extract_score_centering_slice
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
@@ -557,11 +561,11 @@ class PrefixRecovery:
     ) -> Generator[Any, Any, Any]:
         """Hold one live call's cut frozen until its row is written and acknowledged.
 
-        Yields ``(record, chunk_sequence, attachments)``, receives the staged
-        key, then seals and returns its acknowledgement. A call with nothing new
-        to stage returns its acknowledgement (or ``None`` if abort won the race)
-        without yielding. Closing it before the seal rolls the cut back and
-        clears its row.
+        Yields the call's ``GenerationCutRow``, receives its
+        ``StagedGenerationCut``, then seals and returns its acknowledgement. A
+        call with nothing new to stage returns its acknowledgement (or ``None``
+        if abort won the race) without yielding. Closing it before the seal
+        rolls the cut back and clears its row.
 
         ``route_pieces`` are the call's router-replay route pieces, copied with
         its tokens by the cut's progress read.
@@ -687,61 +691,42 @@ class PrefixRecovery:
                 return self._failed_ack(
                     prefix, reason="sampler_topk_unavailable", uncut=uncut
                 )
-            staged_key = None
+            staged = None
             try:
-                # The advertised prefix digest covers tokens and call extras,
-                # not routes: each chunk's own digest covers its routes, and a
-                # restore checks every chunk's routes against it.
-                call_extras = self._parts.prefix_row_extras(state)
-                cumulative_record = capture.build_prefix_record(
-                    state.call,
+                route_extras = None
+                attachments: dict[str, torch.Tensor] = {}
+                if chunk_routes is not None:
+                    route_extras = {
+                        ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(
+                            chunk_routes
+                        )
+                    }
+                    attachments[ROUTED_EXPERTS_FIELD] = chunk_routes
+                if chunk_sampler_topk is not None:
+                    attachments[SAMPLER_TOPK_TOKEN_IDS_FIELD] = chunk_sampler_topk[0]
+                    attachments[SAMPLER_TOPK_LOGPROBS_FIELD] = chunk_sampler_topk[1]
+                row = GenerationCutRow(
+                    call=state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=frozen.generated_logprobs,
-                    extras=call_extras,
+                    chunk_token_ids=frozen.chunk_token_ids,
+                    chunk_logprobs=frozen.chunk_logprobs,
+                    first_chunk=not progress.staging_keys,
+                    chunk_sequence=frozen.chunk_sequence,
+                    call_extras=self._parts.prefix_row_extras(state),
+                    route_extras=route_extras,
+                    attachments=attachments or None,
                 )
                 if frozen.chunk_token_ids:
-                    route_extras = None
-                    attachments: dict[str, torch.Tensor] = {}
-                    if chunk_routes is not None:
-                        route_extras = {
-                            ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(
-                                chunk_routes
-                            )
-                        }
-                        attachments[ROUTED_EXPERTS_FIELD] = chunk_routes
-                    if chunk_sampler_topk is not None:
-                        attachments[SAMPLER_TOPK_TOKEN_IDS_FIELD] = chunk_sampler_topk[
-                            0
-                        ]
-                        attachments[SAMPLER_TOPK_LOGPROBS_FIELD] = chunk_sampler_topk[1]
-                    if progress.staging_keys:
-                        chunk_record = capture.build_generation_chunk_record(
-                            state.call,
-                            generated_token_ids=frozen.chunk_token_ids,
-                            generated_logprobs=frozen.chunk_logprobs,
-                            extras=route_extras,
-                        )
-                    elif route_extras is None:
-                        chunk_record = cumulative_record
-                    else:
-                        # The first chunk is the whole prefix so far, with its
-                        # routes beside the call's extras.
-                        chunk_record = capture.build_prefix_record(
-                            state.call,
-                            prompt_token_ids=state.prompt_token_ids,
-                            generated_token_ids=generated_token_ids,
-                            generated_logprobs=frozen.generated_logprobs,
-                            extras={**(call_extras or {}), **route_extras},
-                        )
-                    staged_key = yield (
-                        chunk_record,
-                        frozen.chunk_sequence,
-                        attachments or None,
-                    )
+                    staged = yield row
+                    prefix_digest = staged.prefix_digest
+                else:
+                    # Nothing new to write, so the digest is built here.
+                    prefix_digest = generation_cut_prefix_record(row, capture).digest
                 candidate_staging_keys = progress.staging_keys
-                if staged_key is not None:
-                    candidate_staging_keys += (staged_key,)
+                if staged is not None:
+                    candidate_staging_keys += (staged.staging_key,)
                 acknowledgement = GenerationCutPrefixAck(
                     **prefix.model_dump(mode="json"),
                     disposition="durable_prefix",
@@ -749,22 +734,24 @@ class PrefixRecovery:
                     frozen_buffer_id=frozen.chunk_key,
                     staging_keys=candidate_staging_keys,
                     prefix_token_count=total_generation_token_count,
-                    prefix_digest=cumulative_record.digest,
+                    prefix_digest=prefix_digest,
                     effective_output_limit=effective_output_limit,
                     terminal_finish_reason=progress.terminal_finish_reason,
                     terminal_stop_reason=progress.terminal_stop_reason,
                 )
-                owned.seal(checkpoint_id, staged_key)
+                owned.seal(
+                    checkpoint_id, None if staged is None else staged.staging_key
+                )
             except BaseException:
                 # Closing the transaction early raises GeneratorExit here.
                 # Leaving the lifecycle rolls the unsealed cut back.
-                if staged_key is not None:
+                if staged is not None:
                     try:
-                        sink.clear([staged_key])
+                        sink.clear([staged.staging_key])
                     except Exception:  # noqa: BLE001 — preserve the cut failure
                         LOGGER.exception(
                             "Failed to clear rejected generation-prefix row %s",
-                            staged_key,
+                            staged.staging_key,
                         )
                 raise
             return acknowledgement
@@ -927,7 +914,7 @@ class PrefixRecovery:
             )
         sink = self._parts.sink
         acknowledgements: list[Any] = []
-        pending: list[tuple[Generator[Any, Any, Any], Any, int, Any, Any]] = []
+        pending: list[tuple[Generator[Any, Any, Any], GenerationCutRow, Any]] = []
         pending_tokens = 0
         pending_bytes = 0
         byte_limit = self._parts.write_limits.max_batch_payload_bytes
@@ -947,7 +934,7 @@ class PrefixRecovery:
 
         def release_pending() -> None:
             nonlocal pending_tokens, pending_bytes
-            for transaction, _, _, _, prefix in pending:
+            for transaction, _, prefix in pending:
                 transaction.close()
                 late.append(prefix)
             pending.clear()
@@ -955,8 +942,8 @@ class PrefixRecovery:
             pending_bytes = 0
 
         def write_alone(
-            batch: list[tuple[Any, Any, int, Any, Any]], error: BaseException
-        ) -> list[str | None]:
+            batch: list[tuple[Any, GenerationCutRow, Any]], error: BaseException
+        ) -> list[StagedGenerationCut | None]:
             """After a failed batch write, write each row alone once."""
             if isinstance(error, PrefixWriterDiedError):
                 # Every later write fails too: fail the whole cut loudly
@@ -965,34 +952,31 @@ class PrefixRecovery:
             # The sink has already discarded the batch's keys.
             if len(batch) == 1:
                 if past_deadline():
-                    late.append(batch[0][4])
+                    late.append(batch[0][2])
                 else:
-                    fail(batch[0][4])
+                    fail(batch[0][2])
                 return [None]
             LOGGER.warning(
                 "generation-prefix batch of %d rows failed; writing each alone",
                 len(batch),
                 exc_info=error,
             )
-            keys: list[str | None] = []
-            for _, record, sequence, attachments, prefix in batch:
+            staged: list[StagedGenerationCut | None] = []
+            for _, row, prefix in batch:
                 if past_deadline():
                     late.append(prefix)
-                    keys.append(None)
+                    staged.append(None)
                     continue
                 try:
-                    keys += sink.stage_generation_prefix_batch(
-                        [record],
-                        checkpoint_id=checkpoint_id,
-                        chunk_sequences=[sequence],
-                        attachments=[attachments],
+                    staged += sink.stage_generation_cut_rows(
+                        [row], checkpoint_id=checkpoint_id
                     )
                 except PrefixWriterDiedError:
                     raise
                 except Exception:
                     fail(prefix)
-                    keys.append(None)
-            return keys
+                    staged.append(None)
+            return staged
 
         def flush() -> CutWrites:
             nonlocal pending_tokens, pending_bytes
@@ -1005,30 +989,27 @@ class PrefixRecovery:
             pending.clear()
             pending_tokens = 0
             size, pending_bytes = pending_bytes, 0
-            keys: list[str | None] = []
+            staged: list[StagedGenerationCut | None] = []
             handed = 0
             try:
-                keys = yield PrefixWrite(
+                staged = yield PrefixWrite(
                     checkpoint_id=checkpoint_id,
-                    records=tuple(record for _, record, _, _, _ in batch),
-                    sequences=tuple(sequence for _, _, sequence, _, _ in batch),
-                    attachments=tuple(attached for _, _, _, attached, _ in batch),
+                    rows=tuple(row for _, row, _ in batch),
                     payload_bytes=size,
                     fallback=functools.partial(write_alone, batch),
                 )
-                ready = []
-                for (transaction, _, _, _, prefix), key in zip(
-                    batch, keys, strict=True
+                for (transaction, _, prefix), written in zip(
+                    batch, staged, strict=True
                 ):
                     handed += 1
-                    if key is None:
+                    if written is None:
                         # Closing rolls the frozen cut back.
                         transaction.close()
                         continue
                     try:
                         # Builds the ack and seals; a failure rolls the call
                         # back and clears its row.
-                        transaction.send(key)
+                        transaction.send(written)
                     except StopIteration as done:
                         acknowledgements.append(done.value)
                     except Exception:
@@ -1036,7 +1017,11 @@ class PrefixRecovery:
             finally:
                 # Only an interruption leaves written rows that no transaction
                 # received; nothing may advertise them.
-                orphaned = [key for key in keys[handed:] if key is not None]
+                orphaned = [
+                    written.staging_key
+                    for written in staged[handed:]
+                    if written is not None
+                ]
                 if orphaned:
                     try:
                         sink.clear(orphaned)
@@ -1044,7 +1029,7 @@ class PrefixRecovery:
                         LOGGER.exception(
                             "Failed to clear interrupted generation-prefix batch"
                         )
-                for transaction, _, _, _, _ in batch:
+                for transaction, _, _ in batch:
                     transaction.close()
             yield WriteSettled()
 
@@ -1068,7 +1053,7 @@ class PrefixRecovery:
                         uncut,
                         route_pieces=route_pieces.get(prefix.model_call_id),
                     )
-                    record, sequence, attachments = next(transaction)
+                    row = next(transaction)
                 except StopIteration as finished:
                     acknowledgement = finished.value
                     if acknowledgement is None:
@@ -1080,8 +1065,8 @@ class PrefixRecovery:
                 except Exception:
                     fail(prefix)
                     continue
-                tokens = len(record.token_ids_delta)
-                size = estimate_prefix_row_bytes(record, attachments)
+                tokens = row.delta_len
+                size = row.estimated_bytes()
                 if pending and (
                     pending_tokens + tokens > max_tokens
                     or pending_bytes + size > byte_limit
@@ -1091,7 +1076,7 @@ class PrefixRecovery:
                     except BaseException:
                         transaction.close()
                         raise
-                pending.append((transaction, record, sequence, attachments, prefix))
+                pending.append((transaction, row, prefix))
                 pending_tokens += tokens
                 pending_bytes += size
                 if (
@@ -1103,7 +1088,7 @@ class PrefixRecovery:
                     yield from flush()
             yield from flush()
         finally:
-            for transaction, _, _, _, _ in pending:
+            for transaction, _, _ in pending:
                 transaction.close()
         if late:
             LOGGER.warning(

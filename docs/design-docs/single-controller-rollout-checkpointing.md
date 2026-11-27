@@ -82,11 +82,18 @@ Every attempt logs its outcome under `rollout/checkpoint_outcome`, and every sav
 ## Pipelined Generation-Prefix Writes
 
 Generation-prefix cut rows always go through a write pipeline, which overlaps
-preparing cut rows with one bounded write stream. With `data_plane.impl:
-transfer_queue` (any backend), the PUTs run in a colocated CPU writer actor on
-the generation node; it needs one free Ray CPU there, and on `mooncake_cpu` its
-client owns no memory segment, like the worker's capture client. A local data
-plane lives inside each process, so there the worker writes itself.
+freezing live calls with one bounded write stream. The worker only freezes each
+call and hands over its tokens, logprobs and attachments. Building Gym's
+records and their digests, which costs time linear in the call's whole prompt
+and prefix, happens where the rows are written. With `data_plane.impl:
+transfer_queue` (any backend), that is a colocated CPU writer actor on the
+generation node, which builds, encodes and writes the rows; it needs one free
+Ray CPU there, and on `mooncake_cpu` its client owns no memory segment, like the
+worker's capture client. A local data plane lives inside each process, so there
+the worker builds and writes the rows itself. The step metrics
+`generation_prefix/pipeline_prepare_us`, `pipeline_prepare_cpu_us`,
+`pipeline_write_us` and `pipeline_write_cpu_us` give each pipeline thread's wall
+and CPU time on cuts.
 Router-replay tensors and media capture are supported: a media call's cut rows
 carry its media digests and placeholder media columns. Terminal writes and
 restore reads use the worker's own client. Checkpoint records and digests are

@@ -1050,8 +1050,8 @@ class VllmAsyncGenerationWorkerImpl(
                     write_limits=PREFIX_WRITE_LIMITS,
                 ),
             )
-        # Prefix PUTs go through a CPU writer actor on this node. A local data
-        # plane lives inside each process, so there the worker writes itself.
+        # Cut rows are built and written by a CPU writer actor on this node. A
+        # local data plane lives inside each process, so there the worker does it.
         if generation_prefix_cuts_enabled and dp_cfg["impl"] == "transfer_queue":
             try:
                 writer = await create_prefix_writer(dp_cfg)

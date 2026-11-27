@@ -70,6 +70,9 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MediaColumnSpec,
     media_tensor_digests,
 )
+from nemo_rl.data_plane.generation_cut_rows import (  # noqa: E402
+    stage_generation_cut_rows,
+)
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_FIELD,
@@ -206,6 +209,9 @@ class _MemorySink:
             self.clear(written)
             raise
         return written
+
+    def stage_generation_cut_rows(self, rows, *, checkpoint_id):
+        return stage_generation_cut_rows(self, rows, checkpoint_id=checkpoint_id)
 
     def clear(self, staging_keys: list[str]) -> None:
         self.cleared_generation_prefix_keys.extend(staging_keys)

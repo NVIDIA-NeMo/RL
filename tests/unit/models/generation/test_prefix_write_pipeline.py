@@ -110,8 +110,12 @@ def _media_cut_rows(
         written = client()
         service = PrefixWriterService(written)
         actor = SimpleNamespace(
-            put_samples=SimpleNamespace(remote=service.put_samples),
-            clear_samples=SimpleNamespace(remote=service.clear_samples),
+            configure_generation_cut_sink=SimpleNamespace(
+                remote=service.configure_generation_cut_sink
+            ),
+            stage_generation_cut_rows=SimpleNamespace(
+                remote=service.stage_generation_cut_rows
+            ),
         )
         sink.set_prefix_writer(RayPrefixWriterClient(actor, writer_pid=1))
     recovery = PrefixRecovery(
@@ -221,16 +225,14 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
         assert release.wait(5)
         return [record.key for record in records]
 
-    sink.stage_generation_prefix_batch.side_effect = write
+    sink.stage_generation_cut_rows.side_effect = write
 
     def prepare(
         inventory: Any, *, deadline: float | None, held_only: bool
     ) -> CutWrites:
         events.append(("prepare", inventory.inventory_digest, threading.get_ident()))
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
-        keys = yield PrefixWrite(
-            "cut", (record,), (0,), (None,), 100, lambda error: [record.key]
-        )
+        keys = yield PrefixWrite("cut", (record,), 100, lambda error: [record.key])
         events.append(("seal", inventory.inventory_digest, threading.get_ident()))
         yield WriteSettled()
         return keys
@@ -371,7 +373,7 @@ def test_only_a_single_row_may_exceed_the_batch_byte_limit() -> None:
             SimpleNamespace(key=f"{inventory.inventory_digest}-{index}", delta_len=1)
             for index in range(2)
         )
-        yield PrefixWrite("cut", records, (0, 0), (None, None), 2, lambda error: [None])
+        yield PrefixWrite("cut", records, 2, lambda error: [None])
 
     pipeline = PrefixWritePipeline(
         limits=replace(
@@ -386,7 +388,7 @@ def test_only_a_single_row_may_exceed_the_batch_byte_limit() -> None:
         future = pipeline.submit(_inventory("one", ["a"]), deadline=None)
         with pytest.raises(ValueError, match="Only a single row"):
             future.result(5)
-        sink.stage_generation_prefix_batch.assert_not_called()
+        sink.stage_generation_cut_rows.assert_not_called()
     finally:
         pipeline.close(wait=True)
 
@@ -412,7 +414,7 @@ def test_byte_limit_splits_a_batch_and_seals_every_row() -> None:
 def test_admission_limit_rejects_new_inventories_but_shares_duplicates() -> None:
     release = threading.Event()
     sink = MagicMock()
-    sink.stage_generation_prefix_batch.side_effect = lambda records, **kwargs: (
+    sink.stage_generation_cut_rows.side_effect = lambda records, **kwargs: (
         release.wait(5),
         [record.key for record in records],
     )[1]
@@ -421,9 +423,7 @@ def test_admission_limit_rejects_new_inventories_but_shares_duplicates() -> None
         inventory: Any, *, deadline: float | None, held_only: bool
     ) -> CutWrites:
         record = SimpleNamespace(key=inventory.inventory_digest, delta_len=1)
-        keys = yield PrefixWrite(
-            "cut", (record,), (0,), (None,), 1, lambda error: [None]
-        )
+        keys = yield PrefixWrite("cut", (record,), 1, lambda error: [None])
         yield WriteSettled()
         return keys
 

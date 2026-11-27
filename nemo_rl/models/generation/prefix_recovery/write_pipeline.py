@@ -16,15 +16,19 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from nemo_rl.data_plane.generation_cut_rows import (
+    GenerationCutRow,
+    StagedGenerationCut,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,45 +62,19 @@ PREFIX_WRITE_LIMITS = PrefixWriteLimits(
 )
 
 
-# token_ids_delta (int64) plus token_mask_delta and generation_logprobs_delta
-# (float32), as the sink encodes them.
-_TOKEN_BYTES = 8 + 2 * 4
-# Rough per-row allowance for the scalar, digest and offset columns.
-_ROW_BYTES = 512
-
-
-def estimate_prefix_row_bytes(
-    record: Any, attachments: Mapping[str, Any] | None
-) -> int:
-    """Estimated encoded size of one cut row, for the write pipeline's byte bounds."""
-    size = len(record.token_ids_delta) * _TOKEN_BYTES + _ROW_BYTES
-    for text in (record.capture_key, record.model_call_id, record.parent_call_id):
-        if text is not None:
-            size += len(text.encode("utf-8"))
-    if record.extras is not None:
-        size += len(json.dumps(record.extras, ensure_ascii=False).encode("utf-8"))
-    if attachments:
-        size += sum(
-            value.numel() * value.element_size() for value in attachments.values()
-        )
-    return size
-
-
 @dataclass(frozen=True)
 class PrefixWrite:
-    """Immutable rows; only their owner thread may resume their transactions."""
+    """Frozen calls' rows; only their owner thread may resume their transactions."""
 
     checkpoint_id: str
-    records: tuple[Any, ...]
-    sequences: tuple[int, ...]
-    attachments: tuple[Any, ...]
+    rows: tuple[GenerationCutRow, ...]
     payload_bytes: int
     # Called with the failed batch write's error; writes what it can row by row.
-    fallback: Callable[[BaseException], list[str | None]]
+    fallback: Callable[[BaseException], list[StagedGenerationCut | None]]
 
     @property
     def tokens(self) -> int:
-        return sum(record.delta_len for record in self.records)
+        return sum(row.delta_len for row in self.rows)
 
 
 @dataclass(frozen=True)
@@ -104,7 +82,7 @@ class WriteSettled:
     """All transactions of the preceding write have sealed or rolled back."""
 
 
-CutWrites = Generator[PrefixWrite | WriteSettled, list[str | None], Any]
+CutWrites = Generator[PrefixWrite | WriteSettled, list[StagedGenerationCut | None], Any]
 
 
 @dataclass(eq=False)
@@ -198,9 +176,9 @@ class PrefixWritePipeline:
             ``failed_inventories`` and ``peak_buffered_payload_bytes``. Then
             microseconds of wall and thread CPU time: ``prepare_us`` and
             ``prepare_cpu_us`` on the preparation thread (reading progress,
-            freezing calls, building rows, sealing or rolling back), and
-            ``write_us`` and ``write_cpu_us`` on the writer thread (encoding
-            rows and the TQ PUT, whose wait is wall time only).
+            freezing calls, sealing or rolling back), and ``write_us`` and
+            ``write_cpu_us`` on the writer thread (building, encoding and
+            writing rows; with a writer actor, its work is wall time only).
         """
         with self._condition:
             return {
@@ -281,14 +259,8 @@ class PrefixWritePipeline:
             oversized = request.payload_bytes > self._limits.max_batch_payload_bytes
             if request.payload_bytes <= 0:
                 raise ValueError("Prefix write must carry a positive payload")
-            if oversized and len(request.records) != 1:
+            if oversized and len(request.rows) != 1:
                 raise ValueError("Only a single row may exceed the batch byte limit")
-            if (
-                not len(request.records)
-                == len(request.sequences)
-                == len(request.attachments)
-            ):
-                raise ValueError("Prefix batch lengths differ")
             job.request = request
             # A row above the batch limit is written alone (_collect never adds to
             # it). Its reservation may exceed the buffer; preparation then waits
@@ -300,10 +272,12 @@ class PrefixWritePipeline:
         except BaseException as error:
             self._finish(job, error=error)
 
-    def _write(self, jobs: list[_Job]) -> list[list[str | None] | BaseException]:
+    def _write(
+        self, jobs: list[_Job]
+    ) -> list[list[StagedGenerationCut | None] | BaseException]:
         requests = [job.request for job in jobs]
         assert all(request is not None for request in requests)
-        records = [record for request in requests for record in request.records]
+        rows = [row for request in requests for row in request.rows]
         with self._timed("write"):
             try:
                 if any(
@@ -311,18 +285,11 @@ class PrefixWritePipeline:
                     for job in jobs
                 ):
                     raise TimeoutError("Prefix batch expired before PUT")
-                keys = self._sink.stage_generation_prefix_batch(
-                    records,
-                    checkpoint_id=requests[0].checkpoint_id,
-                    chunk_sequences=[
-                        seq for request in requests for seq in request.sequences
-                    ],
-                    attachments=[
-                        item for request in requests for item in request.attachments
-                    ],
+                staged = self._sink.stage_generation_cut_rows(
+                    rows, checkpoint_id=requests[0].checkpoint_id
                 )
-                if len(keys) != len(records):
-                    self._sink.clear(keys)
+                if len(staged) != len(rows):
+                    self._sink.clear([row.staging_key for row in staged])
                     raise ValueError("Prefix sink returned the wrong number of keys")
             except Exception as error:
                 results = []
@@ -334,8 +301,8 @@ class PrefixWritePipeline:
             else:
                 results, offset = [], 0
                 for request in requests:
-                    stop = offset + len(request.records)
-                    results.append(keys[offset:stop])
+                    stop = offset + len(request.rows)
+                    results.append(staged[offset:stop])
                     offset = stop
             finally:
                 with self._condition:
@@ -348,7 +315,7 @@ class PrefixWritePipeline:
         group = [first]
         assert first.request is not None
         rows, tokens, size = (
-            len(first.request.records),
+            len(first.request.rows),
             first.request.tokens,
             first.request.payload_bytes,
         )
@@ -357,13 +324,13 @@ class PrefixWritePipeline:
             assert request is not None
             if (
                 request.checkpoint_id != first.request.checkpoint_id
-                or rows + len(request.records) > self._max_batch_rows
+                or rows + len(request.rows) > self._max_batch_rows
                 or tokens + request.tokens > self._max_batch_tokens
                 or size + request.payload_bytes > self._limits.max_batch_payload_bytes
             ):
                 break
             group.append(self._prepared.popleft())
-            rows += len(request.records)
+            rows += len(request.rows)
             tokens += request.tokens
             size += request.payload_bytes
         return group
@@ -375,13 +342,13 @@ class PrefixWritePipeline:
             for job in jobs:
                 self._finish(job, error=error)
             return
-        for job, keys in zip(jobs, results, strict=True):
-            if isinstance(keys, BaseException):
-                self._finish(job, error=keys)
+        for job, staged in zip(jobs, results, strict=True):
+            if isinstance(staged, BaseException):
+                self._finish(job, error=staged)
                 continue
             try:
                 assert job.iterator is not None
-                marker = job.iterator.send(keys)
+                marker = job.iterator.send(staged)
                 if not isinstance(marker, WriteSettled):
                     raise TypeError("Prefix owner must settle a completed write")
             except StopIteration as completed:
@@ -436,7 +403,7 @@ class PrefixWritePipeline:
                     ),
                     None,
                 )
-                prepared_rows = sum(len(job.request.records) for job in self._prepared)
+                prepared_rows = sum(len(job.request.rows) for job in self._prepared)
                 can_prepare = (
                     candidate is not None
                     and self._buffered + self._limits.max_batch_payload_bytes
@@ -491,11 +458,11 @@ class PrefixWritePipeline:
                 try:
                     results = flight[1].result()
                     keys = [
-                        key
+                        row.staging_key
                         for result in results
                         if not isinstance(result, BaseException)
-                        for key in result
-                        if key is not None
+                        for row in result
+                        if row is not None
                     ]
                     if keys:
                         self._sink.clear(keys)
