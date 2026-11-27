@@ -718,7 +718,6 @@ class AutomodelPolicyWorkerImpl(
         """Record the rollout engine's TP size for later use by weight-streaming refit."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
-    @wrap_with_nvtx_name("automodel_policy_worker/train")
     def _make_loss_post_processor(
         self, loss_fn: LossFunction, *, draft_runtime: Optional[Any]
     ) -> LossPostProcessor:
@@ -795,6 +794,7 @@ class AutomodelPolicyWorkerImpl(
         warn_if_inf_grad_norm(grad_norm)
         return grad_norm
 
+    @wrap_with_nvtx_name("automodel_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
