@@ -66,6 +66,7 @@ from nemo_rl.algorithms.metric_utils import (
     RolloutCheckpointAttemptReason,
     rollout_checkpoint_reason_key,
 )
+from nemo_rl.algorithms.ppo_utils.privileged_value import PRIVILEGE_PREFIXES_FILENAME
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
     list_staging_keys,
@@ -202,6 +203,7 @@ async def write_controller_sidecars(
     objects = {
         REPLACEMENT_RESERVE_FILENAME: captured.replacement_reserve,
         REPLAY_BUFFER_METADATA_FILENAME: captured.replay_metadata,
+        PRIVILEGE_PREFIXES_FILENAME: captured.privilege_state,
     }
     for filename, value in objects.items():
         if value is not None:
@@ -719,6 +721,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
             next_nemo_gym_task_index=next_nemo_gym_task_index,
             replacement_reserve=replacement_reserve,
             replay_metadata=replay_metadata,
+            # The prefixes travel with the replay groups that reference them.
+            privilege_state=(
+                self._privilege_store.state_dict()
+                if self._privilege_store is not None and replay_metadata is not None
+                else None
+            ),
             rollout_recovery_payload=recovery_payload,
             rollout_recovery_group_count=recovery_group_count,
             replay_row_count=sum(

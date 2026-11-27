@@ -355,6 +355,15 @@ value:
   make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
   precision: "bfloat16"
 
+  # Privileged value: see docs/guides/ppo.md.
+  privileged_value:
+    # Only the SingleController entrypoint supports it; run_ppo.py rejects enabled: true.
+    enabled: false
+    max_total_tokens: 32768
+    # Built-in builders under nemo_rl.algorithms.ppo_utils: ground_truth_privilege_prefix
+    # and swe_privilege_prefix (the latter needs prefix_builder_kwargs.caps).
+    prefix_builder_fqn: nemo_rl.algorithms.ppo_utils.ground_truth_privilege_prefix.build_privilege_prefix
+
   reward_model_cfg:
     enabled: false
     reward_model_type: "regression"

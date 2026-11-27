@@ -4080,7 +4080,7 @@ class _NoOpValue:
         self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
-    def get_values_from_meta(self, meta: KVBatchMeta) -> None:
+    def get_values_from_meta(self, meta: KVBatchMeta, **kwargs) -> None:
         del meta
         self._record("get_values_from_meta")
 
@@ -4176,6 +4176,52 @@ def test_whole_batch_value_mode_replays_all_chunks_per_critic_epoch() -> None:
     assert value.trained_sample_ids == [
         ["sample-0", "sample-1"],
         ["sample-0", "sample-1"],
+    ]
+
+
+class _PrivilegedValue(_NoOpValue):
+    """Records the privilege kwargs each critic call receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.privilege_kwargs: list[tuple[str, dict]] = []
+
+    def get_values_from_meta(self, meta: KVBatchMeta, **kwargs) -> None:
+        self.privilege_kwargs.append(("forward", kwargs))
+        super().get_values_from_meta(meta)
+
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn, **kwargs) -> dict:
+        self.privilege_kwargs.append(("train", kwargs))
+        return super().train_from_meta(meta, loss_fn)
+
+
+def test_privileged_value_calls_carry_the_batch_prefixes() -> None:
+    # Without these kwargs the critic would train and predict blind, silently.
+    first_meta = _single_group_meta()
+    second_meta = _single_group_meta()
+    second_meta.sample_ids = ["sample-1"]
+    controller, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(first_meta),
+        value=_PrivilegedValue(),
+        value_training_mode="whole_batch",
+    )
+    controller._privilege_store = MagicMock()
+    controller._privilege_store.prefixes_for.side_effect = lambda meta: {
+        "instance": tuple(meta.sample_ids)
+    }
+
+    asyncio.run(controller._value_stage(first_meta))
+    asyncio.run(controller._value_train_epochs([first_meta, second_meta], num_epochs=1))
+
+    assert value.privilege_kwargs == [
+        ("forward", {"privilege_prefixes": {"instance": ("sample-0",)}}),
+        (
+            "train",
+            {
+                "gbs": None,
+                "privilege_prefixes": {"instance": ("sample-0", "sample-1")},
+            },
+        ),
     ]
 
 
@@ -4634,7 +4680,7 @@ class _StreamingPPOValue(_NoOpValue):
         self.inference_prepared = True
         super().prepare_for_inference()
 
-    def get_values_from_meta(self, meta: KVBatchMeta) -> None:
+    def get_values_from_meta(self, meta: KVBatchMeta, **kwargs) -> None:
         assert self.inference_prepared
         super().get_values_from_meta(meta)
 

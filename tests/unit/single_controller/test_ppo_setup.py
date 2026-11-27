@@ -59,7 +59,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.models.value.config import ValueResourcesConfig
+from nemo_rl.models.value.config import (
+    PrivilegedValueConfig,
+    PrivilegedValueConfigDisabled,
+    ValueResourcesConfig,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -669,6 +673,80 @@ class TestPPOValidation:
         validate_single_controller_config(
             self._warmup_ckpt_config(constant_structure=False)
         )
+
+    @staticmethod
+    def _privileged_config(
+        *,
+        value_seq_len: int = 352,
+        builder: str = "ground_truth_privilege_prefix",
+    ) -> MasterConfig:
+        mc = _ppo_master_config()
+        mc.value["max_total_sequence_length"] = value_seq_len
+        mc.value["privileged_value"] = PrivilegedValueConfig(
+            enabled=True,
+            max_total_tokens=64,
+            prefix_builder_fqn=(
+                f"nemo_rl.algorithms.ppo_utils.{builder}.build_privilege_prefix"
+            ),
+        )
+        return mc
+
+    def test_accepts_a_privileged_value_with_room_for_the_block(self):
+        # policy 32 + budget (64 + 256 template slack)
+        validate_single_controller_config(self._privileged_config(value_seq_len=352))
+
+    def test_rejects_a_privileged_value_without_room_for_the_block(self):
+        mc = self._privileged_config(value_seq_len=351)
+
+        with pytest.raises(ValueError, match="value.max_total_sequence_length"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_privileged_value_packing_budget_without_room(self):
+        mc = self._privileged_config(value_seq_len=352)
+        mc.value["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 352,
+            "logprob_mb_tokens": 351,
+        }
+
+        with pytest.raises(
+            ValueError, match="value.sequence_packing.logprob_mb_tokens"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_privileged_value_with_split_value_training(self):
+        mc = self._privileged_config(value_seq_len=352)
+        mc.ppo.value_training_mode = "split"
+
+        with pytest.raises(ValueError, match="value_training_mode=whole_batch"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_privileged_value_with_forest_training(self):
+        mc = self._privileged_config()
+        mc.token_capture.forest_training = True
+
+        with pytest.raises(ValueError, match="token_capture.forest_training"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_an_unloadable_privileged_value_prefix_builder(self):
+        mc = self._privileged_config(builder="no_such_module")
+
+        with pytest.raises(ImportError, match="no_such_module"):
+            validate_single_controller_config(mc)
+
+    def test_runs_the_prefix_builder_kwargs_startup_check(self):
+        # The SWE builder's hook requires caps; the block carries none.
+        mc = self._privileged_config(builder="swe_privilege_prefix")
+
+        with pytest.raises(ValueError, match="caps"):
+            validate_single_controller_config(mc)
+
+    def test_disabled_privileged_value_needs_no_extra_room(self):
+        mc = _ppo_master_config()
+        mc.value["max_total_sequence_length"] = 32
+        mc.value["privileged_value"] = PrivilegedValueConfigDisabled(enabled=False)
+
+        validate_single_controller_config(mc)
 
     def test_accepts_dapo_reward_shaping_on_a_ppo_run(self) -> None:
         """SC setup accepts a validated PPO reward-shaping configuration."""

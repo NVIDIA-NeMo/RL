@@ -69,6 +69,7 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
@@ -161,6 +162,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.models.value.config import PrivilegedValueConfig
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
@@ -224,6 +226,8 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    # Privileged value (value.privileged_value.enabled); None otherwise.
+    privilege_store: Optional[PrivilegePrefixStore] = None
     # warmup_first_pass's arguments when the controller runs the trainer warm-up;
     # None when setup already ran it or it does not run.
     trainer_warmup_kwargs: Optional[dict[str, Any]] = None
@@ -2790,6 +2794,18 @@ def setup_single_controller(
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
     print_setup_timing_summary(setup_timing_metrics)
 
+    # None on a GRPO run: validation already rejected a value block without ppo.
+    privilege_cfg = (
+        master_config.value.get("privileged_value")
+        if master_config.value is not None
+        else None
+    )
+    privilege_store = (
+        PrivilegePrefixStore(tokenizer, privilege_cfg)
+        if isinstance(privilege_cfg, PrivilegedValueConfig)
+        else None
+    )
+
     if master_config.async_rl.refit_actor.enabled:
         weight_synchronizer = _move_synchronizer_to_refit_actor(
             weight_synchronizer, generation
@@ -2830,5 +2846,6 @@ def setup_single_controller(
         value_loss_fn=value_loss_fn,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
+        privilege_store=privilege_store,
     )
     return actor_args, setup_timing_metrics

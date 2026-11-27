@@ -16,7 +16,7 @@
 import torch
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, has_logical_owners
 
 
 def row_group_ids(meta: KVBatchMeta) -> list[str]:
@@ -39,6 +39,20 @@ def row_group_ids(meta: KVBatchMeta) -> list[str]:
             f"(first: {untagged[0]!r}); rollout producers must stamp every row"
         )
     return [tag[GROUP_ID_TAG] for tag in meta.tags]
+
+
+def prompt_group_ids(meta: KVBatchMeta) -> list[str]:
+    """Return the distinct prompt-group ids of ``meta``'s rows, in row order.
+
+    Reads the same tag the advantage stage keys its baseline on rather than
+    parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
+    disagree about what a group is. Forest rows carry ``dispatch_group_id``;
+    others carry ``GROUP_ID_TAG``.
+    """
+    if has_logical_owners(meta):
+        assert meta.tags is not None
+        return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
+    return list(dict.fromkeys(row_group_ids(meta)))
 
 
 def group_index_column(group_ids: list[str]) -> torch.Tensor:

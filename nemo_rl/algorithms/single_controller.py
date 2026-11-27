@@ -139,9 +139,6 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     ChunkReceipt,
     make_debug_writer,
 )
-from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-    has_logical_owners,
-)
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     _maybe_restore_native_data_plane_checkpoint,
@@ -169,6 +166,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.checkpoint import checkpoint_io
+from nemo_rl.data_plane.grouping import prompt_group_ids
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     backend_health_metrics,
@@ -179,6 +177,7 @@ from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    has_logical_owners,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -243,6 +242,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.ppo_utils.privileged_value import PrivilegePrefixStore
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -356,6 +356,10 @@ class SingleControllerActor:
     # handle, so an instance built without running __init__ emits no spans
     # rather than raising out of the training loop.
     _tracer: Any = None
+
+    # Privileged value prefix cache, declared on the class for the same
+    # reason: an instance built without __init__ runs with a blind critic.
+    _privilege_store: Optional[PrivilegePrefixStore] = None
 
     # Declared on the class, like _tracer, so an instance built without __init__ can still time an admission.
     _admission_gate_wait_started: Optional[float] = None
@@ -582,9 +586,14 @@ class SingleControllerActor:
                 ),
                 on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
             )
-            self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
+            self._buffer.add_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # Privileged value: stamp each group with its reference-block prefix
+        # before it becomes selectable.
+        self._privilege_store = getattr(actor_args, "privilege_store", None)
+        if self._privilege_store is not None:
+            self._buffer.add_post_write_enricher(self._privilege_store.enrich)
         if self._value is not None:
             self._trainer.add_data_plane_snapshot_fn(
                 _worker_group_snapshots(self._value.worker_group)
@@ -1087,6 +1096,7 @@ class SingleControllerActor:
             data_plane_barrier=self._data_plane_checkpoint_barrier,
             environment_checkpoint=self._environment_checkpoint,
             runtime_state=self._rollout_runtime,
+            privilege_store=self._privilege_store,
             read_progress=self._training_progress,
             log_metrics=self._log_telemetry_metrics,
             trace=self._rollout_trace,
@@ -1443,6 +1453,34 @@ class SingleControllerActor:
             if claimed:
                 self._filtered_spares_claimed -= 1
 
+    async def _finalized_env_info(
+        self, request: "ReassemblyRequest"
+    ) -> Optional[dict[str, Any]]:
+        """The ``extra_env_info`` the replay buffer's enricher sees for a finalized group.
+
+        Routing metadata comes from the finalized request. A privileged critic
+        also needs the prompt's own env info, which the metadata-only request
+        does not carry, so the prompt is looked up.
+        """
+        env_info: dict[str, Any] = {}
+        if request.attribution_key is not None:
+            env_info["attribution_key"] = request.attribution_key
+        if request.resolved_agent_name is not None:
+            env_info["agent_ref"] = {"name": request.resolved_agent_name}
+        if self._privilege_store is None:
+            return env_info or None
+        prompt = await self._rollout_restorer.load_recovery_prompt(
+            group_id=request.group_id, sample_id=str(request.prompt_idx)
+        )
+        if prompt.get("idx") != request.prompt_idx:
+            # The prefix would describe another prompt: fail, not mislabel.
+            raise ValueError(
+                "privileged critic: dataset position "
+                f"{request.prompt_idx} holds prompt idx={prompt.get('idx')!r} "
+                f"(group={request.group_id!r})"
+            )
+        return {**dict(prompt.get("extra_env_info") or {}), **env_info}
+
     async def _finalize_with_actor(
         self,
         request: "ReassemblyRequest",
@@ -1619,13 +1657,6 @@ class SingleControllerActor:
                     )
                     committed = False
                 else:
-                    extra_env_info: dict[str, Any] = {}
-                    if request.attribution_key is not None:
-                        extra_env_info["attribution_key"] = request.attribution_key
-                    if request.resolved_agent_name is not None:
-                        extra_env_info["agent_ref"] = {
-                            "name": request.resolved_agent_name
-                        }
                     try:
                         meta = finalized.meta
                         # Gym rollout metrics and the finalizer's verified token
@@ -1666,7 +1697,7 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
-                            extra_env_info=extra_env_info or None,
+                            extra_env_info=await self._finalized_env_info(request),
                         )
                     except BaseException as commit_error:
                         try:
@@ -1799,21 +1830,6 @@ class SingleControllerActor:
             return  # observability disabled -> plain adapter
         metrics, scope = result
         log_step_metrics(self._logger, metrics, self._train_steps, scope)
-
-    @staticmethod
-    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
-        """Return stable prompt-group IDs in canonical sample order.
-
-        Reads the same tag the advantage stage keys its baseline on rather than
-        parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
-        disagree about what a group is. The stage would raise on a batch whose
-        tag is missing anyway; doing it here fails one stage earlier in the
-        same iteration.
-        """
-        if has_logical_owners(meta):
-            assert meta.tags is not None
-            return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
-        return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
     async def _rollout_pump(self) -> None:
@@ -2987,7 +3003,7 @@ class SingleControllerActor:
                             training_claim_ids_after - training_claim_ids_before
                         )
                         if train_meta is not None:
-                            selected_group_ids = self._group_ids_from_meta(train_meta)
+                            selected_group_ids = prompt_group_ids(train_meta)
                             if new_training_claim_ids:
                                 if set(selected_group_ids) != new_training_claim_ids:
                                     raise RuntimeError(
@@ -3607,11 +3623,19 @@ class SingleControllerActor:
                     _update_adaptive_loss_state(self._loss_fn, step_metrics)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                if self._privilege_store is not None:
+                    step_metrics.update(
+                        self._privilege_store.step_metrics(consumed_metas)
+                    )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
+                    # Same cut as the claim release: a snapshot between them would
+                    # re-persist groups whose prefixes are gone.
+                    if self._privilege_store is not None:
+                        self._privilege_store.release(consumed_metas)
                     for group_id in step_finalizer_group_ids:
                         self._rollout_runtime.finalizer_metrics_by_group.pop(
                             group_id, None
@@ -4607,13 +4631,18 @@ class SingleControllerActor:
         return len(stale_tasks)
 
     def _prune_finalizer_state(self, selected_group_ids: set[str]) -> None:
-        """Release pending finalizer state for groups evicted before training.
+        """Release pending per-group state for groups evicted before training.
+
+        Covers the finalizer metrics and rewards and the privileged critic's
+        prefix references.
 
         Eviction reports only a count, so reconcile against the groups that can
         still be consumed: those in the buffer plus those already selected by
         the step in progress.
         """
         live = set(self._buffer.group_ids) | selected_group_ids
+        if self._privilege_store is not None:
+            self._privilege_store.retain(live)
         for group_id in (
             self._rollout_runtime.finalizer_metrics_by_group.keys()
             | self._rollout_runtime.finalizer_rewards_by_group.keys()
@@ -5371,7 +5400,15 @@ class SingleControllerActor:
         """
         if not already_prepared:
             await asyncio.to_thread(self._value.prepare_for_inference)
-        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(
+            self._value.get_values_from_meta,
+            meta,
+            privilege_prefixes=(
+                self._privilege_store.prefixes_for(meta)
+                if self._privilege_store is not None
+                else None
+            ),
+        )
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
 
@@ -5389,12 +5426,18 @@ class SingleControllerActor:
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
+            privilege_prefixes = (
+                self._privilege_store.prefixes_for(full_meta)
+                if self._privilege_store is not None
+                else None
+            )
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
                     self._value.train_from_meta,
                     full_meta,
                     value_loss_fn,
                     gbs=gbs,
+                    privilege_prefixes=privilege_prefixes,
                 )
         else:
             # Split exposes the per-chunk API, but this controller still collects

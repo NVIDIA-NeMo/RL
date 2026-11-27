@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 
 from nemo_rl.models.policy import (
     AutomodelConfig,
@@ -32,6 +32,32 @@ from nemo_rl.models.policy import (
     SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
+
+
+class PrivilegedValueConfigDisabled(BaseModel, extra="allow"):
+    """A disabled ``value.privileged_value`` block; its other keys are kept unread."""
+
+    enabled: Literal[False]
+
+
+class PrivilegedValueConfig(BaseModel, extra="forbid"):
+    """``value.privileged_value``: prefix the critic input with a reference block.
+
+    The block is built per prompt from its ``extra_env_info`` by the function at
+    ``prefix_builder_fqn`` and is never shown to the policy. Keep
+    ``max_total_tokens`` and ``prefix_builder_kwargs`` identical to the
+    critic-pretrain run a critic is warm-started from: they change which content
+    is truncated, a distribution shift the warm start was not trained on.
+    """
+
+    enabled: Literal[True]
+    # Token budget for the whole block.
+    max_total_tokens: PositiveInt
+    # Dotted path to build_privilege_prefix(extra_env_info, tokenizer, cfg) ->
+    # (block, stats); see nemo_rl.algorithms.ppo_utils.privileged_value.
+    prefix_builder_fqn: str
+    # Options the builder reads from cfg, e.g. the SWE builder's per-field caps.
+    prefix_builder_kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 class ValueResourcesConfig(BaseModel, extra="forbid"):
@@ -78,6 +104,11 @@ class ValueConfig(TypedDict):
     # Sequence length settings
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+
+    # Privileged value: prefix the critic's input with a reference block the
+    # policy never sees. max_total_sequence_length and the packing token budgets
+    # must then cover policy length + the block budget.
+    privileged_value: NotRequired[PrivilegedValueConfig | PrivilegedValueConfigDisabled]
 
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]

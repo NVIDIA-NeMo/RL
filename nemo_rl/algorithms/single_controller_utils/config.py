@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import math
+import sys
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Optional, cast
 
+from hydra.utils import get_method
 from pydantic import (
     BaseModel,
     Field,
@@ -56,6 +58,7 @@ from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.ppo_utils.privileged_value import privilege_budget_tokens
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -86,6 +89,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
+from nemo_rl.models.value.config import PrivilegedValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -1443,6 +1447,53 @@ def _validate_failure_settings(
         )
 
 
+def _validate_privileged_value(master_config: MasterConfig) -> None:
+    """Check the critic can hold the privileged sequences."""
+    value_cfg = master_config.value
+    if value_cfg is None:
+        return
+    privilege_cfg = value_cfg.get("privileged_value")
+    if not isinstance(privilege_cfg, PrivilegedValueConfig):
+        return
+    ppo_config = master_config.ppo
+    assert ppo_config is not None  # a value block implies the PPO path
+    if master_config.token_capture.forest_training:
+        raise ValueError(
+            "value.privileged_value does not support token_capture.forest_training yet."
+        )
+    if ppo_config.value_training_mode != "whole_batch":
+        raise ValueError(
+            "value.privileged_value requires ppo.value_training_mode="
+            "whole_batch: the split value-training path does not splice the "
+            "reference block, so the critic would train blind."
+        )
+    builder = get_method(privilege_cfg.prefix_builder_fqn)
+    validate_kwargs = getattr(
+        sys.modules[builder.__module__], "validate_prefix_builder_kwargs", None
+    )
+    if validate_kwargs is not None:
+        validate_kwargs(privilege_cfg.prefix_builder_kwargs)
+    needed = master_config.policy["max_total_sequence_length"] + (
+        privilege_budget_tokens(privilege_cfg)
+    )
+    budgets = {
+        "value.max_total_sequence_length": value_cfg["max_total_sequence_length"]
+    }
+    for batching in ("sequence_packing", "dynamic_batching"):
+        batching_cfg = cast(Optional[Mapping[str, Any]], value_cfg.get(batching))
+        if batching_cfg is not None and batching_cfg["enabled"]:
+            for key in ("train_mb_tokens", "logprob_mb_tokens"):
+                budgets[f"value.{batching}.{key}"] = batching_cfg[key]
+    too_small = {name: size for name, size in budgets.items() if size < needed}
+    if too_small:
+        raise ValueError(
+            "value.privileged_value prefixes every critic row with up to "
+            f"{privilege_budget_tokens(privilege_cfg)} tokens, so the critic needs "
+            f"policy.max_total_sequence_length + that = {needed} tokens, but "
+            f"{too_small} is smaller."
+        )
+
+
 def _vlm_architecture_signature(
     model_name: str, hf_config_overrides: Mapping[str, Any] | None
 ) -> tuple[Any, ...]:
@@ -1885,6 +1936,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "is enabled. Set ckpt_assume_constant_structure=false, "
             "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
         )
+
+    _validate_privileged_value(master_config)
 
     sampler_name = async_config.sampler.name
     if sampler_name not in ("in_order", "ready_first"):

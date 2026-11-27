@@ -124,6 +124,13 @@ def main() -> None:
             "SingleController PPO entrypoint (run_grpo_single_controller.py); "
             "the legacy PPO entrypoint requires whole_batch."
         )
+    privilege_cfg = config.value.get("privileged_value")
+    if privilege_cfg is not None and privilege_cfg.enabled:
+        raise ValueError(
+            "value.privileged_value is only supported by "
+            "run_grpo_single_controller.py; the legacy PPO entrypoint would train "
+            "a blind critic."
+        )
 
     # Print config
     print("Final config:")

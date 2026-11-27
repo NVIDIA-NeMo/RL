@@ -15,10 +15,11 @@
 """Restore the rollout parts of a resumed checkpoint.
 
 Restores the replay index (``replay_buffer_metadata.pt``), the recovery ledger
-(``rollout_recovery.pt``), the spare-prompt pool (``replacement_reserve.pt``) and,
-for turn-level groups from a rollout snapshot, the environment's rollouts. Setup
-restores the TQ rows themselves before this runs. Runs once before the pumps
-start; the rollout pump then redispatches what it loaded.
+(``rollout_recovery.pt``), the spare-prompt pool (``replacement_reserve.pt``), the
+privileged value prefixes (``privilege_prefixes.pt``) and, for turn-level groups
+from a rollout snapshot, the environment's rollouts. Setup restores the TQ rows
+themselves before this runs. Runs once before the pumps start; the rollout pump
+then redispatches what it loaded.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     _UsesRolloutParts,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data_plane.schema import PROMPT_IDX_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.checkpointing.interfaces import (
     RestoredEnvironmentRollouts,
@@ -193,9 +195,9 @@ class RolloutRestorer(_UsesRolloutParts):
         """Restore the parts listed in the module docstring.
 
         Call it once, after the weights are in sync and before the pumps start.
-        Restores the replay buffer, the recovery ledger, the spare prompts and the
-        environment's rollouts (turn-level only), checks the sampler cursor against
-        them and logs restore timings.
+        Restores the replay buffer, the privileged value prefixes, the recovery
+        ledger, the spare prompts and the environment's rollouts (turn-level only),
+        checks the sampler cursor against them and logs restore timings.
 
         Returns:
             Whether restore queued groups only ledger-recorded dispatch can
@@ -208,6 +210,7 @@ class RolloutRestorer(_UsesRolloutParts):
         )
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._restore_replay_buffer()
+        await self._restore_privilege_prefixes(restored_replay_groups)
         replay_restore_seconds = time.monotonic() - replay_restore_started
         recovery_prepare_started = time.monotonic()
         await self._restore_recovery_ledger(
@@ -273,6 +276,17 @@ class RolloutRestorer(_UsesRolloutParts):
                     else None
                 ),
             )
+
+    async def _restore_privilege_prefixes(self, restored_groups: int) -> None:
+        """Re-cache the privileged value prefixes the restored replay groups reference."""
+        if self._privilege_store is None or not restored_groups:
+            return
+        # Replay groups are only ever restored from a checkpoint.
+        assert self._resume.path is not None
+        metas = [meta for meta in self._buffer.meta_list if meta is not None]
+        await asyncio.to_thread(
+            self._privilege_store.restore_from_checkpoint, self._resume.path, metas
+        )
 
     async def _restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
@@ -512,7 +526,7 @@ class RolloutRestorer(_UsesRolloutParts):
 
         for group in groups:
             tags = group["meta"].tags or []
-            prompt_indices = {tag.get("prompt_idx") for tag in tags}
+            prompt_indices = {tag.get(PROMPT_IDX_TAG) for tag in tags}
             if len(prompt_indices) != 1:
                 raise ValueError(
                     "replay-free resume requires one stable prompt_idx per group: "
@@ -524,7 +538,7 @@ class RolloutRestorer(_UsesRolloutParts):
                     "replay-free resume requires integer prompt_idx tags: "
                     f"group={group['group_id']!r}, value={prompt_index!r}"
                 )
-            prompt = await self._load_recovery_prompt(
+            prompt = await self.load_recovery_prompt(
                 group_id=group["group_id"], sample_id=str(prompt_index)
             )
             restored_prompt_index = prompt.get("idx")
@@ -555,7 +569,7 @@ class RolloutRestorer(_UsesRolloutParts):
         self._requires_recovery_dispatch = True
         self._groups_to_regenerate = []
 
-    async def _load_recovery_prompt(
+    async def load_recovery_prompt(
         self,
         *,
         group_id: str,
@@ -659,7 +673,7 @@ class RolloutRestorer(_UsesRolloutParts):
             sample_id = group.prompt_ref.sample_id
             prompt = resolved_prompts.get(sample_id)
             if prompt is None:
-                prompt = await self._load_recovery_prompt(
+                prompt = await self.load_recovery_prompt(
                     group_id=group.group_id, sample_id=sample_id
                 )
                 resolved_prompts[sample_id] = prompt

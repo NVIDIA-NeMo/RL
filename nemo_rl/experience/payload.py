@@ -33,6 +33,7 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
+    PROMPT_IDX_TAG,
     ROUTED_EXPERTS_FIELD,
     TRUNCATED,
 )
@@ -237,7 +238,7 @@ def pack_payload(
     tags = [
         {
             "weight_version": weight_version,
-            "prompt_idx": prompt_idx,
+            PROMPT_IDX_TAG: prompt_idx,
             # Named per row rather than left implicit in the sample_id prefix:
             # the advantage stage groups rows by this to build its baseline,
             # and parsing it back out of "{group_id}_g{i}" would make the

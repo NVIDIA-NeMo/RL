@@ -13,8 +13,11 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from dataclasses import dataclass
-from typing import Literal, Optional, Sequence
+from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING, Literal, Optional, Sequence
+
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -35,6 +38,14 @@ ROLLOUT_METRICS = "rollout_metrics"
 # in. The group-relative estimators key their baseline on this rather than on
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
+
+# Per-row key in `KVBatchMeta.tags` holding the row's dataset prompt index.
+PROMPT_IDX_TAG = "prompt_idx"
+
+# Per-row keys in `KVBatchMeta.tags` for the privileged value: which cached
+# prefix the row uses, and that prefix's length in tokens.
+PRIVILEGE_KEY_TAG = "privilege_key"
+PRIVILEGE_PREFIX_LEN_TAG = "privilege_prefix_len"
 
 # Per-response inverse valid-token mass for equal prompt-group loss reduction.
 GROUP_TOKEN_MEAN_WEIGHT = "group_token_mean_inverse_tokens"
@@ -244,6 +255,14 @@ class LogicalRowTag:
     segment_index: int | None
     segment_count: int
     is_execution_padding: bool
+
+
+LOGICAL_OWNER_TAGS = frozenset(field.name for field in fields(LogicalRowTag))
+
+
+def has_logical_owners(meta: "KVBatchMeta") -> bool:
+    """Detect even partially tagged Forest batches so they cannot take ordinary GRPO."""
+    return any(LOGICAL_OWNER_TAGS.intersection(tag) for tag in meta.tags or [])
 
 
 def forest_segment_id(owner_id: str, segment_index: int) -> str:
