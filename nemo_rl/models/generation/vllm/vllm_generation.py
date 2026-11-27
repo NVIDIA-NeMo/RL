@@ -1060,7 +1060,7 @@ class VllmGeneration(GenerationInterface):
         """Get vLLM engine metric deltas for the current window.
 
         Covers the speculative-decoding family plus the engine's token,
-        sequence-length and request-outcome series, all derived from the same
+        sequence-length, request-outcome, prefix-cache and preemption series, all derived from the same
         pair of snapshots so the wider coverage costs no extra RPC.
 
         Args:
@@ -2280,15 +2280,17 @@ class VllmGeneration(GenerationInterface):
         return True
 
     def get_generation_prefix_counts(self) -> dict[str, int]:
-        """Sum over workers of generation-prefix restore and cut counts."""
+        """Sum over workers and their HTTP frontends of generation-prefix counts."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
         futures = self.worker_group.run_all_workers_single_data(
-            "get_generation_prefix_counts",
+            "get_generation_prefix_counts_per_frontend",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         totals: dict[str, int] = {}
-        for counts in ray.get(futures):
+        for counts in (
+            frontend for frontends in ray.get(futures) for frontend in frontends
+        ):
             for name, value in counts.items():
                 totals[name] = totals.get(name, 0) + value
         return totals

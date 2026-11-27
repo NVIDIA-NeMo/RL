@@ -116,7 +116,6 @@ loss_fn:
   sequence_level_importance_ratios: false
   # global_token_mean (default), sequence_mean, or group_token_mean (SC GRPO/Megatron).
   normalization: null
-  token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   # Opt-in single-forward Megatron GRPO: apply the threshold during training
   # and normalize gradients over survivors before the optimizer step.
@@ -193,6 +192,13 @@ policy:
     deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
+    # Pipeline parallel size. Values > 1 need the `pipeline` block below and an
+    # explicit defer_fsdp_grad_sync (false is recommended), and do not support
+    # sequence packing, dynamic batching, LoRA, or non-colocated generation.
+    # See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: 1
+    # pipeline:  # 1F1B schedule, one stage per pipeline rank
+    #   microbatches_per_step: 8  # Required. Microbatches per schedule call; >= pipeline_parallel_size
     custom_parallel_plan: null
 
     # Automodel kwargs passed to from_pretrained.
@@ -797,6 +803,8 @@ data_plane:
       pickup_s: 10.0
       io_threads: 4                  # file-I/O threads per unit (spill writes + cold reads); ~2.5 GB/s each
     nixl: {backend_name: UCX, backend_init_params: {}}
+  # Optional TransferQueue controller metrics port (integer 1024-65535); omit to keep it off.
+  # metrics_port: 8200
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out

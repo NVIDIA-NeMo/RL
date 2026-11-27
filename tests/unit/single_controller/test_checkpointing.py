@@ -132,6 +132,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
 )
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -726,6 +727,13 @@ class _FakeRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
+
     def set_tally_step_provider(self, provider: Any) -> None:
         self.tally_step_provider = provider
 
@@ -801,6 +809,7 @@ class _FakeTQBuffer:
         self.target_step_list = [
             group["target_step"] for group in self._metadata_state["groups"]
         ]
+        self.ready_list: list[bool] = []
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
@@ -825,13 +834,13 @@ class _FakeTQBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[dict[str, Any]]] = None,
+        already_claimed_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         self.metadata_state_dict_calls.append(saved_capacity)
         state = dict(self._metadata_state)
         state["groups"] = [
+            *(already_claimed_groups or []),
             *self._metadata_state["groups"],
-            *(additional_groups or []),
         ]
         return state
 
@@ -3233,6 +3242,9 @@ class TestPeriodicRolloutCheckpoint:
 
         async def sample_twice() -> None:
             await actor._log_rollout_throughput_metrics(emit=False)
+            actor._admission_gate_wait_seconds = 7.0
+            actor._admission_gate_wait_started = 15.0
+            actor._buffer.ready_list = [True, False, True]
             actor._rollout_completion_durations_s.extend([2.0, 4.0])
             actor._rollout_queue_wait_durations_s.extend([1.0, 3.0])
             await actor._log_rollout_throughput_metrics()
@@ -3263,6 +3275,8 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert logged["admission_gate_wait_seconds_total"] == pytest.approx(12.0)
+        assert logged["buffer_ready_groups"] == 2
         assert "rollout_throughput_metrics=" not in capsys.readouterr().out
 
     @pytest.mark.parametrize(
