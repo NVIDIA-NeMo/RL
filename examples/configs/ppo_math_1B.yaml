@@ -49,6 +49,8 @@ ppo:
     overlong_buffer_penalty: 1
     max_response_length: 14336
     stop_properly_penalty_coef: null
+    success_prioritized: false  # Terminal-RSI SPR for pass/partial-credit rewards; overrides the options above
+    spr_partial_divisor: 1.0
 
   adv_estimator:
     name: "gae"

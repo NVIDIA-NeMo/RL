@@ -36,6 +36,8 @@ grpo:
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
+    success_prioritized: false  # Terminal-RSI SPR for pass/partial-credit rewards; overrides the options above
+    spr_partial_divisor: 1.0
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"

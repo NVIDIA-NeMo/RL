@@ -28,6 +28,7 @@ class RewardShapingConfig(BaseModel, extra="allow"):
 
     This configuration enables custom reward shaping, currently supporting DAPO-style
     penalties for responses that exceed the maximum response length threshold.
+    It also supports a success-prioritized reward for pass/partial-credit verifiers.
     """
 
     enabled: bool = False
@@ -48,10 +49,27 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
 
+    # Success-prioritized reward (SPR) from Terminal-RSI (https://arxiv.org/abs/2610.22192) for
+    # rewards in [0, 1] where 1 is a pass: a pass scores 1 + 1 / (1 + c) and a failure with partial
+    # credit r scores r / (r + c), so every failure ranks below every pass. Takes precedence over
+    # the options above.
+    success_prioritized: bool = False
+    # c above. A larger c shrinks partial credit further.
+    spr_partial_divisor: float = 1.0
+
     @model_validator(mode="after")
     def validate_settings(self) -> "RewardShapingConfig":
         """Validate active shaping parameters before any backend consumes them."""
         if not self.enabled:
+            return self
+
+        if self.success_prioritized:
+            divisor = self.spr_partial_divisor
+            if not (math.isfinite(divisor) and divisor > 0):
+                raise ValueError(
+                    f"reward_shaping.spr_partial_divisor={divisor} must be finite "
+                    "and > 0. It divides partial credit."
+                )
             return self
 
         coef = self.stop_properly_penalty_coef
@@ -118,6 +136,7 @@ def apply_reward_shaping(
     """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.
 
     Nonetheless, it can be potentially extended to support any custom reward logic.
+    When success_prioritized is set, the success-prioritized reward is applied instead.
     """
     rewards = batch["total_reward"]
     if not cfg.enabled:
@@ -127,6 +146,32 @@ def apply_reward_shaping(
     # dynamic sampling) can filter prompt groups on the raw task metric
     # rather than on length-dependent shaped rewards.
     batch["unshaped_total_reward"] = rewards.clone()
+
+    if cfg.success_prioritized:
+        ignored_params = [
+            name
+            for name in (
+                "stop_properly_penalty_coef",
+                "overlong_buffer_length",
+                "overlong_buffer_penalty",
+                "max_response_length",
+            )
+            if getattr(cfg, name) is not None
+        ]
+        if ignored_params:
+            print(
+                f"[WARN] success_prioritized is set, so the following reward shaping "
+                f"parameters are ignored: {', '.join(ignored_params)}.",
+                flush=True,
+            )
+        c = cfg.spr_partial_divisor
+        partial = rewards.clamp(0.0, 1.0)
+        batch["total_reward"] = torch.where(
+            rewards >= 1.0,
+            torch.full_like(rewards, 1.0 + 1.0 / (1.0 + c)),
+            partial / (partial + c),
+        )
+        return batch
 
     # Apply stop properly penalty if configured
     if cfg.stop_properly_penalty_coef is not None:
