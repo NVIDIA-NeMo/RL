@@ -866,8 +866,8 @@ CASES = [
         status=400,
         kit="vlm",
     ),
-    # An image after the echoed turn 1: the frontend lays it out and the engine
-    # processes it, both paths run the same pixels, and the splice moves its tokens.
+    # An image after the echoed turn 1: both paths run the same pixels, and the
+    # splice moves its tokens.
     _Case(
         "image_after_echoed_turn",
         messages=[*HISTORY, IMAGE_TURN],

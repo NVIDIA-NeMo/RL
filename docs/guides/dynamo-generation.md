@@ -66,7 +66,7 @@ The frontend serves chat with NeMo RL's chat engine instead of Dynamo's own rend
 
 1. In the frontend, a render-pool process renders the call with the engine's own tokenizer, template, processor and `vllm_cfg` chat settings (parser plugins included), which each engine publishes when it registers. It also decides how a token-capture call's prefix is served.
 2. The chat engine checks on-policy sampling, reads a captured prefix from TQ, splices the prefix into the render, clamps the output budget to the context, and routes the final token IDs through the KV router.
-3. On the engine, the adapter processes a call's media by rendering its request again with the engine's own renderer, snapshots the media, begins the call's capture, generates with the `SamplingParams` the native server builds, and stages the call in one TQ write. Only the commit coordinates travel back.
+3. On the engine, the adapter renders a call with media again to process its media, snapshots the media, begins the call's capture, generates with the `SamplingParams` the native server builds, and stages the call in one TQ write. Only the commit coordinates travel back.
 4. A render-pool process builds the reply with vLLM's reasoning and tool parsers.
 
 `tests/unit/models/generation/test_gym_chat_path.py` sends the same calls down both paths and checks they run the same prompt and `SamplingParams`, stage the same record and return the same reply.
@@ -77,7 +77,7 @@ Where the behavior differs from the native endpoint:
 - gpt-oss (Harmony) chat calls are refused with HTTP 400.
 - A call that streams (`stream: true`) or asks for more than one choice (`n`) is refused with HTTP 400. The native endpoint serves both, and fails the capture of a streamed token-capture call. NeMo-Gym sends neither.
 - A call refused with a status other than 400 (a full queue's 503, for example) is answered with that status and the status's standard text. The engine's own message is only in the frontend's log. A 400 keeps its message, and a refused token-capture call is acknowledged in the `x-ng-capture-refused` header, both as on the native endpoint.
-- A call with media is rendered twice: in the frontend for the prompt's token layout, and on the engine, which processes the media as the native endpoint does. The frontend forwards the call's request, so no processed media crosses the wire. The engine fails a call whose two renders differ.
+- A call with media is rendered twice: in the frontend for the prompt's token layout, and on the engine, which processes the media. The engine fails a call whose two renders give different token IDs, with HTTP 500. Keep vLLM's processor cache off (`vllm_kwargs.mm_processor_cache_gb: 0`, as the shipped VLM recipes set it; vLLM's default is on): every render worker and every engine has its own cache, and for a processor that sizes an image by the other images of its call (the Nemotron VL and Omni family) a cached image can keep a size a fresh render does not give it.
 - A call NeMo-Gym marks as untrained, such as an LLM judge's on the policy model, keeps its own sampling on the native endpoint, which reads the mark from the `x-ng-sampling: null` header. Dynamo's frontend does not forward that header, so NeMo RL's chat engine reads the mark from the `nemo_rl:gym:` annotation (`ng_sampling`). The pinned NeMo-Gym does not send it there yet: until it does, such a call is refused with HTTP 400 unless it matches the training or validation sampling. Give a judge that samples differently a model server of its own.
 
 ### Rollout recovery

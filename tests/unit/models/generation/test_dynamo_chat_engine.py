@@ -327,13 +327,12 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
     assert chunk["usage"]["prompt_tokens"] == 6
 
 
-def test_a_media_call_forwards_the_request_it_rendered_not_pixels() -> None:
+def test_a_media_call_forwards_the_request_it_rendered() -> None:
     pool, router = _Pool(_rendered(has_media=True)), _Router()
 
     _serve(pool, router, _call({}))
 
-    # The engine processes the media itself, from the body the worker rendered,
-    # and checks its own render against the template ids the frontend routed on.
+    # The engine renders this body again and must get these template ids.
     (body,) = pool.bodies
     (routed,) = router.requests
     assert routed["extra_args"][chat_engine.CALL_KEY]["multimodal"] == {

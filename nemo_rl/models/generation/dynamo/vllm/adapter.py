@@ -24,8 +24,8 @@ NeMo-Gym's chat calls, whose prompt NeMo RL's chat engine in the frontend
 rendered, prepared and routed (``chat_engine``). For those the adapter runs the
 native server's steps after that (``prompt_and_capture``): ``start_capture``, the
 generation with the SamplingParams the native server would build, and
-``save_capture``'s one TQ write. A call with media is rendered again here first:
-the frontend sends its request, not pixels, and the engine processes the media.
+``save_capture``'s one TQ write. A call with media is rendered again here first,
+so the engine processes its media.
 """
 
 from __future__ import annotations
@@ -88,6 +88,7 @@ from nemo_rl.models.generation.vllm.prompt_and_capture import (
     PreparedPrompt,
     abort_capture,
     abort_request_capture,
+    error_reply,
     save_capture,
     start_capture,
 )
@@ -99,7 +100,7 @@ from nemo_rl.models.generation.vllm.utils import (
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from nemo_rl.models.generation.vllm.chat_server import EngineMediaRenderer
+    from nemo_rl.models.generation.vllm.chat_server import FrontendRenderer
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
@@ -339,49 +340,62 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             yield chunk
 
     @functools.cached_property
-    def _media_renderer(self) -> "EngineMediaRenderer":
-        """The renderer media calls are processed with, built on the first one."""
+    def _media_renderer(self) -> "FrontendRenderer":
+        """The frontend's renderer, over this engine's own vLLM renderer."""
         # Deferred: chat_server imports vLLM's OpenAI server stack.
         from nemo_rl.models.generation.vllm.chat_server import (
-            build_engine_media_renderer,
+            FrontendRenderer,
+            register_parser_plugins,
+            serving_chat_settings,
         )
 
-        return build_engine_media_renderer(
+        cfg = self._host.cfg
+        register_parser_plugins(cfg)
+        _, renderer_kwargs = serving_chat_settings(cfg)
+        return FrontendRenderer(
             model_config=self._llm.model_config,
             renderer=self._llm.renderer,
-            cfg=self._host.cfg,
+            **renderer_kwargs,
         )
 
-    async def _render_media(self, chat: Any, media: ForwardedMedia) -> dict[str, Any]:
-        """Process a media call's media on this engine, as the native server does.
+    async def _render_media(self, media: ForwardedMedia) -> dict[str, Any]:
+        """This engine's render of a media call, which processes its media.
 
-        Renders the request the frontend rendered with the engine's own
-        renderer, and returns the engine input, in the template's coordinates.
+        Returns the engine input, in the template's coordinates.
         """
         # Deferred: chat_server imports vLLM's OpenAI server stack.
         from nemo_rl.models.generation.vllm.chat_server import (
             NeMoRLChatCompletionRequest,
         )
 
-        host = self._host
         request = NeMoRLChatCompletionRequest.model_validate(media["body"])
         # The frontend planned the splice from the request's own prefix; left
         # set, this render would process the history's media a second time.
         request.required_prefix_token_ids = None
-        engine_prompt = await self._media_renderer.render_media(
-            request,
-            # As the native server (#4124): capture reads a captured call's
-            # media from the engine input, so it must hold concrete pixels.
-            skip_mm_cache=host._capture_media
-            and host._capture_admission(chat) is not None,
-        )
-        if engine_prompt["prompt_token_ids"] != media["template_token_ids"]:
+        try:
+            result = await self._media_renderer.render_chat(request, skip_mm_cache=True)
+            if not isinstance(result, tuple):
+                raise ValueError(result.error.message)
+        except ValueError as error:
+            if error_reply(error) is not None:
+                # A refusal: answered with the native status and text.
+                raise
+            # Dynamo passes a RuntimeError's text on to the frontend's log, but
+            # not a ValueError's.
             raise RuntimeError(
-                "The engine's render of a media call "
-                f"({len(engine_prompt['prompt_token_ids'])} prompt tokens) differs "
-                f"from the frontend's ({len(media['template_token_ids'])}). The "
-                "frontend routed and spliced the call on its own render, so both "
-                "must render alike."
+                "The engine could not render a media call the frontend rendered: "
+                f"{error}"
+            ) from error
+        _, (engine_prompt,) = result
+        engine_ids = engine_prompt["prompt_token_ids"]
+        frontend_ids = media["template_token_ids"]
+        if engine_ids != frontend_ids:
+            raise RuntimeError(
+                f"The engine's render of a media call ({len(engine_ids)} prompt "
+                f"tokens) differs from the frontend's ({len(frontend_ids)}), which "
+                "routed and spliced the call: both must render alike. vLLM's "
+                "processor cache can cause this; set "
+                "policy.generation.vllm_kwargs.mm_processor_cache_gb to 0."
             )
         return engine_prompt
 
@@ -397,7 +411,8 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         version), the generation, and :func:`save_capture`'s one TQ write.
         Returns one chunk whose ``engine_data`` carries the output the
         frontend builds the reply from and the call's :class:`GymCallResult`;
-        None for a captured call whose client went away.
+        None for a call whose client went away: a media call while it
+        rendered, a captured call after it ran.
         """
         host = self._host
         # The worker's own engine client, as the native server uses it, with
@@ -407,7 +422,11 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         engine_prompt: dict[str, Any]
         media = wire["multimodal"]
         if media is not None:
-            engine_prompt = await self._render_media(chat, media)
+            engine_prompt = await self._render_media(media)
+            if context.is_stopped():
+                # Dynamo calls abort() once, and vLLM had no request to cancel
+                # while this call rendered.
+                return None
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
             if chat.cache_salt is not None:

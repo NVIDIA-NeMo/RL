@@ -77,13 +77,11 @@ CALL_KEY = "nemo_rl"
 
 
 class ForwardedMedia(TypedDict):
-    """A media call, for the engine to process its media."""
+    """A media call's request, which the engine renders again to process its media."""
 
-    # The chat request the frontend rendered, messages included. The engine
-    # renders it again with its own processor: no pixels cross the wire.
+    # The chat request the frontend rendered, messages included.
     body: dict[str, Any]
-    # The template's token ids from the frontend's render. The prompt was routed
-    # and spliced on them, so the engine's render must give the same.
+    # The frontend's template ids, which the engine's render must match.
     template_token_ids: list[int]
 
 
@@ -91,9 +89,8 @@ class ForwardedCall(TypedDict):
     """What the chat engine sends the adapter in ``extra_args[CALL_KEY]``.
 
     The call's ``PreparedPrompt.to_json()`` and what the engine needs that the
-    native worker has in process: the rendered request, the request a media
-    call was rendered from, and what vLLM's chat serving hands the engine
-    besides the prompt.
+    native worker has in process: the rendered request, its media, and what
+    vLLM's chat serving hands the engine besides the prompt.
     """
 
     prepared_prompt: dict[str, Any]

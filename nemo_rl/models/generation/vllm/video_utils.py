@@ -523,8 +523,8 @@ def register_vllm_video_loader(generation_config: VllmConfig) -> None:
     """Register NeMo RL's video loader when ``vllm_cfg.video`` is set.
 
     Called by every process that decodes the videos of chat calls: the vLLM
-    engine, and with Dynamo the frontend's render workers, whose pixels the
-    engine then runs.
+    engine, and with Dynamo the frontend's render workers, which decode them
+    for the prompt's token layout only.
     """
     video_config = resolve_vllm_video_config(generation_config)
     if video_config is not None:

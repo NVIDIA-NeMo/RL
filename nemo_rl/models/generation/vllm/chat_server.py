@@ -23,7 +23,6 @@ where vLLM is installed.
 
 import asyncio
 import copy
-import functools
 import logging
 from collections.abc import Mapping
 from copy import deepcopy
@@ -438,15 +437,18 @@ class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
 
 
 class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-    """The render step for NeMo RL's chat engine in Dynamo's frontend.
+    """The render step of NeMo RL's chat path under Dynamo.
 
     Runs only the shared step (:meth:`_render_chat_call`): the frontend reads
-    the TQ prefix and splices, and the engine captures. Media is processed
-    here on every call, for the prompt's token layout only: the engine
-    processes it again for the pixels (:class:`EngineMediaRenderer`).
+    the TQ prefix and splices, and the engine captures. A render worker in the
+    frontend renders every call with it, for the prompt's token layout
+    (:meth:`render_for_frontend`). An engine renders a media call again with
+    it, through ``render_chat``, to process the media itself. Media is read
+    through vLLM's processor-only cache when one is configured.
     """
 
-    # The render the overridden preprocess_chat is asked for, and its result.
+    # What render_for_frontend asks the overridden preprocess_chat for, and its
+    # result. An engine's calls overlap, so it reads neither.
     _admission: Any = None
     _rendered: Any = None
 
@@ -491,59 +493,6 @@ class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
             admission=self._admission,
         )
         return self._rendered.conversation, [self._rendered.engine_prompt]
-
-
-class EngineMediaRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-    """The engine's render of a media call that Dynamo's frontend prepared.
-
-    Runs only the shared step (:meth:`_render_chat_call`), as
-    :class:`FrontendRenderer` did for the same request, so the engine processes
-    the call's media itself and lays the prompt out as the frontend did. The
-    frontend decided the capture and planned the splice; neither runs here.
-    Keeps nothing of a call, so an engine's calls may overlap.
-    """
-
-    async def render_media(self, request, *, skip_mm_cache: bool) -> dict[str, Any]:
-        """Render ``request`` and return its engine input, media processed.
-
-        Args:
-            request: The chat request the frontend rendered, without a prefix
-                of its own.
-            skip_mm_cache: Process the media instead of reading vLLM's
-                processor cache.
-        """
-        result = await self.render_chat(request, skip_mm_cache=skip_mm_cache)
-        if not isinstance(result, tuple):
-            raise ValueError(result.error.message)
-        _, (engine_prompt,) = result
-        return engine_prompt
-
-    async def preprocess_chat(
-        self,
-        request,
-        messages,
-        default_template,
-        default_template_content_format,
-        default_template_kwargs,
-        tool_dicts=None,
-        parser=None,
-        *,
-        skip_mm_cache: bool = False,
-    ):
-        rendered = await self._render_chat_call(
-            request,
-            messages,
-            dict(
-                default_template=default_template,
-                default_template_content_format=default_template_content_format,
-                default_template_kwargs=default_template_kwargs,
-                tool_dicts=tool_dicts,
-                parser=parser,
-                skip_mm_cache=skip_mm_cache,
-            ),
-            admission=None,
-        )
-        return rendered.conversation, [rendered.engine_prompt]
 
 
 _FULL_GENERATOR_SIGNATURE = _full_generator_signature(
@@ -750,39 +699,26 @@ class ChatServer:
     serving_tokenization: NeMoRLServingTokenization
 
 
-@functools.cache
-def _import_tool_parser_plugin(path: str) -> None:
-    ToolParserManager.import_tool_parser(path)
-
-
-@functools.cache
-def _import_reasoning_parser_plugin(path: str) -> None:
-    ReasoningParserManager.import_reasoning_parser(path)
-
-
 def register_parser_plugins(cfg: Mapping[str, Any]) -> None:
-    """Import the tool and reasoning parser plugins ``policy.generation`` names.
-
-    A plugin file is imported once per process: an engine served through
-    Dynamo may build both the chat server and :class:`EngineMediaRenderer`.
-    """
+    """Import the tool and reasoning parser plugins ``policy.generation`` names."""
     maybe_tool_parser_plugin = cfg["vllm_cfg"].get("tool_parser_plugin")
     if maybe_tool_parser_plugin:
-        _import_tool_parser_plugin(maybe_tool_parser_plugin)
+        ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
 
     maybe_reasoning_parser_plugin = cfg["vllm_cfg"].get("reasoning_parser_plugin")
     if maybe_reasoning_parser_plugin:
-        _import_reasoning_parser_plugin(maybe_reasoning_parser_plugin)
+        ReasoningParserManager.import_reasoning_parser(maybe_reasoning_parser_plugin)
 
 
 def serving_chat_settings(
     cfg: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The chat serving's settings and default chat-template kwargs.
+    """The chat serving's settings and the renderer's.
 
     One copy for every host of the chat path, so each renders and parses
     alike. Returns the ``OpenAIServingChat`` kwargs (template loaded,
-    ``default_chat_template_kwargs`` normalized) and those template kwargs.
+    ``default_chat_template_kwargs`` normalized) and the ``OnlineRenderer``
+    kwargs built from them.
     """
     serving_chat_default_kwargs: dict[str, Any] = {
         "response_role": "assistant",
@@ -820,50 +756,26 @@ def serving_chat_settings(
         serving_chat_kwargs["default_chat_template_kwargs"] = (
             _legacy_chat_template_kwargs
         )
-    default_chat_template_kwargs: dict[str, Any] = (
-        serving_chat_kwargs["default_chat_template_kwargs"] or {}
-    )
-    return serving_chat_kwargs, default_chat_template_kwargs
-
-
-def dynamo_renderer_settings(
-    serving_chat_kwargs: dict[str, Any], default_chat_template_kwargs: dict[str, Any]
-) -> dict[str, Any]:
-    """The renderer kwargs both Dynamo hosts of the chat path render with.
-
-    Built from :func:`serving_chat_settings`'s two results. The frontend's
-    render workers and the engine share them, so both lay a prompt out alike.
-    """
-    return {
-        "request_logger": None,
+    renderer_kwargs: dict[str, Any] = {
+        "request_logger": serving_chat_kwargs["request_logger"],
         "chat_template": serving_chat_kwargs["chat_template"],
         "chat_template_content_format": serving_chat_kwargs[
             "chat_template_content_format"
         ],
         "enable_auto_tools": serving_chat_kwargs["enable_auto_tools"],
+        # Keep the renderer's parser consistent with any parser overrides
+        # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
         "tool_parser": serving_chat_kwargs.get("tool_parser"),
         "reasoning_parser": serving_chat_kwargs.get("reasoning_parser"),
-        "default_chat_template_kwargs": default_chat_template_kwargs,
+        # vLLM merges these into every render, with request-supplied keys
+        # winning (preprocess_chat's default_template_kwargs). The renderer
+        # is shared by /v1/chat/completions and /tokenize, so setting it
+        # here keeps the two endpoints rendering identical prompts.
+        "default_chat_template_kwargs": (
+            serving_chat_kwargs["default_chat_template_kwargs"] or {}
+        ),
     }
-
-
-def build_engine_media_renderer(
-    *, model_config: Any, renderer: Any, cfg: Mapping[str, Any]
-) -> EngineMediaRenderer:
-    """Build the renderer an engine served through Dynamo processes media with.
-
-    Args:
-        model_config: The engine's vLLM ``ModelConfig``.
-        renderer: The engine's own vLLM renderer. Its processor cache is the
-            one the engine core mirrors, as for the native chat server.
-        cfg: ``policy.generation``.
-    """
-    register_parser_plugins(cfg)
-    return EngineMediaRenderer(
-        model_config=model_config,
-        renderer=renderer,
-        **dynamo_renderer_settings(*serving_chat_settings(cfg)),
-    )
+    return serving_chat_kwargs, renderer_kwargs
 
 
 def build_chat_server(
@@ -893,25 +805,11 @@ def build_chat_server(
     )
     openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
-    serving_chat_kwargs, default_chat_template_kwargs = serving_chat_settings(cfg)
+    serving_chat_kwargs, renderer_kwargs = serving_chat_settings(cfg)
     online_renderer = NeMoRLOnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
-        request_logger=serving_chat_kwargs["request_logger"],
-        chat_template=serving_chat_kwargs["chat_template"],
-        chat_template_content_format=serving_chat_kwargs[
-            "chat_template_content_format"
-        ],
-        enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
-        # Keep the renderer's parser consistent with any parser overrides
-        # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
-        tool_parser=serving_chat_kwargs.get("tool_parser"),
-        reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
-        # vLLM merges these into every render, with request-supplied keys
-        # winning (preprocess_chat's default_template_kwargs). The renderer
-        # is shared by /v1/chat/completions and /tokenize, so setting it
-        # here keeps the two endpoints rendering identical prompts.
-        default_chat_template_kwargs=default_chat_template_kwargs,
+        **renderer_kwargs,
         host=host,
         model_stop_token_ids=model_stop_token_ids(model_config, cfg),
     )
@@ -936,7 +834,7 @@ def build_chat_server(
         # ServingTokenization reads its own copy in preprocess_chat rather
         # than the renderer's, so /tokenize would otherwise render with {}
         # and diverge from /v1/chat/completions under multi-turn.
-        default_chat_template_kwargs=default_chat_template_kwargs,
+        default_chat_template_kwargs=renderer_kwargs["default_chat_template_kwargs"],
     )
     openai_serving_tokenization = NeMoRLServingTokenization(
         **serving_tokenization_kwargs

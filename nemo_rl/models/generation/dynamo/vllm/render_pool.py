@@ -87,7 +87,7 @@ class RenderedCall:
     admission: Any
     serving_admission: Any
     verify_retained_media: bool
-    # Whether the call has media. The engine processes it: no pixels leave here.
+    # Whether the call has media, which the engine then processes itself.
     has_media: bool
     # The chat request as rendered (parsers may adjust it), without messages:
     # the engine builds its SamplingParams from it, as the native server does.
@@ -140,8 +140,7 @@ class _Worker:
 
         cfg = spec["generation"]
         chat_server.register_parser_plugins(cfg)
-        # This worker decodes the call's videos for the token layout, with the
-        # loader the engine decodes them with.
+        # Decodes videos with the engine's loader, so both lay them out alike.
         register_vllm_video_loader(cfg)
         # The engine's own args, with the weight-free snapshot Dynamo fetched.
         # Sleep mode is the engine's memory management, and vLLM's CPU platform
@@ -162,15 +161,9 @@ class _Worker:
         )
         renderer = renderer_from_config(vllm_config)
         self.tokenizer = renderer.tokenizer
-        serving_chat_kwargs, default_chat_template_kwargs = (
-            chat_server.serving_chat_settings(cfg)
-        )
+        serving_chat_kwargs, renderer_kwargs = chat_server.serving_chat_settings(cfg)
         self.online_renderer = chat_server.FrontendRenderer(
-            model_config=self.model_config,
-            renderer=renderer,
-            **chat_server.dynamo_renderer_settings(
-                serving_chat_kwargs, default_chat_template_kwargs
-            ),
+            model_config=self.model_config, renderer=renderer, **renderer_kwargs
         )
         # As vLLM's API server does at startup: compiles the chat template and
         # warms the multimodal processor, so the first render does neither.

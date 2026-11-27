@@ -329,14 +329,16 @@ def test_a_call_that_does_not_finish_cleanly_fails_its_capture(
     assert len(host._capture_registry) == 0
 
 
-def _multimodal(placeholders: list[PlaceholderRange]) -> dict:
-    """The media of the engine input the engine's own render gives."""
-    return {
-        "type": "multimodal",
-        "mm_kwargs": {"image": [f"pixels-{i}" for i in range(len(placeholders))]},
-        "mm_hashes": {"image": [f"hash-{i}" for i in range(len(placeholders))]},
-        "mm_placeholders": {"image": placeholders},
-    }
+def test_a_media_call_whose_client_left_while_it_rendered_is_not_generated() -> None:
+    template = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 4]
+    llm = _FakeLLM([_output(template, _completion([10], "stop"))])
+    engine = _media_adapter(_host(llm), [PlaceholderRange(1, IMAGE_TOKENS)], template)
+
+    # Dynamo calls abort() once, before vLLM has this call's request.
+    call = _gym_call(template, multimodal=MEDIA_BODY)
+    assert _collect(engine, call, _Disconnected()) == []
+
+    assert llm.calls == []
 
 
 def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
@@ -358,9 +360,7 @@ def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
         return CapturedMedia((), None)
 
     host._capture_request_media = capture_request_media
-    engine = _media_adapter(
-        host, _multimodal([PlaceholderRange(3, IMAGE_TOKENS)]), template
-    )
+    engine = _media_adapter(host, [PlaceholderRange(3, IMAGE_TOKENS)], template)
 
     _collect(
         engine,
@@ -401,15 +401,10 @@ def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
         return CapturedMedia((), None)
 
     host._capture_request_media = capture_request_media
-    engine = _media_adapter(
-        host, _multimodal([PlaceholderRange(1, IMAGE_TOKENS)]), processed
-    )
+    engine = _media_adapter(host, [PlaceholderRange(1, IMAGE_TOKENS)], processed)
 
     (chunk,) = _collect(engine, _captured_call(processed, TEXT, multimodal=MEDIA_BODY))
 
-    # Capture reads the pixels, so the engine processed them past vLLM's cache.
-    ((_, skip_mm_cache),) = engine._media_renderer.calls
-    assert skip_mm_cache
     # Media is snapshotted from the processed prompt the engine runs.
     assert snapshots == [(processed, TEXT, None)]
     (payload,) = host.token_capture.staged
@@ -547,7 +542,7 @@ def test_a_restored_media_call_is_checked_against_its_cuts_tensor_digests(
     )
 
     (chunk,) = _collect(
-        _media_adapter(host, _multimodal([PlaceholderRange(0, 2)]), image),
+        _media_adapter(host, [PlaceholderRange(0, 2)], image),
         _captured_call(image, admission, multimodal=MEDIA_BODY),
     )
 
