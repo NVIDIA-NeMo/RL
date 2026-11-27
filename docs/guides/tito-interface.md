@@ -1,6 +1,6 @@
 # TITO Inference Interface
 
-The token-in/token-out (TITO) inference interface lets the vLLM HTTP server accept and return token IDs. With it enabled, the server also builds a multi-turn chat prompt from the tokens the parent call produced instead of re-tokenizing the conversation text. For a model family with an incremental tokenizer, it builds that prompt without rendering the history at all. The design and its rationale are in the [TITO design document](../design-docs/tito.md).
+The token-in/token-out (TITO) inference interface lets the vLLM HTTP server accept and return token IDs. With it enabled, the server also builds a multi-turn chat prompt from the tokens the parent call produced instead of re-tokenizing the conversation text. For a model family with an incremental tokenizer, it builds that prompt without rendering the history at all.
 
 The interface is off by default. The existing chat path is unchanged when it is off.
 
@@ -161,7 +161,7 @@ With `tito_model` set, the server also requires that:
 | The bridge alone | `policy.generation.vllm_cfg.tito_model=null` |
 | The existing prefix splice | `policy.generation.vllm_cfg.tito_model=null policy.generation.vllm_cfg.tito_interface=false` |
 
-Compare `finalize/token_in_rate` and the root-reason counts across the runs, and check the worker log for `Captured TITO` events with `outcome=incremental`. A model that produces no tool calls has no second turn and exercises neither path. The [design document](../design-docs/tito.md#swe-smoke) has the numbers of the runs so far.
+Compare `finalize/token_in_rate` and the root-reason counts across the runs, and check the worker log for `Captured TITO` events with `outcome=incremental`. A model that produces no tool calls has no second turn and exercises neither path.
 
 ## Megatron backend
 

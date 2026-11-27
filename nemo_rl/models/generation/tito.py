@@ -17,7 +17,7 @@ The core accepts token IDs and returns token IDs. A chat adapter in front of it
 renders messages, continues a captured parent with the tokens of the appended
 messages and parses the reply. Those tokens come from :func:`bridge_suffix`, or
 from an :class:`IncrementalTokenizer` for a model family that has one. See
-``docs/design-docs/tito.md``.
+``docs/guides/tito-interface.md``.
 """
 
 import hashlib

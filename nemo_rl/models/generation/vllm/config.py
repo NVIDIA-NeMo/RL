@@ -66,7 +66,7 @@ class VllmSpecificArgs(TypedDict):
     skip_tokenizer_init: bool
     async_engine: bool
     # Serve the token-in/token-out route and bridge chat continuations onto
-    # their captured parent's tokens. See docs/design-docs/tito.md.
+    # their captured parent's tokens. See docs/guides/tito-interface.md.
     tito_interface: NotRequired[bool]
     # Model family whose appended messages are tokenized without rendering the
     # history. Requires tito_interface; None bridges every continuation.
