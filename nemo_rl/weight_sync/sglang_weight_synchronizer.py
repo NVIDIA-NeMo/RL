@@ -58,6 +58,93 @@ import ray
 from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import sglang_nccl_reshard_violations
+from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+    NcclReshardWeightSynchronizer,
+)
+
+
+class SGLangNcclReshardWeightSynchronizer(WeightSynchronizer):
+    """Own the SGLang serving lifecycle around the shared NCCL reshard mover."""
+
+    def __init__(
+        self,
+        policy: Any,
+        generation: Any,
+        *,
+        train_cluster: Any,
+        inference_cluster: Any,
+        refit_timeout_s: float | None,
+    ) -> None:
+        violations = sglang_nccl_reshard_violations(policy.cfg, generation.cfg)
+        if violations:
+            raise ValueError("\n".join(violations))
+        if generation.num_gpus_per_engine > generation.num_gpus_per_node:
+            raise ValueError(
+                "SGLang NCCL reshard requires an engine to fit on one node."
+            )
+        if inference_cluster.world_size() != generation.num_gpus_per_engine:
+            raise ValueError(
+                "SGLang NCCL reshard requires one engine's GPU allocation."
+            )
+        self._policy = policy
+        self._generation = generation
+        self._transport = NcclReshardWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
+        )
+        self._connected = False
+        self._stale = True
+        self._terminal_error: BaseException | None = None
+
+    @property
+    def is_stale(self) -> bool:
+        return self._stale
+
+    def init_communicator(self) -> None:
+        # GPU-side custom-loader requests require an open weight-update session.
+        self._policy.prepare_refit_info()
+
+    def sync_weights(
+        self,
+        *,
+        timer: Optional[Timer] = None,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
+        if kv_scales is not None:
+            raise ValueError("SGLang NCCL reshard does not support KV-cache scales.")
+        if self._terminal_error is not None:
+            raise RuntimeError("SGLang NCCL reshard failed; restart the run.") from (
+                self._terminal_error
+            )
+        self._stale = True
+        try:
+            self._generation.prepare_for_generation(tags=["weights"])
+            self._generation.pause_generation(
+                mode=self._generation.pause_generation_mode
+            )
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError("SGLang cache invalidation failed before reshard.")
+            self._generation.begin_weight_update()
+            if not self._connected:
+                self._transport.init_communicator()
+                self._connected = True
+                self._generation.clear_updatable_num_new_engines()
+            self._transport.sync_weights(timer=timer)
+            self._generation.end_weight_update()
+            self._generation.prepare_for_generation(tags=["kv_cache"])
+            self._generation.continue_generation()
+        except BaseException as error:
+            # Partial writes are terminal; serving must stay paused on mixed weights.
+            self._terminal_error = error
+            raise
+        self._stale = False
+
+    def shutdown(self) -> None:
+        self._transport.shutdown()
 
 
 class _SGLangWeightSynchronizer(WeightSynchronizer):

@@ -19,7 +19,7 @@ At setup, `check_nccl_reshard_refit_support()` validates the configuration and r
 
 * **Non-colocated only** — `policy.generation.colocated.enabled=false`. The colocated path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel training backend is not supported yet.).
-* **vLLM, Megatron or TensorRT-LLM generation backend** — `policy.generation.backend` must be `vllm`, `megatron` or `trtllm` (SGLang is not supported yet). TensorRT-LLM moves only routed MoE experts shard-to-shard, needs pure expert parallelism (`moe_expert_parallel_size == tensor_parallel_size`, `pipeline_parallel_size: 1`) on every engine role, and rejects models with dense MLP layers. Generation-side expert TP is tracked in [#5131](https://github.com/NVIDIA-NeMo/RL/issues/5131).
+* **vLLM, Megatron, TensorRT-LLM, or SGLang generation backend** — `policy.generation.backend` must be `vllm`, `megatron`, `trtllm`, or `sglang`. SGLang supports dense Qwen2 BF16 on one engine within one node. It requires generation PP=EP=DP=1, BF16 weights, an unquantized KV cache, and disabled memory offload and fault tolerance. TensorRT-LLM moves only routed MoE experts shard-to-shard, needs pure expert parallelism (`moe_expert_parallel_size == tensor_parallel_size`, `pipeline_parallel_size: 1`) on every engine role, and rejects models with dense MLP layers. Generation-side expert TP is tracked in [#5131](https://github.com/NVIDIA-NeMo/RL/issues/5131).
 * Training-side Megatron supports expert tensor parallelism when the generation destination is Megatron. A vLLM or TensorRT-LLM destination still requires `expert_tensor_parallel_size: 1`. Custom PP layouts (`pipeline_model_parallel_layout`, virtual PP > 1, embedding/loss pipeline-split accounting) are not supported yet.
 * **Generation-side ETP with `inference_optimized` is pinned to 1.** Those MoE layers do not implement expert tensor parallelism and raise whenever the *resolved* ETP exceeds 1 — and an omitted ETP resolves to TP, not 1. So `merged_inference_megatron_cfg` pins generation-side `expert_tensor_parallel_size` to 1 for that transformer implementation, which is what lets generation-side TP > 1 work; the reshard then handles the train-ETP → gen-ETP=1 gather. Other transformer implementations retain their configured ETP. An explicitly requested generation-side ETP > 1 with `inference_optimized` is rejected by config key name rather than surfacing as a raw MCore assert at model build.
 * **Supported precisions** are listed in the table below.
@@ -71,6 +71,14 @@ Weight-quantization scale exports associated with bulk weights are excluded from
 
 The feature is integrated into the `nemo_rl/weight_sync/` framework. For vLLM, `create_weight_synchronizer(...)` returns an `NcclReshardWeightSynchronizer` directly.
 For Megatron generation, the existing `MegatronWeightSynchronizer` retains ownership of the inference-engine lifecycle and delegates only the transfer to an `NcclReshardWeightSynchronizer`.
+
+For SGLang, `SGLangNcclReshardWeightSynchronizer` owns pause, cache invalidation,
+weight-update sessions and resume, and delegates communication and transfer to the
+same mover. A registered SGLang custom weight loader receives control metadata over
+HTTP; weight payloads travel over NCCL. Dense gate/up shards write into the two
+halves of SGLang's fused `gate_up_proj`; down shards write into `down_proj`.
+Miscellaneous full tensors use SGLang's standard model loader. An interrupted
+transfer is terminal and leaves serving paused until the run is restarted.
 
 ### Quantized parameter support
 
@@ -189,13 +197,17 @@ xferdtensor(src_tensor, src_mesh, src_placement,
             process_group, stream=None)
 ```
 
-and dispatches to one of two transports:
+and selects an implementation:
 
-* **Core NCCL reshard** — the reshard operation provided by the **nccl4py wrapper** (`nccl.m2n.reshard`). When the package is accessible, this is the default: the local shards, mesh rank grids, and placements are handed to the NCCL library, which executes the cross-mesh redistribution natively.
+* **Core NCCL reshard** — the reshard operation provided by [NCCL Extensions](https://github.com/NVIDIA/nccl-extensions) (`nccl.m2n.reshard`) using an NCCL4Py communicator. When the package is accessible, this is the default: the local shards, mesh rank grids, and placements are handed to the NCCL library, which executes the cross-mesh redistribution natively.
 * **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — a pure Python + nccl4py-collectives **backup implementation** for environments without a proper NCCL / nccl4py reshard installation. It computes the exact shard overlaps between the source and destination layouts, moves each destination region once via batched point-to-point (with striped receives across replica groups), and fans out to replicas with cached split-communicator broadcasts. It is a drop-in with the same signature and is selected automatically when `nccl.m2n` is not importable, or for layouts the native op does not support (meshes with more than two axes or more than one shard axis).
 * **`xferdtensor_golden`** (`nemo_rl/weight_sync/xferdtensor.py`) — a pure function-only implementation intended for debugging. This implementation simply broadcasts the full tensor to the destination ranks, which then discard the unused parts. While not performant, it guarantees functionally correct outputs.
 
-Both transports honor the `stream` argument so the transfer is ordered with the caller's `pre`/`post` staging work on one CUDA stream.
+All implementations honor the `stream` argument so the transfer is ordered with the caller's `pre`/`post` staging work on one CUDA stream.
+
+The pinned NCCL Extensions 0.1.0 release requires NCCL 2.30.7. Native M2N also
+requires symmetric memory, so SGLang NCCL reshard selects `NCCL_CUMEM_ENABLE=1`
+in both the training and serving processes before either initializes NCCL.
 
 
 ## Expected Performance

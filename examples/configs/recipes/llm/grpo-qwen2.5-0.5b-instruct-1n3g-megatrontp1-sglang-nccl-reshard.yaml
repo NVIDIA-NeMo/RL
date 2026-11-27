@@ -1,0 +1,37 @@
+defaults: ../../grpo_math_1B_sglang.yaml
+grpo:
+  max_num_steps: 2
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+  automodel_cfg:
+    enabled: false
+  generation:
+    max_new_tokens: 128
+    refit_transport: nccl_reshard
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 2
+    sglang_cfg:
+      tp_size: 2
+      sglang_server_config:
+        needs_offload: false
+        pause_generation_mode: abort
+data:
+  max_input_seq_length: 384
+logger:
+  log_dir: logs/grpo-qwen2.5-0.5b-instruct-1n3g-megatrontp1-sglang-nccl-reshard
+  wandb_enabled: false
+cluster:
+  gpus_per_node: 3

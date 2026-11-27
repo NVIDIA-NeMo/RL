@@ -24,7 +24,10 @@ test shards.
 """
 
 import ast
+import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -67,6 +70,65 @@ def test_refit_environment_is_configured_before_first_process_group() -> None:
     )
 
     assert configure_line < init_process_group_line
+
+
+@pytest.mark.parametrize("transport, expected", [(None, "0"), ("nccl_reshard", "1")])
+def test_training_and_sglang_launch_select_matching_allocator(
+    monkeypatch, transport: str | None, expected: str
+) -> None:
+    """Both process families must preserve the allocator M2N needs at bootstrap."""
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    tree = ast.parse((REPO_ROOT / "nemo_rl/models/megatron/setup.py").read_text())
+    configure = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "configure_refit_environment"
+    )
+    namespace = {"os": os}
+    # Execute the bootstrap function without loading optional training packages.
+    exec(
+        compile(ast.Module(body=[configure], type_ignores=[]), "setup.py", "exec"),
+        namespace,
+    )
+    config = {
+        "backend": "sglang",
+        "refit_transport": transport,
+        "colocated": {"enabled": False},
+    }
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0" if expected == "1" else "1")
+    namespace["configure_refit_environment"]({"generation": config})
+    assert os.environ["NCCL_CUMEM_ENABLE"] == expected
+
+    generation = SimpleNamespace(
+        sglang_cfg=config,
+        num_gpus_per_engine=2,
+        num_gpus_per_node=4,
+        pg=MagicMock(),
+        pg_reordered_bundle_indices=[0, 1],
+        pg_reordered_gpu_ids=[0, 1],
+        all_engines=[None],
+        rank_offset=0,
+        gpu_offset=0,
+        cluster=SimpleNamespace(max_colocated_worker_groups=1),
+    )
+    monkeypatch.setattr(
+        sglang_generation, "make_actor_runtime_env", lambda *_: {"env_vars": {}}
+    )
+    monkeypatch.setattr(
+        sglang_generation, "get_nsight_config_if_pattern_matches", lambda *_: {}
+    )
+    actor_options = MagicMock(side_effect=RuntimeError("captured actor launch"))
+    monkeypatch.setattr(
+        sglang_generation.SGLangGenerationWorker, "options", actor_options
+    )
+    with pytest.raises(RuntimeError, match="captured actor launch"):
+        sglang_generation.SGLangGeneration._start_engines(generation)
+    assert (
+        actor_options.call_args.kwargs["runtime_env"]["env_vars"]["NCCL_CUMEM_ENABLE"]
+        == expected
+    )
 
 
 @pytest.mark.parametrize("relative_path", REFIT_DRIVER_MODULES)

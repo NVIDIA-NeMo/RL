@@ -14,7 +14,7 @@
 
 """NCCL-xfer (shard-to-shard) weight synchronizer for non-colocated deployments.
 
-Handles disaggregated Megatron-train -> vLLM/Megatron/TRT-LLM-gen weight refit
+Handles disaggregated Megatron-train -> vLLM/Megatron/TRT-LLM/SGLang-gen weight refit
 via xferdtensor: bulk FFN/expert params are resharded shard-to-shard between the
 train and gen parallelism layouts over dedicated per-(generation layout, PP stage)
 NCCL communicators, while the remaining misc params ride a packed broadcast over
@@ -98,7 +98,7 @@ def _settle_before_propagating(futures, budget_s, what: str) -> None:
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using the ``xferdtensor`` shard-to-shard reshard.
 
-    For non-colocated Megatron-train -> vLLM/Megatron-gen deployments where weights are
+    For non-colocated Megatron-train -> vLLM/Megatron/TRT-LLM/SGLang-gen deployments where weights are
     redistributed directly between the two parallelism layouts (bulk path) plus
     a packed broadcast for the misc params. Mirrors
     :class:`CollectiveWeightSynchronizer` but additionally bootstraps the
@@ -160,7 +160,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def _gen_layouts(self) -> list[dict[str, Any]]:
         """Destination layouts, each ``{tp_size, ep_size, etp_size, pp_size, world_size}``.
 
-        vLLM and Megatron generation are one layout spanning every inference
+        vLLM, Megatron, and SGLang use one layout spanning every inference
         rank. TRT-LLM reports one per engine role: under prefill/decode
         disaggregation the context and generation engines have different
         TP/EP, and xferdtensor needs one destination mesh per transfer, so the
@@ -198,6 +198,17 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "world_size": None,
                 }
             ]
+        if backend == "sglang":
+            tp_size = generation_cfg["sglang_cfg"]["tp_size"]
+            return [
+                {
+                    "tp_size": tp_size,
+                    "ep_size": 1,
+                    "etp_size": tp_size,
+                    "pp_size": 1,
+                    "world_size": None,
+                }
+            ]
         if backend == "trtllm":
             return [
                 {
@@ -211,7 +222,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 for layout in self._generation.get_nccl_reshard_layouts()
             ]
         raise ValueError(
-            "NCCL M-to-N refit only supports vLLM, Megatron or TRT-LLM generation, got "
+            "NCCL M-to-N refit only supports vLLM, Megatron, TRT-LLM, or SGLang generation, got "
             f"{backend!r}."
         )
 
@@ -285,6 +296,16 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
+        if self._policy.cfg["generation"]["backend"] == "sglang":
+            self._build(
+                desired_membership(
+                    absent_shards=[],
+                    dp_size=1,
+                    total_gen_workers=self._inference_cluster.world_size(),
+                    train_world_size=self._train_cluster.world_size(),
+                )
+            )
+            return
         self._build(
             desired_membership(
                 absent_shards=[],

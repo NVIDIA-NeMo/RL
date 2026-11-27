@@ -36,6 +36,7 @@ The reload API path currently supports only `policy.generation.backend: vllm`, `
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM, Megatron or TensorRT-LLM | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). TensorRT-LLM moves only routed MoE experts shard-to-shard and needs pure expert parallelism (`moe_expert_parallel_size == tensor_parallel_size`, generation PP 1) on every engine role, with no expert load balancer; models with dense MLP layers or expert TP use the default NCCL transport (generation-side expert TP support is tracked in [#5131](https://github.com/NVIDIA-NeMo/RL/issues/5131)). Example: [`grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml`](../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated-reshard.yaml). |
+| NCCL reshard | SGLang | Megatron | Experimental dense Qwen2 BF16 on one engine within one node. Requires generation PP=EP=DP=1 and disabled memory offload and fault tolerance. |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
 | NIXL, full weights | vLLM | Automodel or Megatron | Supports the standard full-weight FP8 loader. Automodel FP8 KV-cache scale transfer is not yet supported. |
 | NIXL, sharded experts | vLLM | Automodel or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
@@ -169,6 +170,41 @@ policy:
 ```
 
 With vLLM, TensorRT-LLM, or Megatron generation, `offload_policy_before_refit` also works with this transport. The reshard moves only parameters, so releasing gradient buffers, optimizer state, and caches before transfer is safe.
+
+For experimental SGLang NCCL reshard, use dense Qwen2 BF16 weights with Megatron
+training and one rollout engine. Keep the engine within one node and disable
+memory offload and fault tolerance:
+
+```yaml
+policy:
+  precision: bfloat16
+  generation:
+    backend: sglang
+    refit_transport: nccl_reshard
+    colocated:
+      enabled: false
+    sglang_cfg:
+      tp_size: 2
+      pp_size: 1
+      ep_size: 1
+      dp_size: 1
+      quantization:
+        scheme: bf16
+      sglang_server_config:
+        num_gpus: 2
+        needs_offload: false
+        pause_generation_mode: abort
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+```
+
+SGLang's optimized path rejects MoE and quantized weights. A failed transfer
+keeps generation paused and requires restarting the run.
+
+Both worker environments get `nccl-extensions==0.1.0` from the base dependencies. The lockfile pins NCCL 2.30.7. NeMo RL enables the symmetric-memory allocator before initializing the communicators.
+The startup log identifies native transfer as
+`reshard path: real nccl.m2n.reshard`; environments missing the extension use the
+Python exact-transfer implementation.
 
 For sparse delta, select one data plane and configure its scope:
 

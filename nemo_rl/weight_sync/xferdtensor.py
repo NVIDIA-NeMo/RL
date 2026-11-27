@@ -26,9 +26,7 @@ try:
         reshard as _reshard,
     )
 except ImportError:
-    # Containers without the nccl4py M2N integration don't ship the real
-    # reshard op; xferdtensor() then defaults to the Python exact-transfer
-    # implementation (xferdtensor_python).
+    # Runtime images without nccl-extensions use exact Python shard transfers.
     _reshard = None
     logging.warning("nccl.m2n.reshard not found, defaulting to xferdtensor_python")
 
