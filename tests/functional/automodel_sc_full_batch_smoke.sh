@@ -37,8 +37,17 @@ cd "$PROJECT_ROOT"
 TRAIN_CMD=(
     uv run --group test coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage"
     --source="$PROJECT_ROOT/nemo_rl" examples/run_grpo_single_controller.py
-    --config examples/configs/recipes/llm/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch.yaml
+    --config examples/configs/grpo_math_1B_automodel_single_controller.yaml
     grpo.max_num_steps=4
+    grpo.num_prompts_per_step=2
+    grpo.num_generations_per_prompt=4
+    grpo.seq_logprob_error_threshold=1000
+    policy.train_micro_batch_size=1
+    policy.max_total_sequence_length=1024
+    policy.generation.max_new_tokens=512
+    policy.generation.vllm_cfg.enforce_eager=true
+    data.max_input_seq_length=512
+    checkpointing.enabled=true
     logger.monitor_gpus=false
     checkpointing.checkpoint_dir="$CKPT_DIR"
     checkpointing.save_period=2

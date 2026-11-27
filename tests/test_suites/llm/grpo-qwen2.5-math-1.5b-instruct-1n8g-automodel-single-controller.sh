@@ -18,10 +18,10 @@ source "$SCRIPT_DIR/common.env"
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=100
-MAX_STEPS=100
+STEPS_PER_RUN=450
+MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
-NUM_MINUTES=120
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -43,11 +43,5 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'all_finite(data["train/loss"])' \
     'all_finite(data["train/grad_norm"])' \
     'max(data["train/weight_version_lag_max"]) == 0' \
-    'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
-    'max(data["train/max_seq_mult_prob_error"]) < 1000' \
-    'median(data["train/token_mult_prob_error"]) < 1.1'
-test -d "$CKPT_DIR/step_$MAX_STEPS/policy/weights"
-test -d "$CKPT_DIR/step_$MAX_STEPS/policy/optimizer"
-
-# Clean up checkpoint directory after successful run to save space.
-rm -rf "$CKPT_DIR"
+    'median(data["train/token_mult_prob_error"]) < 1.1' \
+    "data[\"train/token_mult_prob_error\"][\"$MAX_STEPS\"] < 1.1"

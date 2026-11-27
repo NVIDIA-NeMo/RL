@@ -38,7 +38,7 @@ Run the checkpoint/resume integration smoke on two GPUs:
 bash tests/functional/automodel_sc_full_batch_smoke.sh
 ```
 
-The script uses the Qwen2.5-1.5B SC recipe with one training GPU and one rollout GPU.
+The script runs the AutoModel SC exemplar with a small batch on one training GPU and one rollout GPU.
 It saves after step 1 and resumes through step 4.
 Append normal config overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
 
