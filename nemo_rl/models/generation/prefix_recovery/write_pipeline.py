@@ -15,15 +15,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 LOGGER = logging.getLogger(__name__)
 
@@ -154,6 +155,14 @@ class PrefixWritePipeline:
             "failed_inventories": 0,
             "peak_buffered_payload_bytes": 0,
         }
+        # Nanoseconds each thread spent on cuts: wall time, and the CPU time
+        # that thread itself used, which excludes waiting for the GIL or a PUT.
+        self._stage_ns = {
+            "prepare": 0,
+            "prepare_cpu": 0,
+            "write": 0,
+            "write_cpu": 0,
+        }
         self._writers = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-prefix-write"
         )
@@ -186,10 +195,31 @@ class PrefixWritePipeline:
 
         Returns:
             ``write_batches``, the ``merged_inventories`` they carried,
-            ``failed_inventories`` and ``peak_buffered_payload_bytes``.
+            ``failed_inventories`` and ``peak_buffered_payload_bytes``. Then
+            microseconds of wall and thread CPU time: ``prepare_us`` and
+            ``prepare_cpu_us`` on the preparation thread (reading progress,
+            freezing calls, building rows, sealing or rolling back), and
+            ``write_us`` and ``write_cpu_us`` on the writer thread (encoding
+            rows and the TQ PUT, whose wait is wall time only).
         """
         with self._condition:
-            return dict(self._counts)
+            return {
+                **self._counts,
+                **{f"{stage}_us": ns // 1000 for stage, ns in self._stage_ns.items()},
+            }
+
+    @contextlib.contextmanager
+    def _timed(self, stage: Literal["prepare", "write"]) -> Iterator[None]:
+        """Add the wall and thread CPU time of the block to ``stage``'s totals."""
+        wall, cpu = time.perf_counter_ns(), time.thread_time_ns()
+        try:
+            yield
+        finally:
+            wall = time.perf_counter_ns() - wall
+            cpu = time.thread_time_ns() - cpu
+            with self._condition:
+                self._stage_ns[stage] += wall
+                self._stage_ns[f"{stage}_cpu"] += cpu
 
     def _reserve(self, job: _Job, amount: int, *, allow_overflow: bool = False) -> None:
         with self._condition:
@@ -274,42 +304,43 @@ class PrefixWritePipeline:
         requests = [job.request for job in jobs]
         assert all(request is not None for request in requests)
         records = [record for request in requests for record in request.records]
-        try:
-            if any(
-                job.deadline is not None and time.monotonic() >= job.deadline
-                for job in jobs
-            ):
-                raise TimeoutError("Prefix batch expired before PUT")
-            keys = self._sink.stage_generation_prefix_batch(
-                records,
-                checkpoint_id=requests[0].checkpoint_id,
-                chunk_sequences=[
-                    seq for request in requests for seq in request.sequences
-                ],
-                attachments=[
-                    item for request in requests for item in request.attachments
-                ],
-            )
-            if len(keys) != len(records):
-                self._sink.clear(keys)
-                raise ValueError("Prefix sink returned the wrong number of keys")
-        except Exception as error:
-            results = []
-            for request in requests:
-                try:
-                    results.append(request.fallback(error))
-                except BaseException as error:
-                    results.append(error)
-        else:
-            results, offset = [], 0
-            for request in requests:
-                stop = offset + len(request.records)
-                results.append(keys[offset:stop])
-                offset = stop
-        finally:
-            with self._condition:
-                self._counts["write_batches"] += 1
-                self._counts["merged_inventories"] += len(jobs)
+        with self._timed("write"):
+            try:
+                if any(
+                    job.deadline is not None and time.monotonic() >= job.deadline
+                    for job in jobs
+                ):
+                    raise TimeoutError("Prefix batch expired before PUT")
+                keys = self._sink.stage_generation_prefix_batch(
+                    records,
+                    checkpoint_id=requests[0].checkpoint_id,
+                    chunk_sequences=[
+                        seq for request in requests for seq in request.sequences
+                    ],
+                    attachments=[
+                        item for request in requests for item in request.attachments
+                    ],
+                )
+                if len(keys) != len(records):
+                    self._sink.clear(keys)
+                    raise ValueError("Prefix sink returned the wrong number of keys")
+            except Exception as error:
+                results = []
+                for request in requests:
+                    try:
+                        results.append(request.fallback(error))
+                    except BaseException as error:
+                        results.append(error)
+            else:
+                results, offset = [], 0
+                for request in requests:
+                    stop = offset + len(request.records)
+                    results.append(keys[offset:stop])
+                    offset = stop
+            finally:
+                with self._condition:
+                    self._counts["write_batches"] += 1
+                    self._counts["merged_inventories"] += len(jobs)
         return results
 
     def _collect(self) -> list[_Job]:
@@ -376,7 +407,8 @@ class PrefixWritePipeline:
                         self._ready.append(self._incoming.popleft())
                     closed = self._closed
                 if flight is not None and flight[1].done():
-                    self._complete(*flight)
+                    with self._timed("prepare"):
+                        self._complete(*flight)
                     flight = None
                     continue
                 if closed:
@@ -431,7 +463,8 @@ class PrefixWritePipeline:
                 if not closed and can_prepare:
                     assert candidate is not None
                     self._ready.remove(candidate)
-                    self._advance(candidate)
+                    with self._timed("prepare"):
+                        self._advance(candidate)
                     if prepared_at is None and self._prepared:
                         prepared_at = time.monotonic()
                     continue

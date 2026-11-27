@@ -250,6 +250,8 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
         assert started.wait(5)
         assert not first.done() and not second.done()
         assert not any(event[1] == "three" for event in events)
+        # A PUT's wait counts as the writer's wall time, not its CPU time.
+        time.sleep(0.05)
         release.set()
         assert first.result(5) == ["one"]
         assert second.result(5) == ["two"]
@@ -264,6 +266,8 @@ def test_cross_inventory_merge_duplicates_and_overlap_barrier() -> None:
         assert counts["merged_inventories"] == 3
         assert counts["failed_inventories"] == 0
         assert counts["peak_buffered_payload_bytes"] > 0
+        assert counts["prepare_us"] > 0 and counts["prepare_cpu_us"] > 0
+        assert counts["write_us"] >= 50_000 > counts["write_cpu_us"]
     finally:
         release.set()
         pipeline.close(wait=True)
@@ -450,7 +454,11 @@ def test_prepared_batch_that_expires_before_put_fails_without_a_write(
 
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3], batch_size=1)
     clock = {"now": 0.0}
-    fake_time = SimpleNamespace(monotonic=lambda: clock["now"])
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        perf_counter_ns=time.perf_counter_ns,
+        thread_time_ns=time.thread_time_ns,
+    )
     monkeypatch.setattr(recovery_module, "time", fake_time)
     monkeypatch.setattr(write_pipeline_module, "time", fake_time)
     entered, release = threading.Event(), threading.Event()

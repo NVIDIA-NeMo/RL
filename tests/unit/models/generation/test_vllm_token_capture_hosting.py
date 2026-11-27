@@ -4909,7 +4909,11 @@ def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
     clock = {"now": 0.0}
     # The cut and the write pipeline both compare the deadline to this clock.
-    fake_time = SimpleNamespace(monotonic=lambda: clock["now"])
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        perf_counter_ns=time.perf_counter_ns,
+        thread_time_ns=time.thread_time_ns,
+    )
     monkeypatch.setattr(recovery_module, "time", fake_time)
     monkeypatch.setattr(write_pipeline, "time", fake_time)
 
