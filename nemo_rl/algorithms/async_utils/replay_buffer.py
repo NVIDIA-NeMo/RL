@@ -57,6 +57,7 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
+from nemo_rl.experience.metric_utils import looping_metrics_from_flags
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.path_utils import load_checkpoint_object, save_checkpoint_object
 from nemo_rl.utils.r3_trace import trace_rollout_payload
@@ -888,6 +889,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     batch["verifier_reward"] = torch.full_like(
                         batch["total_reward"], float("nan"), dtype=torch.float64
                     )
+                metrics = trajectory["rollout_metrics"]
+                if "looping/completed_total" not in metrics:
+                    metrics.update(looping_metrics_from_flags(batch["is_looping"]))
 
             if "max_size" in state and state["max_size"] != self.max_size:
                 print(

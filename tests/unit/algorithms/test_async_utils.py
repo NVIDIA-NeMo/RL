@@ -48,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _startup_pipeline_ready,
     add_grpo_token_loss_masks_and_generation_logprobs,
+    aggregate_rollout_metrics,
     extract_initial_prompt_messages,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -63,6 +64,7 @@ from nemo_rl.experience.interfaces import (
     PENDING_PROMPTS_KEY,
     RETAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.metric_utils import looping_metrics_from_flags
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
@@ -533,30 +535,35 @@ class TestReplayBufferImplCheckpointing:
         )
 
     @pytest.mark.parametrize("old_checkpoint", [True, False])
+    @pytest.mark.parametrize("assessments_available", [False, True])
     def test_local_restore_merges_pre_taskset_batches_with_new_batches(
-        self, tmp_path: Path, old_checkpoint: bool
+        self, tmp_path: Path, old_checkpoint: bool, assessments_available: bool
     ) -> None:
+        flags = [True, False] if assessments_available else [None, None]
+        reasons = [["repeated_text"], []] if assessments_available else [[], []]
+
         def flat_group(agent_name: str, *, with_attribution_key: bool) -> dict:
             batch = BatchedDataDict(
                 {
                     "agent_ref": [{"name": agent_name}] * 2,
                     "total_reward": torch.tensor([1.0, 0.0]),
-                    "is_looping": [None, None],
-                    "reasons": [[], []],
+                    "is_looping": flags,
+                    "reasons": reasons,
                     "verifier_reward": torch.tensor([2.0, 0.0], dtype=torch.float64),
                 }
             )
             if with_attribution_key:
                 batch["attribution_key"] = [agent_name] * 2
-            return {"batch": batch, "rollout_metrics": {}}
+            return {
+                "batch": batch,
+                "rollout_metrics": looping_metrics_from_flags(flags),
+            }
 
         saved_group = flat_group("math_agent", with_attribution_key=False)
         if old_checkpoint:
             for key in ("is_looping", "reasons", "verifier_reward"):
                 saved_group["batch"].pop(key)
-        else:
-            saved_group["batch"]["is_looping"] = [True, False]
-            saved_group["batch"]["reasons"] = [["repeated_text"], []]
+            saved_group["rollout_metrics"].clear()
         checkpoint_path = tmp_path / "replay_buffer.pt"
         source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         assert (
@@ -596,17 +603,27 @@ class TestReplayBufferImplCheckpointing:
             == [{"name": "math_agent"}] * 2 + [{"name": "code_agent"}] * 2
         )
         assert train_batch["total_reward"].tolist() == [1, 0, 1, 0]
-        assert train_batch["is_looping"] == (
-            [None, None] if old_checkpoint else [True, False]
-        ) + [None, None]
-        assert train_batch["reasons"] == (
-            [[], []] if old_checkpoint else [["repeated_text"], []]
-        ) + [[], []]
+        saved_flags = [None, None] if old_checkpoint else flags
+        saved_reasons = [[], []] if old_checkpoint else reasons
+        assert train_batch["is_looping"] == saved_flags + flags
+        assert train_batch["reasons"] == saved_reasons + reasons
         assert train_batch["verifier_reward"][2:].tolist() == [2, 0]
         if old_checkpoint:
             assert torch.isnan(train_batch["verifier_reward"][:2]).all()
         else:
             assert train_batch["verifier_reward"][:2].tolist() == [2, 0]
+        per_group_metrics = {}
+        for trajectory in sampled["trajectories"]:
+            for key, value in trajectory["rollout_metrics"].items():
+                per_group_metrics.setdefault(key, []).append(value)
+        metrics = aggregate_rollout_metrics(per_group_metrics)
+        assert metrics["looping/completed_total"] == 4
+        if assessments_available:
+            assert metrics["looping/coverage"] == (0.5 if old_checkpoint else 1.0)
+            assert metrics["looping/rate"] == 0.5
+        else:
+            assert metrics["looping/coverage"] == 0.0
+            assert "looping/rate" not in metrics
 
 
 class TestReplayBuffer:
