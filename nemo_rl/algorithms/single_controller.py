@@ -366,6 +366,10 @@ class SingleControllerActor:
     # without __init__ (the test stubs) trains rather than raises.
     _simulator: Optional[SimulatorConfig] = None
 
+    # Declared on the class, like _tracer, so an instance built without __init__ can still time an admission.
+    _admission_gate_wait_started: Optional[float] = None
+    _admission_gate_wait_seconds: float = 0.0
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -1218,6 +1222,16 @@ class SingleControllerActor:
             assert group_id is not None, "a recorded prompt group has an ID"
             self._rollout_manager.discard_prompt_group(cut, group_id)
 
+    @contextlib.contextmanager
+    def _admission_gate_wait(self) -> Iterator[None]:
+        """Add a wait at the sampler's admission gate to the telemetry total."""
+        self._admission_gate_wait_started = started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._admission_gate_wait_seconds += time.monotonic() - started
+            self._admission_gate_wait_started = None
+
     async def _admit_step(
         self,
         group_ids: list[Optional[str]],
@@ -1229,11 +1243,12 @@ class SingleControllerActor:
             return await self._admit_reserved_prompt_groups(
                 cast(list[str], group_ids), wait_until_admissible=wait_until_admissible
             )
-        if wait_until_admissible is not None:
-            await wait_until_admissible()
-        target_step = await self._sampler.admit(
-            trainer_version_fn=lambda: self._trainer_version
-        )
+        with self._admission_gate_wait():
+            if wait_until_admissible is not None:
+                await wait_until_admissible()
+            target_step = await self._sampler.admit(
+                trainer_version_fn=lambda: self._trainer_version
+            )
         self._rollout_runtime.sampler_stamps_target_steps = True
         self._require_unoccupied_target_step(target_step)
         return target_step
@@ -1273,12 +1288,13 @@ class SingleControllerActor:
             return target_step
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
-            if wait_until_admissible is not None:
-                await wait_until_admissible()
-            else:
-                await self._sampler.wait_until_admissible(
-                    trainer_version_fn=lambda: self._trainer_version
-                )
+            with self._admission_gate_wait():
+                if wait_until_admissible is not None:
+                    await wait_until_admissible()
+                else:
+                    await self._sampler.wait_until_admissible(
+                        trainer_version_fn=lambda: self._trainer_version
+                    )
             async with self._data_plane_checkpoint_barrier.mutation(
                 "prompt_reservations"
             ) as cut:
@@ -1294,9 +1310,10 @@ class SingleControllerActor:
         async with self._data_plane_checkpoint_barrier.mutation(
             "prompt_reservations"
         ) as cut:
-            target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
-            )
+            with self._admission_gate_wait():
+                target_step = await self._sampler.admit(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
             return _commit(cut, target_step)
 
     async def _ray_get(self, obj_ref: Any) -> Any:
@@ -4684,6 +4701,10 @@ class SingleControllerActor:
     ) -> None:
         """Compare generation-engine output with canonical TQ publication."""
         now = time.monotonic()
+        # Count a wait still in progress, so a long one shows before it ends.
+        admission_wait_seconds = self._admission_gate_wait_seconds
+        if self._admission_gate_wait_started is not None:
+            admission_wait_seconds += now - self._admission_gate_wait_started
         counters = self._rollout_manager.telemetry_snapshot()
         barrier = await self._data_plane_checkpoint_barrier.drain_telemetry()
         generation_metrics: dict[str, Any] = {}
@@ -4728,6 +4749,7 @@ class SingleControllerActor:
                 "controller_buffer_capacity_waiters": float(
                     self._buffer_capacity_waiters
                 ),
+                "admission_gate_wait_seconds_total": admission_wait_seconds,
                 "checkpoint_barrier_active": float(barrier.checkpoint_active),
                 "checkpoint_active_mutations": float(barrier.active_mutations),
                 "checkpoint_waiting_mutations": float(barrier.waiting_mutations),
@@ -4738,6 +4760,7 @@ class SingleControllerActor:
                     sum(barrier.blocked_by_kind.values())
                 ),
                 "buffer_occupancy_groups": float(len(self._buffer)),
+                "buffer_ready_groups": float(sum(self._buffer.ready_list)),
             }
         )
         for kind in CHECKPOINT_MUTATION_KINDS:

@@ -4593,8 +4593,9 @@ def _grpo_train_impl(
                         "draft_grad_norm"
                     ].numpy()
                 if master_config.grpo.use_dynamic_sampling:
-                    metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"] = repeated_batch["total_reward"].numpy()
+                    metrics["unfiltered_reward"] = repeated_batch[
+                        "total_reward"
+                    ].numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -4615,7 +4616,7 @@ def _grpo_train_impl(
                         "draft_lr",
                         "wd",
                         "reward",
-                        "filtered_reward",
+                        "unfiltered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -4771,9 +4772,6 @@ def _grpo_train_impl(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo.use_dynamic_sampling:
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
@@ -4842,13 +4840,11 @@ def _grpo_train_impl(
                     else "not reported"
                 )
             )
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             if master_config.grpo.use_dynamic_sampling:
-                print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
-                    f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
+                    f"  • Avg Unfiltered Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
                 )
-            else:
-                print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
@@ -6754,10 +6750,6 @@ def async_grpo_train(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo.use_dynamic_sampling:
-                    # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
-                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
