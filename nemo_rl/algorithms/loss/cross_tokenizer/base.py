@@ -112,9 +112,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         Identical tokenizer => teacher tokens == student tokens (identity
         position alignment), so no projection / no chunk-averaging. The top-k
-        vocab list is chosen from KD positions only (the semantic KD mask). The
-        reduction is the KD-position mean normalized by ``global_valid_toks``
-        (the KD-token count), scaled by ``T**2``.
+        vocab columns are ranked by their max teacher logit over every position
+        of the microbatch (see ``same_tokenizer_topk_kl``); only KD positions
+        (the semantic KD mask) enter the KL. The reduction is the KD-position
+        mean normalized by ``global_valid_toks`` (the KD-token count), scaled by
+        ``T**2``.
         """
         kd = same_tokenizer_topk_kl(
             student_logits_contig,
