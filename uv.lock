@@ -130,6 +130,12 @@ name = "nv-grouped-gemm"
 version = "1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
+[[manifest.dependency-metadata]]
+name = "nvidia-resiliency-ext"
+version = "0.7.0"
+requires-dist = ["defusedxml", "fastapi>=0.100", "grpcio>=1.76,<2", "grpcio-tools>=1.76,<2", "httpx>=0.24", "mcp>=1.28.1,<2 ; extra == 'attribution'", "numpy>=1.26", "nvidia-ml-py>=12.570.86", "packaging", "protobuf>=4.22", "psutil>=6", "pydantic>=2", "pydantic-settings>=2", "pyyaml", "setproctitle>=1.3 ; extra == 'attribution'", "slack-bolt>=1.23 ; extra == 'attribution'", "slack-sdk>=3.35 ; extra == 'attribution'", "slowapi>=0.1.9", "torch>=2.3", "uvicorn[standard]>=0.20"]
+provides-extras = ["attribution"]
+
 [[package]]
 name = "absl-py"
 version = "2.5.0"

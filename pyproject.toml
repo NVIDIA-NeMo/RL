@@ -744,6 +744,35 @@ requires-dist = [
 # Override drain3 to relax cachetools==4.2.1 pin (conflicts with mlflow's cachetools>=5.0.0)
 # Tracking: https://github.com/logpai/Drain3/issues/119
 [[tool.uv.dependency-metadata]]
+# Its build backend (poetry-dynamic-versioning) is not installed for --no-build-isolation runs, so uv must not need
+# to call it for metadata. Keep the version and requires-dist equal to the tag in [tool.uv.sources].
+name = "nvidia-resiliency-ext"
+version = "0.7.0"
+requires-dist = [
+  "defusedxml",
+  "fastapi>=0.100",
+  "grpcio>=1.76,<2",
+  "grpcio-tools>=1.76,<2",
+  "httpx>=0.24",
+  "mcp>=1.28.1,<2; extra == 'attribution'",
+  "numpy>=1.26",
+  "nvidia-ml-py>=12.570.86",
+  "packaging",
+  "protobuf>=4.22",
+  "psutil>=6",
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "pyyaml",
+  "setproctitle>=1.3; extra == 'attribution'",
+  "slack-bolt>=1.23; extra == 'attribution'",
+  "slack-sdk>=3.35; extra == 'attribution'",
+  "slowapi>=0.1.9",
+  "torch>=2.3",
+  "uvicorn[standard]>=0.20",
+]
+provides-extras = ["attribution"]
+
+[[tool.uv.dependency-metadata]]
 name = "drain3"
 version = "0.9.11"
 requires-dist = ["jsonpickle", "cachetools>=4.2.1"]
