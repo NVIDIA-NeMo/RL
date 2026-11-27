@@ -1,0 +1,163 @@
+# ScaleCUA recipe: verifier rewards, osworld-v2, and an annealed FD-KL budget.
+# The filename is retained for compatibility with existing experiment launchers.
+# OSWORLD_ROOT points to the user's installed dataset/model/runtime assets.
+# CUA_OUTPUT_DIR must be a new writable experiment directory.
+defaults: ../../../examples/configs/grpo_math_1B.yaml
+training:
+  max_steps: 600
+  batch_size: 128
+  rollout_pool_size: 256
+  seed: 43
+  eval_period: 50
+  eval_at_start: true
+  eval_limit: null # Full benchmark; the driver also reports instruction-de-duplicated scores.
+  resume: null
+  eval_only: false
+logra:
+  enabled: true
+  rank: 256
+  seed: 4321
+  optimizer: sgd
+  refresh: true
+  distribution: rademacher
+  freeze_non_target: true
+  target_prefixes: [language_model]
+  target_modules: [q_proj, k_proj, v_proj, o_proj, in_proj, out_proj, up_proj, down_proj, gate_proj, fc1_latent_proj, fc2_latent_proj]
+  target_parameters: [gate_and_up_projs, down_projs]
+cua:
+  kl_budget: 5.0e-4
+  kl_budget_final: 5.0e-5
+  kl_budget_steps: 600
+  max_update_ratio: 6.0e-5
+  alpha_max: 3.0
+  probe_sequences: 2
+  probe_tokens: 2048
+  check_realized_kl: true # An extra forward records actual KL; it does not change the update.
+  # Production source recipe: per-segment visits, token-level aggregation.
+  baseline_prior: 8.0
+  baseline_ema: 0.1
+  baseline_by_template: false
+  length_normalization: false
+  routing_replay: true
+osworld:
+  credentials_file: ${oc.env:OSWORLD_CREDENTIAL_FILE,null}
+  train_data: ${oc.env:OSWORLD_ROOT}/data/scalecua-train/rfc0040-step881/train_no5bc63fb9.hsg.jsonl
+  validation_data: ${oc.env:OSWORLD_ROOT}/data/osworld-eval/validation_nogdrive_361.jsonl
+  train_task_base: ${oc.env:OSWORLD_ROOT}/data/scalecua-train/rfc0040-step881
+  validation_task_base: ${oc.env:OSWORLD_ROOT}/code/Nemo_GYM/responses_api_agents/nemotron_agent
+  setup_cache: ${oc.env:OSWORLD_ROOT}/data/osworld_setup_cache
+  template_capabilities: ${oc.env:OSWORLD_ROOT}/code/RPGA/scripts/osworld/data/template_caps.json
+  task_requirements: ${oc.env:OSWORLD_ROOT}/code/RPGA/scripts/osworld/data/scalecua_task_reqs.json
+  template_weights: {osworld-v2: 1.0}
+  # The original source enables compatibility filtering only when explicitly requested.
+  task_compatible_templates: false
+  evaluation_template: osworld-v2
+  score_mode: verifier # Match the reference verifier reward; retain adjusted diagnostics.
+  concurrency: 128 # Evaluation concurrency; training uses rollout_pool_size.
+  max_steps: 200
+  max_tokens: 8192 # Production submitter training cap; evaluation has its own cap.
+  evaluation_max_tokens: 16384
+  temperature: 1.0
+  top_p: 1.0
+  evaluation_temperature: 0.5
+  evaluation_top_p: 0.9
+  block_size: 8
+  boundary_images: 3
+policy:
+  model_name: ${oc.env:OSWORLD_ROOT}/models/rfc0040_iter881_hf
+  tokenizer:
+    name: ${policy.model_name}
+  precision: bfloat16
+  train_global_batch_size: 128 # The driver passes the actual padded segment count.
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  router_replay:
+    enabled: true
+  automodel_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    sequence_parallel: false
+    defer_fsdp_grad_sync: false
+    automodel_kwargs:
+      force_hf: false
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch
+        experts: torch_mm
+        dispatcher: torch
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 1.0 # CUA sets the global proposal norm before applying FD KL control.
+      weight_decay: 0.0
+  scheduler:
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs: {factor: 1.0, total_iters: 1}
+    - milestones: []
+  generation:
+    worker_extension_cls_fqn: logra.generation.CuaGenerationWorker
+    max_new_tokens: ${osworld.max_tokens}
+    temperature: ${osworld.temperature}
+    top_p: ${osworld.top_p}
+    val_temperature: ${osworld.evaluation_temperature}
+    val_top_p: ${osworld.evaluation_top_p}
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        # Match the original client-side renderer for every role.
+        chat_template_content_format: string
+      enable_prefix_caching: true
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.55
+      enforce_eager: false
+    vllm_kwargs:
+      interleave_mm_strings: false # Explicit placeholders preserve the original order.
+      mm_processor_cache_gb: 0 # Avoid sender/receiver screenshot-cache drift during token-in continuation.
+      max_num_batched_tokens: 32768
+      max_num_seqs: 256
+      gdn_prefill_backend: triton
+      enable_return_routed_experts: true
+      attention_backend: TRITON_ATTN
+      mm_encoder_attn_backend: TORCH_SDPA
+      moe_backend: triton
+      mamba_cache_dtype: float32
+      mamba_ssm_cache_dtype: float32
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  disable_ppo_ratio: true
+  force_on_policy_ratio: false
+  token_level_loss: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.5
+  truncated_importance_sampling_ratio: 2.0
+logger:
+  log_dir: ${oc.env:CUA_OUTPUT_DIR}
+  wandb_enabled: false
+  tensorboard_enabled: true
+checkpointing:
+  checkpoint_dir: ${oc.env:CUA_OUTPUT_DIR}/checkpoints
+  save_period: 100
+  keep_top_k: 0
+  metric_name: null
+  save_optimizer: true
+  ft_keep_latest_k: 3
+cluster:
+  num_nodes: 4
+  gpus_per_node: 4
