@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_rl.algorithms.x_token import token_aligner as ta
-from nemo_rl.algorithms.x_token.token_aligner import (
+from nemo_rl.algorithms.cross_tokenizer import token_aligner as ta
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import (
     AlignmentBatch,
     NativeAlignmentPart,
     NativeAlignmentRegions,

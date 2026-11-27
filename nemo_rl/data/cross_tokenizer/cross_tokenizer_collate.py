@@ -46,7 +46,7 @@ import torch
 from pydantic import BaseModel, PositiveInt
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import TokenAligner
 from nemo_rl.data.cross_tokenizer.native_chat import (
     RenderedChatDocument,
     _render_and_tokenize_chat,

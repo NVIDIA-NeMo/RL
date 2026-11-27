@@ -17,7 +17,7 @@ import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from nemo_rl.algorithms.x_token.token_aligner import canonical_token
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import canonical_token
 
 
 def parse_arguments():

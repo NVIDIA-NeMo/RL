@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the projection-prep CLI helpers under ``tools/x_token``.
+"""Unit tests for the projection-prep CLI helpers under ``tools/cross_tokenizer/x_token``.
 
 Scoped to saver / parser / sort-cut / reapply math. Real HuggingFace
 tokenizer / model loads are stubbed via ``monkeypatch`` — these tests
@@ -32,20 +32,20 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_rl.algorithms.x_token.loss_utils import parse_projection_file
-from tools.x_token import (
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import parse_projection_file
+from tools.cross_tokenizer.x_token import (
     minimal_projection_generator,
     minimal_projection_via_multitoken,
     utils,
 )
-from tools.x_token import (
+from tools.cross_tokenizer.x_token import (
     reapply_exact_map as reapply_mod,
 )
-from tools.x_token import (
+from tools.cross_tokenizer.x_token import (
     sort_and_cut_projection_matrix as sort_cut_mod,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +510,13 @@ class TestReapplyExactMap:
 
 
 class TestBuildProjectionMatrixShDryRun:
-    BUILD_SH = REPO_ROOT / "tools" / "x_token" / "build_projection_matrix.sh"
+    BUILD_SH = (
+        REPO_ROOT
+        / "tools"
+        / "cross_tokenizer"
+        / "x_token"
+        / "build_projection_matrix.sh"
+    )
 
     @pytest.fixture(autouse=True)
     def _require_bash(self):
@@ -538,3 +544,42 @@ class TestBuildProjectionMatrixShDryRun:
             timeout=30,
         )
         assert result.returncode != 0
+
+    def test_runs_every_step_from_the_repo_root(self, tmp_path):
+        """Each step runs ``python -m tools.cross_tokenizer.x_token...`` from the
+        repo root, whatever directory the wrapper is started from."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        calls = tmp_path / "uv_calls.txt"
+        stub = bin_dir / "uv"
+        stub.write_text(f'#!/usr/bin/env bash\necho "$PWD|$*" >> "{calls}"\n')
+        stub.chmod(0o755)
+        result = subprocess.run(
+            [
+                "bash",
+                str(self.BUILD_SH),
+                "--student-model",
+                "org/student",
+                "--teacher-model",
+                "org/teacher",
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--final-output",
+                str(tmp_path / "final.pt"),
+            ],
+            cwd=tmp_path,
+            env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        lines = calls.read_text().splitlines()
+        assert len(lines) == 3
+        for line in lines:
+            cwd, command = line.split("|", 1)
+            assert Path(cwd).resolve() == REPO_ROOT
+            assert command.startswith("run python -m tools.cross_tokenizer.x_token.")
+            # `python -m` resolves the module from the cwd, so it must exist there.
+            module = command.removeprefix("run python -m ").split()[0]
+            assert (REPO_ROOT / f"{module.replace('.', '/')}.py").is_file(), module

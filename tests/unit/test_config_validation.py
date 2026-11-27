@@ -25,6 +25,9 @@ import yaml
 from omegaconf import DictConfig, OmegaConf
 from pydantic import TypeAdapter, ValidationError
 
+from nemo_rl.algorithms.cross_tokenizer_distillation import (
+    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
+)
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
@@ -44,9 +47,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.xtoken_off_policy_distillation import (
-    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
 )
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.models.megatron.zero_train_gen_mismatch import (

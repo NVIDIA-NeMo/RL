@@ -117,6 +117,7 @@ redirects = {
     "guides/eval": "../about/evaluation.html",
     "guides/dtensor-tp-accuracy": "automodel-tp-accuracy.html",
     "design-docs/fsdp2-parallel-plan": "automodel-parallel-plan.html",
+    "guides/xtoken-off-policy-distillation": "cross-tokenizer-distillation.html",
 }
 
 

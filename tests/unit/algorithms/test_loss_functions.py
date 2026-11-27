@@ -19,6 +19,12 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
+    build_exact_token_map,
+    chunk_average_log_probs,
+    localize_alignment,
+    valid_chunk_mask,
+)
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -31,15 +37,11 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
 )
 from nemo_rl.algorithms.loss.clipped_pg import clipped_pg_diagnostic_metrics
-from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.utils import calculate_kl
-from nemo_rl.algorithms.x_token.loss_utils import (
-    build_exact_token_map,
-    chunk_average_log_probs,
-    localize_alignment,
-    valid_chunk_mask,
+from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
+    CrossTokenizerDistillationLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
+from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     cp_shift_next,
@@ -3085,7 +3087,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
         return value
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.loss_functions.group_all_reduce_sum_with_grad",
+        "nemo_rl.algorithms.loss.cross_tokenizer.x_token.group_all_reduce_sum_with_grad",
         reduce_sum,
     )
 

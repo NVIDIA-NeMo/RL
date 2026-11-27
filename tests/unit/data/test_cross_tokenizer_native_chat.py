@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import TokenAligner
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,

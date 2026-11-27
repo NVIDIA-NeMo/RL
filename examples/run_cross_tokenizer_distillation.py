@@ -21,12 +21,12 @@ import pprint
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+from nemo_rl.algorithms.cross_tokenizer_distillation import (
     MasterConfig,
     setup,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import (

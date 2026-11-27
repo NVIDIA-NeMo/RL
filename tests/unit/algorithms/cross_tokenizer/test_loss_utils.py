@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``nemo_rl/algorithms/x_token/loss_utils.py``.
+"""Unit tests for ``nemo_rl/algorithms/cross_tokenizer/loss_utils.py``.
 
 Most tests here are CPU-only. ``Fp32SparseMM`` is GPU-pinned via
 ``custom_fwd(device_type="cuda")`` and is intentionally not covered. The TP/CP
@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from nemo_rl.algorithms.x_token.loss_utils import (
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
     _EXACT_TOKEN_MAP_CACHE,
     _SPARSE_PROJECTION_CACHE,
     _TOPK_PROJECTION_CACHE,
@@ -99,7 +99,7 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         patch("torch.distributed.get_world_size", return_value=2),
         patch("torch.distributed.get_rank", return_value=1),
         patch(
-            "nemo_rl.algorithms.x_token.loss_utils."
+            "nemo_rl.algorithms.cross_tokenizer.loss_utils."
             "rebuild_teacher_full_logits_from_ipc",
             return_value=teacher_logits,
         ) as rebuild_teacher,
@@ -738,7 +738,7 @@ class XtokenShardTestActor:
         self.cp_size = cp_size
 
     def run_tp(self):
-        from nemo_rl.algorithms.x_token.loss_utils import (
+        from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
             project_student_to_teacher_vocab,
             slice_sparse_projection_cols,
         )
@@ -813,7 +813,7 @@ class XtokenShardTestActor:
                 torch.distributed.destroy_process_group()
 
     def run_cp(self):
-        from nemo_rl.algorithms.x_token.loss_utils import (
+        from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
             chunk_average_log_probs,
             select_teacher_topk_indices,
         )

@@ -20,7 +20,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
-from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import TokenAligner
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,

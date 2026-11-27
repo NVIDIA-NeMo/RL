@@ -34,7 +34,10 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import (
+    AlignmentBatch,
+    TokenAligner,
+)
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
@@ -272,7 +275,7 @@ def _full_context_tokenize_batch(
     )
 
 
-# Expected keys consumed by xtoken_off_policy_distillation.py's per-teacher
+# Expected keys consumed by cross_tokenizer_distillation.py's per-teacher
 # train_data packer — drift detector. Adding/removing keys here in lockstep
 # with the trainer catches silent breakage. Teacher-indexed (single cross-
 # tokenizer teacher at index 0).

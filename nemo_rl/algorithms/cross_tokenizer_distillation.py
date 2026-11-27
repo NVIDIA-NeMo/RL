@@ -43,17 +43,17 @@ from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.loss_functions import (
-    CrossTokenizerDistillationLossConfig,
-    CrossTokenizerDistillationLossFn,
-)
-from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.algorithms.x_token import TokenAligner
-from nemo_rl.algorithms.x_token.utils import (
+from nemo_rl.algorithms.cross_tokenizer import TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.utils import (
     assert_teacher_student_batch_grid,
     assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
+from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
+    CrossTokenizerDistillationLossConfig,
+    CrossTokenizerDistillationLossFn,
+)
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,

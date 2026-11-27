@@ -13,8 +13,9 @@
 # limitations under the License.
 """Shared utilities for cross-tokenizer distillation.
 
-Used by both :mod:`token_aligner` and
-:mod:`nemo_rl.algorithms.loss.loss_functions`:
+Used by the cross-tokenizer losses in
+:mod:`nemo_rl.algorithms.loss.cross_tokenizer` and by
+:mod:`nemo_rl.algorithms.loss.loss_input`:
 
 - :class:`Fp32SparseMM` — FP32 sparse-dense matmul that ignores BF16
   autocast (no BF16 sparse-mm kernel exists).

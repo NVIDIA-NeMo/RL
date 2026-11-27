@@ -24,7 +24,7 @@ PROJ_DIR=$EXP_DIR/projection
 mkdir -p $PROJ_DIR
 PROJ_PATH=$PROJ_DIR/xtoken_nightly_special.pt
 if [[ ! -f $PROJ_PATH ]]; then
-  uv run python -m tools.x_token.minimal_projection_via_multitoken \
+  uv run python -m tools.cross_tokenizer.x_token.minimal_projection_via_multitoken \
       --student-model $STUDENT_MODEL \
       --teacher-model $TEACHER_MODEL \
       --top-k 4 \
@@ -38,7 +38,7 @@ fi
 
 # Run the experiment. Parallelism (student TP4xCP2 <- teacher TP2xCP2), models,
 # loss mode (P-KL), and batch/seq sizes live in the recipe YAML.
-uv run examples/run_xtoken_off_policy_distillation.py \
+uv run examples/run_cross_tokenizer_distillation.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
     teachers.0.aligner.projection_matrix_path=$PROJ_PATH \

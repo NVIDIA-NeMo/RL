@@ -23,12 +23,14 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.x_token.loss_utils import (
+from nemo_rl.algorithms.cross_tokenizer.loss_utils import (
     LocalizedAlignment,
     same_tokenizer_topk_kl,
 )
-from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.algorithms.cross_tokenizer.token_aligner import TokenAligner
+from nemo_rl.algorithms.loss.cross_tokenizer.x_token import (
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
