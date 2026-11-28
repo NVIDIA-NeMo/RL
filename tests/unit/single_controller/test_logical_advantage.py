@@ -132,6 +132,12 @@ def test_forest_selection_config(policy):
         TokenCaptureConfig(forest_training=True, selection_policy="guess")
 
 
+def test_forest_penalty_scope_requires_forest_training():
+    assert TokenCaptureConfig(forest_training=True, forest_penalty_scope="all_segments")
+    with pytest.raises(ValueError, match="forest_penalty_scope.*forest_training"):
+        TokenCaptureConfig(forest_penalty_scope="all_segments")
+
+
 def _controller(
     meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
 ):

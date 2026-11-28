@@ -1531,6 +1531,7 @@ class AsyncNemoGymRolloutImpl:
                         result["full_result"],
                         inputs_by_rowidx[rowidx],
                         self._effort_config,
+                        text_checks=result["scored_text_checks"],
                     )
                     if self._length_penalty_config is not None:
                         result["reward_checks"] = replace(

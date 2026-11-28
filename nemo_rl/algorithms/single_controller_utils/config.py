@@ -779,6 +779,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Which Forest segments the token-level reward penalties (unwanted tokens,
+    # malformed think tags) check.
+    # scored_segment: only the segment holding the scored call (default).
+    # all_segments: every segment; a hit in any of them zeroes the owner's reward.
+    # Text penalties run once per rollout, on the scored response.
+    forest_penalty_scope: Literal["scored_segment", "all_segments"] = "scored_segment"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -786,6 +792,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
+            )
+        if self.forest_penalty_scope != "scored_segment" and not self.forest_training:
+            raise ValueError(
+                "token_capture.forest_penalty_scope requires forest_training=true"
             )
         return self
 
@@ -2373,10 +2383,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
-        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
-            raise ValueError(
-                "Forest does not support reward penalties or on-policy distillation"
-            )
+        if opd_module.is_opd_enabled(master_config):
+            raise ValueError("Forest does not support on-policy distillation")
         # Validate the fixed-batch policy and critic shapes before
         # workers/generation start. Setup recomputes Q from the actual DP meshes.
         forest_execution_row_multiple(

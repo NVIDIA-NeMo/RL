@@ -136,6 +136,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
+from nemo_rl.experience.reward_penalties import scored_text_checks
 from nemo_rl.models.generation.dynamo.config import (
     dynamo_enabled,
 )
@@ -2210,6 +2211,7 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+            "scored_text_checks": scored_text_checks(nemo_gym_result),
         }
 
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
@@ -2354,6 +2356,8 @@ Depending on your data shape, you may want to change these values."""
             "receipt": receipt,
             "logical_selection": selection,
             "truncated": truncated,
+            # full_result drops the response; its text checks are taken here.
+            "scored_text_checks": scored_text_checks(result),
         }
 
     @staticmethod
