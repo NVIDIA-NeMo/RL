@@ -133,8 +133,12 @@ def has_malformed_think_tag(
     mean thinking off (no tags generated), one trailing open tag means thinking
     on (exactly one close tag generated); any other prompt is a violation. Tags
     spelled with ordinary tokens bypass the ID check, so the decoded generation
-    must also hold no open tag and at most one close tag.
+    must also hold no open tag and at most the expected number of close tags:
+    the count the ID check expects (0 or 1) when the IDs are known, else at
+    most one. A spelled-out close tag in a thinking-off turn is therefore a
+    violation, where the old ``> 1`` rule let it pass.
     """
+    expected_close = None
     if think_tag_ids is not None:
         think_open, think_close = think_tag_ids
         prompt_open, prompt_close = carry.count(think_open), carry.count(think_close)
@@ -146,8 +150,10 @@ def has_malformed_think_tag(
             return True
         if (generation.count(think_open), generation.count(think_close)) != expected:
             return True
+        expected_close = expected[1]
     text = decode(generation)
-    return text.count(thinking_tags[0]) > 0 or text.count(thinking_tags[1]) > 1
+    max_close = 1 if expected_close is None else expected_close
+    return text.count(thinking_tags[0]) > 0 or text.count(thinking_tags[1]) > max_close
 
 
 @dataclass(frozen=True)

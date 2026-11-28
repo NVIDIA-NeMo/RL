@@ -92,6 +92,7 @@ from nemo_rl.experience.reward_penalties import (
     effort_shaping_enabled,
     has_duplicated_reasoning,
     has_empty_final_answer,
+    has_malformed_think_tag,
     has_unwanted_tokens,
     is_low_effort,
     shape_effort_reward,
@@ -2237,24 +2238,15 @@ def apply_reward_penalties(
          token sequence is checked rather than excluding the trailing position.
          Data: message_log[i]["token_ids"] where role == "assistant".
 
-      4. penalize_malformed_think_tag (message flag + token/string fallback)
-         Three complementary checks to catch malformed think tags:
+      4. penalize_malformed_think_tag (message flag + shared per-turn check)
+         Two complementary checks to catch malformed think tags:
          a) Existing Gym flag: honors assistant message has_malformed_thinking.
-         b) Token ID check: when think tag IDs are resolved from config override
-            or single-token tokenizer encodings, infers thinking mode from
-            prompt token counts. If prompt has open==close:
-            enable_thinking=False, expect 0 open
-            and 0 close in generation. If prompt has open==close+1:
-            enable_thinking=True, expect 0 open and 1 close in generation.
-            Any other prompt pattern or mismatched generation counts is a violation.
-            This fallback is skipped when the tags do not resolve to one token
-            each.
-         c) String check: the model can spell out thinking tags with piecemeal
-            regular tokens (e.g. "<", "/", "thi", "nk", ">") that bypass special
-            token IDs. Checks generation_str (decoded generation text) per output
-            item: open-tag count must be 0 (always in prompt, never generated),
-            close-tag count must be 0 or 1.
-         Data: message_log pairs for token IDs, full_result output items for strings.
+         b) Per-turn shared check: calls ``has_malformed_think_tag`` (the same
+            predicate the capture path runs) for each (user, assistant) turn.
+            It infers thinking mode from prompt token counts and checks the
+            turn's decoded generation text; see that function for the rules.
+         Data: message_log pairs for token IDs, generation_str per output item
+         for decoded text (one output item per Gym turn, in turn order).
     """
     counts = {
         "duplicated_reasoning": 0,
@@ -2327,7 +2319,7 @@ def apply_reward_penalties(
 
                 counts["unwanted_token"] += 1
 
-    # --- Penalty 4: Malformed think tags (existing flag + optional token ID + string) ---
+    # --- Penalty 4: Malformed think tags (existing flag + shared per-turn check) ---
     if _get_reward_penalty_config_value(
         reward_penalty_config, "penalize_malformed_think_tag"
     ):
@@ -2343,6 +2335,15 @@ def apply_reward_penalties(
                 "set or both omitted; omitted IDs are inferred from single-token "
                 "thinking_tags, otherwise only the decoded-text check runs"
             )
+        think_tag_ids = (
+            (think_open_token_id, think_close_token_id)
+            if think_open_token_id is not None and think_close_token_id is not None
+            else None
+        )
+        thinking_tags = (
+            _get_reward_penalty_config_value(reward_penalty_config, "thinking_tags")
+            or DEFAULT_THINKING_TAGS
+        )
         for result in results:
             has_violation = any(
                 msg.get("role") == "assistant"
@@ -2350,61 +2351,56 @@ def apply_reward_penalties(
                 for msg in result["message_log"]
             )
 
-            # 4a) Token ID check per (user, assistant) turn pair.
-            # Infer thinking mode from prompt token counts:
-            #   enable_thinking=True:  prompt has open=close+1 (trailing <think>), expect asst: 0 open, 1 close
-            #   enable_thinking=False: prompt has open=close (balanced), expect asst: 0 open, 0 close
-            msgs = result["message_log"]
-            if (
-                not has_violation
-                and think_open_token_id is not None
-                and think_close_token_id is not None
-            ):
-                for i in range(len(msgs) - 1):
-                    if msgs[i]["role"] != "user" or msgs[i + 1]["role"] != "assistant":
-                        continue
-                    user_ids = msgs[i]["token_ids"]
-                    asst_ids = msgs[i + 1]["token_ids"]
-                    prompt_open = (user_ids == think_open_token_id).sum().item()
-                    prompt_close = (user_ids == think_close_token_id).sum().item()
-                    asst_open = (asst_ids == think_open_token_id).sum().item()
-                    asst_close = (asst_ids == think_close_token_id).sum().item()
-                    if prompt_open == prompt_close:
-                        # enable_thinking=False: both tags in prompt, none in generation
-                        expected_open, expected_close = 0, 0
-                    elif prompt_open == prompt_close + 1:
-                        # enable_thinking=True: trailing <think> in prompt, expect </think> in generation
-                        expected_open, expected_close = 0, 1
-                    else:
-                        # Unexpected prompt pattern - flag as violation
-                        has_violation = True
-                        break
-                    if asst_open != expected_open or asst_close != expected_close:
-                        has_violation = True
-                        break
-
-            # 4b) String check on generation_str per output item.
+            # Shared per-turn check, same predicate the capture path runs.
+            # The decoded text for a turn is its generation_str (Gym decodes
+            # one output item per turn, in turn order); the predicate decodes
+            # nothing itself here, it only reads that text.
             if not has_violation:
-                thinking_tags = (
-                    _get_reward_penalty_config_value(
-                        reward_penalty_config, "thinking_tags"
-                    )
-                    or DEFAULT_THINKING_TAGS
-                )
-                think_open_text, think_close_text = thinking_tags[:2]
+                msgs = result["message_log"]
                 output_items = (
                     result["full_result"].get("response", {}).get("output", [])
                 )
-                for item in output_items:
-                    gen_str = item.get("generation_str", "")
-                    if not gen_str:
+                turn_index = 0
+                for i in range(len(msgs) - 1):
+                    if msgs[i]["role"] != "user" or msgs[i + 1]["role"] != "assistant":
                         continue
-                    if (
-                        gen_str.count(think_open_text) > 0
-                        or gen_str.count(think_close_text) > 1
+                    generation_str = (
+                        output_items[turn_index].get("generation_str", "")
+                        if turn_index < len(output_items)
+                        else ""
+                    )
+                    # The shared predicate counts plain sequences; message
+                    # token IDs arrive as tensors on the Gym path.
+                    user_ids = msgs[i]["token_ids"]
+                    asst_ids = msgs[i + 1]["token_ids"]
+                    if hasattr(user_ids, "tolist"):
+                        user_ids = user_ids.tolist()
+                    if hasattr(asst_ids, "tolist"):
+                        asst_ids = asst_ids.tolist()
+                    if has_malformed_think_tag(
+                        user_ids,
+                        asst_ids,
+                        think_tag_ids=think_tag_ids,
+                        thinking_tags=thinking_tags,
+                        decode=lambda _ids, text=generation_str: text,
                     ):
                         has_violation = True
                         break
+                    turn_index += 1
+                # Any output items beyond the message turns (not a Gym layout)
+                # still get the decoded-text check with unknown IDs.
+                if not has_violation:
+                    for item in output_items[turn_index:]:
+                        gen_str = item.get("generation_str", "")
+                        if gen_str and has_malformed_think_tag(
+                            [],
+                            [],
+                            think_tag_ids=None,
+                            thinking_tags=thinking_tags,
+                            decode=lambda _ids, text=gen_str: text,
+                        ):
+                            has_violation = True
+                            break
             if has_violation:
                 result["full_result"]["reward"] = 0.0
 
