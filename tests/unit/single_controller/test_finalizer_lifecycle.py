@@ -756,19 +756,25 @@ def test_zero_variance_group_borrows_a_finished_group_and_repays_the_lender() ->
     assert reserve_cut is discard_cut
 
 
-def test_zero_variance_group_closes_its_step_short_when_no_spare_is_left() -> None:
+@pytest.mark.parametrize("lender_step", [None, 5])
+def test_zero_variance_group_closes_a_step_short_when_no_spare_is_left(
+    lender_step: int | None,
+) -> None:
+    """Past EOF the borrow needs no spare: a lender, if any, closes short instead."""
     ctrl = _controller(
         SimpleNamespace(finalize=_RemoteFinalize(result=_signal_result([1.0, 1.0])))
     )
-    _dynamic_sampling(ctrl, spares=[], exhausted=True)
+    _dynamic_sampling(ctrl, spares=[], exhausted=True, lender_step=lender_step)
 
     outcome = _finalize_for_step_3(ctrl)
 
+    short_step = 3 if lender_step is None else lender_step
     assert isinstance(outcome, ZeroVarianceGroup)
     assert outcome.replacement is None
-    assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
-    assert 3 in ctrl._rollout_runtime.steps_allowed_short
-    ctrl._buffer.promote_ready_group.assert_not_called()
+    assert outcome.target_step == short_step
+    assert ctrl._rollout_runtime.batch_shortfall == {short_step: 1}
+    assert short_step in ctrl._rollout_runtime.steps_allowed_short
+    ctrl._buffer.promote_ready_group.assert_called_once_with(to_target_step=3)
     ctrl._buffer.commit_finalized.assert_not_awaited()
 
 
