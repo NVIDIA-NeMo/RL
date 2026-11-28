@@ -72,9 +72,8 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Configs outside examples/configs receive only the
-# outdated-config and local-path checks; their manifests and templates
-# may lack the training schema or contain unset environment interpolations.
+# Every shipped config tree. Training configs and MM-coding recipes get full
+# schema checks. Other manifests and templates get local-path and outdated checks.
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -369,6 +368,11 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
     with subtests.test(check="local_paths"):
         _check_no_local_paths(config_file)
 
+    coding_recipe = Path(
+        config_file
+    ).parent == repo_root / "examples/nemo_gym/mm_coding" and Path(
+        config_file
+    ).name.startswith("mm_coding_")
     # Load the config
     config = load_config_with_inheritance(config_file)
 
@@ -376,8 +380,8 @@ def test_shipped_config(config_file: str, subtests: pytest.Subtests) -> None:
     with subtests.test(check="outdated_config"):
         _check_outdated_config(config_file, deepcopy(config))
 
-    # Check each applicable check separately if the config is in examples/configs.
-    if config_file in config_files:
+    # Training configs and MM-coding overlays share the full schema checks.
+    if config_file in config_files or coding_recipe:
         with subtests.test(check="required_keys"):
             _check_required_keys(config_file, deepcopy(config))
         with subtests.test(check="tp_size_accuracy"):

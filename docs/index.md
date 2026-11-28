@@ -335,6 +335,7 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
+guides/mm-coding.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md

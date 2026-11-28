@@ -1,0 +1,78 @@
+# Compose onto the operator's validated model/runtime/parallelism configuration.
+defaults:
+- ../../configs/grpo_math_1B_megatron_single_controller.yaml
+- ${oc.env:MM_CODING_BASE_CONFIG}
+grpo:
+  async_grpo: null
+  # Captured rows carry their own media; SingleController rejects deduplication.
+  deduplicate_multimodal_data: false
+  val_at_start: false
+  val_period: 0
+checkpointing:
+  checkpoint_dir: results/grpo-mm-coding-single
+  metric_name: null
+  save_data_plane: true
+token_capture:
+  enabled: true
+policy:
+  is_vlm: true
+  max_total_sequence_length: 65536
+  megatron_cfg:
+    enabled: true
+  automodel_cfg:
+    enabled: false
+  generation:
+    backend: vllm
+    max_new_tokens: ${oc.decode:${oc.env:MM_CODING_MAX_NEW_TOKENS,32768}}
+    vllm_cfg:
+      max_model_len: ${policy.max_total_sequence_length}
+      cap_max_tokens_to_context: true
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 2
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    _override_: true
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:MM_CODING_TRAIN_DATA}
+  validation:
+    _override_: true
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:MM_CODING_VALIDATION_DATA}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: false
+    is_trajectory_collection: false
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mm_coding_training/configs/mm_coding_training.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+logger:
+  log_dir: logs/grpo-mm-coding-single
+  wandb_enabled: false
+  wandb:
+    project: visual-coding
+    name: mm-coding-single-acceptance
