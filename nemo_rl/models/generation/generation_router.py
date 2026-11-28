@@ -50,6 +50,9 @@ import threading
 from typing import Any, Optional
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
 
 # Hop-by-hop headers are per-connection and must not be forwarded; passing Host through
 # would also make the backend see the router's address.
@@ -60,6 +63,8 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 # Body chunk size for the streaming pass-through. Large enough that a long completion
 # does not cost thousands of iterations, small enough not to buffer a whole response.
 _STREAM_CHUNK_BYTES = 64 * 1024
+# vLLM reads a request's priority from this header before the body's ``priority`` field.
+_PRIORITY_HEADER = "X-Vllm-Priority"
 
 
 class GenerationRouterImpl:
@@ -71,10 +76,11 @@ class GenerationRouterImpl:
         backend_urls: list[str],
         host: str,
         port: int,
-        backend_timeout_s: float,
+        backend_timeout_s: Optional[float],
         connect_timeout_s: float,
         no_healthy_backend_status: int,
         health_managed: bool = False,
+        request_priority: Optional[int] = None,
     ) -> None:
         if not backend_urls:
             raise ValueError("GenerationRouter requires at least one backend URL")
@@ -101,6 +107,10 @@ class GenerationRouterImpl:
         # membership push puts it back. With no monitor nothing ever pushes, so the drop
         # would be permanent and a few transient blips would drain the fleet to nothing.
         self._health_managed = health_managed
+        # vLLM priority sent as a header on every request, so on an engine that also
+        # serves other clients these run first. None adds no header; any other value
+        # needs the engines started with scheduling_policy="priority".
+        self._request_priority = request_priority
         self._requests_total = 0
         self._no_backend_total = 0
         self._backend_error_total = 0
@@ -297,6 +307,11 @@ class GenerationRouterImpl:
             if key.lower() not in _SKIPPED_REQUEST_HEADERS
         }
 
+        if self._request_priority is not None:
+            # A header, not the body field: the body keeps streaming through, so a
+            # large (multimodal) request is not capped by aiohttp's client_max_size.
+            headers[_PRIORITY_HEADER] = str(self._request_priority)
+
         async with session.request(
             method=request.method,
             url=self._target_url(backend, request.rel_url.path_qs),
@@ -432,3 +447,49 @@ class GenerationRouterActor(GenerationRouterImpl):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.serve_in_background()
+
+
+def start_generation_router(
+    backend_urls: list[str],
+    *,
+    port_range_low: int,
+    port_range_high: int,
+    backend_timeout_s: Optional[float],
+    connect_timeout_s: float,
+    no_healthy_backend_status: int,
+    health_managed: bool,
+    request_priority: Optional[int] = None,
+) -> ray.actor.ActorHandle:
+    """Start a router on the driver node and wait until it is listening.
+
+    The port is reserved once and passed in, so Ray recreating a restarted actor
+    rebinds the same address: NeMo-Gym holds the URL for the life of the run and
+    never re-resolves it.
+
+    Args:
+        request_priority: vLLM priority to send as a header on every request, or
+            None to add no header.
+
+    Returns:
+        The router actor handle.
+    """
+    router = GenerationRouterActor.options(  # type: ignore[attr-defined]
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=False
+        )
+    ).remote(
+        backend_urls=backend_urls,
+        host=_get_node_ip_local(),
+        port=_get_free_port_local(port_range_low, port_range_high),
+        backend_timeout_s=backend_timeout_s,
+        connect_timeout_s=connect_timeout_s,
+        no_healthy_backend_status=no_healthy_backend_status,
+        health_managed=health_managed,
+        request_priority=request_priority,
+    )
+    # Resolve the URL now so the driver fails here rather than inside Gym if the actor
+    # could not start. The router binds its socket inside __init__, so a port conflict
+    # fails actor construction and surfaces here with the port in the traceback.
+    base_url = ray.get(router.base_url.remote())
+    print(f"📡 Policy router fronting {len(backend_urls)} backend(s) at {base_url}")
+    return router

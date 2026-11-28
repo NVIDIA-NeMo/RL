@@ -50,6 +50,7 @@ class _Backend:
         self.status = status
         self.body = body
         self.requests: list[tuple[str, str, bytes]] = []
+        self.priorities: list[str | None] = []
         self._runner: web.AppRunner | None = None
         self.port = _free_port()
 
@@ -58,9 +59,12 @@ class _Backend:
         return f"http://127.0.0.1:{self.port}/v1"
 
     async def start(self) -> None:
-        app = web.Application()
+        # No body cap, like vLLM's own server: aiohttp's 1 MiB default would hide
+        # whether the router forwarded a large request.
+        app = web.Application(client_max_size=0)
 
         async def _handle(request: web.Request) -> web.Response:
+            self.priorities.append(request.headers.get("X-Vllm-Priority"))
             self.requests.append((request.method, request.path, await request.read()))
             return web.Response(
                 status=self.status,
@@ -154,6 +158,43 @@ class TestEndpointSurface:
             async with _Harness([backend]) as harness:
                 payload = b'{"model":"x","messages":[{"role":"user"}]}'
                 await harness.call("/v1/chat/completions", body=payload)
+                assert backend.requests[0][2] == payload
+
+        asyncio.run(_main())
+
+    def test_request_priority_is_sent_as_a_header(self):
+        """vLLM reads the header before the body field, so the body is not rewritten."""
+        backend = _Backend("b0")
+
+        async def _main():
+            async with _Harness([backend], request_priority=-1) as harness:
+                payload = b'{"model":"x","priority":5}'
+                await harness.call("/v1/chat/completions", body=payload)
+                assert backend.priorities == ["-1"]
+                assert backend.requests[0][2] == payload
+
+        asyncio.run(_main())
+
+    def test_no_priority_header_without_a_request_priority(self):
+        backend = _Backend("b0")
+
+        async def _main():
+            async with _Harness([backend]) as harness:
+                await harness.call("/v1/chat/completions")
+                assert backend.priorities == [None]
+
+        asyncio.run(_main())
+
+    def test_a_request_over_1mib_is_forwarded_with_a_priority(self):
+        """Multimodal bodies carry base64 images; aiohttp caps a buffered read at 1 MiB."""
+        backend = _Backend("b0")
+        payload = b"x" * (2 * 1024 * 1024)
+
+        async def _main():
+            async with _Harness([backend], request_priority=-1) as harness:
+                status, _, _ = await harness.call("/v1/chat/completions", body=payload)
+                assert status == 200
+                assert backend.priorities == ["-1"]
                 assert backend.requests[0][2] == payload
 
         asyncio.run(_main())

@@ -263,6 +263,7 @@ The validation set you pass in will directly be used for validation with no addi
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
+            validation_engine_pool,
         ) = setup(
             config,
             tokenizer,
@@ -284,7 +285,11 @@ The validation set you pass in will directly be used for validation with no addi
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
     # NeMo-Gym is the only environment used by this runner.
     task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = task_to_env
+    val_task_to_env = (
+        {"nemo_gym": validation_engine_pool.nemo_gym}
+        if validation_engine_pool is not None
+        else task_to_env
+    )
 
     trainer_owns_environment_shutdown = False
     try:
@@ -342,6 +347,7 @@ The validation set you pass in will directly be used for validation with no addi
                 teacher_worker_groups=teacher_worker_groups,
                 alias_to_group_alias=alias_to_group_alias,
                 processor=processor,
+                validation_engine_pool=validation_engine_pool,
             )
         else:
             print("🚀 Running synchronous GRPO training")
@@ -366,6 +372,8 @@ The validation set you pass in will directly be used for validation with no addi
     finally:
         if not trainer_owns_environment_shutdown:
             shutdown_environments(task_to_env, val_task_to_env)
+        if validation_engine_pool is not None:
+            validation_engine_pool.shutdown()
         try:
             policy_generation.shutdown()
         except Exception as error:
