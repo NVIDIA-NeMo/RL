@@ -603,10 +603,7 @@ class VllmAsyncGenerationWorkerImpl(
             # the stat logger feeds its per-engine load signal.
             llm_kwargs.setdefault(
                 "kv_events_config",
-                dynamo_kv_events_config(
-                    dynamo_cfg(self.cfg),
-                    prefix_caching=llm_kwargs["enable_prefix_caching"],
-                ),
+                dynamo_kv_events_config(dynamo_cfg(self.cfg), llm_kwargs),
             )
             self.stat_loggers.append(SnapshotStatLogger)
 

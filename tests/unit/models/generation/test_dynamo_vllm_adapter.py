@@ -134,7 +134,12 @@ class _FakeLLM:
         self.vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
             kv_events_config=None,
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
         )
+        self.kv_event_sources = {}
+
+    def get_kv_event_sources(self):
+        return dict(self.kv_event_sources)
 
     def check_admission(self, n, request_id):
         if self.admission_error is not None:
@@ -372,8 +377,22 @@ def test_an_endpoint_that_stops_serving_reports_why() -> None:
     ]
 
 
-def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
+@pytest.mark.parametrize(
+    ("rank", "bound", "subscribed"),
+    [
+        (0, "ipc://@nemo-rl-kv-events-0123", "ipc://@nemo-rl-kv-events-0123"),
+        # A user's own kv_events_config can keep vLLM's wildcard default.
+        (0, "tcp://*:5557", "tcp://127.0.0.1:5557"),
+        # One rank of a data-parallel group, on the port vLLM bound for it.
+        (2, "tcp://10.0.0.7:41000", "tcp://10.0.0.7:41000"),
+    ],
+)
+def test_engines_register_the_block_size_and_rank_of_their_kv_events(
+    rank, bound, subscribed
+) -> None:
     llm = _FakeLLM()
+    llm.vllm_config.parallel_config.data_parallel_rank = rank
+    llm.kv_event_sources = {rank: SimpleNamespace(endpoint=bound)}
     llm.vllm_config.cache_config = SimpleNamespace(block_size=16, num_gpu_blocks=64)
     llm.vllm_config.scheduler_config = SimpleNamespace(
         max_num_seqs=8, max_num_batched_tokens=256
@@ -394,12 +413,21 @@ def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
 
     config = asyncio.run(engine.start(worker_id=0))
     registration = config.llm
+    (source,) = asyncio.run(engine.kv_event_sources())
 
     # The KV router hashes events in blocks of the main-attention group; a
     # wrong size would quietly turn KV routing into load-only routing.
     assert registration.kv_cache_block_size == 528
     assert registration.total_kv_blocks == 64
     assert registration.context_length == MAX_MODEL_LEN
+    # vLLM stamps the engine's rank on its KV events and load, and Dynamo drops
+    # what arrives under a rank the worker did not register or declare.
+    assert (
+        registration.data_parallel_start_rank,
+        registration.data_parallel_size,
+    ) == (rank, 1)
+    assert (source.endpoint, source.dp_rank) == (subscribed, rank)
+    assert engine.component_metrics_dp_ranks() == [rank]
     # The frontend's chat engine renders with what the engine publishes.
     assert config.runtime_data == vllm_adapter.chat_runtime_data(host)
 
@@ -717,8 +745,9 @@ def test_engines_publish_kv_events_only_where_the_kv_router_can_use_them(
     router_mode, prefix_caching, publishes
 ) -> None:
     cfg = DynamoCfg(frontend_args=DynamoFrontendArgs(router_mode=router_mode))
+    llm_kwargs = {"enable_prefix_caching": prefix_caching}
 
-    config = vllm_adapter.dynamo_kv_events_config(cfg, prefix_caching=prefix_caching)
+    config = vllm_adapter.dynamo_kv_events_config(cfg, llm_kwargs)
 
     # vLLM publishes block events only for blocks its prefix cache stores.
     assert (config is not None) is publishes
@@ -727,8 +756,33 @@ def test_engines_publish_kv_events_only_where_the_kv_router_can_use_them(
         # A per-engine abstract socket, which vLLM's publisher binds and Dynamo's
         # source connects to: no port for two engines on a node to collide on.
         assert config["endpoint"].startswith("ipc://@")
-        other = vllm_adapter.dynamo_kv_events_config(cfg, prefix_caching=True)
+        other = vllm_adapter.dynamo_kv_events_config(cfg, llm_kwargs)
         assert other["endpoint"] != config["endpoint"]
+
+
+def test_vllm_binds_a_data_parallel_engines_kv_endpoint_above_rank_zero(
+    monkeypatch,
+) -> None:
+    from vllm.distributed.kv_events import ZmqEventPublisher
+
+    # vLLM binds the node's IP, which it otherwise reads from the default route.
+    monkeypatch.setenv("VLLM_HOST_IP", "127.0.0.1")
+    cfg = DynamoCfg(frontend_args=DynamoFrontendArgs(router_mode="kv"))
+    # The engine arguments of one rank of a vLLM data-parallel group.
+    config = vllm_adapter.dynamo_kv_events_config(
+        cfg, {"enable_prefix_caching": True, "data_parallel_size": 2}
+    )
+
+    # vLLM offsets the endpoint by the rank, and refuses the abstract socket there.
+    publisher = ZmqEventPublisher(data_parallel_rank=3, endpoint=config["endpoint"])
+    try:
+        bound = publisher.get_publisher_config().endpoint
+    finally:
+        publisher.shutdown()
+
+    # A free port of the engine's own, reported as a subscriber can connect to it.
+    host, _, port = bound.removeprefix("tcp://").rpartition(":")
+    assert host == "127.0.0.1" and int(port) > 0
 
 
 def test_main_attention_kinds_match_dynamos() -> None:

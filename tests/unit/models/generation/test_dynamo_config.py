@@ -79,19 +79,6 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
         (_vllm_config(dynamo=True, backend="sglang"), "backend=vllm"),
         # dynamo_cfg alone would be ignored.
         (_vllm_config(dynamo_cfg={}), "dynamo is not true"),
-        # Dynamo does not serve data parallelism inside vLLM yet.
-        (
-            _vllm_config(
-                dynamo=True,
-                vllm_cfg={
-                    "async_engine": False,
-                    "max_model_len": 512,
-                    "tensor_parallel_size": 1,
-                    "expert_parallel_size": 2,
-                },
-            ),
-            "expert_parallel_size <= tensor_parallel_size",
-        ),
         # The frontend serves the same engines and checks no bearer token.
         (
             _vllm_config(
