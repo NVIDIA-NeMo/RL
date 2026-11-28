@@ -94,7 +94,6 @@ loss_fn:
   sequence_level_importance_ratios: false
   # global_token_mean (default) or sequence_mean; group_token_mean needs SC GRPO/Megatron (not PPO).
   normalization: null
-  token_level_loss: null  # Deprecated true/false alias; do not set with normalization.
   force_on_policy_ratio: false
   seq_logprob_error_in_loss: false  # Supported by Megatron GRPO trainers and SingleController PPO (ppo_epochs=1).
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
@@ -149,6 +148,7 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1
     custom_parallel_plan: null
     lora_cfg:
       enabled: False
@@ -394,6 +394,7 @@ value:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    pipeline_parallel_size: 1  # The Automodel value worker rejects PP > 1
     custom_parallel_plan: null
     lora_cfg:
       enabled: false

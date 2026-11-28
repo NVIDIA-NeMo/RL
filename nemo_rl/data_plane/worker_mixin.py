@@ -1025,6 +1025,8 @@ class TQWorkerMixin:
             keep_on_gpu: Write the tensor from its own device instead of
                 copying it to CPU first.
         """
+        if not self._is_replica_leader():
+            return
         if self._dp_client is None:
             return
         from collections.abc import Mapping

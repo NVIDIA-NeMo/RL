@@ -67,7 +67,7 @@ if [[ "${SC_TEST_CONTEXT_COMPACTION:-0}" == "1" ]]; then
         policy.logprob_batch_size=1
         policy.max_total_sequence_length=16384
         grpo.calculate_advantages_on_gpu=false
-        loss_fn.token_level_loss=true
+        loss_fn.normalization=global_token_mean
         loss_fn.sequence_level_importance_ratios=false
         ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
         env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true

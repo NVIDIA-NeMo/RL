@@ -247,8 +247,7 @@ def _topology_attributes(master_config: Any) -> dict[str, Any]:
     this function.
 
     Read from the enabled backend alone, under that backend's own spelling: the
-    two disagree on names as well as values, and Automodel has no pipeline
-    dimension to report at all.
+    two disagree on names as well as values.
 
     No ``nv.dl.topology.size.dp``, though lens defines it. RL configures no
     data-parallel size, so it could only be derived from the cluster's GPU
@@ -268,7 +267,7 @@ def _topology_attributes(master_config: Any) -> dict[str, Any]:
         # Only the current spelling: ``check_outdated_config`` rejects a config
         # still saying ``dtensor_cfg`` before a run reaches here.
         tp = _dig(master_config, "policy", "automodel_cfg", "tensor_parallel_size")
-        pp = None
+        pp = _dig(master_config, "policy", "automodel_cfg", "pipeline_parallel_size")
 
     attrs: dict[str, Any] = {}
     if tp:

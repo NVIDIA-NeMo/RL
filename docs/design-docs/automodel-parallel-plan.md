@@ -66,7 +66,7 @@ policy:
     dp_replicate_size: 2  # number of replicas; 1 disables HSDP
 ```
 
-The data-parallel size is `dp_size = world_size / (tp_size * cp_size * ep_size)`. `dp_replicate_size` must be a positive integer. Use `1` to disable HSDP. For HSDP, it must be greater than `1`, evenly divide `dp_size`, and be smaller than `dp_size`. The shard size is then `dp_size / dp_replicate_size`. A typical choice is `dp_replicate_size = num_nodes`.
+The data-parallel size is `dp_size = world_size / (pp_size * tp_size * cp_size)`. `dp_replicate_size` must be a positive integer. Use `1` to disable HSDP. For HSDP, it must be greater than `1`, evenly divide `dp_size`, and be smaller than `dp_size`. The shard size is then `dp_size / dp_replicate_size`. A typical choice is `dp_replicate_size = num_nodes`.
 
 ### When to use it
 

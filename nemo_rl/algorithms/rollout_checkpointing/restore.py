@@ -393,6 +393,10 @@ class RolloutRestorer(_UsesRolloutParts):
         parsed_state = await read_recovery_sidecar(
             recovery_path, metadata, master_config=self._master_config
         )
+        # Before any group is restored, finished or mid-episode.
+        self._rollout_manager.require_unchanged_multi_harness(
+            parsed_state.multi_harness_routes
+        )
 
         recovery_ledger = self._rollout_manager.recovery_ledger
         async with self._data_plane_checkpoint_barrier.mutation(

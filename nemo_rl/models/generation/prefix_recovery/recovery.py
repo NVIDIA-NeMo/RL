@@ -202,8 +202,8 @@ class PrefixRecovery:
             max_batch_rows=parts.prefix_write_max_rows,
             max_batch_tokens=parts.prefix_write_max_tokens,
             sink=parts.sink,
-            prepare=lambda inventory, deadline: self._cut_writes(
-                inventory, deadline=deadline
+            prepare=lambda inventory, deadline, held_only: self._cut_writes(
+                inventory, deadline=deadline, held_only=held_only
             ),
         )
         LOGGER.info(
@@ -217,6 +217,11 @@ class PrefixRecovery:
     def control_token(self) -> str | None:
         """The bearer token the cut route requires; None refuses every cut."""
         return self._parts.control_token
+
+    @property
+    def control_timeout_s(self) -> float | None:
+        """How long a cut may take from its arrival; None waits indefinitely."""
+        return self._parts.control_timeout_s
 
     # ---- A call's life --------------------------------------------------
 
@@ -367,18 +372,26 @@ class PrefixRecovery:
 
     # ---- A checkpoint cut -----------------------------------------------
 
-    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         """Cut every call Gym's inventory names, off the serving loop.
 
         ``deadline`` is a ``time.monotonic()`` bound from a caller that waits
         on one of its own (the Dynamo frontend). Without it the cut gets
         ``control_timeout_s`` from its arrival here.
+
+        With ``held_only``, for one engine's share of a cut that a coordinator
+        merges, the receipt leaves out calls this process has no record of:
+        another engine holds them, and the merge fails any call no engine cut.
         """
         if deadline is None:
             # Measured from arrival so time queued behind a stale cut counts.
             timeout_s = self._parts.control_timeout_s
             deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        future = self._pipeline.submit(inventory, deadline=deadline)
+        future = self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
+        )
         return await asyncio.shield(asyncio.wrap_future(future))
 
     def _record_progress(
@@ -458,6 +471,21 @@ class PrefixRecovery:
                 logprobs_container=progress.logprobs,
             )
         return route_pieces
+
+    def _held_prefixes(self, inventory: Any) -> list[Any]:
+        """The inventory's calls this process holds live or finished state for."""
+        # The live registry first: a finishing call is remembered as completed
+        # before it leaves the registry, so it is found in one or the other.
+        live = [
+            self._registry.get_by_model_call_id(prefix.model_call_id) is not None
+            for prefix in inventory.active_prefixes
+        ]
+        with self._lock:
+            return [
+                prefix
+                for prefix, held in zip(inventory.active_prefixes, live)
+                if held or prefix.model_call_id in self._completed
+            ]
 
     @staticmethod
     def _failed_ack(prefix: Any, *, reason: str, uncut: Counter[str]) -> Any:
@@ -798,11 +826,17 @@ class PrefixRecovery:
             num_candidates=top_k,
         )
 
-    def checkpoint_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+    def checkpoint_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         """Run one cut through the write pipeline and wait for its receipt."""
-        return self._pipeline.submit(inventory, deadline=deadline).result()
+        return self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
+        ).result()
 
-    def _cut_writes(self, inventory: Any, *, deadline: float | None) -> CutWrites:
+    def _cut_writes(
+        self, inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
         """Prepare transactions, then seal their rows after durable write replies.
 
         ``deadline`` is a ``time.monotonic()`` bound. Gym stops waiting for the
@@ -820,9 +854,12 @@ class PrefixRecovery:
             cached_receipt = self._receipts.get(receipt_key)
         if cached_receipt is not None:
             return cached_receipt
+        prefixes = (
+            self._held_prefixes(inventory) if held_only else inventory.active_prefixes
+        )
         active_states = [
             state
-            for prefix in inventory.active_prefixes
+            for prefix in prefixes
             if (state := self._registry.get_by_model_call_id(prefix.model_call_id))
             is not None
         ]
@@ -830,14 +867,14 @@ class PrefixRecovery:
         # Why each uncut call was left uncut; Gym counts them per checkpoint.
         uncut: Counter[str] = Counter()
         acknowledgements = yield from self._cut_batched(
-            inventory, uncut, route_pieces=route_pieces, deadline=deadline
+            inventory, prefixes, uncut, route_pieces=route_pieces, deadline=deadline
         )
         if uncut:
             LOGGER.info(
                 "generation cut %s left %d of %d model calls uncut: %s",
                 inventory.checkpoint_id,
                 uncut.total(),
-                len(inventory.active_prefixes),
+                len(prefixes),
                 dict(sorted(uncut.items())),
             )
         receipt = GenerationCutReceipt(
@@ -857,12 +894,13 @@ class PrefixRecovery:
     def _cut_batched(
         self,
         inventory: Any,
+        prefixes: Sequence[Any],
         uncut: Counter[str],
         *,
         route_pieces: dict[str, list[Any]],
         deadline: float | None,
     ) -> CutWrites:
-        """Cut every call of the inventory, writing their rows in batches.
+        """Cut ``prefixes``, the inventory's calls, writing their rows in batches.
 
         Each call's cut stays frozen until its batch is written and every
         acknowledgement in the batch is built. A batch holds at most
@@ -1011,10 +1049,10 @@ class PrefixRecovery:
             yield WriteSettled()
 
         try:
-            for index, prefix in enumerate(inventory.active_prefixes):
+            for index, prefix in enumerate(prefixes):
                 if past_deadline():
                     release_pending()
-                    late.extend(inventory.active_prefixes[index:])
+                    late.extend(prefixes[index:])
                     break
                 state = self._registry.get_by_model_call_id(prefix.model_call_id)
                 try:
@@ -1073,7 +1111,7 @@ class PrefixRecovery:
                 "uncut=%d of %d model_call_ids=%s",
                 checkpoint_id,
                 len(late),
-                len(inventory.active_prefixes),
+                len(prefixes),
                 [prefix.model_call_id for prefix in late],
             )
             acknowledgements.extend(
@@ -1081,7 +1119,7 @@ class PrefixRecovery:
                 for prefix in late
             )
         by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
-        return [by_ticket[prefix.ticket_id] for prefix in inventory.active_prefixes]
+        return [by_ticket[prefix.ticket_id] for prefix in prefixes]
 
     def _fetch_rows(self, staging_keys: list[str]) -> list[Any]:
         """Fetch cut rows with their extras, routes and top-k, in the requested order.
@@ -1316,6 +1354,7 @@ class NoPrefixRecovery:
     """
 
     control_token: str | None = None
+    control_timeout_s: float | None = None
 
     async def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
@@ -1368,5 +1407,7 @@ class NoPrefixRecovery:
     def shutdown(self) -> None:
         pass
 
-    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")
