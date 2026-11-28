@@ -48,8 +48,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    sampler_supports_buffer_checkpoint,
-    sampler_supports_training_claims,
+    sampler_capabilities,
     sampler_supports_transactional_admission,
 )
 from nemo_rl.algorithms.grpo import (
@@ -1431,9 +1430,9 @@ def setup_single_controller(
             f"data_plane.backend={dp_config['backend']!r}."
         )
     if master_config.checkpointing.enabled:
-        sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
+        sampler_supports_replay_recovery = sampler_capabilities(
             master_config.async_rl.sampler
-        )
+        ).supports_buffer_checkpoint
         # msc:// checkpoints cannot hold data-plane snapshots, so the replay-capable
         # sampler falls back to the same cursor-only recovery as the others.
         checkpoint_dir_is_msc = is_msc_path(master_config.checkpointing.checkpoint_dir)
@@ -1581,12 +1580,13 @@ def setup_single_controller(
             raise ValueError(
                 "rollout checkpointing currently requires token_capture.enabled=true"
             )
-        if not sampler_supports_buffer_checkpoint(master_config.async_rl.sampler):
+        capabilities = sampler_capabilities(master_config.async_rl.sampler)
+        if not capabilities.supports_buffer_checkpoint:
             raise ValueError(
                 "rollout checkpointing requires a sampler that supports "
                 "replay-buffer recovery"
             )
-        if not sampler_supports_training_claims(master_config.async_rl.sampler):
+        if not capabilities.supports_training_claims:
             raise ValueError(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"

@@ -1181,7 +1181,7 @@ class TestTakeReplacement:
 
         ctrl = self._controller(spares=1)
         ctrl._sampler = _PlainSampler()
-        with pytest.raises(AttributeError, match="uses_pooled_replacements"):
+        with pytest.raises(AttributeError, match="capabilities"):
             ctrl._take_replacement(0)
 
     def test_the_per_slot_budget_stops_substituting(self):
@@ -2048,7 +2048,9 @@ def _claiming_controller(*, spares: int, exhausted: bool = False) -> Any:
     ctrl._dynamic_sampling_enabled = True
     # Claiming a filtered spare only applies to a sampler that pools replacements;
     # a non-pooled sampler (windowed) refills from later dispatches and never waits.
-    ctrl._sampler = SimpleNamespace(uses_pooled_replacements=True)
+    ctrl._sampler = SimpleNamespace(
+        capabilities=SimpleNamespace(uses_pooled_replacements=True)
+    )
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._rollout_runtime.filtered_reserve = deque({"idx": i} for i in range(spares))
     ctrl._filtered_spares_claimed = 0

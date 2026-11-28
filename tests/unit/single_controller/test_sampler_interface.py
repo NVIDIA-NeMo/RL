@@ -23,6 +23,7 @@ and FQN loading of an out-of-repo sampler.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -35,6 +36,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     PromptGroupSampler,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    SamplerCapabilities,
     SamplerConfig,
     TransactionalAdmissionSampler,
     WeightFifoSampler,
@@ -44,8 +46,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
     require_drop_accounting_members,
     required_buffer_capacity_for_config,
-    sampler_supports_buffer_checkpoint,
-    sampler_supports_training_claims,
+    sampler_capabilities,
     sampler_supports_transactional_admission,
 )
 from nemo_rl.data_plane import KVBatchMeta
@@ -133,8 +134,8 @@ class TestDropAccounting:
             target_step=3, assembling_version=7
         )
         assert charged == 3
-        assert sampler.uses_pooled_replacements is True
-        assert sampler.closes_short_at_exhaustion is False
+        assert sampler.capabilities.uses_pooled_replacements is True
+        assert sampler.capabilities.closes_short_at_exhaustion is False
 
     @pytest.mark.parametrize(
         "sampler",
@@ -149,17 +150,21 @@ class TestDropAccounting:
             target_step=None, assembling_version=7
         )
         assert unstamped == 7
-        assert sampler.closes_short_at_exhaustion is False
+        assert sampler.capabilities.closes_short_at_exhaustion is False
 
     def test_weight_fifo_has_no_spare_pool_but_ready_first_does(self):
         """A weight_fifo replacement lands in a newer weight bucket, so it has no pool."""
         buf = FakeBuffer()
         assert (
-            WeightFifoSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            WeightFifoSampler(
+                buf, max_staleness_versions=1
+            ).capabilities.uses_pooled_replacements
             is False
         )
         assert (
-            ReadyFirstSampler(buf, max_staleness_versions=1).uses_pooled_replacements
+            ReadyFirstSampler(
+                buf, max_staleness_versions=1
+            ).capabilities.uses_pooled_replacements
             is True
         )
 
@@ -173,8 +178,8 @@ class TestDropAccounting:
             sampler.charge_step_for_lost_group(target_step=3, assembling_version=7)
             is None
         )
-        assert sampler.uses_pooled_replacements is False
-        assert sampler.closes_short_at_exhaustion is True
+        assert sampler.capabilities.uses_pooled_replacements is False
+        assert sampler.capabilities.closes_short_at_exhaustion is True
 
     def test_a_custom_subclass_of_a_builtin_keeps_that_policy(self):
         sampler = EchoSampler(FakeBuffer(), max_lookahead_versions=1)
@@ -342,7 +347,7 @@ class TestFactory:
         ],
     )
     def test_capability_comes_from_sampler_class(self, config, expected):
-        assert sampler_supports_buffer_checkpoint(config) is expected
+        assert sampler_capabilities(config).supports_buffer_checkpoint is expected
         assert "supports_buffer_checkpoint" not in config.model_dump()
 
     def test_windowed_config_builds_windowed(self):
@@ -366,7 +371,7 @@ class TestFactory:
 
     def test_factory_rejects_dynamic_capability_before_construction(self):
         PropertyCapabilitySampler.constructed = False
-        with pytest.raises(TypeError, match="boolean class attribute"):
+        with pytest.raises(TypeError, match="in its own class body"):
             create_sampler(
                 FakeBuffer(),
                 CustomSamplerConfig(
@@ -377,11 +382,11 @@ class TestFactory:
 
     def test_custom_checkpoint_capability_is_discoverable_without_construction(self):
         CheckpointingEchoSampler.constructed = False
-        assert sampler_supports_buffer_checkpoint(
+        assert sampler_capabilities(
             CustomSamplerConfig(
                 target=f"{__name__}:CheckpointingEchoSampler",
             )
-        )
+        ).supports_buffer_checkpoint
         assert not CheckpointingEchoSampler.constructed
 
     @pytest.mark.parametrize(
@@ -396,7 +401,7 @@ class TestFactory:
         ],
     )
     def test_training_claim_capability_requires_custom_opt_in(self, config, expected):
-        assert sampler_supports_training_claims(config) is expected
+        assert sampler_capabilities(config).supports_training_claims is expected
 
     def test_ready_first_config_builds_ready_first_sampler(self):
         s = create_sampler(
@@ -607,21 +612,22 @@ def test_filter_refill_requires_separate_admission_wait(cfg, expected):
 
 
 class TestRequireDropAccountingMembers:
-    def test_raises_when_no_member_is_defined(self):
-        with pytest.raises(ValueError, match="missing the required"):
+    def test_raises_when_no_capabilities_are_declared(self):
+        with pytest.raises(TypeError, match="capabilities = SamplerCapabilities"):
             require_drop_accounting_members(_custom("NoDropAccounting"))
 
-    def test_names_the_missing_members_of_a_partial_implementation(self):
-        with pytest.raises(ValueError) as excinfo:
-            require_drop_accounting_members(_custom("PartialDropAccounting"))
-        text = str(excinfo.value)
-        # The reported list names the three members this class omits and not the one
-        # it declares (``uses_pooled_replacements``).
-        reported = text.split("attribute(s) ", 1)[1].split("]", 1)[0]
-        assert "closes_short_at_exhaustion" in reported
-        assert "requires_shortfall_reconciliation" in reported
-        assert "charge_step_for_lost_group" in reported
-        assert "uses_pooled_replacements" not in reported
+    def test_separate_flag_attributes_get_the_migration_message(self):
+        with pytest.raises(TypeError, match="replaces the separate"):
+            require_drop_accounting_members(_custom("SeparateFlagAttributes"))
+
+    def test_a_custom_subclass_must_declare_its_own_capabilities(self):
+        # The parent's declaration may not hold once the subclass overrides it.
+        with pytest.raises(TypeError, match="in its own class body"):
+            require_drop_accounting_members(_custom("UndeclaredInOrderSubclass"))
+
+    def test_raises_without_charge_step_for_lost_group(self):
+        with pytest.raises(ValueError, match="charge_step_for_lost_group"):
+            require_drop_accounting_members(_custom("CapabilitiesWithoutCharge"))
 
     @pytest.mark.parametrize(
         "cfg",
@@ -637,18 +643,17 @@ class TestRequireDropAccountingMembers:
         # A fully-declared custom class, or any built-in, passes without raising.
         assert require_drop_accounting_members(cfg) is None
 
-    def test_flags_assigned_in_init_are_rejected(self):
-        """Setup inspects the class, before __init__ runs, so instance-only flags
-        are invisible here and the check must reject the sampler.
+    def test_capabilities_assigned_in_init_are_rejected(self):
+        """Setup inspects the class, before __init__ runs, so an instance-only
+        declaration is invisible here and the check must reject the sampler.
         """
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(TypeError, match="not in __init__"):
             require_drop_accounting_members(_custom("InstanceAttrDropAccounting"))
 
-        text = str(excinfo.value)
-        assert "Declare them as class" in text
-        # The flags set in __init__ are not visible to the pre-construction check,
-        # so they are reported missing.
-        assert "uses_pooled_replacements" in text
+
+def test_sampler_capabilities_reject_a_non_bool_flag():
+    with pytest.raises(TypeError, match="closes_short_at_exhaustion must be a bool"):
+        dataclasses.replace(InOrderSampler.capabilities, closes_short_at_exhaustion=1)
 
 
 class TestWindowedSelect:
@@ -1256,49 +1261,80 @@ class TestInflightAbortPolicy:
         )
 
 
+_WINDOWED_STYLE_CAPABILITIES = SamplerCapabilities(
+    supports_buffer_checkpoint=False,
+    supports_training_claims=False,
+    requires_single_weight_batch=False,
+    uses_pooled_replacements=False,
+    closes_short_at_exhaustion=True,
+    requires_shortfall_reconciliation=False,
+)
+
+
 class NoDropAccounting:
-    """Defines none of the drop-accounting members."""
+    """Declares no capabilities and no charge_step_for_lost_group."""
 
 
-class PartialDropAccounting:
-    """Defines one member, which isinstance ignores because the rest are missing."""
+class SeparateFlagAttributes:
+    """Declares the flags as separate class attributes instead of capabilities."""
 
+    supports_buffer_checkpoint = True
     uses_pooled_replacements = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
 
 
 class InstanceAttrDropAccounting:
-    """Assigns the flags in __init__, where the setup check cannot see them."""
+    """Assigns capabilities in __init__, where the setup check cannot see them."""
 
     def __init__(self) -> None:
-        self.uses_pooled_replacements = False
-        self.closes_short_at_exhaustion = True
+        self.capabilities = _WINDOWED_STYLE_CAPABILITIES
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
         return None
+
+
+class CapabilitiesWithoutCharge:
+    capabilities = _WINDOWED_STYLE_CAPABILITIES
 
 
 class FullDropAccounting:
-    uses_pooled_replacements = False
-    closes_short_at_exhaustion = True
-    requires_shortfall_reconciliation = False
+    capabilities = _WINDOWED_STYLE_CAPABILITIES
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
         return None
+
+
+class UndeclaredInOrderSubclass(InOrderSampler):
+    """Custom subclass relying on its parent's capabilities."""
 
 
 class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
 
+    # Keeps in_order's drop policy without opting in to replay recovery.
+    capabilities = dataclasses.replace(
+        InOrderSampler.capabilities,
+        supports_buffer_checkpoint=False,
+        supports_training_claims=False,
+    )
+
 
 class InheritedWeightFifoSampler(WeightFifoSampler):
     """Custom policy retaining strict single-weight selection."""
+
+    capabilities = WeightFifoSampler.capabilities
 
 
 class CheckpointingEchoSampler(EchoSampler):
     """Custom sampler with a static replay-checkpoint capability."""
 
-    supports_buffer_checkpoint = True
-    supports_training_claims = True
+    capabilities = dataclasses.replace(
+        EchoSampler.capabilities,
+        supports_buffer_checkpoint=True,
+        supports_training_claims=True,
+    )
     constructed = False
 
     def __init__(self, *args, **kwargs) -> None:
@@ -1315,8 +1351,8 @@ class PropertyCapabilitySampler:
         type(self).constructed = True
 
     @property
-    def supports_buffer_checkpoint(self) -> bool:
-        return True
+    def capabilities(self) -> SamplerCapabilities:
+        return _WINDOWED_STYLE_CAPABILITIES
 
 
 NOT_A_SAMPLER_CLASS = object()

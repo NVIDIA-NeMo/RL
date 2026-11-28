@@ -15,6 +15,7 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import dataclasses
 import json
 import math
 import threading
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    SamplerCapabilities,
     WindowedSampler,
 )
 from nemo_rl.algorithms.grpo import (
@@ -2366,12 +2368,17 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
 
 
 class _EmptySampler:
-    # Matches BaseSampler's gated defaults: the controller reads these directly off
-    # the sampler, so every pump-driving stub must declare them. Specialized stubs
-    # override individual flags to stand in for a different policy.
-    uses_pooled_replacements = True
-    closes_short_at_exhaustion = False
-    requires_shortfall_reconciliation = True
+    # Gated drop accounting, like ready_first: the controller reads these off the
+    # sampler, so every pump-driving stub must declare them. Specialized stubs
+    # replace individual flags to stand in for a different policy.
+    capabilities = SamplerCapabilities(
+        supports_buffer_checkpoint=False,
+        supports_training_claims=False,
+        requires_single_weight_batch=False,
+        uses_pooled_replacements=True,
+        closes_short_at_exhaustion=False,
+        requires_shortfall_reconciliation=True,
+    )
 
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -2846,8 +2853,11 @@ def _dropping_controller(*, credit_in_evict: bool):
 class _ClosesShortSampler(_OneThenEmptySampler):
     """Yields one group, then nothing: a windowed-style sampler at the end of the data."""
 
-    uses_pooled_replacements = False
-    closes_short_at_exhaustion = True
+    capabilities = dataclasses.replace(
+        _EmptySampler.capabilities,
+        uses_pooled_replacements=False,
+        closes_short_at_exhaustion=True,
+    )
 
     def __init__(self, meta: KVBatchMeta) -> None:
         super().__init__(meta)
@@ -2972,7 +2982,9 @@ def test_windowed_filtered_budget_counts_selected_plus_drawn(
     draws, so an all-filtered wrapping loader eventually trips the budget.
     """
     ctrl = _train_pump_controller(
-        sampler=SimpleNamespace(uses_pooled_replacements=pooled)
+        sampler=SimpleNamespace(
+            capabilities=SimpleNamespace(uses_pooled_replacements=pooled)
+        )
     )
     ctrl._filtered_prompt_budget = 10
     ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 5
@@ -2992,12 +3004,12 @@ def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None
     windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
     stub = _ClosesShortSampler(MagicMock())
 
-    assert stub.uses_pooled_replacements == windowed.uses_pooled_replacements
-    assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
-    assert (
-        stub.requires_shortfall_reconciliation
-        == windowed.requires_shortfall_reconciliation
-    )
+    for flag in (
+        "uses_pooled_replacements",
+        "closes_short_at_exhaustion",
+        "requires_shortfall_reconciliation",
+    ):
+        assert getattr(stub.capabilities, flag) == getattr(windowed.capabilities, flag)
     for target_step in (None, 3):
         assert stub.charge_step_for_lost_group(
             target_step=target_step, assembling_version=7
@@ -3019,9 +3031,6 @@ class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
         super().__init__(meta)
         self._real = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
         self.ctrl = None
-
-    uses_pooled_replacements = True
-    closes_short_at_exhaustion = False
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
         return self._real.charge_step_for_lost_group(
@@ -3102,9 +3111,6 @@ def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step(
 class _GatedUnstampedSampler(_FullStepSampler):
     """A whole step in one chunk, from a gated sampler that stamps no step."""
 
-    uses_pooled_replacements = True
-    closes_short_at_exhaustion = False
-
     def charge_step_for_lost_group(
         self, *, target_step: int | None, assembling_version: int
     ) -> int | None:
@@ -3145,9 +3151,6 @@ def test_unstamped_losses_preserve_selected_groups(
             provisional_shortfalls.append(dict(ctrl._rollout_runtime.batch_shortfall))
 
         class Sampler(_EmptySampler):
-            uses_pooled_replacements = True
-            closes_short_at_exhaustion = False
-
             def __init__(self) -> None:
                 self.policy = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
                 self.sizes = [3] + ([5 - drops] if drops < 5 else [])
@@ -3246,9 +3249,6 @@ def test_selection_reconciliation_preserves_sampler_charge_policy(
     )
 
     class Sampler(_ChunkedSampler):
-        uses_pooled_replacements = True
-        closes_short_at_exhaustion = False
-
         def charge_step_for_lost_group(self, *, target_step, assembling_version):
             if policy == "windowed":
                 return None
@@ -3288,9 +3288,10 @@ def test_a_loss_racing_selection_defers_only_under_reconciliation(
     reconciling sampler also collects the credit and defers the snapshot."""
 
     class Sampler(_EmptySampler):
-        uses_pooled_replacements = True
-        closes_short_at_exhaustion = False
-        requires_shortfall_reconciliation = reconciles
+        capabilities = dataclasses.replace(
+            _EmptySampler.capabilities,
+            requires_shortfall_reconciliation=reconciles,
+        )
 
         def charge_step_for_lost_group(self, *, target_step, assembling_version):
             return assembling_version if target_step is None else target_step

@@ -668,7 +668,7 @@ class SingleControllerActor:
         # only a data-plane snapshot can give back. Without one (e.g. msc://), those
         # groups are gone, so counting them as dispatched would stall the resume.
         buffered_groups_not_restored = (
-            self._sampler.supports_buffer_checkpoint
+            self._sampler.capabilities.supports_buffer_checkpoint
             and actor_args.last_checkpoint_path is not None
             and data_plane_checkpoint_metadata is None
         )
@@ -680,7 +680,7 @@ class SingleControllerActor:
             self._sampler.restore_dispatch_index(restored_dispatch_index)
         if (
             self._master_config.checkpointing.enabled
-            and self._sampler.supports_buffer_checkpoint
+            and self._sampler.capabilities.supports_buffer_checkpoint
             and not self._master_config.checkpointing.save_data_plane
             # msc:// cannot hold data-plane snapshots; setup warns that buffered
             # rollouts are then discarded on resume.
@@ -701,7 +701,7 @@ class SingleControllerActor:
             or (
                 self._master_config.checkpointing.enabled
                 and self._master_config.checkpointing.save_data_plane
-                and self._sampler.supports_buffer_checkpoint
+                and self._sampler.capabilities.supports_buffer_checkpoint
             )
         )
         # ── asyncio state ──────────────────────────────────────────────────
@@ -1417,7 +1417,7 @@ class SingleControllerActor:
         """
         if (
             not self._dynamic_sampling_enabled
-            or not self._sampler.uses_pooled_replacements
+            or not self._sampler.capabilities.uses_pooled_replacements
         ):
             # A sampler without a spare pool (windowed) never has a filtered spare to
             # claim -- its pool is never refilled -- and refills filtered slots from
@@ -1591,7 +1591,7 @@ class SingleControllerActor:
                             "finalizer group carried no reward signal and known-key "
                             f"cleanup failed for group {request.group_id}"
                         ) from cleanup_error
-                    if self._sampler.uses_pooled_replacements:
+                    if self._sampler.capabilities.uses_pooled_replacements:
                         replacement = self._pop_filtered_replacement(target_step)
                         # filtered=True: a zero-variance EOF short close is allowed
                         # below the floor, like the non-capture filtered path.
@@ -2068,7 +2068,10 @@ class SingleControllerActor:
 
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
-                        if filtered and not self._sampler.uses_pooled_replacements:
+                        if (
+                            filtered
+                            and not self._sampler.capabilities.uses_pooled_replacements
+                        ):
                             async with self._dispatch_reservation(
                                 "prompt_reservations"
                             ) as cut:
@@ -2170,7 +2173,7 @@ class SingleControllerActor:
         async def maybe_refill() -> None:
             if (
                 not self._dynamic_sampling_enabled
-                or not self._sampler.uses_pooled_replacements
+                or not self._sampler.capabilities.uses_pooled_replacements
                 or self._dataloader_exhausted
                 or len(self._rollout_runtime.filtered_reserve)
                 >= self._algo_cfg.num_prompts_per_step
@@ -2364,7 +2367,7 @@ class SingleControllerActor:
             and not self._dynamic_sampling_enabled
         ):
             return False
-        if not self._sampler.uses_pooled_replacements:
+        if not self._sampler.capabilities.uses_pooled_replacements:
             return False
         if not self._rollout_runtime.sampler_stamps_target_steps:
             return False
@@ -2488,12 +2491,12 @@ class SingleControllerActor:
         to ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
         replacements keep failing still has to close.
 
-        The sampler's uses_pooled_replacements flag decides whether it uses a pool.
+        The sampler's capabilities.uses_pooled_replacements decides whether it uses a pool.
         """
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if not self._sampler.uses_pooled_replacements:
+        if not self._sampler.capabilities.uses_pooled_replacements:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -2568,7 +2571,7 @@ class SingleControllerActor:
         Raises:
             RuntimeError: Selected plus filtered draws spent the whole allowance.
         """
-        if self._sampler.uses_pooled_replacements:
+        if self._sampler.capabilities.uses_pooled_replacements:
             return
         drawn = self._filtered_prompts_by_step.get(step, 0)
         if selected_groups + drawn <= self._filtered_prompt_budget:
@@ -2937,7 +2940,7 @@ class SingleControllerActor:
                         )
                         if (
                             self._rollout_exhausted.is_set()
-                            and self._sampler.closes_short_at_exhaustion
+                            and self._sampler.capabilities.closes_short_at_exhaustion
                         ):
                             # Nothing more will arrive, so take what is left instead of
                             # waiting for a full chunk.
@@ -3016,7 +3019,7 @@ class SingleControllerActor:
                                         flush=True,
                                     )
                                     return
-                                if self._sampler.closes_short_at_exhaustion:
+                                if self._sampler.capabilities.closes_short_at_exhaustion:
                                     # At EOF, later groups cannot fill these slots.
                                     missing = target_groups - groups_dispatched
                                     if self._dynamic_sampling_enabled:

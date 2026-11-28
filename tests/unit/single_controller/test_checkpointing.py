@@ -70,8 +70,9 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    SamplerCapabilities,
     WindowedSamplerConfig,
-    sampler_supports_buffer_checkpoint,
+    sampler_capabilities,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -377,13 +378,17 @@ class _FailingFinalizeTrainer(_FakeTrainer):
 class _FakeSampler:
     """PromptGroupSampler stand-in: always returns a full, fresh batch."""
 
-    # BaseSampler's gated defaults; the controller reads these directly off the sampler.
-    uses_pooled_replacements = True
-    closes_short_at_exhaustion = False
-    requires_shortfall_reconciliation = True
-
     def __init__(self, supports_buffer_checkpoint: bool = True) -> None:
-        self._supports_buffer_checkpoint = supports_buffer_checkpoint
+        # Gated drop accounting, like ready_first; the controller reads these off
+        # the sampler.
+        self.capabilities = SamplerCapabilities(
+            supports_buffer_checkpoint=supports_buffer_checkpoint,
+            supports_training_claims=True,
+            requires_single_weight_batch=False,
+            uses_pooled_replacements=True,
+            closes_short_at_exhaustion=False,
+            requires_shortfall_reconciliation=True,
+        )
         self._step = 0
         self._dispatch_index = -1
 
@@ -421,10 +426,6 @@ class _FakeSampler:
     @property
     def is_on_policy(self) -> bool:
         return False
-
-    @property
-    def supports_buffer_checkpoint(self) -> bool:
-        return self._supports_buffer_checkpoint
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
@@ -1357,9 +1358,9 @@ def _run_train_pump(
     async def _main():
         actor = _ACTOR_CLS(mc, actor_args, SetupTimingMetrics())
         actor._sampler = _FakeSampler(
-            supports_buffer_checkpoint=sampler_supports_buffer_checkpoint(
+            supports_buffer_checkpoint=sampler_capabilities(
                 mc.async_rl.sampler
-            )
+            ).supports_buffer_checkpoint
         )
         if seed is not None:
             seed(actor)

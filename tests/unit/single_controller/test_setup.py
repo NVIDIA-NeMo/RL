@@ -122,8 +122,7 @@ _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
-    supports_buffer_checkpoint = True
-    supports_training_claims = True
+    capabilities = WindowedSampler.capabilities
 
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
@@ -132,7 +131,11 @@ class _CheckpointingCustomSampler(WindowedSampler):
 class _NonCheckpointingCustomSampler(WindowedSampler):
     """Custom sampler that explicitly opts out of replay recovery."""
 
-    supports_buffer_checkpoint = False
+    capabilities = dataclasses.replace(
+        WindowedSampler.capabilities,
+        supports_buffer_checkpoint=False,
+        supports_training_claims=False,
+    )
 
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
@@ -141,7 +144,9 @@ class _NonCheckpointingCustomSampler(WindowedSampler):
 class _CheckpointingNonClaimingCustomSampler(WindowedSampler):
     """Replay-capable custom sampler that retains legacy local selection."""
 
-    supports_buffer_checkpoint = True
+    capabilities = dataclasses.replace(
+        WindowedSampler.capabilities, supports_training_claims=False
+    )
 
     def __init__(self, buffer: Any) -> None:
         super().__init__(buffer, max_staleness_versions=1)
