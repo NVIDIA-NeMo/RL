@@ -28,6 +28,39 @@ if TYPE_CHECKING:
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
 
+def load_draft_weights_with_stable_kv_buffers(
+    draft_model: Any,
+    weights: list[tuple[str, "torch.Tensor"]],
+    *,
+    vllm_version: str,
+) -> None:
+    """Refresh the draft while retaining the KV buffer addresses CUDA graphs use."""
+    import torch
+
+    if vllm_version != "0.33.0":
+        raise RuntimeError(
+            f"DSpark/DFlash draft refit requires vLLM 0.33.0 for stable context KV "
+            f"buffers, but found {vllm_version}. Install the pinned vLLM or "
+            "revalidate the context KV buffer layout before updating the patch."
+        )
+    backbone = getattr(draft_model, "model", None)
+    # The Qwen3 DSpark and DFlash loaders rebuild these private context KV tensors.
+    buffer_names = ("_fused_kv_weight", "_fused_kv_bias", "_k_norm_weights")
+    buffers = {name: getattr(backbone, name, None) for name in buffer_names}
+    draft_model.load_weights(weights=weights)
+    for name, captured in buffers.items():
+        if captured is None:
+            continue
+        updated = getattr(backbone, name)
+        if updated is captured:
+            continue
+        if updated is None or updated.shape != captured.shape:
+            raise RuntimeError(f"Draft refit changed the layout of {name}.")
+        with torch.inference_mode():
+            captured.copy_(updated)
+        setattr(backbone, name, captured)
+
+
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
 

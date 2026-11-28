@@ -268,14 +268,14 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             bias=False,
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Reduced-draft-vocab checkpoints (e.g. RedHat speculators): lm_head
-        # predicts over draft_vocab_size tokens; d2t maps draft index ->
-        # target token id and t2d marks target-vocab membership. Both load
-        # from the checkpoint as persistent buffers. Full-vocab checkpoints
-        # (draft_vocab_size unset) keep the original behavior.
-        self.draft_vocab_size = getattr(config, "draft_vocab_size", None)
+        # Match vLLM's identity mapping when the checkpoint declares the full vocab.
+        output_vocab_size = int(
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
+        self.draft_vocab_size = (
+            None if output_vocab_size == config.vocab_size else output_vocab_size
+        )
         if self.draft_vocab_size is not None:
-            self.draft_vocab_size = int(self.draft_vocab_size)
             self.register_buffer(
                 "d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long)
             )
@@ -285,9 +285,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             self._t2d_index: Optional[torch.Tensor] = None
         self.lm_head = nn.Linear(
             config.hidden_size,
-            self.draft_vocab_size
-            if self.draft_vocab_size is not None
-            else config.vocab_size,
+            output_vocab_size,
             bias=False,
         )
         self.block_size = int(config.block_size)
