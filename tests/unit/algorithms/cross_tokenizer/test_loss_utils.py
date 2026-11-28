@@ -88,6 +88,8 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         "token_mask": torch.ones(1, 6),
         "sample_mask": torch.ones(1),
         "teacher_0_full_logits_ipc": teacher_ipc,
+        "teacher_0_input_ids": torch.arange(20, 24).unsqueeze(0),
+        "teacher_0_token_mask": torch.tensor([[1, 1, 0, 1]]),
         "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13, 14, 15]]),
         "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
         "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
@@ -126,6 +128,57 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         local_logits, seq_dim=1, trim=True
     )
     rebuild_teacher.assert_called_once_with(teacher_ipc, cp_group=cp_group, device=0)
+    # CP rank 1 of 2 holds the second teacher window (2 of 4 positions); its ids
+    # and token mask match the teacher-logit window that the scoring code reads.
+    torch.testing.assert_close(
+        aligns[0].teacher_input_ids, data["teacher_0_input_ids"][:, 2:4]
+    )
+    torch.testing.assert_close(
+        aligns[0].teacher_token_mask, data["teacher_0_token_mask"][:, 2:4]
+    )
+
+
+def test_cp1_layout_keeps_the_teacher_logit_window():
+    """Without CP the teacher window is the first teacher-logit-width positions."""
+    teacher_logits = torch.randn(1, 3, 4)
+    data = {
+        "input_ids": torch.arange(4).unsqueeze(0),
+        "token_mask": torch.ones(1, 4),
+        "sample_mask": torch.ones(1),
+        "teacher_0_full_logits_ipc": [{"opaque": "handle"}],
+        "teacher_0_input_ids": torch.arange(20, 24).unsqueeze(0),
+        "teacher_0_token_mask": torch.tensor([[1, 1, 0, 1]]),
+        "alignment_0_student_chunk_id": torch.tensor([[10, 11, 12, 13]]),
+        "alignment_0_teacher_chunk_id": torch.tensor([[20, 21, 22, 23]]),
+        "alignment_0_pair_valid": torch.ones(1, 2, dtype=torch.bool),
+        "alignment_0_pair_is_correct": torch.ones(1, 2, dtype=torch.bool),
+    }
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "nemo_rl.algorithms.cross_tokenizer.loss_utils."
+            "rebuild_teacher_full_logits_from_ipc",
+            return_value=teacher_logits,
+        ),
+    ):
+        _, _, aligns, _, _ = prepare_xtoken_cross_tokenizer_loss_input(
+            torch.randn(1, 4, 2),
+            data,
+            projection_matrix_paths=["projection.pt"],
+            context_parallel_group=None,
+            cp_sharder=None,
+        )
+
+    # localize_alignment trims the teacher chunk ids to the teacher-logit width;
+    # the teacher ids and token mask use the same window.
+    assert aligns[0].teacher_chunk_id.shape[1] == 3
+    torch.testing.assert_close(
+        aligns[0].teacher_input_ids, data["teacher_0_input_ids"][:, :3]
+    )
+    torch.testing.assert_close(
+        aligns[0].teacher_token_mask, data["teacher_0_token_mask"][:, :3]
+    )
 
 
 def test_automodel_cp_layout_rejects_non_divisible_student_sequence():
@@ -474,12 +527,12 @@ class TestBuildExactTokenMap:
         assert out["uncommon_teacher"].tolist() == [3]
 
     def test_strict_mode_collision_picks_lowest_student(self, tmp_path: Path):
-        """Strict (xtoken_loss=False) exact maps require weight 1.0 and a
-        ``-1`` sentinel in the second slot. On a teacher collision the lowest
-        student index wins; fuzzy rows (second slot != -1) are excluded.
+        """Strict (xtoken_loss=False) exact maps require a slot-0 weight of
+        1.0. On a teacher collision the lowest student index wins; fuzzy rows
+        (top weight below 1.0) are excluded.
 
           s0, s1 both exact-map to teacher 1 -> s0 wins (lowest index)
-          s2 fuzzy (second slot 0) -> excluded
+          s2 fuzzy (0.7 / 0.3) -> excluded
           s3 exact-maps to teacher 0 (unique)
         """
         indices = [[1, -1], [1, -1], [2, 0], [0, -1]]
@@ -494,6 +547,50 @@ class TestBuildExactTokenMap:
         assert out["common_teacher"].tolist() == [1, 0]
         assert out["uncommon_student"].tolist() == [1, 2]
         assert out["uncommon_teacher"].tolist() == [2]
+
+    def test_strict_mode_accepts_zero_weight_trailing_ids(self, tmp_path: Path):
+        """Strict exact maps accept a zero-weight trailing id; no -1 sentinel is needed.
+
+        s0 -> teacher 1 @ 1.0 with a zero-weight trailing id (no -1 sentinel)
+        s1 fuzzy (0.7 / 0.3) -> uncommon
+        s2 -> teacher 0 @ 1.0 with the -1 sentinel
+        """
+        indices = [[1, 0], [2, 1], [0, -1]]
+        likelihoods = [[1.0, 0.0], [0.7, 0.3], [1.0, 0.0]]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=False,
+            teacher_vocab_size=3,
+        )
+        assert out["common_student"].tolist() == [0, 2]
+        assert out["common_teacher"].tolist() == [1, 0]
+        assert out["uncommon_student"].tolist() == [1]
+        assert out["uncommon_teacher"].tolist() == [2]
+
+    def test_strict_mode_rejects_rows_with_mass_outside_slot_0(self, tmp_path: Path):
+        """Strict exact maps need weight 1.0 in slot 0 and 0 in every other slot.
+
+        s0 bf16-rounded near 1-to-1 (1.0 / 0.0009) -> uncommon
+        s1 its 1.0 outside slot 0 (0 / 0 / 0 / 1.0) -> uncommon
+        s2 -> teacher 0 @ 1.0 -> common
+        """
+        indices = [[1, 2, -1, -1], [0, 1, 2, 2], [0, -1, -1, -1]]
+        likelihoods = [
+            [1.0, 0.0009, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=False,
+            teacher_vocab_size=3,
+        )
+        assert out["common_student"].tolist() == [2]
+        assert out["common_teacher"].tolist() == [0]
+        assert out["uncommon_student"].tolist() == [0, 1]
+        assert out["uncommon_teacher"].tolist() == [1, 2]
 
 
 # NOTE: the TP/CP > 1 paths of vocab_parallel_log_softmax / vocab_parallel_full_log_softmax /

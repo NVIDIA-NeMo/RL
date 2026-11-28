@@ -505,6 +505,11 @@ class LocalizedAlignment:
     # next-token-accuracy metric and the same-tokenizer KD path.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
+    # Filled post-construction for a cross-tokenizer teacher: this CP rank's
+    # contiguous teacher input ids and token mask. Left ``None`` for a
+    # same-tokenizer teacher.
+    teacher_input_ids: Optional[torch.Tensor] = None
+    teacher_token_mask: Optional[torch.Tensor] = None
 
 
 def localize_alignment(
@@ -1059,7 +1064,7 @@ def build_exact_token_map(
     student row's projection weights descending, then picks an exact-token
     map per the ``xtoken_loss`` flag:
 
-    - ``xtoken_loss=False`` (strict): ``has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)``.
+    - ``xtoken_loss=False`` (strict): slot 0 has weight ``1.0`` and every other slot ``0``.
       On collision (multiple students mapping to the same teacher id),
       the earliest (lowest) student index wins.
     - ``xtoken_loss=True`` (relaxed): ``has_exact_map = sorted_values[:, 0] >= 0.6``.
@@ -1097,11 +1102,10 @@ def build_exact_token_map(
     if xtoken_loss:
         has_exact_map = sorted_values[:, 0] >= 0.6
     else:
-        # Strict: exactly one top-k entry with weight 1.0, no second
-        # mapping. `indices[:, 1] == -1` is the sentinel used by the
-        # `_exact_map_remapped` projection files for "no second
-        # mapping".
-        has_exact_map = (sorted_values[:, 0] == 1.0) & (indices[:, 1] == -1)
+        # Strict: slot 0 has weight 1.0 and every other slot 0. Checking only the
+        # top weight also accepts bf16-rounded 0.999 rows and scale-trick-only rows.
+        rest_is_zero = (likelihoods[:, 1:] == 0).all(dim=-1)
+        has_exact_map = (likelihoods[:, 0] == 1.0) & rest_is_zero
 
     # Gather (s_idx, t_idx, prob) for each exact-map candidate.
     s_candidates = torch.where(has_exact_map)[0]
@@ -1322,6 +1326,22 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             align.teacher_chunk_id = cp_shift_next(
                 align.teacher_chunk_id, cp_group, fill=-1
             )
+            # localize_alignment keeps the first teacher_seq_len positions.
+            teacher_seq_len = teacher_full_logits.shape[1]
+            teacher_seq_start = 0
+        # Teacher input ids and token mask for the same contiguous teacher window
+        # as the teacher logits and teacher_chunk_id.
+        teacher_window = slice(teacher_seq_start, teacher_seq_start + teacher_seq_len)
+        teacher_ids_full = data.get(f"teacher_{i}_input_ids")
+        if teacher_ids_full is not None:
+            align.teacher_input_ids = to_local_if_dtensor(teacher_ids_full)[
+                :, teacher_window
+            ]
+        teacher_mask_full = data.get(f"teacher_{i}_token_mask")
+        if teacher_mask_full is not None:
+            align.teacher_token_mask = to_local_if_dtensor(teacher_mask_full)[
+                :, teacher_window
+            ]
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
         aligns_by_idx[i] = align
