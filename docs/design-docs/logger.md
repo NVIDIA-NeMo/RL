@@ -182,6 +182,10 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ![Validation Pretty Logging Example](../assets/val-log.png)
 
+## Per-Step Train Data Dumps
+
+Each training step writes the full training batch (token ids, masks, advantages, rewards, generation logprobs) to `<log_dir>/train_data_step<N>.jsonl`. These files can be very large, so set `logger.log_train_data_jsonl: false` on low-storage runs to skip them. The default is `true`, preserving existing behavior. In GRPO, `env.should_log_nemo_gym_responses: true` also suppresses the dump because NeMo Gym owns response logging there; the logger flag is the direct switch for the files themselves.
+
 ## GPU Metric Logging
 
 NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.

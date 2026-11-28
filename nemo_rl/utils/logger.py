@@ -108,6 +108,13 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    # Write the per-step ``train_data_step*.jsonl`` dump (token ids, masks,
+    # advantages, rewards, generation logprobs) to ``log_dir``. Set to false
+    # on low-storage runs to skip these potentially very large files. This
+    # is the direct switch for the JSONL files; in GRPO,
+    # ``env.should_log_nemo_gym_responses=true`` also suppresses them
+    # because NeMo Gym owns response logging there.
+    log_train_data_jsonl: bool = True
     # LoggerInterface subclasses as "pkg.module.Class", constructed without arguments.
     extra_backends: list[str] = Field(default_factory=list)
 

@@ -3124,7 +3124,8 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
     When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
-    When **False** (the default if unset), write the local JSONL file.
+    When **False** (the default if unset), write the local JSONL file unless
+    ``logger.log_train_data_jsonl`` is false.
 
     W&B full-result Tables are controlled independently by
     ``logger.wandb.log_nemo_gym_full_result_tables``.
@@ -3135,6 +3136,21 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     )
 
     return should_log_nemo_gym_responses
+
+
+def _should_log_train_data_jsonl(master_config: MasterConfig) -> bool:
+    """Whether to write the per-step ``train_data_step*.jsonl`` dump.
+
+    The dump is written only when ``logger.log_train_data_jsonl`` is true
+    (the default, preserving existing behavior) and NeMo Gym is not
+    responsible for response logging (``env.should_log_nemo_gym_responses``
+    is false). The logger flag is the direct switch for these files; the
+    Gym flag only suppresses them as a side effect of Gym owning response
+    logging.
+    """
+    return master_config.logger.log_train_data_jsonl and not (
+        _should_log_nemo_gym_responses(master_config)
+    )
 
 
 def _write_latest_checkpoint_status(
@@ -4764,7 +4780,7 @@ def _grpo_train_impl(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_nemo_gym_responses(master_config):
+            if _should_log_train_data_jsonl(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -6741,8 +6757,8 @@ def async_grpo_train(
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
             # env.should_log_nemo_gym_responses is true, skip this jsonl (see
-            # _should_log_nemo_gym_responses).
-            if not _should_log_nemo_gym_responses(master_config):
+            # _should_log_train_data_jsonl).
+            if _should_log_train_data_jsonl(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
