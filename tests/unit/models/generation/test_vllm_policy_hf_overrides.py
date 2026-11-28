@@ -19,8 +19,6 @@ wholesale, which silently dropped any generation-only overrides the user set
 under ``policy.generation.vllm_kwargs.hf_overrides`` (#3728).
 """
 
-import warnings
-
 import pytest
 
 from nemo_rl.models.generation.vllm.config import merge_policy_hf_overrides
@@ -37,9 +35,7 @@ def test_generation_only_overrides_survive():
 def test_policy_overrides_are_added_without_conflict():
     vllm_kwargs = {"hf_overrides": {"max_position_embeddings": 8192}}
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 1_000_000.0})
+    merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 1_000_000.0})
 
     assert vllm_kwargs["hf_overrides"] == {
         "max_position_embeddings": 8192,
@@ -54,14 +50,41 @@ def test_conflicting_values_raise():
         merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 2.0})
 
 
-def test_equal_values_do_not_warn():
+def test_equal_values_pass():
     vllm_kwargs = {"hf_overrides": {"rope_theta": 2.0}}
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 2.0})
+    merge_policy_hf_overrides(vllm_kwargs, {"rope_theta": 2.0})
 
     assert vllm_kwargs["hf_overrides"] == {"rope_theta": 2.0}
+
+
+def test_disjoint_nested_sub_keys_merge():
+    vllm_kwargs = {"hf_overrides": {"text_config": {"max_position_embeddings": 8192}}}
+
+    merge_policy_hf_overrides(
+        vllm_kwargs, {"text_config": {"router_aux_loss_coef": 0.0}}
+    )
+
+    assert vllm_kwargs["hf_overrides"] == {
+        "text_config": {"max_position_embeddings": 8192, "router_aux_loss_coef": 0.0}
+    }
+
+
+def test_conflicting_nested_leaf_raises_with_full_path():
+    vllm_kwargs = {"hf_overrides": {"text_config": {"rope_theta": 1.0, "other": 1}}}
+
+    with pytest.raises(ValueError, match=r"\['text_config\.rope_theta'\]"):
+        merge_policy_hf_overrides(vllm_kwargs, {"text_config": {"rope_theta": 2.0}})
+
+
+def test_policy_nested_mapping_is_not_aliased():
+    policy_overrides = {"text_config": {"router_aux_loss_coef": 0.0}}
+    vllm_kwargs = {}
+
+    merge_policy_hf_overrides(vllm_kwargs, policy_overrides)
+    vllm_kwargs["hf_overrides"]["text_config"]["extra"] = 1
+
+    assert policy_overrides == {"text_config": {"router_aux_loss_coef": 0.0}}
 
 
 @pytest.mark.parametrize("existing", [{}, {"hf_overrides": None}, {"hf_overrides": {}}])

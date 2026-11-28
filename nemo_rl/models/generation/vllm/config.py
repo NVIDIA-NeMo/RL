@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import warnings
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
@@ -45,36 +46,58 @@ VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 
+def _merge_hf_overrides(
+    generation: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    path: str,
+    conflicts: list[str],
+) -> dict[str, Any]:
+    merged = dict(generation)
+    for key, value in policy.items():
+        existing = generation.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_hf_overrides(
+                existing, value, f"{path}{key}.", conflicts
+            )
+        elif key in generation and existing != value:
+            conflicts.append(f"{path}{key}")
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def merge_policy_hf_overrides(
     vllm_kwargs: dict[str, Any], policy_hf_config_overrides: Mapping[str, Any] | None
 ) -> None:
     """Sync ``vllm_kwargs["hf_overrides"]`` with ``policy.hf_config_overrides`` in place.
 
-    The trainer and vLLM must load the same HF config, so a key set to
-    different values in both dicts raises a ``ValueError`` naming it. Keys only set
-    under ``policy.generation.vllm_kwargs.hf_overrides`` survive: they exist to
-    correct the generation engine's view of the HF config without touching the
-    trainer, and a wholesale ``vllm_kwargs["hf_overrides"] = ...`` silently
-    discarded them (#3728). Mirrors ``_merge_fp8_kwargs`` one layer down.
+    The trainer and vLLM must load the same HF config, so a leaf set to different
+    values in both dicts raises a ``ValueError`` naming its full path. Keys only set
+    under ``policy.generation.vllm_kwargs.hf_overrides`` survive, including sub-keys
+    of a nested config such as ``text_config``: they exist to correct the generation
+    engine's view of the HF config without touching the trainer, and a wholesale
+    ``vllm_kwargs["hf_overrides"] = ...`` silently discarded them (#3728).
     """
     generation_overrides = vllm_kwargs.get("hf_overrides") or {}
     if not isinstance(generation_overrides, Mapping):
         raise ValueError("policy.generation.vllm_kwargs.hf_overrides must be a mapping")
-    policy_overrides = dict(policy_hf_config_overrides or {})
 
-    conflicts = sorted(
-        key
-        for key, value in policy_overrides.items()
-        if key in generation_overrides and generation_overrides[key] != value
+    # Recurse into nested mappings: vLLM merges a nested PreTrainedConfig such as
+    # text_config key by key (ModelConfig._apply_dict_overrides), and so does
+    # AutoConfig.from_pretrained on the trainer side, so disjoint sub-keys agree.
+    conflicts: list[str] = []
+    merged = _merge_hf_overrides(
+        generation_overrides, policy_hf_config_overrides or {}, "", conflicts
     )
     if conflicts:
         raise ValueError(
-            f"policy.generation.vllm_kwargs.hf_overrides sets {conflicts} to values "
-            "that differ from policy.hf_config_overrides. The trainer and vLLM must "
-            "load the same HF config; set these keys only in policy.hf_config_overrides."
+            f"policy.generation.vllm_kwargs.hf_overrides sets {sorted(conflicts)} to "
+            "values that differ from policy.hf_config_overrides. The trainer and vLLM "
+            "must load the same HF config; remove these keys from "
+            "vllm_kwargs.hf_overrides or make both values equal."
         )
 
-    vllm_kwargs["hf_overrides"] = {**generation_overrides, **policy_overrides}
+    vllm_kwargs["hf_overrides"] = merged
 
 
 # TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
