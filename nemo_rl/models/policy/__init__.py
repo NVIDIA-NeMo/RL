@@ -23,6 +23,7 @@ from nemo_rl.models.policy.draft_config import (
     DSparkDraftConfig,
     Eagle3DraftConfig,
 )
+from nemo_rl.models.policy.training_engine_adapter.config import TrainingEngineConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -817,3 +818,7 @@ class PolicyConfig(TypedDict):
     # combined with quant_cfg. Its runtime environment must already be in
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
+
+    # Runs the model through Megatron-Bridge's TrainingEngine: the policy builds
+    # TrainingEnginePolicyWorker instead of the Megatron worker.
+    training_engine: NotRequired[TrainingEngineConfig]
