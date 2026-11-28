@@ -98,9 +98,6 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
-from nemo_rl.models.policy.workers.patches import (
-    apply_transformer_engine_patch,
-)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -477,8 +474,6 @@ class AutomodelPolicyWorkerImpl(
         """Initialize the AutomodelPolicyWorker."""
         if config["automodel_cfg"].get("deterministic"):
             enable_deterministic_algorithms()
-        # Apply TE patch until TE is upgraded to 2.10.0
-        apply_transformer_engine_patch()
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 

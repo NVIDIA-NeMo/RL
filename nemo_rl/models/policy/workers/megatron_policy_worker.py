@@ -176,7 +176,6 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -968,9 +967,6 @@ class MegatronPolicyWorkerImpl(
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
-
-        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
-        apply_transformer_engine_patch()
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
