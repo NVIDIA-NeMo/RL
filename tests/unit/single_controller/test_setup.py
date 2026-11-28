@@ -378,6 +378,22 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_merges_vllm_hf_overrides():
+    """Generation-only vLLM HF overrides survive; the policy's win on shared keys."""
+    master_config = _make_master_config()
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    master_config.policy["hf_config_overrides"] = {"shared": "policy"}
+    master_config.policy["generation"]["vllm_kwargs"] = {
+        "hf_overrides": {"generation_only": 1, "shared": "generation"}
+    }
+
+    with patch.object(sc_setup_mod, "VllmGeneration") as mock_vllm:
+        sc_setup_mod._build_generation(MagicMock(name="cluster"), master_config)
+
+    vllm_kwargs = mock_vllm.call_args.kwargs["config"]["vllm_kwargs"]
+    assert vllm_kwargs["hf_overrides"] == {"generation_only": 1, "shared": "policy"}
+
+
 def test_setup_rejects_sglang_fault_tolerance_before_anything_builds(
     patched_factories,
 ):

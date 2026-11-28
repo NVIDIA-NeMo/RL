@@ -153,7 +153,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    merge_vllm_hf_overrides,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -693,8 +696,8 @@ def _apply_vllm_generation_config(master_config: MasterConfig) -> None:
     generation_config = master_config.policy["generation"]
     generation_config["model_name"] = master_config.policy["model_name"]
     vllm_config = cast(VllmConfig, generation_config)
-    vllm_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-        master_config.policy.get("hf_config_overrides", {})
+    merge_vllm_hf_overrides(
+        vllm_config.setdefault("vllm_kwargs", {}), master_config.policy
     )
     configure_vllm_for_router_replay(master_config.policy)
 

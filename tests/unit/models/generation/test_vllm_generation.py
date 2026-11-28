@@ -3755,6 +3755,80 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
         asyncio.run(anext(generation.generate_async(data)))
 
 
+def test_vllm_dynamo_rejects_per_sample_output_caps(monkeypatch):
+    from nemo_rl.experience.failures import UnsupportedOutputCap
+    from nemo_rl.models.generation.dynamo import rollout_client
+    from nemo_rl.models.generation.rollout_result import (
+        RolloutResult,
+        rollout_result_to_wire,
+    )
+
+    result = RolloutResult([7], [-0.5], False, None, None)
+    frontend = AsyncMock(
+        return_value={
+            "rollout": rollout_result_to_wire(result),
+            "gen_leader_worker_idx": 0,
+        }
+    )
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend)
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"max_model_len": 16},
+    }
+    generation.dynamo_frontend_urls = ("http://frontend/v1",)
+    data = {"input_ids": torch.tensor([[5, 6, 0]]), "input_lengths": torch.tensor([2])}
+
+    # A capped row would lose its cap at the frontend, so it is rejected before sending.
+    capped = BatchedDataDict({**data, "max_output_tokens": [4]})
+    with pytest.raises(
+        UnsupportedOutputCap, match="not supported through the Dynamo frontend"
+    ):
+        asyncio.run(anext(generation.generate_async(capped)))
+    frontend.assert_not_called()
+
+    # An uncapped row from a partly capped batch still goes through the frontend.
+    uncapped = BatchedDataDict({**data, "max_output_tokens": [None]})
+    asyncio.run(anext(generation.generate_async(uncapped)))
+    frontend.assert_awaited_once()
+
+
+def test_vllm_dynamo_output_cap_rejection_stops_async_rollout():
+    from nemo_rl.experience.failures import UnsupportedOutputCap
+    from nemo_rl.experience.rollouts import _run_multi_turn_rollout_async
+
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "backend": "vllm",
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"async_engine": True, "max_model_len": 16},
+    }
+    generation.dynamo_frontend_urls = ("http://frontend/v1",)
+    batch = BatchedDataDict(
+        message_log=[
+            [{"role": "user", "content": "hi", "token_ids": torch.tensor([5, 6])}]
+        ],
+        extra_env_info=[{"max_output_tokens": 4}],
+        task_name=["math"],
+    )
+
+    # The per-turn handler ends a sample on generation errors; this one must
+    # stop the run instead of returning an empty, zero-reward rollout.
+    with pytest.raises(RuntimeError, match="not supported through the Dynamo") as err:
+        asyncio.run(
+            _run_multi_turn_rollout_async(
+                generation,
+                batch,
+                types.SimpleNamespace(pad_token_id=0),
+                task_to_env={},
+                max_seq_len=16,
+            )
+        )
+    assert isinstance(err.value.__cause__, UnsupportedOutputCap)
+
+
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation

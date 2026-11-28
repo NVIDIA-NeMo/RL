@@ -97,6 +97,10 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
+from nemo_rl.models.generation.vllm.output_limits import (
+    per_request_output_limits,
+    validate_output_caps,
+)
 from nemo_rl.models.generation.vllm.progress_reader import VllmProgressReader
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
@@ -1845,16 +1849,27 @@ class VllmAsyncGenerationWorkerImpl(
             ),
         )
 
-    def _rollout_max_new_tokens(self, input_length: int) -> int:
+    def _rollout_max_new_tokens(
+        self, input_length: int, max_output_tokens: Optional[int] = None
+    ) -> int:
         """Token budget for one rollout prompt; 0 means nothing fits.
 
-        The configured cap, clipped to the context window and to speculative
-        decoding's lookahead.
+        The configured cap, clipped to the rollout's own cap, the context window
+        and speculative decoding's lookahead.
         """
         max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
         allowed_new_tokens = max(
             0, min(self.cfg["max_new_tokens"], max_model_len - input_length)
         )
+        if max_output_tokens is not None:
+            validate_output_caps([max_output_tokens])
+            if allowed_new_tokens > 0:
+                (allowed_new_tokens,) = per_request_output_limits(
+                    [max_output_tokens],
+                    [input_length],
+                    configured_max_new_tokens=allowed_new_tokens,
+                    max_model_len=max_model_len,
+                )
         spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
         spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
         if allowed_new_tokens > 0 and spec_lookahead > 0:
@@ -1876,6 +1891,7 @@ class VllmAsyncGenerationWorkerImpl(
         stop_strings: Optional[list[str]],
         request_id: str,
         device: torch.device,
+        max_output_tokens: Optional[int] = None,
     ) -> tuple[RolloutResult, Optional[Any]]:
         """Serve one rollout from this engine: its budget, sampling, generation and result.
 
@@ -1887,13 +1903,17 @@ class VllmAsyncGenerationWorkerImpl(
                 configured ones.
             request_id: The vLLM request ID.
             device: Where to place the routed-experts tensor.
+            max_output_tokens: The rollout's own response-token cap; None keeps
+                the configured limit.
 
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
             The final output supplies finish and usage metadata to Dynamo
             (``dynamo/vllm_adapter.py``).
         """
-        max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
+        max_new_tokens = self._rollout_max_new_tokens(
+            len(prompt_token_ids), max_output_tokens
+        )
         if max_new_tokens == 0:
             return RolloutResult.nothing_generated(), None
         sampling_params = self._build_sampling_params(
@@ -1910,7 +1930,11 @@ class VllmAsyncGenerationWorkerImpl(
             final_output = output
         if final_output is None:
             raise RuntimeError(f"No output received for request {request_id}")
-        validate_rollout_prompt(prompt_token_ids, final_output.prompt_token_ids)
+        validate_rollout_prompt(
+            prompt_token_ids,
+            final_output.prompt_token_ids,
+            expanded_placeholder_token_id=self._expanded_placeholder_token_id,
+        )
         result = rollout_result(
             final_output,
             input_length=len(prompt_token_ids),
@@ -1963,6 +1987,7 @@ class VllmAsyncGenerationWorkerImpl(
             stop_strings=(data.get("stop_strings") or [None])[0],
             request_id=str(uuid.uuid4()),
             device=input_ids.device,
+            max_output_tokens=(data.get("max_output_tokens") or [None])[0],
         )
         yield 0, rollout_output(result, input_ids=input_ids, input_length=input_length)
 
