@@ -3087,6 +3087,9 @@ def setup_reference_model_state(
             data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
             pre_wrap_hook=ref_pre_wrap_hooks,
             mixed_precision_wrapper=ref_mixed_precision_wrapper,
+            # Never trained and has no optimizer: skip the DDP wrap (no grad
+            # buffers). FSDP2 keeps the wrap since it shards the model.
+            wrap_with_ddp=megatron_cfg.dist.use_torch_fsdp2,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 

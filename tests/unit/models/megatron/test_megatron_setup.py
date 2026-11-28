@@ -4825,6 +4825,84 @@ class TestSetupModelAndOptimizer:
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.initialize_megatron")
+    @patch("nemo_rl.models.megatron.setup.set_jit_fusion_options")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.build_tokenizer")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.setup_optimizer")
+    @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.MoEFloat16Module")
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.barrier")
+    @patch("torch.tensor")
+    def test_setup_without_optimizer_skips_ddp_wrap_and_optimizer(
+        self,
+        mock_tensor,
+        mock_barrier,
+        mock_all_reduce,
+        mock_custom_float16,
+        mock_checkpoint_exists,
+        mock_setup_optimizer,
+        mock_get_model,
+        mock_build_tokenizer,
+        mock_init_ckpt_context,
+        mock_set_jit,
+        mock_init_megatron,
+        mock_global_state,
+        mock_pg_collection,
+    ):
+        """Test setup_model_and_optimizer with load_optimizer=False (teacher).
+
+        A teacher worker never trains, so the model must not be DDP-wrapped
+        and no optimizer may be created for it.
+        """
+        from nemo_rl.models.megatron.setup import setup_model_and_optimizer
+
+        mock_state = MagicMock()
+        mock_state.start_time = 0.0
+        mock_global_state.return_value = mock_state
+
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.ft = None
+        mock_megatron_cfg.model.vocab_size = 32000
+        mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
+        mock_megatron_cfg.model.tensor_model_parallel_size = 1
+        mock_megatron_cfg.ddp.overlap_param_gather = True
+        mock_megatron_cfg.ddp.align_param_gather = True
+        mock_megatron_cfg.checkpoint.load = None
+        mock_megatron_cfg.checkpoint.pretrained_checkpoint = None
+
+        mock_model_chunk = MagicMock()
+        mock_model_chunk.start_param_sync = MagicMock()
+        mock_get_model.return_value = [mock_model_chunk]
+
+        mock_tensor_instance = MagicMock()
+        mock_tensor_instance.item.return_value = 0.0
+        mock_tensor.return_value = mock_tensor_instance
+
+        mock_checkpoint_exists.return_value = False
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "freeze_moe_router": True,
+            }
+        }
+
+        result = setup_model_and_optimizer(
+            policy_cfg=policy_cfg,
+            megatron_cfg=mock_megatron_cfg,
+            load_optimizer=False,
+        )
+
+        mock_get_model.assert_called_once()
+        assert mock_get_model.call_args[1]["wrap_with_ddp"] is False
+        mock_setup_optimizer.assert_not_called()
+        assert result.optimizer is None
+        assert result.scheduler is None
+
 
 @pytest.mark.mcore
 class TestSetupReferenceModelState:
@@ -4884,6 +4962,10 @@ class TestSetupReferenceModelState:
         # Verify checkpoint was loaded
         mock_load_checkpoint.assert_called_once()
 
+        # The reference model is never trained and has no optimizer: it must
+        # not be DDP-wrapped (no grad buffers, no optimizer state).
+        assert mock_get_model.call_args[1]["wrap_with_ddp"] is False
+
         # Verify model was set to eval mode
         mock_model.eval.assert_called_once()
 
@@ -4898,6 +4980,60 @@ class TestSetupReferenceModelState:
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
         mock_clear_global_router_replay_instances.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
+    @patch("nemo_rl.models.megatron.setup.load_checkpoint")
+    @patch("nemo_rl.models.megatron.setup.HAVE_FSDP2", False)
+    def test_setup_reference_model_keeps_ddp_wrap_with_fsdp2(
+        self,
+        mock_load_checkpoint,
+        mock_clear_global_router_replay_instances,
+        mock_checkpoint_exists,
+        mock_get_model,
+        mock_global_state,
+        mock_init_ckpt_context,
+        mock_pg_collection,
+    ):
+        """Test setup_reference_model_state keeps the wrap under FSDP2.
+
+        With torch FSDP2 the wrap is what shards the model across ranks, so
+        it must stay on even though the reference model is never trained.
+        """
+        from nemo_rl.models.megatron.setup import setup_reference_model_state
+
+        mock_state = MagicMock()
+        mock_global_state.return_value = mock_state
+
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.dist.use_torch_fsdp2 = True
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {
+            "layer1.weight": torch.tensor([1.0, 2.0]),
+        }
+        mock_get_model.return_value = [mock_model]
+
+        mock_checkpoint_exists.return_value = True
+
+        config = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+            }
+        }
+
+        setup_reference_model_state(
+            config=config,
+            megatron_cfg=mock_megatron_cfg,
+            pretrained_path="/path/to/pretrained",
+        )
+
+        mock_get_model.assert_called_once()
+        assert mock_get_model.call_args[1]["wrap_with_ddp"] is True
 
     @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
