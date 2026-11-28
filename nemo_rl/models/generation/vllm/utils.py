@@ -46,6 +46,13 @@ from nemo_rl.models.generation.vllm.metric_names import (
     GENERATIONS_FAILED_KEY,
     GENERATIONS_OK_KEY,
     OK_FINISH_REASONS,
+    PREEMPTION_COUNTERS,
+    PREEMPTIONS_KEY,
+    PREFIX_CACHE_HIT_COUNTERS,
+    PREFIX_CACHE_HIT_RATE_KEY,
+    PREFIX_CACHE_HITS_KEY,
+    PREFIX_CACHE_QUERIES_KEY,
+    PREFIX_CACHE_QUERY_COUNTERS,
     PROMPT_LENGTH_HISTOGRAMS,
     PROMPT_LENGTH_MEAN_KEY,
     PROMPT_TOKEN_COUNTERS,
@@ -1080,6 +1087,9 @@ _KEPT_COUNTER_NAMES: tuple[str, ...] = (
     + PROMPT_LENGTH_HISTOGRAMS
     + GENERATION_LENGTH_HISTOGRAMS
     + REQUEST_SUCCESS_COUNTERS
+    + PREFIX_CACHE_QUERY_COUNTERS
+    + PREFIX_CACHE_HIT_COUNTERS
+    + PREEMPTION_COUNTERS
 )
 
 
@@ -1168,7 +1178,7 @@ def compute_engine_step_metrics(
     start_counters: dict[str | tuple[str, int], float],
     end_counters: dict[str | tuple[str, int], float],
 ) -> dict[str, float]:
-    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+    """Compute per-step vLLM engine token, length, outcome, prefix-cache and preemption metrics.
 
     These are the engine's own accounting, which is why they are worth carrying
     even though the driver already derives token counts from the tensors a
@@ -1224,6 +1234,24 @@ def compute_engine_step_metrics(
     if saw_any:
         metrics[GENERATIONS_OK_KEY] = ok
         metrics[GENERATIONS_FAILED_KEY] = failed
+
+    prefix_cache_queries = _first_delta(delta, PREFIX_CACHE_QUERY_COUNTERS)
+    if prefix_cache_queries is not None:
+        metrics[PREFIX_CACHE_QUERIES_KEY] = prefix_cache_queries
+    prefix_cache_hits = _first_delta(delta, PREFIX_CACHE_HIT_COUNTERS)
+    if prefix_cache_hits is not None:
+        metrics[PREFIX_CACHE_HITS_KEY] = prefix_cache_hits
+    # No queries is "no data", not a 0% hit rate. Hits above queries means a
+    # restart dropped part of one series but not the other, so the pair is unusable.
+    if (
+        prefix_cache_queries
+        and prefix_cache_hits is not None
+        and prefix_cache_hits <= prefix_cache_queries
+    ):
+        metrics[PREFIX_CACHE_HIT_RATE_KEY] = prefix_cache_hits / prefix_cache_queries
+    preemptions = _first_delta(delta, PREEMPTION_COUNTERS)
+    if preemptions is not None:
+        metrics[PREEMPTIONS_KEY] = preemptions
 
     return metrics
 
