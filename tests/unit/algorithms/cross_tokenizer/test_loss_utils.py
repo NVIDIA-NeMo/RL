@@ -549,11 +549,11 @@ class TestBuildExactTokenMap:
         assert out["uncommon_teacher"].tolist() == [2]
 
     def test_strict_mode_accepts_zero_weight_trailing_ids(self, tmp_path: Path):
-        """Strict exact maps key on a top weight of 1.0 alone.
+        """Strict exact maps accept a zero-weight trailing id; no -1 sentinel is needed.
 
         s0 -> teacher 1 @ 1.0 with a zero-weight trailing id (no -1 sentinel)
         s1 fuzzy (0.7 / 0.3) -> uncommon
-        s2 -> teacher 0 @ 1.0 with the legacy -1 sentinel
+        s2 -> teacher 0 @ 1.0 with the -1 sentinel
         """
         indices = [[1, 0], [2, 1], [0, -1]]
         likelihoods = [[1.0, 0.0], [0.7, 0.3], [1.0, 0.0]]
@@ -567,6 +567,30 @@ class TestBuildExactTokenMap:
         assert out["common_teacher"].tolist() == [1, 0]
         assert out["uncommon_student"].tolist() == [1]
         assert out["uncommon_teacher"].tolist() == [2]
+
+    def test_strict_mode_rejects_rows_with_mass_outside_slot_0(self, tmp_path: Path):
+        """Strict exact maps need weight 1.0 in slot 0 and 0 in every other slot.
+
+        s0 bf16-rounded near 1-to-1 (1.0 / 0.0009) -> uncommon
+        s1 its 1.0 outside slot 0 (0 / 0 / 0 / 1.0) -> uncommon
+        s2 -> teacher 0 @ 1.0 -> common
+        """
+        indices = [[1, 2, -1, -1], [0, 1, 2, 2], [0, -1, -1, -1]]
+        likelihoods = [
+            [1.0, 0.0009, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=False,
+            teacher_vocab_size=3,
+        )
+        assert out["common_student"].tolist() == [2]
+        assert out["common_teacher"].tolist() == [0]
+        assert out["uncommon_student"].tolist() == [0, 1]
+        assert out["uncommon_teacher"].tolist() == [1, 2]
 
 
 # NOTE: the TP/CP > 1 paths of vocab_parallel_log_softmax / vocab_parallel_full_log_softmax /

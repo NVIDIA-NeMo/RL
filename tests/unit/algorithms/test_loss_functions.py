@@ -2742,7 +2742,7 @@ _CT_TEMPERATURE = 2.0
 def _write_ct_projection(tmp_path):
     """Dense top-k projection with two strict exact maps (s0->t0, s5->t4).
 
-    Strict exact-map rule: slot-0 weight 1.0 and a ``-1`` sentinel in slot 1.
+    Strict exact-map rule: slot-0 weight 1.0 and 0 in every other slot.
     The four middle rows are fuzzy (0.7/0.3, both slots real) so they fall in
     the uncommon partition. Result: common student {0, 5} / teacher {0, 4};
     uncommon teacher {1, 2, 3}.
