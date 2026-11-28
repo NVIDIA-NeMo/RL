@@ -656,3 +656,104 @@ def test_stop_properly_penalty_error_cases():
     config.stop_properly_penalty_coef = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
+
+
+def test_overlong_penalty_is_unbounded_by_default():
+    """Multi-turn lengths can pass max_response_length; the default keeps the old penalty."""
+    batch = BatchedDataDict(
+        total_reward=torch.ones(4),
+        response_token_lengths=torch.tensor([3000, 4096, 8192, 16384]),
+    )
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=1024,
+        overlong_buffer_penalty=1.0,
+        max_response_length=4096,
+    )
+    result = apply_reward_shaping(batch, config)
+    assert torch.allclose(
+        result["total_reward"], torch.tensor([1.0, 0.0, -4.0, -12.0]), atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("penalty", [0.5, 1.0, 2.0])
+def test_clamp_overlong_penalty_floors_at_the_buffer_penalty(penalty: float):
+    batch = BatchedDataDict(
+        total_reward=torch.ones(5),
+        response_token_lengths=torch.tensor([3000, 3584, 4096, 8192, 16384]),
+    )
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=1024,
+        overlong_buffer_penalty=penalty,
+        max_response_length=4096,
+        clamp_overlong_penalty=True,
+    )
+    result = apply_reward_shaping(batch, config)
+    # Inside the buffer the penalty is unchanged; past max_response_length it stops at -penalty.
+    expected = torch.tensor(
+        [1.0, 1.0 - 0.5 * penalty, 1.0 - penalty, 1.0 - penalty, 1.0 - penalty]
+    )
+    assert torch.allclose(result["total_reward"], expected, atol=1e-6)
+    assert torch.equal(result["unshaped_total_reward"], torch.ones(5))
+
+
+def test_combine_stop_properly_and_overlong_applies_both(capsys):
+    batch = BatchedDataDict(
+        total_reward=torch.ones(4),
+        response_token_lengths=torch.tensor([3000, 4096, 8192, 16384]),
+        truncated=torch.tensor([False, True, True, True]),
+    )
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=1024,
+        overlong_buffer_penalty=1.0,
+        max_response_length=4096,
+        stop_properly_penalty_coef=0.5,
+        combine_stop_properly_and_overlong=True,
+        clamp_overlong_penalty=True,
+    )
+    result = apply_reward_shaping(batch, config)
+
+    assert "[WARN]" not in capsys.readouterr().out
+    # Truncated rows are scaled first (1.0 -> 0.5), then the clamped overlong penalty applies.
+    expected = torch.tensor([1.0, -0.5, -0.5, -0.5])
+    assert torch.allclose(result["total_reward"], expected, atol=1e-6)
+    assert torch.equal(result["unshaped_total_reward"], torch.ones(4))
+
+
+def test_stop_properly_alone_still_ignores_the_overlong_settings(capsys):
+    batch = BatchedDataDict(
+        total_reward=torch.ones(2),
+        response_token_lengths=torch.tensor([3000, 16384]),
+        truncated=torch.tensor([False, True]),
+    )
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=1024,
+        overlong_buffer_penalty=1.0,
+        max_response_length=4096,
+        stop_properly_penalty_coef=0.5,
+    )
+    result = apply_reward_shaping(batch, config)
+
+    assert "[WARN]" in capsys.readouterr().out
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("buffer_length", "penalty", "max_length"),
+    [(None, 1.0, 4096), (512, None, 4096), (512, 1.0, None), (0, 1.0, 4096)],
+)
+def test_combine_stop_properly_and_overlong_validates_the_overlong_settings(
+    buffer_length: int | None, penalty: float | None, max_length: int | None
+):
+    with pytest.raises(ValidationError):
+        RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=buffer_length,
+            overlong_buffer_penalty=penalty,
+            max_response_length=max_length,
+            stop_properly_penalty_coef=0.5,
+            combine_stop_properly_and_overlong=True,
+        )
