@@ -65,6 +65,7 @@ from nemo_rl.experience.dynamic_sampling import (
     drain_step_reward_metrics,
     mask_sample_flagged,
     record_group_rewards,
+    record_looping_flags,
     rewards_carry_no_signal,
     voting_rewards_from_finalized,
     voting_rewards_from_record,
@@ -92,7 +93,11 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    looping_metrics_from_flags,
+    pct,
+)
 from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -1543,6 +1548,8 @@ class AsyncNemoGymRolloutImpl:
                             ),
                         )
                     result["reward_log_context"] = RewardLogContext(
+                        is_looping=result["full_result"].get("is_looping"),
+                        reasons=tuple(result["full_result"].get("reasons", ())),
                         agent_name=harness_metric_namespace(
                             _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                             result["full_result"],
@@ -1895,6 +1902,14 @@ class AsyncNemoGymRolloutImpl:
             )
             # Receipt metrics come from their manifests, not token-bearing results.
             receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
+            rollout_metrics.update(
+                looping_metrics_from_flags(
+                    [
+                        result["full_result"].get("is_looping")
+                        for result in completed_results
+                    ]
+                )
+            )
             if not receipt_mode:
                 rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
@@ -2190,7 +2205,7 @@ class AsyncNemoGymRolloutImpl:
             for result in agent_results
         ]
         for key in agent_extras[0].keys():
-            if key in _SHARED_GENRM_METRICS:
+            if key in _SHARED_GENRM_METRICS or key == "is_looping":
                 continue
             values = [
                 float(r[key])  # type: ignore
@@ -2358,6 +2373,7 @@ class RolloutManager:
         # Keyed by the step a group was generated for; the controller pops a step's
         # entry when that step closes.
         self._step_rewards: dict[int, StepRewardStats] = {}
+        self._looping_metrics_incomplete_through: int | None = None
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
@@ -2646,6 +2662,14 @@ class RolloutManager:
             )
         )
 
+    def record_looping_flags(
+        self, target_step: int | None, flags: Sequence[object]
+    ) -> None:
+        """Count the completed population before any dynamic-sampling rejection."""
+        if target_step is None and self._tally_step_provider is not None:
+            target_step = self._tally_step_provider()
+        record_looping_flags(self._step_rewards, target_step, flags)
+
     def record_group_rewards(
         self,
         target_step: Optional[int],
@@ -2665,9 +2689,27 @@ class RolloutManager:
             zero_variance=zero_variance,
         )
 
+    def suppress_restored_looping_metrics(self, through_step: int) -> None:
+        """Mark steps whose pre-checkpoint dynamic-sampling counts are unavailable."""
+        self._looping_metrics_incomplete_through = through_step
+        print(
+            f"Skipping looping ratios through restored step {through_step}: pre-filter counts were not checkpointed.",
+            flush=True,
+        )
+
     def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
         """Report this step's rewards and retire this and older step tallies."""
-        return drain_step_reward_metrics(self._step_rewards, step)
+        metrics = drain_step_reward_metrics(self._step_rewards, step)
+        if (
+            self._looping_metrics_incomplete_through is not None
+            and step <= self._looping_metrics_incomplete_through
+        ):
+            metrics = {
+                key: value
+                for key, value in metrics.items()
+                if not key.startswith("looping/")
+            }
+        return metrics
 
     async def generate_and_push(
         self,
@@ -2819,6 +2861,13 @@ class RolloutManager:
                         replacement_index=replacement_index,
                         zero_variance=True,
                     )
+                    self.record_looping_flags(
+                        target_step,
+                        [
+                            (c.env_extras or {}).get("is_looping")
+                            for c in record.completions
+                        ],
+                    )
                     # Report the voting rows; under exclude they differ from the group size.
                     scored = voting[0] if voting else float("nan")
                     print(
@@ -2843,6 +2892,13 @@ class RolloutManager:
                     [c.reward for c in record.completions],
                     replacement_index=replacement_index,
                     zero_variance=is_zero_variance,
+                )
+                self.record_looping_flags(
+                    target_step,
+                    [
+                        (c.env_extras or {}).get("is_looping")
+                        for c in record.completions
+                    ],
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an

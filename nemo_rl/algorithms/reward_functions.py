@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import warnings
+from collections.abc import Sequence
 from typing import TypeVar
 
 import torch
@@ -26,11 +27,13 @@ Tensor = TypeVar("Tensor", bound=torch.Tensor)
 class RewardShapingConfig(BaseModel, extra="allow"):
     """Configuration for reward function processing.
 
-    This configuration enables custom reward shaping, currently supporting DAPO-style
-    penalties for responses that exceed the maximum response length threshold.
+    The master switch enables configured length penalties and severe-loop zeroing.
+    Loop-only shaping requires no length-penalty parameters.
     """
 
     enabled: bool = False
+    # Requires the master switch; only confirmed text loops are zeroed.
+    zero_looping_rewards: bool = False
 
     # The length of the buffer to penalize responses that exceed the maximum response length threshold.
     # Responses of length greater than overlong_buffer_length + max_response_length will
@@ -48,10 +51,25 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
 
+    @property
+    def length_shaping_enabled(self) -> bool:
+        """Whether the stage selects a length penalty, including its default DAPO mode."""
+        return self.enabled and (
+            not self.zero_looping_rewards
+            or self.stop_properly_penalty_coef is not None
+            or self.overlong_buffer_length is not None
+            or self.overlong_buffer_penalty is not None
+            or self.max_response_length is not None
+        )
+
     @model_validator(mode="after")
     def validate_settings(self) -> "RewardShapingConfig":
         """Validate active shaping parameters before any backend consumes them."""
-        if not self.enabled:
+        if self.zero_looping_rewards and not self.enabled:
+            raise ValueError(
+                "reward_shaping.zero_looping_rewards requires reward_shaping.enabled=true"
+            )
+        if not self.length_shaping_enabled:
             return self
 
         coef = self.stop_properly_penalty_coef
@@ -112,7 +130,35 @@ class RewardShapingConfig(BaseModel, extra="allow"):
         return self
 
 
+def zero_looping_rewards(
+    rewards: torch.Tensor, flags: Sequence[object] | None
+) -> torch.Tensor:
+    """Zero only known boolean True labels, leaving unknown rows unchanged."""
+    if flags is None:
+        return rewards
+    looping = torch.tensor(
+        [flag is True for flag in flags], device=rewards.device, dtype=torch.bool
+    )
+    return rewards.masked_fill(looping, 0)
+
+
 def apply_reward_shaping(
+    batch: BatchedDataDict, cfg: RewardShapingConfig
+) -> BatchedDataDict:
+    """Apply length adjustments, then zero confirmed loops in learning rewards."""
+    if not cfg.enabled:
+        return batch
+    batch = _apply_length_shaping(batch, cfg)
+    if cfg.zero_looping_rewards:
+        if "unshaped_total_reward" not in batch:
+            batch["unshaped_total_reward"] = batch["total_reward"].clone()
+        for key in batch:
+            if key == "total_reward" or key.startswith("reward/"):
+                batch[key] = zero_looping_rewards(batch[key], batch.get("is_looping"))
+    return batch
+
+
+def _apply_length_shaping(
     batch: BatchedDataDict, cfg: RewardShapingConfig
 ) -> BatchedDataDict:
     """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.
@@ -120,7 +166,7 @@ def apply_reward_shaping(
     Nonetheless, it can be potentially extended to support any custom reward logic.
     """
     rewards = batch["total_reward"]
-    if not cfg.enabled:
+    if not cfg.length_shaping_enabled:
         return batch
 
     # Preserve the pre-shaping reward so downstream consumers (e.g. DAPO

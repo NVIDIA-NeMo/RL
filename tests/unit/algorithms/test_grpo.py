@@ -113,6 +113,7 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.metric_utils import looping_metrics_from_flags
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
@@ -9392,6 +9393,7 @@ def _run_tq_train_step(
     rollout_metrics: dict[str, Any],
     actor_data: BatchedDataDict[Any],
     estimator: MagicMock,
+    rollout_replies: list[tuple[Any, ...]] | None = None,
 ) -> Any:
     """Drive one ``grpo_train_sync`` step on the actor's payload.
 
@@ -9408,6 +9410,7 @@ def _run_tq_train_step(
             rollout_metrics,
             {},
         )
+        grpo_sync_mod.SyncRolloutActor.options.return_value.remote.return_value.rollout_to_tq.remote.side_effect = rollout_replies
         policy.read_from_dataplane.side_effect = (
             lambda _meta, select_fields, **kwargs: BatchedDataDict(
                 {k: actor_data[k] for k in select_fields}
@@ -9536,7 +9539,10 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     ``rollout_to_tq`` and the driver centres it on the policy's population,
     not on every row.
     """
+    with pytest.raises(ValueError, match="reward_shaping.enabled=true"):
+        RewardShapingConfig(zero_looping_rewards=True)
     components = mock_grpo_components
+    monkeypatch.setattr(grpo_sync_mod, "MemoryTracker", MagicMock)
     cfg = components["master_config"]
     cfg.data_plane = {"enabled": True, "backend": "simple"}
     cfg.grpo.max_num_steps = 1
@@ -9545,9 +9551,16 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     cfg.grpo.masked_reward_policy = reward_policy
     cfg.grpo.overlong_filtering = False
     cfg.grpo.seq_logprob_error_threshold = None
+    cfg.grpo.use_dynamic_sampling = True
+    cfg.grpo.reward_shaping = RewardShapingConfig(
+        enabled=True, zero_looping_rewards=True
+    )
     cfg.loss_fn.use_kl_in_reward = False
     batch = next(iter(components["train_dataloader"])).repeat_interleave(4)
-    batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    batch["total_reward"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    batch["is_looping"] = [True, False, None, None]
+    batch["reasons"] = [["repeated_text"], [], [], []]
+    batch["verifier_reward"] = batch["total_reward"].clone()
     # Only the environment-masked row carries a nonzero pre-penalty env reward.
     batch["env_reward"] = torch.tensor([0.0, 0.0, 0.0, 1.0])
     batch["mask_sample"] = [False, False, False, True]
@@ -9556,6 +9569,16 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
         components, cfg, batch, monkeypatch
     )
     assert torch.equal(carry["env_reward"], batch["env_reward"])
+    rollout_metrics.update(looping_metrics_from_flags(batch["is_looping"]))
+    dropped = carry.select_indices(range(4))
+    dropped["total_reward"] = torch.ones(4)
+    dropped["verifier_reward"] = torch.ones(4)
+    dropped["is_looping"] = [True] * 4
+    dropped["reasons"] = [["repeated_text"]] * 4
+    dropped_meta = meta.subset(range(4))
+    dropped_meta.sample_ids = [f"dropped_{index}" for index in range(4)]
+    dropped_metrics = rollout_metrics.copy()
+    dropped_metrics.update(looping_metrics_from_flags(dropped["is_looping"]))
     actor_data["prev_logprobs"] = torch.zeros_like(actor_data["generation_logprobs"])
     actor_data["reference_policy_logprobs"] = torch.zeros_like(
         actor_data["generation_logprobs"]
@@ -9573,20 +9596,31 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
         grpo_sync_mod, "calculate_baseline_and_std_per_prompt", recording_baseline
     )
     estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
-    _run_tq_train_step(
-        components, cfg, meta, carry, rollout_metrics, actor_data, estimator
+    fields = _run_tq_train_step(
+        components,
+        cfg,
+        meta,
+        carry,
+        rollout_metrics,
+        actor_data,
+        estimator,
+        [
+            (dropped_meta, dropped, dropped_metrics, {}),
+            (meta, carry, rollout_metrics, {}),
+        ],
     )
 
-    # Two driver-side calls, the training baseline/std and then the env
-    # baseline, with one mask (the estimator binds its own copy).
-    assert len(seen) == 2
+    # Each attempt computes training and env baselines; inspect the retained one.
+    assert len(seen) == 4
+    seen = seen[-2:]
+    assert carry["unshaped_total_reward"].tolist() == [1, 0, 1, 0]
     expected_mask = (
         torch.tensor([1.0, 1.0, 1.0, 0.0])
         if reward_policy == "exclude"
         else torch.ones(4)
     )
     (train_rewards, train_mask, _), (env_rewards, env_mask, env_baseline) = seen
-    torch.testing.assert_close(train_rewards, batch["total_reward"])
+    torch.testing.assert_close(train_rewards, torch.tensor([0.0, 0.0, 1.0, 0.0]))
     torch.testing.assert_close(env_rewards, batch["env_reward"])
     assert torch.equal(train_mask, expected_mask)
     assert torch.equal(env_mask, expected_mask)
@@ -9596,6 +9630,17 @@ def test_tq_env_baseline_site_uses_the_statistics_mask(
     else:
         # ... whereas under include it votes (non-leave-one-out mean 1/4).
         torch.testing.assert_close(env_baseline[:3], torch.full((3,), 0.25))
+    saved = components["logger"].log_batched_dict_as_jsonl.call_args.args[0]
+    assert [row["is_looping"] for row in saved["metadata"]] == batch["is_looping"]
+    assert [row["reasons"] for row in saved["metadata"]] == batch["reasons"]
+    assert saved["verifier_rewards"] == [1, 0, 1, 0]
+    assert saved["rewards"] == [0, 0, 1, 0]
+    assert saved["sample_loss_mask"] == [1, 1, 1, 0]
+    assert fields["advantages"][1, -1] < 0 < fields["advantages"][2, -1]
+    assert len(saved["token_ids"]) == len(saved["token_loss_mask"]) == 4
+    final = _logged_train_metrics_with_key(components["logger"], "reward")
+    assert final["looping/rate"] == 5 / 6
+    assert final["looping/coverage"] == 6 / 8
 
 
 @pytest.mark.parametrize("reward_policy", ["exclude", "include"])

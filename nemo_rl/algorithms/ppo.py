@@ -82,7 +82,10 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    should_use_nemo_gym,
+    validate_looping_reward_safeguard,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -374,6 +377,9 @@ def setup(
         )
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
+    validate_looping_reward_safeguard(
+        env_configs, enabled=master_config.ppo.reward_shaping.zero_looping_rewards
+    )
     loss_config: ClippedPGLossConfig = master_config.loss_fn
     if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
@@ -1623,10 +1629,9 @@ def ppo_train(
                     repeated_batch, master_config.ppo.reward_scaling
                 )
                 reward_shaping_config = master_config.ppo.reward_shaping
-                if reward_shaping_config.enabled:
-                    repeated_batch = apply_reward_shaping(
-                        repeated_batch, reward_shaping_config
-                    )
+                repeated_batch = apply_reward_shaping(
+                    repeated_batch, reward_shaping_config
+                )
 
                 # Process rewards and build training data
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())

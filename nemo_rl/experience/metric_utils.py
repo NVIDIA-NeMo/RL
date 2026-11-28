@@ -19,6 +19,29 @@ import statistics
 from collections.abc import Sequence
 
 
+def looping_metrics(*, completed: int, assessed: int, flagged: int) -> dict[str, float]:
+    """Report ratios alongside the sufficient counts used to pool groups."""
+    metrics: dict[str, float] = {
+        "looping/completed_total": completed,
+        "looping/assessed_total": assessed,
+        "looping/flagged_total": flagged,
+    }
+    if completed:
+        metrics["looping/coverage"] = assessed / completed
+    if assessed:
+        metrics["looping/rate"] = flagged / assessed
+    return metrics
+
+
+def looping_metrics_from_flags(flags: Sequence[object]) -> dict[str, float]:
+    """Count all completed outputs, including masked and unassessed rows."""
+    return looping_metrics(
+        completed=len(flags),
+        assessed=sum(type(flag) is bool for flag in flags),
+        flagged=sum(flag is True for flag in flags),
+    )
+
+
 def is_histogram_metric(name: str) -> bool:
     """Return whether a metric key represents raw histogram observations."""
     return name.startswith("histogram/") or name.endswith("/histogram")

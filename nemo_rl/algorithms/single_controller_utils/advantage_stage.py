@@ -505,6 +505,9 @@ class AdvantageComputer:
                     "total_reward": rewards,
                     "response_token_lengths": token_mask.sum(dim=-1).long(),
                     "truncated": truncated,
+                    "is_looping": [tag.get("is_looping") for tag in meta.tags]
+                    if meta.tags is not None
+                    else None,
                 }
             ),
             cfg.algo.reward_shaping,

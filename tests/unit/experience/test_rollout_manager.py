@@ -395,6 +395,7 @@ def _make_manager(
     mgr._masked_reward_policy = None
     mgr._overlong_filtering = False
     mgr._step_rewards = {}
+    mgr._looping_metrics_incomplete_through = None
     return mgr
 
 
@@ -3401,7 +3402,7 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
     from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 
     checks = RewardChecks(True, True, True)
-    log_context = RewardLogContext("agent", '{"answer":"ok"}')
+    log_context = RewardLogContext("agent", '{"answer":"ok"}', True, ("repeated_text",))
     original = _receipt_record
 
     def with_checks(*args, **kwargs):
@@ -3463,6 +3464,27 @@ def _scored_record(*rewards: float) -> PromptGroupRecord:
         ],
         rollout_metrics={},
     )
+
+
+@pytest.mark.parametrize("rewards", [[1.0] * 4, [1.0, 0.0, 0.0, 0.0]])
+def test_looping_labels_preserve_raw_dynamic_sampling(rewards):
+    record = _scored_record(*rewards)
+    flags = [True, False, None, False]
+    for completion, flag in zip(record.completions, flags, strict=True):
+        completion.env_extras = {"is_looping": flag, "mask_sample": True}
+    manager = _make_manager(_FakeBuffer(), _FakeImpl(record=record))
+    manager._filter_zero_variance_groups = True
+    outcome = _run(manager.generate_and_push({"idx": 0}, target_step=0))
+    expected = RolloutOutcome.FILTERED if rewards[1] else RolloutOutcome.COMMITTED
+    assert outcome is expected
+    assert manager._voting_rewards(record) == rewards
+    metrics = manager.drain_step_reward_metrics(0)
+    assert metrics["looping/rate"] == 1 / 3
+    assert metrics["looping/coverage"] == 3 / 4
+    assert metrics["unfiltered_reward"] == sum(rewards) / 4
+    manager.suppress_restored_looping_metrics(0)
+    manager.record_looping_flags(0, flags)
+    assert "looping/rate" not in manager.drain_step_reward_metrics(0)
 
 
 class TestStepRewardMetrics:

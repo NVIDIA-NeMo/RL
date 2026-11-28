@@ -215,6 +215,12 @@ class RolloutRestorer(_UsesRolloutParts):
         )
         await self._restore_spare_prompts()
         self._validate_sampler_cursor()
+        if self._resume.path is not None and self._master_config.env.get(
+            "should_use_nemo_gym"
+        ):
+            self._rollout_manager.suppress_restored_looping_metrics(
+                max(self._read_progress().trainer_version, self._sampler.dispatch_index)
+            )
         recovery_prepare_seconds = time.monotonic() - recovery_prepare_started
         self._log_restore_metrics(
             replay_metadata_load_seconds=replay_restore_seconds,

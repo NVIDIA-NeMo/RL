@@ -2644,7 +2644,9 @@ def test_legacy_train_dump_serializes_unsupported_logprobs_as_null(tmp_path):
     logger.gpu_monitor = None
     logger.base_log_dir = str(tmp_path)
     values = torch.tensor([[0.0, -torch.inf]])
-    logger.log_batched_dict_as_jsonl({"prev_logprobs": values}, "train.jsonl")
+    logger.log_batched_dict_as_jsonl(
+        {"prev_logprobs": values, "verifier_rewards": [float("nan")]}, "train.jsonl"
+    )
 
     def reject_nonfinite(value):
         raise AssertionError(value)
@@ -2653,4 +2655,5 @@ def test_legacy_train_dump_serializes_unsupported_logprobs_as_null(tmp_path):
         (tmp_path / "train.jsonl").read_text(), parse_constant=reject_nonfinite
     )
     assert row["prev_logprobs"] == [[0.0, None]]
+    assert row["verifier_rewards"] == [None]
     assert torch.isneginf(values[0, 1])

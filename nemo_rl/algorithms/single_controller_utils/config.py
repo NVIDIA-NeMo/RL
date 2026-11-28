@@ -1097,7 +1097,7 @@ def validate_forest_objective(
         # The loss filters physical rows; forest training masks whole owners.
         "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         f"{section}.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
-        f"{section}.reward_shaping.enabled": algo_cfg.reward_shaping.enabled,
+        f"{section}.reward_shaping.enabled": algo_cfg.reward_shaping.length_shaping_enabled,
         f"{section}.invalid_tool_call_advantage": algo_cfg.invalid_tool_call_advantage
         is not None,
         f"{section}.malformed_thinking_advantage": algo_cfg.malformed_thinking_advantage

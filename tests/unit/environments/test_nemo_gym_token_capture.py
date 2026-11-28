@@ -79,11 +79,22 @@ def test_capture_stream_yields_ready_sibling_before_slow_drain(
             # The second Gym result arrives after the first starts draining.
             if row["_rowidx"] == 1:
                 await drain_started.wait()
-            return row, {"reward": 1.0}
+            return row, {"reward": 1.0, "response": {"output": []}}
 
         env, rows = _capture_stream_env(forest_training, completed)
+        env.cfg["assess_looping"] = True
+        env._looping_assessor = SimpleNamespace(
+            assess=AsyncMock(
+                return_value=SimpleNamespace(
+                    is_looping=True, reasons=("repeated_text",)
+                )
+            )
+        )
 
         async def postprocess(row: dict, result: dict) -> dict:
+            result.pop("response")
+            assert result.pop("is_looping") is True
+            assert result.pop("reasons") == ["repeated_text"]
             if row["_rowidx"] == 0:
                 drain_started.set()
                 await release_drain.wait()

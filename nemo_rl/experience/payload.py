@@ -183,6 +183,13 @@ def record_to_train_batch(
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
     }
+    if any("is_looping" in (c.env_extras or {}) for c in completions):
+        train_data["is_looping"] = [
+            (c.env_extras or {}).get("is_looping") for c in completions
+        ]
+        train_data["reasons"] = [
+            (c.env_extras or {}).get("reasons", []) for c in completions
+        ]
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     if include_message_violation_fields:
@@ -248,4 +255,8 @@ def pack_payload(
         }
         for i in range(n)
     ]
+    for key in ("is_looping", "reasons"):
+        if key in train_batch:
+            for tag, value in zip(tags, train_batch[key], strict=True):
+                tag[key] = value
     return sample_ids, fields_td, tags

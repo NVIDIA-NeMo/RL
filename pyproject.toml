@@ -504,6 +504,8 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # Allow Bridge and Gym to share Hydra's security-fixed 1.4 release line.
+  { package = { name = "megatron-bridge" }, dependencies = ["hydra-core>=1.3.4,<1.5"] },
   # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
   # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
   "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",

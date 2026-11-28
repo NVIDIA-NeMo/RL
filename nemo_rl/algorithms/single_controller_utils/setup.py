@@ -125,6 +125,7 @@ from nemo_rl.environments.nemo_gym import (
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
+    validate_looping_reward_safeguard,
 )
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
@@ -1822,6 +1823,9 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    validate_looping_reward_safeguard(
+        master_config.env, enabled=algo_cfg.reward_shaping.zero_looping_rewards
+    )
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):

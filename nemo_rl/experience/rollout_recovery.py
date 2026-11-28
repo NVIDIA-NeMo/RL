@@ -169,6 +169,8 @@ def _reward_log_context_state(context: RewardLogContext) -> dict[str, Any]:
     return {
         "agent_name": _copy_checkpoint_value(context.agent_name),
         "full_result_json": _copy_checkpoint_value(context.full_result_json),
+        "is_looping": context.is_looping,
+        "reasons": context.reasons,
     }
 
 

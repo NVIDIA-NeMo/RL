@@ -58,6 +58,7 @@ from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
+    zero_looping_rewards,
 )
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -102,6 +103,7 @@ from nemo_rl.environments.nemo_gym import (
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
+    validate_looping_reward_safeguard,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
@@ -113,13 +115,14 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.experience.metric_utils import is_histogram_metric, looping_metrics
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
     get_effort_config,
     get_nemo_gym_thinking_tags,
+    nemo_gym_logging_metadata,
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
@@ -925,6 +928,9 @@ def setup(
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_looping_reward_safeguard(
+        master_config.env, enabled=grpo_config.reward_shaping.zero_looping_rewards
+    )
 
     _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
@@ -3799,6 +3805,7 @@ def _grpo_train_impl(
         batch_cache: BatchedDataDict[DatumSpec] = None
         # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by dynamic_sampling_max_gen_batches. Used in the case of dynamic sampling.
         dynamic_sampling_num_gen_batches = 0
+        looping_batches: dict[str, list] = {}
         next_prompt_group_id = 0
 
         # Run grpo/dapo training loop (single-turn)
@@ -4053,16 +4060,19 @@ def _grpo_train_impl(
                     metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = (
                         rollout_metrics[MEAN_GEN_TOKENS_PER_SAMPLE_KEY]
                     )
+                    for key, value in rollout_metrics.items():
+                        if key.startswith("looping/") and key.endswith("_total"):
+                            looping_batches.setdefault(key, []).append(value)
+                    rollout_metrics.update(aggregate_rollout_metrics(looping_batches))
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
                 )
                 # Process rewards with custom reward function
-                if master_config.grpo.reward_shaping.enabled:
-                    repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.grpo.reward_shaping
-                    )
+                repeated_batch = apply_reward_shaping(
+                    repeated_batch, master_config.grpo.reward_shaping
+                )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -4772,6 +4782,7 @@ def _grpo_train_impl(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
+                log_data.update(nemo_gym_logging_metadata(repeated_batch))
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
@@ -4905,6 +4916,7 @@ def _grpo_train_impl(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
+            looping_batches.clear()
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
@@ -5235,7 +5247,10 @@ def aggregate_rollout_metrics(
     """
     aggregated = {}
     for k, v in per_group_metrics.items():
-        if is_histogram_metric(k):
+        if k.startswith("looping/"):
+            if k.endswith("_total"):
+                aggregated[k] = sum(v)
+        elif is_histogram_metric(k):
             aggregated[k] = [observation for group in v for observation in group]
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
@@ -5260,6 +5275,14 @@ def aggregate_rollout_metrics(
             )
         else:
             aggregated[k] = sum(v) / len(v)
+    if "looping/completed_total" in aggregated:
+        aggregated.update(
+            looping_metrics(
+                completed=aggregated["looping/completed_total"],
+                assessed=aggregated["looping/assessed_total"],
+                flagged=aggregated["looping/flagged_total"],
+            )
+        )
     return aggregated
 
 
@@ -6069,6 +6092,17 @@ def async_grpo_train(
                             f"groups account for {prompt_ids_for_adv.shape[0]}"
                         )
 
+                    if (
+                        master_config.grpo.reward_shaping.enabled
+                        and master_config.grpo.reward_shaping.zero_looping_rewards
+                    ):
+                        for key in (
+                            "total_reward",
+                            *get_gdpo_reward_component_keys(repeated_batch),
+                        ):
+                            repeated_batch[key] = zero_looping_rewards(
+                                repeated_batch[key], repeated_batch.get("is_looping")
+                            )
                     rewards = repeated_batch["total_reward"]
 
                     print(
@@ -6750,6 +6784,7 @@ def async_grpo_train(
                     log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
+                log_data.update(nemo_gym_logging_metadata(repeated_batch))
                 log_data["input_lengths"] = input_lengths.tolist()
                 log_data["token_ids"] = train_data["input_ids"].tolist()
                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()

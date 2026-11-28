@@ -308,6 +308,31 @@ class NemoGymPostprocessConfig(BaseModel):
     invalid_tool_call_patterns: list[str] | None = None
     thinking_tags: list[str] | None = None
     truncate_noncontiguous_episodes: bool = False
+    assess_looping: bool = False
+
+
+def validate_looping_reward_safeguard(env: dict[str, Any], *, enabled: bool) -> None:
+    """Require diagnostic labels on every Gym shard before objective zeroing."""
+    if not enabled:
+        return
+    if not env.get("should_use_nemo_gym"):
+        raise ValueError(
+            "zero_looping_rewards requires NeMo Gym with assess_looping=true"
+        )
+    gym_config = env["nemo_gym"]
+    plan = parse_shard_plan(gym_config)
+    configs = (
+        [apply_shard_overlay(gym_config, plan, shard) for shard in plan.shards]
+        if plan is not None
+        else [gym_config]
+    )
+    if not all(
+        NemoGymPostprocessConfig.model_validate(config).assess_looping
+        for config in configs
+    ):
+        raise ValueError(
+            "zero_looping_rewards requires env.nemo_gym.assess_looping=true on every shard"
+        )
 
 
 def _prepare_materialized_nemo_gym_rows(
@@ -711,6 +736,7 @@ def get_nemo_gym_venv_dir() -> str | None:
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    assess_looping: NotRequired[bool]
     # The bearer token the generation server requires on its OpenAI routes, handed
     # to the Gym model server as policy_api_key. None when the server checks none.
     policy_api_key: NotRequired[Optional[str]]
@@ -1199,6 +1225,8 @@ class NemoGym(EnvironmentInterface):
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
         self._tokenizer: Optional[PreTrainedTokenizerBase] = None
+        # Gym is optional on the driver; its text worker belongs to this actor.
+        self._looping_assessor: Any = None
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
@@ -1929,6 +1957,7 @@ Depending on your data shape, you may want to change these values."""
             head_server_config=self.head_server_config,
             **({"retry_requests": False} if self._forest_training else {}),
             route_failures_to_sidecar=True,
+            enrich_results=False,
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -1999,6 +2028,17 @@ Depending on your data shape, you may want to change these values."""
                     )
                 except (GymTransportError, RolloutDataFailure) as error:
                     return nemo_gym_row, error
+                if self.cfg.get("assess_looping"):
+                    if self._looping_assessor is None:
+                        # Only the rollout actor needs the optional Gym dependency.
+                        from nemo_gym.rollouts import LoopingAssessor
+
+                        self._looping_assessor = LoopingAssessor()
+                    assessment = await self._looping_assessor.assess(
+                        result.get("response")
+                    )
+                    result["is_looping"] = assessment.is_looping
+                    result["reasons"] = [str(reason) for reason in assessment.reasons]
                 # Label the result for metrics; the row sent to Gym names only the server.
                 if is_nemo_gym_task(nemo_gym_row):
                     harness = self._selected_harness(nemo_gym_row)
@@ -2341,7 +2381,7 @@ Depending on your data shape, you may want to change these values."""
             key: value
             for key, value in result.items()
             if isinstance(value, (str, int, float, bool))
-            or key in ("_ng_episode_id", "_ng_task_id")
+            or key in ("_ng_episode_id", "_ng_task_id", "is_looping", "reasons")
         }
         full_result["instance_config"] = {
             "mask_sample": result["instance_config"]["mask_sample"]
@@ -2926,6 +2966,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         whatever it leaves running is stopped too; see _shut_down_gym_servers.
         """
         try:
+            if self._looping_assessor is not None:
+                self._looping_assessor.close()
+                self._looping_assessor = None
             rh, self.rh = self.rh, None
             if rh is not None:
                 _shut_down_gym_servers(rh)
@@ -3314,6 +3357,7 @@ def _build_gym_actor_config(
         policy_api_key=policy_api_key,
         invalid_tool_call_patterns=postprocess_cfg.invalid_tool_call_patterns,
         thinking_tags=postprocess_cfg.thinking_tags,
+        assess_looping=postprocess_cfg.assess_looping,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,

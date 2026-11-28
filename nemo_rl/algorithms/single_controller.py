@@ -1928,6 +1928,15 @@ class SingleControllerActor:
                                     target_step=target_step,
                                     replacements_used=replacements,
                                 )
+                            self._rollout_manager.record_looping_flags(
+                                target_step,
+                                [
+                                    context.is_looping if context is not None else None
+                                    for context in request.reward_log_contexts
+                                ]
+                                if request.reward_log_contexts is not None
+                                else [None] * len(request.rollout_ids),
+                            )
                             if finalized is None:
                                 # Finalizer dropped the group as a structural
                                 # outcome (e.g. router replay with no routed
@@ -3851,6 +3860,9 @@ class SingleControllerActor:
                 reward_metrics = self._rollout_manager.drain_step_reward_metrics(
                     version_during_step
                 )
+                for key in list(step_metrics):
+                    if key.startswith("looping/"):
+                        del step_metrics[key]
                 step_metrics.update(reward_metrics)
 
                 # Checkpointing (mirrors async_grpo_train's save block).

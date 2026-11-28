@@ -376,7 +376,13 @@ class SyncRolloutActor:
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
         }
-        for key in ("agent_ref", "attribution_key"):
+        for key in (
+            "agent_ref",
+            "attribution_key",
+            "is_looping",
+            "reasons",
+            "verifier_reward",
+        ):
             if key in fb:
                 driver_carry[key] = fb[key]
         # Pre-length-penalty env reward (present only when grpo.length_penalty
@@ -424,6 +430,10 @@ class SyncRolloutActor:
             tags = [{} for _ in sample_ids]
         for tag, uid in zip(tags, (uid for uid in uids for _ in range(n_per_prompt))):
             tag[GROUP_ID_TAG] = uid
+        for key in ("is_looping", "reasons"):
+            if key in fb:
+                for tag, value in zip(tags, fb[key], strict=True):
+                    tag[key] = value
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
