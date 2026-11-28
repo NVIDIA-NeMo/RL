@@ -3,7 +3,8 @@ grpo:
   num_prompts_per_step: 16
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
-  enabled: false
+  save:
+    enabled: false
 data_plane: null
 policy:
   train_global_batch_size: 128

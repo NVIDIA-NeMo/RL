@@ -66,7 +66,7 @@ uv run --no-sync python tests/functional/_sglang_grpo_chaos.py \
     "logger.log_dir=$LOG_DIR" \
     logger.wandb_enabled=false \
     logger.monitor_gpus=false \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     "$@" \
     2>&1 | tee "$EXP_DIR/harness.log"
 

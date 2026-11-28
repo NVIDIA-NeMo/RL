@@ -29,7 +29,8 @@ loss_fn:
 
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel
-  save_period: 5
+  save:
+    save_period: 5
 
 policy:
   model_name: Qwen/Qwen3-8B

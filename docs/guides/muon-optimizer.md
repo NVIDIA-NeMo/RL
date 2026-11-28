@@ -115,7 +115,7 @@ uv run examples/run_sft.py \
   policy.sequence_packing.enabled=true \
   policy.model_name=Qwen/Qwen3-235B-A22B \
   policy.tokenizer.name=Qwen/Qwen3-235B-A22B \
-  checkpointing.enabled=true \
+  checkpointing.save.enabled=true \
   policy.megatron_cfg.num_layers_in_first_pipeline_stage=11 \
   policy.megatron_cfg.num_layers_in_last_pipeline_stage=11
 ```

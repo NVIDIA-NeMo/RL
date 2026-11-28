@@ -10,10 +10,11 @@ grpo:
   val_batch_size: 32
 
 checkpointing:
-  enabled: true
   checkpoint_dir: results/audio_grpo_3B_megatron
-  keep_top_k: 10
-  save_period: 400
+  save:
+    enabled: true
+    keep_top_k: 10
+    save_period: 400
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-3B

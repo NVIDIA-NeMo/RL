@@ -40,7 +40,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.wandb.name="$EXP_NAME" \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.save.enabled=False \
     "${teacher_args[@]}" \
     "$@" \
     2>&1 | tee "$RUN_LOG"

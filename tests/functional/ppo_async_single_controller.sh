@@ -61,11 +61,11 @@ TRAIN_CMD=(
     logger.tensorboard_enabled=true
     logger.wandb_enabled=false
     logger.monitor_gpus=true
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="${CKPT_DIR}"
-    checkpointing.metric_name=null
-    checkpointing.save_period=1
-    checkpointing.save_data_plane=true
+    checkpointing.save.metric_name=null
+    checkpointing.save.save_period=1
+    checkpointing.save.save_data_plane=true
 )
 
 cd "${PROJECT_ROOT}"

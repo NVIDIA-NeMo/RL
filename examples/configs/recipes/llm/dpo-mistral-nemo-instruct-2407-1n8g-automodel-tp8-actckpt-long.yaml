@@ -7,7 +7,8 @@ dpo:
   reference_policy_kl_penalty: 0.1
 checkpointing:
   checkpoint_dir: results/dpo-mistral-nemo-instruct-2407-1n8g-automodel-tp8-actckpt-long
-  keep_top_k: 1
+  save:
+    keep_top_k: 1
 policy:
   model_name: mistralai/Mistral-Nemo-Instruct-2407
   tokenizer:

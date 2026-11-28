@@ -5,9 +5,10 @@ loss_fn:
   reference_policy_kl_penalty: 0.04
   use_importance_sampling_correction: true
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo_megatron
-  save_period: 10000
+  save:
+    enabled: false
+    save_period: 10000
 policy:
   model_name: moonshotai/Moonlight-16B-A3B-Instruct
   train_micro_batch_size: 1

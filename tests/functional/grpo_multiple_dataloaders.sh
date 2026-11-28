@@ -18,7 +18,7 @@ rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
 # This test will run for 2 steps and make sure that 1+1 steps w/ resume leads to the same result.
-# We use the checkpointing.checkpoint_must_save_by=0:0:0:1 feature to exit after 1 step.
+# We use the checkpointing.save.checkpoint_must_save_by=0:0:0:1 feature to exit after 1 step.
 
 prefix_output() {
   sed "s/^/$1/"
@@ -44,8 +44,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.tensorboard_enabled=true \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
-    checkpointing.save_period=1 \
+    checkpointing.save.enabled=false \
+    checkpointing.save.save_period=1 \
     $@
 }
 
@@ -55,9 +55,9 @@ cd $PROJECT_ROOT
 train_cmd logger.log_dir=$LOG_DIR/baseline $@ 2>&1 | prefix_output "[baseline 2step] " | tee ${RUN_LOG}.2step_baseline
 uv run tests/json_dump_tb_logs.py $LOG_DIR/baseline --output_path $EXP_DIR/baseline.json
 # 1+1 step
-train_cmd logger.log_dir=$LOG_DIR/resume checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/resume $@ 2>&1 | prefix_output "[resume 1step] " | tee ${RUN_LOG}.resume_1step
+train_cmd logger.log_dir=$LOG_DIR/resume checkpointing.save.checkpoint_must_save_by=0:0:0:1 checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/resume $@ 2>&1 | prefix_output "[resume 1step] " | tee ${RUN_LOG}.resume_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/resume --output_path $EXP_DIR/resume_1step.json
-train_cmd logger.log_dir=$LOG_DIR/resume checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/resume $@ 2>&1 | prefix_output "[resume 2step] " | tee ${RUN_LOG}.resume_2step
+train_cmd logger.log_dir=$LOG_DIR/resume checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/resume $@ 2>&1 | prefix_output "[resume 2step] " | tee ${RUN_LOG}.resume_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/resume --output_path $EXP_DIR/resume_2step.json
 
 uv run python - <<EOF $EXP_DIR/baseline.json $EXP_DIR/resume_1step.json $EXP_DIR/resume_2step.json

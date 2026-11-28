@@ -10,7 +10,8 @@ grpo:
   num_prompts_per_step: 4
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym
-  enabled: false
+  save:
+    enabled: false
 data_plane: null
 policy:
   train_global_batch_size: 32

@@ -3,7 +3,8 @@ sft:
   max_num_steps: 100
 checkpointing:
   checkpoint_dir: results/sft-qwen3-0.6B-1n8g-megatron-yarn-128k
-  save_period: 20
+  save:
+    save_period: 20
 policy:
   model_name: Qwen/Qwen3-0.6B
   train_global_batch_size: 16

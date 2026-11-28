@@ -21,12 +21,13 @@ ppo:
   policy_training_start_step: 10
 
 checkpointing:
-  enabled: false
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller
-  # Without a validation loop there is no val:accuracy to select on, and SC
-  # rejects any metric_name outside the train: namespace.
-  metric_name: null
-  save_data_plane: true
+  save:
+    enabled: false
+    # Without a validation loop there is no val:accuracy to select on, and SC
+    # rejects any metric_name outside the train: namespace.
+    metric_name: null
+    save_data_plane: true
 
 policy:
   # Offload optimizer state for policy logprob computation.

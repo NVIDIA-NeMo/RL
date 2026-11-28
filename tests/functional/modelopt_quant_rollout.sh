@@ -91,7 +91,7 @@ run_quant_rollout_case() {
         logger.log_dir="$log_dir" \
         logger.wandb_enabled=false \
         logger.monitor_gpus=true \
-        checkpointing.enabled=false \
+        checkpointing.save.enabled=false \
         "${real_quant_override[@]}" \
         "$@" \
         2>&1 | tee "$run_log"

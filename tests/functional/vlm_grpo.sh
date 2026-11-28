@@ -30,7 +30,7 @@ uv run $PROJECT_ROOT/examples/run_vlm_grpo.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     cluster.gpus_per_node=2 \
     $@ \
     2>&1 | tee $RUN_LOG

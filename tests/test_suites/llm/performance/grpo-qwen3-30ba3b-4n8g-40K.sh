@@ -25,8 +25,8 @@ uv run examples/run_grpo.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
-    checkpointing.save_period=4 \
+    checkpointing.save.enabled=True \
+    checkpointing.save.save_period=4 \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG

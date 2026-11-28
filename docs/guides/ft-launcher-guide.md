@@ -35,9 +35,9 @@ fault_tolerance:
 
 1. **Checkpointing**: Enable checkpointing for recovery to work:
    ```bash
-   ++checkpointing.enabled=true
+   ++checkpointing.save.enabled=true
    ++checkpointing.checkpoint_dir=/path/to/checkpoints
-   ++checkpointing.save_period=50
+   ++checkpointing.save.save_period=50
    ```
 
 2. **Timeouts**: Set `--ft-initial-rank-heartbeat-timeout` higher than `--ft-rank-heartbeat-timeout` to allow for model loading/setup time.

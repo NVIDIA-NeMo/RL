@@ -80,7 +80,7 @@ if [[ -n "${MPO_CHECKPOINT_MUST_SAVE_BY}" ]]; then
     echo "MPO_CHECKPOINT_MUST_SAVE_BY must use DD:HH:MM:SS format" >&2
     exit 2
   }
-  OPTIONAL_OVERRIDES+=" checkpointing.checkpoint_must_save_by='${MPO_CHECKPOINT_MUST_SAVE_BY}'"
+  OPTIONAL_OVERRIDES+=" checkpointing.save.checkpoint_must_save_by='${MPO_CHECKPOINT_MUST_SAVE_BY}'"
 fi
 if [[ -n "${WANDB_RUN_ID}" ]]; then
   [[ "${WANDB_RUN_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || {

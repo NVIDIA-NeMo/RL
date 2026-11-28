@@ -29,6 +29,7 @@ policy:
       overlap_param_gather: false
 checkpointing:
   checkpoint_dir: results/vlm_mpo_nemotron_omni_mmpr_megatron
-  keep_top_k: 4
-  save_period: 100
-  checkpoint_must_save_by: 00:03:45:00
+  save:
+    keep_top_k: 4
+    save_period: 100
+    checkpoint_must_save_by: 00:03:45:00

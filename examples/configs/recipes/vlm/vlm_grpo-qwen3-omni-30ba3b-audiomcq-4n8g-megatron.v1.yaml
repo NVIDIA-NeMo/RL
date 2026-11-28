@@ -8,9 +8,10 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
   truncated_importance_sampling_type: tis
 checkpointing:
-  enabled: true
   checkpoint_dir: results/audio_grpo_qwen3_omni_megatron
-  keep_top_k: 5
+  save:
+    enabled: true
+    keep_top_k: 5
 policy:
   model_name: Qwen/Qwen3-Omni-30B-A3B-Instruct
   train_global_batch_size: 32

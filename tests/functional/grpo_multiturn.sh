@@ -34,7 +34,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     $@ \
     2>&1 | tee $RUN_LOG
 

@@ -7,9 +7,10 @@ ppo:
   ppo_epochs: 1
   critic_ppo_epochs: 1
 checkpointing:
-  enabled: true
   checkpoint_dir: results/vlm_ppo-qwen2.5-vl-3b-geometry3k-megatron-single-controller
-  save_period: 10
+  save:
+    enabled: true
+    save_period: 10
 policy:
   model_name: Qwen/Qwen2.5-VL-3B-Instruct
   is_vlm: true

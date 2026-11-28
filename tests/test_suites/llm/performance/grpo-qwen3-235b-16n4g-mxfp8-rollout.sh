@@ -28,7 +28,7 @@ uv run examples/run_grpo.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.save.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     +policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \
     $@ \

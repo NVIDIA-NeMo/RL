@@ -157,7 +157,7 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.log_dir="${LOG_DIR}" \
     logger.wandb_enabled=false \
     logger.monitor_gpus=false \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     "$@" 2>&1 | tee "${RUN_LOG}"
 
 uv run --no-sync tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"

@@ -4,10 +4,11 @@ defaults: "grpo_qwen3_30ba3b_instruct.yaml"
 
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30b-thinking-swe1
-  metric_name: train:total_reward/mean
-  keep_top_k: 2
-  save_period: 5
-  checkpoint_must_save_by: 00:03:35:00
+  save:
+    metric_name: train:total_reward/mean
+    keep_top_k: 2
+    save_period: 5
+    checkpoint_must_save_by: 00:03:35:00
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 8

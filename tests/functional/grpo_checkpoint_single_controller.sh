@@ -11,7 +11,7 @@
 # later step boundary, the next save, or exit. Two runs share one
 # checkpoint_dir and one config (same max_num_steps, so Megatron train_iters
 # stays consistent across the restart):
-#   Run 1 sets a tiny checkpointing.checkpoint_must_save_by so the timeout
+#   Run 1 sets a tiny checkpointing.save.checkpoint_must_save_by so the timeout
 #   save fires at the first step boundary and training stops early (also
 #   exercising the timeout-save path).
 #   Run 2 drops the timeout and must resume from step_1 to max_num_steps.
@@ -50,11 +50,11 @@ TRAIN_CMD=(
     logger.tensorboard_enabled=false
     logger.wandb_enabled=false
     logger.monitor_gpus=false
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir=$CKPT_DIR
-    checkpointing.save_period=2
-    checkpointing.metric_name=null
-    checkpointing.save_data_plane=true
+    checkpointing.save.save_period=2
+    checkpointing.save.metric_name=null
+    checkpointing.save.save_data_plane=true
     data_plane.enabled=true
     data_plane.impl=transfer_queue
     data_plane.backend=simple
@@ -77,7 +77,7 @@ cd $PROJECT_ROOT
 # training early, leaving a complete step_1 checkpoint. ---
 echo "=== Run 1: timeout save + early stop ==="
 "${TRAIN_CMD[@]}" \
-    checkpointing.checkpoint_must_save_by=00:00:00:01 \
+    checkpointing.save.checkpoint_must_save_by=00:00:00:01 \
     logger.log_dir=$LOG_DIR/run1 \
     $@ \
     2>&1 | tee $EXP_DIR/run1.log

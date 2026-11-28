@@ -6,7 +6,8 @@ dpo:
   val_at_start: false
   sft_loss_weight: 0.01
 checkpointing:
-  enabled: false
+  save:
+    enabled: false
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:

@@ -14,8 +14,9 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
 checkpointing:
-  enabled: false
   checkpoint_dir: results/nemo-rl-omni/nemotron-omni-circle-count-1n4g
+  save:
+    enabled: false
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   is_vlm: true

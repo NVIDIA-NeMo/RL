@@ -19,7 +19,7 @@ uv run examples/run_grpo_single_controller.py \
     ppo.max_num_steps=$MAX_STEPS \
     logger.log_dir="$LOG_DIR" \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.save.enabled=False \
     "$@" \
     2>&1 | tee "$RUN_LOG"
 

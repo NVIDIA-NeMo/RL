@@ -88,13 +88,14 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports `simple`, `mooncake_cpu` and `nixl` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports `simple`, `mooncake_cpu` and `nixl` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
-      enabled: true
       checkpoint_dir: /shared/checkpoints/my-run
-      save_data_plane: true
+      save:
+        enabled: true
+        save_data_plane: true
 
     data_plane:
       enabled: true
@@ -144,7 +145,7 @@ Existing low/high effort means and exact length medians are preserved; `mean_rew
 
 ## Checkpointing and Replay Recovery
 
-With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
+With `checkpointing.save.save_data_plane: true`, each Single-Controller checkpoint contains:
 
 - The normal model, dataloader, and controller state, plus optimizer state when configured.
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
@@ -173,10 +174,11 @@ Normal trainer checkpoints are written at step boundaries. Periodic rollout snap
 
 ```yaml
 checkpointing:
-  enabled: true
   checkpoint_dir: /shared/checkpoints/my-run
-  save_data_plane: true
-  save_period: 1
+  save:
+    enabled: true
+    save_data_plane: true
+    save_period: 1
 
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
@@ -193,7 +195,7 @@ token_capture:
 
 `snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts a rollout snapshot. It is not a guarantee that a snapshot is written at every interval. An attempt after step N succeeds only when the immutable trainer checkpoint `step_N` is already durable. Consequently, `save_period: 1` is recommended for continuous post-step coverage; with a larger value, attempts are skipped until the matching trainer checkpoint exists. Before the first training step, snapshots are anchored to the initial model and a fingerprint of the rollout-semantic configuration.
 
-With `rollout_recovery.target_level: turn`, rollout snapshots are on even with `snapshot_attempt_interval_s: null`, because only a snapshot holds the environment's state. A snapshot also follows the trainer checkpoint that `checkpointing.checkpoint_must_save_by` triggers, before the run stops. The snapshot runs while the policy weights are still being written and is moved into `step_N` once it is published, so leave room in that deadline for the longer of the two saves. `step_N` never waits for the snapshot: if the job ends first, it restores from `step_N` and redoes the unfinished turns.
+With `rollout_recovery.target_level: turn`, rollout snapshots are on even with `snapshot_attempt_interval_s: null`, because only a snapshot holds the environment's state. A snapshot also follows the trainer checkpoint that `checkpointing.save.checkpoint_must_save_by` triggers, before the run stops. The snapshot runs while the policy weights are still being written and is moved into `step_N` once it is published, so leave room in that deadline for the longer of the two saves. `step_N` never waits for the snapshot: if the job ends first, it restores from `step_N` and redoes the unfinished turns.
 
 | Saves environment state | `snapshot_on_trainer_checkpoint` | `snapshot_attempt_interval_s` |
 |---|---|---|
@@ -225,7 +227,7 @@ Only exclude values that cannot affect prompts, generation, rewards, lineage, or
 
 Periodic snapshots currently require all of the following:
 
-- `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
+- `checkpointing.save.enabled: true` and `checkpointing.save.save_data_plane: true`.
 - `data_plane.backend: simple`, `mooncake_cpu` or `nixl`, because native TQ save/load is required.
 - `token_capture.enabled: true`.
 - A replay-recoverable sampler with training-claim ownership. All built-in samplers qualify. A custom sampler must explicitly declare both `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
@@ -276,7 +278,7 @@ The `turn` target currently requires vLLM generation, NeMo Gym, token capture, p
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load works with `data_plane.backend: "simple"`, `"mooncake_cpu"` and `"nixl"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with `data_plane.backend: "simple"`, `"mooncake_cpu"` and `"nixl"`, using the existing `checkpointing.save.enabled: true` and `checkpointing.save.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 

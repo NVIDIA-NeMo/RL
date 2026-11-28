@@ -45,16 +45,17 @@ cluster:
 # Checkpointing
 # =============================================================================
 checkpointing:
-  enabled: true
   checkpoint_dir: "results/grpo_ultra_v3"
-  metric_name: "val:total_reward/mean"
-  higher_is_better: true
-  keep_top_k: 1000000
-  save_period: 6
-  ft_keep_latest_k: 1
-  ft_save_period: 1
-  checkpoint_must_save_by: "00:23:30:00"
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: "val:total_reward/mean"
+    higher_is_better: true
+    keep_top_k: 1000000
+    save_period: 6
+    ft_keep_latest_k: 1
+    ft_save_period: 1
+    checkpoint_must_save_by: "00:23:30:00"
+    save_optimizer: true
 
 # =============================================================================
 # GRPO Algorithm

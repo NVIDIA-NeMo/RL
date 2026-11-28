@@ -889,7 +889,7 @@ cluster.num_nodes=${NUM_ACTOR_NODES} \
 policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
 env.nemo_gym.num_gpu_nodes=${NUM_GYM_NODES} \
 checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
-${CHECKPOINTING_SAVE_BY:+checkpointing.checkpoint_must_save_by=${CHECKPOINTING_SAVE_BY}} \
+${CHECKPOINTING_SAVE_BY:+checkpointing.save.checkpoint_must_save_by=${CHECKPOINTING_SAVE_BY}} \
 data.train.data_path=${TRAIN_PATH} \
 data.validation.data_path=${VAL_PATH} \
 ${GENRM_OVERRIDE:+${GENRM_OVERRIDE}} \

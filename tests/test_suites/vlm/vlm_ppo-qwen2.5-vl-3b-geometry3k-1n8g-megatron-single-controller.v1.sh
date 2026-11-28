@@ -22,7 +22,7 @@ uv run examples/run_grpo_single_controller.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.save.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     ++data_plane.observability.enabled=True \
     ++data_plane.observability.verify_tensor_hash=True \

@@ -681,7 +681,7 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
 With storage units on, the `MooncakeStorageUnit` actors are the only checkpoint participants. Otherwise the participants are the actors that hold a segment, as described below.
 
 
-The existing `checkpointing.enabled=true` and `checkpointing.save_data_plane=true` settings enable Mooncake storage save/load support through TQ's existing explicit checkpoint API. Resuming a checkpoint also prepares this storage mode, even when saving new checkpoints is disabled.
+The existing `checkpointing.save.enabled=true` and `checkpointing.save.save_data_plane=true` settings enable Mooncake storage save/load support through TQ's existing explicit checkpoint API. Resuming a checkpoint also prepares this storage mode, even when saving new checkpoints is disabled.
 No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
 On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the controller's object keys and group their location metadata by destination.
@@ -825,7 +825,7 @@ bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 Set `data_plane.simple.async_checkpoint: true` (needs `ssd_offload.enabled: false`) to shorten the data-plane pause during SC checkpoints:
 
 - **Rollout snapshots:** TQ is captured under the barrier, then rollouts and Gym resume while the shards are written. The snapshot is published only after the write finishes.
-- **Trainer checkpoints** (with `checkpointing.save_data_plane: true`): same capture, but the trainer save still waits for the write before saving model weights.
+- **Trainer checkpoints** (with `checkpointing.save.save_data_plane: true`): same capture, but the trainer save still waits for the write before saving model weights.
 - Other backends and configurations keep the synchronous save.
 - If a captured view cannot be released, checkpointing stops and keeps the unpublished directory; do not delete it while the run is alive.
 

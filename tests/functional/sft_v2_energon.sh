@@ -53,9 +53,9 @@ uv run --no-sync python examples/run_sft_v2.py \
     logger.log_dir="${LOG_DIR}" \
     logger.wandb_enabled=false \
     logger.monitor_gpus=false \
-    checkpointing.enabled=true \
-    checkpointing.save_period=3 \
-    checkpointing.save_optimizer=false \
+    checkpointing.save.enabled=true \
+    checkpointing.save.save_period=3 \
+    checkpointing.save.save_optimizer=false \
     checkpointing.checkpoint_dir="${CKPT_DIR}" \
     "$@" 2>&1 | tee "${RUN_LOG}"
 

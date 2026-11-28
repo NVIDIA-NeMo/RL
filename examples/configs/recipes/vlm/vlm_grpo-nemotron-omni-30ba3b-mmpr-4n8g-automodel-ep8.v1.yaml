@@ -14,8 +14,9 @@ loss_fn:
   normalization: sequence_mean
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr
-  keep_top_k: 1000000
-  checkpoint_must_save_by: 00:01:15:00
+  save:
+    keep_top_k: 1000000
+    checkpoint_must_save_by: 00:01:15:00
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   train_global_batch_size: 32

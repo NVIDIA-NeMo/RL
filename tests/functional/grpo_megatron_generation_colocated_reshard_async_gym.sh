@@ -88,8 +88,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=true \
-    checkpointing.save_period=5 \
+    checkpointing.save.enabled=true \
+    checkpointing.save.save_period=5 \
     checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \

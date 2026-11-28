@@ -54,7 +54,7 @@ uv run examples/run_xtoken_off_policy_distillation.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.save.enabled=False \
     $@ \
     2>&1 | tee $RUN_LOG
 

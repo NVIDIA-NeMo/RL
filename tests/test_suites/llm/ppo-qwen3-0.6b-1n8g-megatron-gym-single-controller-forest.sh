@@ -72,11 +72,11 @@ for run_spec in "run1 2" "run2 4"; do
         logger.wandb.name=${EXP_NAME}_${run} \
         logger.monitor_gpus=True \
         logger.tensorboard_enabled=True \
-        checkpointing.enabled=True \
+        checkpointing.save.enabled=True \
         checkpointing.checkpoint_dir=$CKPT_DIR \
-        checkpointing.metric_name=null \
-        checkpointing.save_period=1 \
-        ++checkpointing.save_data_plane=true \
+        checkpointing.save.metric_name=null \
+        checkpointing.save.save_period=1 \
+        ++checkpointing.save.save_data_plane=true \
         data.train.data_path=$TRAIN_PATH \
         data.validation.data_path=$VALIDATION_PATH \
         $@ \

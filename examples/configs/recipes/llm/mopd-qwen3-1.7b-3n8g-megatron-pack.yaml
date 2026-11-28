@@ -24,13 +24,14 @@ loss_fn:
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: icepop
 checkpointing:
-  enabled: false
   checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack
-  metric_name: val:total_reward/mean
-  keep_top_k: 1
-  save_period: 1000
-  checkpoint_must_save_by: 00:03:40:00
-  save_optimizer: false
+  save:
+    enabled: false
+    metric_name: val:total_reward/mean
+    keep_top_k: 1
+    save_period: 1000
+    checkpoint_must_save_by: 00:03:40:00
+    save_optimizer: false
 policy:
   model_name: Qwen/Qwen3-1.7B
   train_global_batch_size: 32

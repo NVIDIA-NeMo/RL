@@ -2,7 +2,8 @@ defaults: ../../dpo.yaml
 dpo:
   max_num_steps: 10
 checkpointing:
-  enabled: false
+  save:
+    enabled: false
 policy:
   model_name: Qwen/Qwen2.5-Math-7B
   tokenizer:

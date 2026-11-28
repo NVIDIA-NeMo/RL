@@ -33,7 +33,7 @@ uv run $PROJECT_ROOT/examples/run_sft.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \
     $@ \
     2>&1 | tee $RUN_LOG

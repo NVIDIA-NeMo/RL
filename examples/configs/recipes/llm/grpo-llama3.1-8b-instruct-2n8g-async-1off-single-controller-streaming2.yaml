@@ -14,8 +14,9 @@ grpo:
   val_period: 0
 
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2
+  save:
+    enabled: false
 
 # TransferQueue data plane is mandatory for the SingleController path.
 data_plane:

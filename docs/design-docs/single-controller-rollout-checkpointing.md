@@ -61,7 +61,7 @@ Trainer checkpoints and rollout snapshots save rollout state through one `captur
 | | Trainer checkpoint | Rollout snapshot |
 |---|---|---|
 | Model state | Saved by the controller | Referenced: anchored to a durable trainer checkpoint |
-| TQ and replay metadata | Only with `checkpointing.save_data_plane`, and replay metadata only for a sampler that restores buffered groups | Always |
+| TQ and replay metadata | Only with `checkpointing.save.save_data_plane`, and replay metadata only for a sampler that restores buffered groups | Always |
 | Rows an unfinished streamed step owns | Refused | Re-indexed into the saved replay view |
 | Recovery ledger | Only while dispatch records prompt groups | Always |
 | Environment state | Never; the environment keeps running | Captured when the backend holds rollout state |

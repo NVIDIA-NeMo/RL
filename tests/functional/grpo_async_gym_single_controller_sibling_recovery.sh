@@ -37,11 +37,11 @@ rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
 COMMON_OVERRIDES=(
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.metric_name=null
-    checkpointing.save_period=1
-    ++checkpointing.save_data_plane=true
+    checkpointing.save.metric_name=null
+    checkpointing.save.save_period=1
+    ++checkpointing.save.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.target_level=sibling
     async_rl.sampler.name=in_order
@@ -64,7 +64,7 @@ SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
 SC_SIBLING_RECOVERY_BLOCK_TARGET_STEP=1 \
 RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
-    checkpointing.checkpoint_must_save_by=0:0:0:1
+    checkpointing.save.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
 
 STEP1=$CHECKPOINT_DIR/step_1

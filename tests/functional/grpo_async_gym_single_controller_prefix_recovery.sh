@@ -140,11 +140,11 @@ install_phase_cleanup "$CHECKPOINT_DIR" "$BASELINE_CHECKPOINT_DIR" "$SELECTED_BA
 COMMON_OVERRIDES=(
     policy.model_name="$MODEL_NAME"
     policy.tokenizer.name="$MODEL_NAME"
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.metric_name=null
-    checkpointing.save_period=1
-    ++checkpointing.save_data_plane=true
+    checkpointing.save.metric_name=null
+    checkpointing.save.save_period=1
+    ++checkpointing.save.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.target_level=prefix
     ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"

@@ -55,8 +55,9 @@ policy:
         num_nodes: 2
 checkpointing:
   checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
-  metric_name: null
-  save_data_plane: true
+  save:
+    metric_name: null
+    save_data_plane: true
 
 # TransferQueue is mandatory for SingleController.
 data_plane:

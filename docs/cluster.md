@@ -573,8 +573,9 @@ Redirect these to `/shared` so they persist after the pod is deleted.
 
 ```yaml
 checkpointing:
-  enabled: true
   checkpoint_dir: "/shared/results/grpo"
+  save:
+    enabled: true
 
 # ...
 

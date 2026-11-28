@@ -114,13 +114,14 @@ data:
   validation: null
 
 checkpointing:
-  enabled: true
-  metric_name: val:validation-default_loss
-  higher_is_better: false
-  keep_top_k: 50
-  save_period: 100
-  checkpoint_must_save_by: 00:03:45:00
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: val:validation-default_loss
+    higher_is_better: false
+    keep_top_k: 50
+    save_period: 100
+    checkpoint_must_save_by: 00:03:45:00
+    save_optimizer: true
 
 cluster:
   num_nodes: 4

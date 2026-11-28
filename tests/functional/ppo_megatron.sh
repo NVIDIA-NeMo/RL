@@ -42,10 +42,10 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true \
     value.megatron_cfg.checkpoint.async_save=true \
     value.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true \
-    checkpointing.enabled=true \
+    checkpointing.save.enabled=true \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    checkpointing.metric_name=null \
-    checkpointing.save_period=1 \
+    checkpointing.save.metric_name=null \
+    checkpointing.save.save_period=1 \
     $@ \
     2>&1 | tee $RUN_LOG
 

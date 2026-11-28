@@ -4,7 +4,8 @@ grpo:
   num_prompts_per_step: 2
 checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k
-  save_period: 20
+  save:
+    save_period: 20
 policy:
   train_global_batch_size: 32
   train_micro_batch_size: 1

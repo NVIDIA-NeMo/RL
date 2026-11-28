@@ -1,8 +1,9 @@
 defaults: ../../grpo_math_1B.yaml
 checkpointing:
   checkpoint_dir: results/grpo-math-qwen3-30ba3b-megatron-tp4-32k
-  save_period: 3
-  keep_top_k: 1
+  save:
+    save_period: 3
+    keep_top_k: 1
 grpo:
   max_num_steps: 3
   num_prompts_per_step: 64

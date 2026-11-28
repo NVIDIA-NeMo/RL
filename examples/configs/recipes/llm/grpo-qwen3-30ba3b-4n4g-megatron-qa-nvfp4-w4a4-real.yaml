@@ -3,11 +3,12 @@ grpo:
   max_num_steps: 300
   val_at_end: true
 checkpointing:
-  enabled: true
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
-  save_period: 30
-  keep_top_k: 1
-  checkpoint_must_save_by: 00:03:45:00
+  save:
+    enabled: true
+    save_period: 30
+    keep_top_k: 1
+    checkpoint_must_save_by: 00:03:45:00
 policy:
   quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
   generation:

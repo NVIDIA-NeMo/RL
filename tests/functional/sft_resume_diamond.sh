@@ -19,7 +19,7 @@ mkdir -p $EXP_DIR
 
 # This test will run for 2 steps and make sure that 1+1 steps w/ resume leads to the same result
 # Because mcore does not support setting different max steps, to control this behavior we run for just 2 steps,
-# but use the checkpointing.checkpoint_must_save_by=0:0:0:1 feature to exit after 1 step.
+# but use the checkpointing.save.checkpoint_must_save_by=0:0:0:1 feature to exit after 1 step.
 
 prefix_output() {
   sed "s/^/$1/"
@@ -38,8 +38,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.tensorboard_enabled=true \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
-    checkpointing.save_period=1 \
+    checkpointing.save.enabled=false \
+    checkpointing.save.save_period=1 \
     $@ 
 }
 
@@ -49,14 +49,14 @@ cd $PROJECT_ROOT
 train_cmd logger.log_dir=$LOG_DIR/baseline sft.max_num_steps=2 policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[baseline 2step] " | tee ${RUN_LOG}.2step_baseline
 uv run tests/json_dump_tb_logs.py $LOG_DIR/baseline --output_path $EXP_DIR/baseline.json
 # Automodel 1+1 step
-train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 1step] " | tee ${RUN_LOG}.automodel_1step
+train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.save.checkpoint_must_save_by=0:0:0:1 checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 1step] " | tee ${RUN_LOG}.automodel_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/automodel --output_path $EXP_DIR/automodel_1step.json
-train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 2step] " | tee ${RUN_LOG}.automodel_2step
+train_cmd logger.log_dir=$LOG_DIR/automodel sft.max_num_steps=2 checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/automodel policy.automodel_cfg.enabled=true policy.megatron_cfg.enabled=false $@ 2>&1 | prefix_output "[automodel 2step] " | tee ${RUN_LOG}.automodel_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/automodel --output_path $EXP_DIR/automodel_2step.json
 # Mcore 2+2 step
-train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 1step] " | tee ${RUN_LOG}.mcore_1step
+train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.save.checkpoint_must_save_by=0:0:0:1 checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 1step] " | tee ${RUN_LOG}.mcore_1step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_1step.json
-train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 2step] " | tee ${RUN_LOG}.mcore_2step
+train_cmd logger.log_dir=$LOG_DIR/mcore sft.max_num_steps=2 checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=true $@ 2>&1 | prefix_output "[mcore 2step] " | tee ${RUN_LOG}.mcore_2step
 uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore --output_path $EXP_DIR/mcore_2step.json
 
 uv run python - <<EOF $EXP_DIR/baseline.json $EXP_DIR/automodel_1step.json $EXP_DIR/automodel_2step.json $EXP_DIR/mcore_1step.json $EXP_DIR/mcore_2step.json
@@ -109,9 +109,9 @@ MCORE_OVERRIDE=(policy.automodel_cfg.enabled=false policy.megatron_cfg.enabled=t
   +policy.megatron_cfg.scheduler.override_opt_param_scheduler=true
   policy.megatron_cfg.scheduler.lr_warmup_init=1.0e-7
   policy.megatron_cfg.scheduler.lr_warmup_iters=10
-  checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore_override)
+  checkpointing.save.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore_override)
 # Train for 1 step and save a checkpoint.
-train_cmd logger.log_dir=$LOG_DIR/mcore_override sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 "${MCORE_OVERRIDE[@]}" $@ 2>&1 | prefix_output "[mcore override 1step] " | tee ${RUN_LOG}.mcore_override_1step
+train_cmd logger.log_dir=$LOG_DIR/mcore_override sft.max_num_steps=2 checkpointing.save.checkpoint_must_save_by=0:0:0:1 "${MCORE_OVERRIDE[@]}" $@ 2>&1 | prefix_output "[mcore override 1step] " | tee ${RUN_LOG}.mcore_override_1step
 # Resume from checkpoint and trains another step.
 train_cmd logger.log_dir=$LOG_DIR/mcore_override sft.max_num_steps=2 "${MCORE_OVERRIDE[@]}" $@ 2>&1 | prefix_output "[mcore override 2step] " | tee ${RUN_LOG}.mcore_override_2step
 # Dump TB logs.

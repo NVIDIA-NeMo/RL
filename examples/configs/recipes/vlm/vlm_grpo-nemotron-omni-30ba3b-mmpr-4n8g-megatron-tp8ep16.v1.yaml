@@ -10,8 +10,9 @@ loss_fn:
   normalization: sequence_mean
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_megatron
-  keep_top_k: 4
-  checkpoint_must_save_by: 00:03:45:00
+  save:
+    keep_top_k: 4
+    checkpoint_must_save_by: 00:03:45:00
 policy:
   train_global_batch_size: 2048
   logprob_chunk_size: 1024

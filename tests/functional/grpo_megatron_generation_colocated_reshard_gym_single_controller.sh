@@ -153,11 +153,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=true \
+    checkpointing.save.enabled=true \
     checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
-    checkpointing.save_period=5 \
-    checkpointing.metric_name=null \
-    ++checkpointing.save_data_plane=true \
+    checkpointing.save.save_period=5 \
+    checkpointing.save.metric_name=null \
+    ++checkpointing.save.save_data_plane=true \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     ++token_capture.enabled=true \

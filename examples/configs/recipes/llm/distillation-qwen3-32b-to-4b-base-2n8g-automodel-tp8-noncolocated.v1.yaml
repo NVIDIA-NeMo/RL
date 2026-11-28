@@ -9,7 +9,8 @@ loss_fn:
   kl_type: reverse
 checkpointing:
   checkpoint_dir: checkpoints/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp8-noncolocated
-  save_period: 50
+  save:
+    save_period: 50
 policy:
   model_name: Qwen/Qwen3-4B-Base
   automodel_cfg:

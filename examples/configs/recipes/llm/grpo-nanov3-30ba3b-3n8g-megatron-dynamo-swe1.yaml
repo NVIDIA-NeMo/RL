@@ -3,11 +3,12 @@ cluster:
   num_nodes: 3
   segment_size: 1
 checkpointing:
-  enabled: false
   checkpoint_dir: results/nemotron-3-nano-swe-dynamo
-  save_period: 3
-  keep_top_k: 1
-  checkpoint_must_save_by: 00:03:30:00
+  save:
+    enabled: false
+    save_period: 3
+    keep_top_k: 1
+    checkpoint_must_save_by: 00:03:30:00
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2

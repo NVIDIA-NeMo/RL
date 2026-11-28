@@ -14,8 +14,9 @@ grpo:
   val_period: 0
 
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync
+  save:
+    enabled: false
 
 # TransferQueue data plane is mandatory for the SingleController path.
 data_plane:

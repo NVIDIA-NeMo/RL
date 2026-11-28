@@ -19,10 +19,10 @@ rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
 COMMON_OVERRIDES=(
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.save_period=1
-    checkpointing.save_data_plane=true
+    checkpointing.save.save_period=1
+    checkpointing.save.save_data_plane=true
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=1
     async_rl.max_inflight_prompts=4
@@ -45,7 +45,7 @@ SC_RECOVERY_TEST_BLOCK_TARGET_STEP=1 \
 RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
     grpo.max_num_steps=2 \
-    checkpointing.checkpoint_must_save_by=0:0:0:1
+    checkpointing.save.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
 
 STEP1=$CHECKPOINT_DIR/step_1

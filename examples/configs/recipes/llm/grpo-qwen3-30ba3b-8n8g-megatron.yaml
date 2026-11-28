@@ -3,8 +3,9 @@ grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 32
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-8n8g-megatron
+  save:
+    enabled: false
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1

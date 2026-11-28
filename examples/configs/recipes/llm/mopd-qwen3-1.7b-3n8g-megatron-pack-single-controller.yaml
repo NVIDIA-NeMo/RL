@@ -20,7 +20,8 @@ data_plane:
 
 checkpointing:
   checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller
-  metric_name: null
+  save:
+    metric_name: null
 
 logger:
   wandb:

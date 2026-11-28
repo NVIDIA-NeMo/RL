@@ -16,7 +16,8 @@ policy:
   optimizer: null
 checkpointing:
   checkpoint_dir: results/sft_${policy.model_name}_clevr_energon_v2
-  metric_name: null
+  save:
+    metric_name: null
 data:
   _override_: true
   backend: energon

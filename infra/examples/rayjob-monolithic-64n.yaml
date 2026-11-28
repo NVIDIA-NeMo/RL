@@ -77,7 +77,7 @@ spec:
       sft.max_num_steps=10 \
       sft.val_period=5 \
       sft.val_global_batch_size=512 \
-      checkpointing.enabled=false \
+      checkpointing.save.enabled=false \
       logger.wandb_enabled=true \
       logger.wandb.project=nemorl-rayjob-64n \
       logger.wandb.name=sft-64n-gb300 \

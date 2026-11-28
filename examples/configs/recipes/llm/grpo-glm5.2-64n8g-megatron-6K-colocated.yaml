@@ -25,9 +25,10 @@ loss_fn:
 
 checkpointing:
   checkpoint_dir: results/grpo-glm5.2-64n8g-megatron-6K-colocated
-  keep_top_k: 1
-  save_period: 3
-  checkpoint_must_save_by: "00:03:45:00"
+  save:
+    keep_top_k: 1
+    save_period: 3
+    checkpoint_must_save_by: "00:03:45:00"
 
 policy:
   model_name: zai-org/GLM-5.2

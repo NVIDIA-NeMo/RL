@@ -48,16 +48,17 @@ sif_dir: /path/to/sif_images
 # Checkpointing
 # =============================================================================
 checkpointing:
-  enabled: true
   checkpoint_dir: "results/grpo_ultra_e2e"
-  metric_name: "val:total_reward/mean"
-  higher_is_better: true
-  keep_top_k: 1000000
-  save_period: 5
-  ft_keep_latest_k: 1
-  ft_save_period: 1
-  checkpoint_must_save_by: "00:03:30:00"
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: "val:total_reward/mean"
+    higher_is_better: true
+    keep_top_k: 1000000
+    save_period: 5
+    ft_keep_latest_k: 1
+    ft_save_period: 1
+    checkpoint_must_save_by: "00:03:30:00"
+    save_optimizer: true
 
 # =============================================================================
 # GRPO Algorithm

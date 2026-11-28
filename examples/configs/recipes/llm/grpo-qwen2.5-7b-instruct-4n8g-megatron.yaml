@@ -4,9 +4,10 @@ grpo:
   num_generations_per_prompt: 32
   max_num_steps: 30
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen2.5-7b-instruct-4n8g-megatron
-  save_period: 100
+  save:
+    enabled: false
+    save_period: 100
 policy:
   model_name: Qwen/Qwen2.5-7B-Instruct
   train_micro_batch_size: 1

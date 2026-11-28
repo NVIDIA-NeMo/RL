@@ -7,8 +7,9 @@ sft:
   val_micro_batch_size: 2
 checkpointing:
   checkpoint_dir: results/sft_openmathinstruct2
-  keep_top_k: 100
-  save_period: 500
+  save:
+    keep_top_k: 100
+    save_period: 500
 policy:
   model_name: meta-llama/Llama-3.1-8B
   tokenizer:
