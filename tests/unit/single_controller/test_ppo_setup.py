@@ -653,8 +653,8 @@ class TestPPOValidation:
         mc.policy["megatron_cfg"]["checkpoint"] = {
             "ckpt_assume_constant_structure": constant_structure
         }
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_optimizer = True
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_optimizer = True
         return mc
 
     def test_rejects_constant_ckpt_structure_with_warmup(self):

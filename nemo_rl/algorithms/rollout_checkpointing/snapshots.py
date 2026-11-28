@@ -564,7 +564,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
     ) -> SnapshotCapture:
         """Capture restart-facing controller state under the mutation barrier.
 
-        A trainer checkpoint saves TQ only with ``checkpointing.save_data_plane``,
+        A trainer checkpoint saves TQ only with ``checkpointing.save.save_data_plane``,
         and refuses rows an unfinished streamed step still owns. A rollout
         snapshot always saves TQ and re-indexes those rows in the persisted cut
         only; the live trainer keeps accumulating gradients without modification.
@@ -604,7 +604,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
         recovery_state_serialize_seconds = 0.0
         staging_inventory_seconds = 0.0
         data_plane_capture: CheckpointCapture | None = None
-        if snapshot or self._master_config.checkpointing.save_data_plane:
+        if snapshot or self._master_config.checkpointing.save.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
             if training_owned_groups and not snapshot:
                 raise RuntimeError(

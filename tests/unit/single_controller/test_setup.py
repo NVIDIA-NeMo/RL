@@ -469,9 +469,9 @@ def test_forest_restores_discovered_checkpoint(
     mc = _make_forest_master_config()
     mc.policy["sequence_packing"]["enabled"] = packing
     mc.checkpointing.checkpoint_dir = str(tmp_path)
-    mc.checkpointing.enabled = saving
-    mc.checkpointing.save_data_plane = True
-    mc.checkpointing.save_period = 1
+    mc.checkpointing.save.enabled = saving
+    mc.checkpointing.save.save_data_plane = True
+    mc.checkpointing.save.save_period = 1
     mc.rollout_checkpointing = RolloutCheckpointConfig(
         snapshot_attempt_interval_s=interval, restore_mode=restore_mode
     )
@@ -529,8 +529,8 @@ def test_forest_restores_discovered_checkpoint(
 @pytest.mark.parametrize(
     "invalid,reason",
     [
-        ("no_data", "requires checkpointing.save_data_plane=true"),
-        ("no_trainer", "requires checkpointing.enabled=true"),
+        ("no_data", "requires checkpointing.save.save_data_plane=true"),
+        ("no_trainer", "requires checkpointing.save.enabled=true"),
     ],
 )
 def test_forest_retains_shared_checkpoint_requirements(
@@ -539,8 +539,8 @@ def test_forest_retains_shared_checkpoint_requirements(
     reason: str,
 ) -> None:
     mc = _make_forest_master_config()
-    mc.checkpointing.enabled = invalid != "no_trainer"
-    mc.checkpointing.save_data_plane = invalid != "no_data"
+    mc.checkpointing.save.enabled = invalid != "no_trainer"
+    mc.checkpointing.save.save_data_plane = invalid != "no_data"
     mc.rollout_checkpointing.snapshot_attempt_interval_s = 60
     with pytest.raises(ValueError, match=reason):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -557,9 +557,9 @@ def test_forest_ppo_restores_discovered_checkpoint(
     mc.policy["sequence_packing"]["enabled"] = packing
     mc.value["sequence_packing"]["enabled"] = packing
     mc.checkpointing.checkpoint_dir = str(tmp_path)
-    mc.checkpointing.enabled = True
-    mc.checkpointing.save_data_plane = True
-    mc.checkpointing.save_period = 1
+    mc.checkpointing.save.enabled = True
+    mc.checkpointing.save.save_data_plane = True
+    mc.checkpointing.save.save_period = 1
     checkpoint = tmp_path / "step_3"
     for component in ("policy", "value"):
         (checkpoint / component / "weights").mkdir(parents=True)
@@ -1299,7 +1299,7 @@ class TestSetup:
     def test_rejects_unknown_backend_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "future_backend"
-        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save.save_data_plane = True
         with pytest.raises(NotImplementedError, match="backend='future_backend'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1328,8 +1328,8 @@ class TestSetup:
             )
         )
         mc.data_plane["backend"] = backend
-        mc.checkpointing.enabled = checkpointing_enabled
-        mc.checkpointing.save_data_plane = save_data_plane
+        mc.checkpointing.save.enabled = checkpointing_enabled
+        mc.checkpointing.save.save_data_plane = save_data_plane
         mc.async_rl.generation_fleet_health.enabled = True
         mc.async_rl.generation_fleet_health.restart_dead_shards = restart_dead_shards
         patched_factories["fake_gen"].worker_group.dp_size = 1
@@ -1340,13 +1340,15 @@ class TestSetup:
 
     def test_periodic_checkpointing_requires_trainer_checkpointing(self):
         mc = _make_master_config()
-        mc.checkpointing.enabled = False
-        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save.enabled = False
+        mc.checkpointing.save.save_data_plane = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
 
-        with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
+        with pytest.raises(
+            ValueError, match="requires checkpointing.save.enabled=true"
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_data_plane_save(self):
@@ -1355,8 +1357,8 @@ class TestSetup:
                 target=f"{__name__}:_NonCheckpointingCustomSampler"
             )
         )
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1364,15 +1366,15 @@ class TestSetup:
         with (
             pytest.warns(UserWarning, match="cannot recover completed buffered"),
             pytest.raises(
-                ValueError, match="requires checkpointing.save_data_plane=true"
+                ValueError, match="requires checkpointing.save.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_token_capture(self):
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1398,8 +1400,8 @@ class TestSetup:
                 target=f"{__name__}:_NonCheckpointingCustomSampler"
             )
         )
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -1417,8 +1419,8 @@ class TestSetup:
                 target=(f"{__name__}:_CheckpointingNonClaimingCustomSampler")
             )
         )
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -1629,10 +1631,10 @@ class TestSetup:
     ):
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
-        mc.checkpointing.save_period = 2
-        mc.checkpointing.checkpoint_must_save_by = must_save_by
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
+        mc.checkpointing.save.save_period = 2
+        mc.checkpointing.save.checkpoint_must_save_by = must_save_by
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1677,9 +1679,9 @@ class TestSetup:
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
         # Turn recovery alone snapshots after each trainer checkpoint, so only
         # a periodic interval needs a step_N for every step.
-        assert any("checkpointing.save_period=2" in str(w.message) for w in caught) is (
-            interval_s is not None
-        )
+        assert any(
+            "checkpointing.save.save_period=2" in str(w.message) for w in caught
+        ) is (interval_s is not None)
 
     def test_nemo_gym_log_dir_is_set_before_gym_build(
         self, patched_factories, tmp_path
@@ -1724,9 +1726,9 @@ class TestSetup:
         mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
         mc.policy["router_replay"] = {"enabled": router_replay}
         mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
-        mc.checkpointing.save_period = 1
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
+        mc.checkpointing.save.save_period = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1788,9 +1790,9 @@ class TestSetup:
         mc = _make_master_config(colocated=False, backend="vllm")
         checkpoint_dir = tmp_path / "checkpoints"
         mc.checkpointing.checkpoint_dir = str(checkpoint_dir)
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
-        mc.checkpointing.save_period = 1
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
+        mc.checkpointing.save.save_period = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1846,8 +1848,8 @@ class TestSetup:
             )
         )
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.enabled = enabled
-        mc.checkpointing.save_data_plane = save_data_plane
+        mc.checkpointing.save.enabled = enabled
+        mc.checkpointing.save.save_data_plane = save_data_plane
 
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1861,8 +1863,8 @@ class TestSetup:
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "simple"
 
@@ -1870,15 +1872,15 @@ class TestSetup:
             ValueError,
             match=(
                 "replay-checkpoint-capable sampler requires "
-                "checkpointing.save_data_plane=true"
+                "checkpointing.save.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_mooncake_checkpointing_requires_only_the_shared_data_plane_setting(self):
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "mooncake_cpu"
 
@@ -1886,15 +1888,15 @@ class TestSetup:
             ValueError,
             match=(
                 "replay-checkpoint-capable sampler requires "
-                "checkpointing.save_data_plane=true"
+                "checkpointing.save.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_rejects_checkpointing_custom_sampler_without_native_tq(self):
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.async_rl.sampler = CustomSamplerConfig(
             target=f"{__name__}:_CheckpointingCustomSampler"
         )
@@ -1904,7 +1906,7 @@ class TestSetup:
             ValueError,
             match=(
                 "replay-checkpoint-capable sampler requires "
-                "checkpointing.save_data_plane=true"
+                "checkpointing.save.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1931,8 +1933,8 @@ class TestSetup:
         )
         monkeypatch.setenv("MSC_CONFIG", str(msc_config))
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.checkpointing.checkpoint_dir = "msc://profile/run"
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "simple"
@@ -1944,8 +1946,8 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config()
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = False
         mc.async_rl.sampler = CustomSamplerConfig(
             target=f"{__name__}:_NonCheckpointingCustomSampler"
         )
@@ -4685,8 +4687,8 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.enabled = save_enabled
-        mc.checkpointing.save_data_plane = save_enabled
+        mc.checkpointing.save.enabled = save_enabled
+        mc.checkpointing.save.save_data_plane = save_enabled
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -4726,9 +4728,9 @@ class TestNativeTQRecoverySetup:
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.data_plane["backend"] = "mooncake_cpu"
         mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
-        mc.checkpointing.enabled = True
-        mc.checkpointing.save_data_plane = True
-        mc.checkpointing.save_period = 1
+        mc.checkpointing.save.enabled = True
+        mc.checkpointing.save.save_data_plane = True
+        mc.checkpointing.save.save_period = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",

@@ -23,14 +23,15 @@ mpo:
   reward_shift: 0.0
 
 checkpointing:
-  enabled: true
   checkpoint_dir: results/vlm_mpo
-  metric_name: val:validation-default_loss
-  higher_is_better: false
-  keep_top_k: 3
-  save_period: 50
-  checkpoint_must_save_by: null
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: val:validation-default_loss
+    higher_is_better: false
+    keep_top_k: 3
+    save_period: 50
+    checkpoint_must_save_by: null
+    save_optimizer: true
 
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
