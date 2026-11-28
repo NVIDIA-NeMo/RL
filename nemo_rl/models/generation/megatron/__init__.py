@@ -12,16 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
+
+from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
     MCoreGenerationSpecificArgs,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import dynamo_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.megatron.dynamo_generation import (
+        MegatronDynamoGeneration,
+    )
+
+
+def megatron_generation_cls(
+    generation_config: GenerationConfig,
+) -> type[MegatronGeneration] | type["MegatronDynamoGeneration"]:
+    """``MegatronGeneration``, or the class that serves prefill/decode engines through Dynamo.
+
+    ``policy.generation.dynamo=true`` picks ``MegatronDynamoGeneration``, which
+    owns one ``MegatronGeneration`` per prefill or decode engine instead of one
+    dedicated inference policy.
+    """
+    if dynamo_enabled(generation_config):
+        # Deferred: the plain backend never needs the Dynamo engines.
+        from nemo_rl.models.generation.megatron.dynamo_generation import (
+            MegatronDynamoGeneration,
+        )
+
+        return MegatronDynamoGeneration
+    return MegatronGeneration
+
 
 __all__ = [
     "MCoreGenerationConfig",
     "MCoreGenerationSpecificArgs",
     "MegatronGeneration",
+    "megatron_generation_cls",
 ]

@@ -83,6 +83,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
+    MegatronDynamoGenerationMixin,
+)
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -785,6 +788,9 @@ def _reserved_http_server_port_for_rank(
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
     ManualGCMixin,
+    # Ahead of MegatronGenerationMixin: its engine hooks serve a prefill or
+    # decode engine behind Dynamo and fall back to the plain ones otherwise.
+    MegatronDynamoGenerationMixin,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
@@ -944,6 +950,9 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Before anything loads: a worker that cannot build its inference
+        # engine would otherwise fail only at its first refit.
+        self._check_generation_requirements(config)
         # Resume loads from weights_path/optimizer_path during setup, before any
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)

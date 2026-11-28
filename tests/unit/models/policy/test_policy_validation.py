@@ -523,6 +523,86 @@ def test_policy_constructor_worker_extension_allows_quantization() -> None:
     assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
 
 
+_MEGATRON_WORKERS = "nemo_rl.models.policy.workers.megatron_policy_worker."
+
+
+def _construct_megatron_policy(config: PolicyConfig) -> tuple[MagicMock, MagicMock]:
+    """Build a Policy with the Ray side mocked; return the worker builder and group mocks."""
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+    return worker_builder, worker_group
+
+
+@pytest.mark.parametrize("role", [None, "prefill", "decode"])
+def test_every_megatron_engine_role_uses_the_one_policy_worker(
+    role: str | None,
+) -> None:
+    """A prefill or decode engine behind Dynamo is a plain MegatronPolicyWorker.
+
+    Its Dynamo hooks act on ``generation._disaggregation_role`` inside the worker, so
+    there is no second actor class (or venv) to pick.
+    """
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    if role is not None:
+        config["generation"]["_disaggregation_role"] = role
+
+    worker_builder, _ = _construct_megatron_policy(config)
+
+    assert (
+        worker_builder.call_args.args[0] == _MEGATRON_WORKERS + "MegatronPolicyWorker"
+    )
+
+
+def test_a_worker_extension_is_kept_for_a_dynamo_engine() -> None:
+    """An extension built on MegatronPolicyWorkerImpl keeps the Dynamo hooks."""
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    config["generation"]["_disaggregation_role"] = "decode"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+def test_policy_rejects_quantization_on_a_dynamo_engine() -> None:
+    config = create_megatron_config("test-model", tp=1)
+    config["generation"]["backend"] = "megatron"
+    config["generation"]["_disaggregation_role"] = "prefill"
+    config["quant_cfg"] = {"algorithm": "fp8"}
+
+    with pytest.raises(ValueError, match="quant_cfg is not supported"):
+        _construct_megatron_policy(config)
+
+
 @pytest.mark.parametrize(
     ("config_updates", "explicit_extension_fqn", "error_match"),
     [

@@ -41,7 +41,6 @@ from nemo_rl.models.generation.megatron.config import (
 from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_widths,
     reject_role_layouts_without_dynamo,
-    validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -236,6 +235,16 @@ class MegatronGeneration(GenerationInterface):
                 "colocated generation shares the training policy's worker group."
             )
 
+        # The role is written into each prefill/decode engine's own config by
+        # MegatronDynamoGeneration; those derived configs never come back
+        # through here, so a role in the user's config is always a stray one
+        # that would hand the trainer's policy the Dynamo engine worker.
+        if "_disaggregation_role" in policy_config["generation"]:
+            raise ValueError(
+                "policy.generation._disaggregation_role is set per engine by "
+                "MegatronDynamoGeneration; remove it from the config"
+            )
+
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
@@ -259,36 +268,18 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
-        if dynamo_enabled(policy_config["generation"]):
-            cls._validate_dynamo_settings(master_config)
-        elif resolve_disagg_layout(policy_config["generation"]).enabled:
-            # Only the Dynamo engine fleet reads the disaggregation block; without
-            # it the run would train plain aggregated engines.
-            raise ValueError(
-                "policy.generation.disaggregation.enabled=true with "
-                "policy.generation.backend='megatron' requires "
-                "policy.generation.dynamo=true: Megatron prefill/decode engines are "
-                "served only behind Dynamo. Set dynamo to true, or set "
-                "disaggregation.enabled to false."
-            )
-        else:
+        if not dynamo_enabled(policy_config["generation"]):
+            if resolve_disagg_layout(policy_config["generation"]).enabled:
+                # Only MegatronDynamoGeneration reads the disaggregation block;
+                # without Dynamo the run would train plain aggregated engines.
+                raise ValueError(
+                    "policy.generation.disaggregation.enabled=true with "
+                    "policy.generation.backend='megatron' requires "
+                    "policy.generation.dynamo=true: Megatron prefill/decode engines "
+                    "are served only behind Dynamo. Set dynamo to true, or set "
+                    "disaggregation.enabled to false."
+                )
             reject_role_layouts_without_dynamo(policy_config["generation"])
-
-    @classmethod
-    def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:
-        """Reject ``policy.generation.dynamo=true`` until the engine fleet exists.
-
-        The config is checked first so a shape the fleet could never serve is
-        named as such; any config is then refused, because nothing builds
-        prefill/decode engines yet and the run would otherwise train plain
-        aggregated engines.
-        """
-        validate_megatron_dynamo_generation(master_config.policy["generation"])
-        raise NotImplementedError(
-            "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
-            "the Megatron prefill/decode engine fleet is not built. Remove "
-            "policy.generation.dynamo."
-        )
 
     @classmethod
     def verify_served_addresses(

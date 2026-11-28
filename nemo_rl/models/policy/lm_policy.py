@@ -320,6 +320,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
             )
+            # One half of a prefill/decode pair behind Dynamo. The worker
+            # class stays the same; its Dynamo hooks act on the role.
+            if (config.get("generation") or {}).get("_disaggregation_role") is not None:
+                if config.get("quant_cfg") is not None:
+                    raise ValueError(
+                        "policy.quant_cfg is not supported for a Megatron engine "
+                        "served through Dynamo (policy.generation._disaggregation_role)."
+                    )
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]

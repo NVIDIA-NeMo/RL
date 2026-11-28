@@ -70,18 +70,23 @@ class MultimodalPromptConfigOverrides(BaseModel):
 
 
 class EngineLayoutOverrides(BaseModel, extra="forbid"):
-    """Parallel layout a prefill or decode engine uses instead of the shared one.
+    """``mcore_generation_config`` keys a prefill or decode engine sets for itself.
 
-    A field left ``None`` keeps the shared layout for that dimension. The KV
-    handoff reshards the cache between the two sides, so prefill and decode
-    engines may span different numbers of GPUs.
+    A field left ``None`` keeps the shared ``mcore_generation_config`` value.
+    The KV handoff reshards the cache between the two sides, so prefill and
+    decode engines may span different numbers of GPUs.
     """
 
     tensor_model_parallel_size: PositiveInt | None = None
     pipeline_model_parallel_size: PositiveInt | None = None
+    # Cap on the requests one engine holds at once. A prefill engine keeps each
+    # finished prompt in a request slot until a decode engine claims it, so
+    # with every decode slot busy a shared cap also throttles prefill; set it
+    # here to size prefill's slots on their own.
+    max_requests: PositiveInt | None = None
 
 
-# Per-role layout keys of mcore_generation_config: they size one prefill or
+# Per-role keys of mcore_generation_config: they size one prefill or
 # decode engine behind Dynamo and never reach a model's megatron_cfg.
 ENGINE_ROLE_KEYS = ("prefill_engine", "decode_engine")
 
@@ -157,6 +162,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     mamba_inference_ssm_states_dtype: NotRequired[str | None]
     mamba_inference_conv_states_dtype: NotRequired[str | None]
     # GPU budget for cached Mamba states; null disables it (MCore default).
+    # With dynamo: true it applies to prefill engines only; decode engines
+    # never hold one.
     prefix_caching_mamba_gb: NotRequired[float | None]
 
     # Prefix-cache block eviction policy. MCore default: 'lru'.
@@ -218,7 +225,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     fp8_cfg: NotRequired[Fp8Config]
     # Megatron Bridge provider fields without a first-class NeMo-RL setting.
     model_overrides: NotRequired[dict[str, Any]]
-    # Per-role layouts of the prefill and decode engines behind Dynamo
+    # Per-role layouts and request caps of the prefill and decode engines behind Dynamo
     # (policy.generation.dynamo=true), on top of the layout above; as
     # trtllm_cfg keeps its own prefill_engine / decode_engine.
     prefill_engine: NotRequired[EngineLayoutOverrides]
@@ -239,10 +246,10 @@ class MCoreGenerationConfig(GenerationConfig):
     # timeouts.
     dynamo: NotRequired[bool]
     dynamo_cfg: NotRequired["DynamoCfg"]
-    # Not a user key: the Dynamo engine fleet sets it on each engine's own copy
+    # Not a user key: MegatronDynamoGeneration sets it on each engine's own copy
     # of the config, as TrtllmGeneration injects trtllm_cfg._engine_roles. A
     # worker whose config carries it builds the prefill/decode handoff engine.
-    _dynamo_role: NotRequired[Literal["prefill", "decode"]]
+    _disaggregation_role: NotRequired[Literal["prefill", "decode"]]
 
 
 def merged_inference_megatron_cfg(

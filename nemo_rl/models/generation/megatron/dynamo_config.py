@@ -28,6 +28,7 @@ from typing import Any
 from nemo_rl.models.generation.disagg_layout import (
     ROLES,
     Role,
+    plan_engines,
     resolve_disagg_layout,
 )
 from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
@@ -37,12 +38,21 @@ from nemo_rl.models.generation.megatron.config import (
     merged_inference_megatron_cfg,
 )
 
+# How the engines take new weights. None is NeMo RL's packed collective: train
+# rank zero exports HF tensors and broadcasts them to every engine rank, which
+# imports them into Megatron. "mcore" is Megatron-Core's native refit, where
+# each training rank sends its own shards straight to the engine ranks that
+# hold them, as the aggregated Megatron engines do.
+DYNAMO_REFIT_TRANSPORTS: tuple[str | None, ...] = (None, "mcore")
+# Copy services the native refit may use behind Dynamo.
+DYNAMO_MCORE_REFIT_BACKENDS: tuple[str, ...] = ("nccl", "gloo")
+
 
 def role_overrides(generation_cfg: Mapping[str, Any], role: Role) -> dict[str, int]:
-    """Layout keys an engine of ``role`` sets on top of the shared layout.
+    """Keys an engine of ``role`` sets on top of ``mcore_generation_config``.
 
     Read from ``mcore_generation_config.{role}_engine``; an absent block keeps
-    the shared layout.
+    the shared values.
     """
     raw = generation_cfg["mcore_generation_config"].get(f"{role}_engine")
     overrides = EngineLayoutOverrides.model_validate(raw or {})
@@ -152,22 +162,58 @@ def reject_role_layouts_without_dynamo(generation_config: Mapping[str, Any]) -> 
         )
 
 
-def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> None:
-    """What a prefill/decode fleet of Megatron engines can and cannot carry.
+def plan_megatron_engines(
+    policy_config: Mapping[str, Any], world_size: int
+) -> tuple[list[Role], list[int]]:
+    """Role and width of every engine, in launch (refit rank) order.
+
+    Each replica contributes its prefill engines, then its decode engines, as
+    ``disagg_layout.plan_engines`` lays them out; the replica count follows
+    from ``world_size``.
+
+    Args:
+        policy_config: The full ``policy`` config, already checked by
+            :func:`validate_megatron_dynamo_generation`.
+        world_size: GPUs in the inference cluster.
+
+    Returns:
+        ``(roles, widths)``, one entry per engine.
 
     Raises:
-        ValueError: For a config whose shape the fleet cannot serve.
+        ValueError: When the engines do not tile ``world_size`` GPUs.
+    """
+    layout = resolve_disagg_layout(policy_config["generation"])
+    # validate_megatron_dynamo_generation refuses aggregated engines, so the
+    # planner never returns its "aggregated" role here.
+    assert layout.enabled, "Megatron engines behind Dynamo are always disaggregated"
+    widths = engine_widths(policy_config)
+    roles, per_engine_widths, _ = plan_engines(
+        world_size,
+        layout=layout,
+        # Unused with disaggregation enabled.
+        aggregated_width=widths["prefill"],
+        prefill_width=widths["prefill"],
+        decode_width=widths["decode"],
+        backend_cfg_key="policy.generation.mcore_generation_config",
+    )
+    planned_roles: list[Role] = []
+    for role in roles:
+        assert role == "prefill" or role == "decode", role
+        planned_roles.append(role)
+    return planned_roles, per_engine_widths
+
+
+def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> None:
+    """What prefill/decode Megatron engines behind Dynamo can and cannot carry.
+
+    Raises:
+        ValueError: For a config whose shape the engines cannot serve.
     """
     assert generation_cfg["backend"] == "megatron" and dynamo_enabled(generation_cfg)
     # The same schema as vLLM behind Dynamo: one managed frontend for both.
     dynamo_cfg(generation_cfg)
     for role in ROLES:
         role_overrides(generation_cfg, role)
-    if "_dynamo_role" in generation_cfg:
-        raise ValueError(
-            "policy.generation._dynamo_role is set per engine by the Dynamo engine "
-            "fleet; remove it from the config"
-        )
     disaggregation = resolve_disagg_layout(generation_cfg)
     if not disaggregation.enabled:
         raise ValueError(
@@ -194,11 +240,23 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
             "policy.generation.dynamo=true; the engines are dedicated inference "
             "policies"
         )
-    if generation_cfg.get("refit_transport") is not None:
+    refit_transport = generation_cfg.get("refit_transport")
+    if refit_transport not in DYNAMO_REFIT_TRANSPORTS:
         raise ValueError(
-            "policy.generation.refit_transport must be null when "
-            "policy.generation.dynamo=true; the engines refit through the "
-            "collective transport"
+            "policy.generation.refit_transport must be null (packed collective) "
+            "or 'mcore' (native Megatron-Core refit) when "
+            f"policy.generation.dynamo=true, got {refit_transport!r}"
+        )
+    refit_backend = generation_cfg["mcore_generation_config"].get("refit_backend")
+    if refit_transport == "mcore" and refit_backend not in DYNAMO_MCORE_REFIT_BACKENDS:
+        # nccl_m2n and nvshmem are left out: neither has been run against
+        # engines of different widths, and nvshmem also needs a pre-transfer
+        # initialization step these engines do not have.
+        raise ValueError(
+            "policy.generation.mcore_generation_config.refit_backend must be "
+            f"one of {list(DYNAMO_MCORE_REFIT_BACKENDS)} when "
+            "policy.generation.dynamo=true and refit_transport='mcore', got "
+            f"{refit_backend!r}"
         )
     for quantization_field in ("quant_cfg", "real_quant"):
         if generation_cfg.get(quantization_field):
