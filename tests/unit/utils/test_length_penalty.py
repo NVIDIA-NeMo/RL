@@ -1699,3 +1699,150 @@ def test_capture_metadata_reads_materialized_task_profiles(
     )
     assert sample.agent_name == "dataset"
     assert adjusted == [expected_reward]
+
+
+class TestCorrectRewardThreshold:
+    """correct_reward_threshold: graded (non-binary) rewards opt in to the length settings."""
+
+    @staticmethod
+    def graded_group(rewards):
+        # Total lengths (chars): 10, 30, 10, 30.
+        texts = [("12345", "12345"), ("1234567890123456789012345", "12345")] * 2
+        return [make_result(r, a, w) for (r, a), w in zip(texts, rewards)]
+
+    @staticmethod
+    def cfg(threshold=None, **settings):
+        cfg = make_config(default={"enabled": True, **settings}, num_gens=4)
+        if threshold is not None:
+            cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+                AGENT: {"correct_reward_threshold": threshold}
+            }
+        return cfg
+
+    def test_default_still_skips_graded_groups(self, monkeypatch):
+        monkeypatch.setattr(length_penalty_mod, "_NON_BINARY_WARNED_AGENTS", set())
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        metrics = apply(results, self.cfg(group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == [1.0, 1.0, 0.4, 0.2]
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    def test_threshold_compares_only_correct_rollouts(self):
+        # Rewards above 0.5 count as correct: the two 1.0 rollouts are compared
+        # (short +0.05, long -0.05, as for binary rewards); the graded rollouts
+        # below the threshold keep their env reward.
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        metrics = apply(
+            results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1)
+        )
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, 0.4, 0.2])
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 0.0
+
+    def test_adjustment_is_added_to_the_graded_reward(self):
+        # Correct rollouts with different graded rewards keep their own reward
+        # plus the length adjustment (not a 0/1 reward).
+        results = self.graded_group([0.9, 0.7, 0.1, 0.3])
+        apply(results, self.cfg(threshold=0.5, longest_total_penalty=0.2))
+        assert rewards_of(results) == pytest.approx([0.9, 0.5, 0.1, 0.3])
+
+    def test_binary_rewards_unchanged_by_threshold(self):
+        settings = {
+            "group_total_length_penalty_coeff": 0.1,
+            "longest_total_penalty": 0.2,
+        }
+        plain = self.graded_group([1.0, 1.0, 0.0, 1.0])
+        thresholded = self.graded_group([1.0, 1.0, 0.0, 1.0])
+        apply(plain, self.cfg(**settings))
+        apply(thresholded, self.cfg(threshold=0.5, **settings))
+        assert rewards_of(thresholded) == pytest.approx(rewards_of(plain))
+
+    def test_negative_reward_is_not_raised_to_zero(self):
+        # A graded env may score below 0 (e.g. an env-side penalty); the clamp
+        # that keeps adjusted rewards >= 0 must not lift it.
+        results = self.graded_group([1.0, 1.0, -0.1, 0.3])
+        apply(results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, -0.1, 0.3])
+
+    def test_cap_never_raises_a_negative_reward(self):
+        # Total lengths 10, 30, 10, 30 are all over the cap (5): over the cap must
+        # never pay better than under it, so -0.1 stays -0.1.
+        results = self.graded_group([1.0, 1.0, -0.1, 0.3])
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [5, 5]
+        apply(
+            results,
+            self.cfg(threshold=0.5, profiled_length_penalty_type="zero_over_max"),
+        )
+        assert rewards_of(results) == [0.0, 0.0, -0.1, 0.0]
+
+    def test_near_zero_binary_reward_still_clamped_without_threshold(self):
+        # _is_binary_reward accepts |r| <= 1e-6, so -1e-7 is a binary 0; the
+        # profiled penalty must not push it below 0 (all-wrong groups stay
+        # variance-free).
+        results = self.graded_group([-1e-7] * 4)
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [20, 20]
+        apply(results, self.cfg(profiled_length_penalty=0.2))
+        assert rewards_of(results) == [0.0] * 4
+
+    def test_reward_components_still_skipped(self):
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        for r in results:
+            r["full_result"]["reward_components"] = {"a": r["full_result"]["reward"]}
+        metrics = apply(
+            results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1)
+        )
+        assert rewards_of(results) == [1.0, 1.0, 0.4, 0.2]
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    def test_pass_rate_penalty_uses_the_threshold(self):
+        # Pass rate = share of rollouts above the threshold (2 of 4 = 0.5);
+        # only those take -w * rho * len / l_max.
+        results = self.graded_group([1.0, 1.0, 0.4, 0.2])
+        apply(results, self.cfg(threshold=0.5, pass_rate_length_penalty_weight=0.2))
+        assert rewards_of(results) == pytest.approx(
+            [1.0 - 0.2 * 0.5 * 10 / 30, 1.0 - 0.2 * 0.5, 0.4, 0.2]
+        )
+
+    @staticmethod
+    def group(rewards, lengths, band=None):
+        return [
+            make_result("x" * n, "", w, band=band) for w, n in zip(rewards, lengths)
+        ]
+
+    def test_reward_equal_to_threshold_is_not_correct(self):
+        # "Strictly greater than": the two 0.5 rollouts are not compared.
+        results = self.graded_group([1.0, 1.0, 0.5, 0.5])
+        apply(results, self.cfg(threshold=0.5, group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == pytest.approx([1.05, 0.95, 0.5, 0.5])
+
+    @pytest.mark.parametrize("limit, expected", [(12, [1.05, 0.95]), (20, [1.0, 1.0])])
+    def test_profile_gate_averages_only_rollouts_above_threshold(self, limit, expected):
+        # Correct rollouts average 15 chars; counting the long graded ones
+        # (0.4, 0.2 > 0) would make it 30 and open the gate at limit 20.
+        band = {"total": {"a": limit, "b": 1000, "f": 1.0}}
+        results = self.group([1.0, 1.0, 0.4, 0.2], [10, 20, 40, 50], band=band)
+        cfg = self.cfg(
+            threshold=0.5,
+            group_total_length_penalty_coeff=0.1,
+            group_length_penalty_profile_gate=True,
+        )
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx(expected + [0.4, 0.2])
+
+    def test_profile_band_scales_only_rollouts_above_threshold(self):
+        # The multiplier scales the graded reward of correct rollouts
+        # (0.8 * 0.5) and leaves rollouts at or below the threshold alone.
+        band = {"total": {"a": 10, "b": 20, "f": 0.5}}
+        results = self.group([1.0, 0.8, 0.4, 0.2], [10, 20, 20, 20], band=band)
+        apply(results, self.cfg(threshold=0.5, profile_band_total=True))
+        assert rewards_of(results) == pytest.approx([1.0, 0.4, 0.4, 0.2])
+
+    def test_pass_rate_l_max_is_longest_rollout_above_threshold(self):
+        # l_max = 20 (longest correct), not 50 (longest reward > 0).
+        results = self.group([1.0, 1.0, 0.4, 0.2], [10, 20, 40, 50])
+        apply(results, self.cfg(threshold=0.5, pass_rate_length_penalty_weight=0.2))
+        assert rewards_of(results) == pytest.approx(
+            [1.0 - 0.2 * 0.5 * 10 / 20, 1.0 - 0.2 * 0.5, 0.4, 0.2]
+        )
