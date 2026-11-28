@@ -89,6 +89,7 @@ from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.path_utils import is_msc_path
 from nemo_rl.weight_sync.factory import validate_refit_actor_transport
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -2132,6 +2133,67 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if master_config.data.get("use_multiple_dataloader"):
+        data_config = master_config.data
+        if (
+            is_ppo_run(master_config)
+            or master_config.env.get("should_use_nemo_gym", False)
+            or opd_module.is_opd_enabled(master_config)
+            or algo_cfg.use_dynamic_sampling
+        ):
+            raise ValueError(
+                "SingleController multiple dataloaders require standard GRPO "
+                "with dynamic sampling disabled."
+            )
+        sampler = async_config.sampler
+        if (
+            not isinstance(sampler, InOrderSamplerConfig)
+            or sampler.max_lookahead_versions != 0
+        ):
+            raise ValueError(
+                "SingleController multiple dataloaders require the in_order "
+                "sampler with max_lookahead_versions=0."
+            )
+        if algo_cfg.max_num_epochs is not None or algo_cfg.max_num_steps <= 0:
+            raise ValueError(
+                "SingleController multiple dataloaders require max_num_epochs=null "
+                "and a positive max_num_steps."
+            )
+        prompts_per_source = data_config.get("num_prompts_per_dataloader")
+        if (
+            prompts_per_source is None
+            or prompts_per_source <= 0
+            or algo_cfg.num_prompts_per_step % prompts_per_source
+        ):
+            raise ValueError(
+                "SingleController multiple dataloaders require a positive "
+                "num_prompts_per_dataloader that divides num_prompts_per_step."
+            )
+        if not data_config.get("custom_dataloader"):
+            raise ValueError(
+                "SingleController multiple dataloaders require data.custom_dataloader."
+            )
+        train_configs = data_config["train"]
+        if not isinstance(train_configs, list) or len(train_configs) != 2:
+            raise ValueError(
+                "SingleController multiple dataloaders require data.train to list "
+                "exactly two task sources."
+            )
+        checkpointing = master_config.checkpointing
+        if checkpointing.enabled and is_msc_path(checkpointing.checkpoint_dir):
+            raise ValueError(
+                "SingleController multiple dataloader checkpoints require a POSIX "
+                "checkpoint_dir; msc:// does not support native replay snapshots."
+            )
+        if checkpointing.enabled and (
+            not checkpointing.load_replay_buffer or not checkpointing.save_data_plane
+        ):
+            raise ValueError(
+                "SingleController multiple dataloader checkpoints require "
+                "save_data_plane=true and load_replay_buffer=true to restore "
+                "prompt ownership along with the dataloader cursors."
+            )
 
     # The sampler's drop-accounting members are read on the async SC path regardless
     # of dynamic sampling, so a custom sampler missing one must fail validation here.

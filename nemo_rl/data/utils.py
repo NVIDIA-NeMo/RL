@@ -87,6 +87,8 @@ def load_dataloader_state(
     checkpoint_path: str,
     data_config: DataConfig,
     suffix: str = "",
+    *,
+    require_nonempty_state: bool = False,
 ) -> None:
     """Restore a dataloader's state from a checkpoint, with dataset-swap guard.
 
@@ -103,10 +105,19 @@ def load_dataloader_state(
     its existing raw-``state_dict`` shape, and the saved ``dataset_name`` is
     read out of the sibling ``config.yaml`` so every existing checkpoint is
     automatically compatible.
+
+    Set `require_nonempty_state` when a missing cursor would invalidate recovery.
     """
     saved_state = load_checkpoint_object(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
+
+    if require_nonempty_state and (
+        not isinstance(saved_state, dict) or not saved_state
+    ):
+        raise ValueError(
+            f"train_dataloader{suffix}.pt must contain a nonempty dataloader state."
+        )
 
     config_path = os.path.join(checkpoint_path, "config.yaml")
     if path_exists(config_path):

@@ -60,6 +60,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
     RolloutParts,
     _UsesRolloutParts,
 )
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.checkpointing.interfaces import (
@@ -70,6 +71,7 @@ from nemo_rl.experience.rollout_recovery import (
     SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     ParsedRolloutRecoveryState,
     PromptGroupPhase,
+    PromptRef,
     parse_rollout_recovery_state,
 )
 from nemo_rl.utils.path_utils import (
@@ -285,6 +287,17 @@ class RolloutRestorer(_UsesRolloutParts):
             return 0
         self._validate_forest_checkpoint_metadata()
         metadata_path = os.path.join(self._resume.path, REPLAY_BUFFER_METADATA_FILENAME)
+        if isinstance(self._dataloader, MultipleDataloaderWrapper) and (
+            not self._master_config.checkpointing.load_replay_buffer
+            or not os.path.isfile(metadata_path)
+            or not (self._resume.data_plane_metadata or {}).get(
+                "rollout_recovery_payload_sha256"
+            )
+        ):
+            raise RuntimeError(
+                "Multiple dataloader resume requires native replay metadata "
+                "and a recorded rollout recovery ledger."
+            )
         if (
             os.path.exists(metadata_path)
             and not self._sampler.supports_buffer_checkpoint
@@ -560,6 +573,7 @@ class RolloutRestorer(_UsesRolloutParts):
         *,
         group_id: str,
         sample_id: str,
+        task_name: str | None = None,
     ) -> DatumSpec:
         """Resolve and collate one stable dataset prompt reference."""
         try:
@@ -575,7 +589,14 @@ class RolloutRestorer(_UsesRolloutParts):
                 f"dataset sample_id={sample_id!r}"
             )
 
-        dataset = getattr(self._dataloader, "dataset", None)
+        dataloader = self._dataloader
+        if isinstance(dataloader, MultipleDataloaderWrapper):
+            if task_name is None or task_name not in dataloader.dataloaders:
+                raise ValueError(
+                    f"Recovery group {group_id!r} identifies unknown task {task_name!r}."
+                )
+            dataloader = dataloader.dataloaders[task_name]
+        dataset = getattr(dataloader, "dataset", None)
         if dataset is None:
             raise RuntimeError(
                 "cannot restore unfinished rollouts because the dataloader does "
@@ -594,7 +615,7 @@ class RolloutRestorer(_UsesRolloutParts):
                 f"{type(dataset_prompt).__name__}, expected a DatumSpec dictionary"
             )
 
-        collate_fn = getattr(self._dataloader, "collate_fn", None)
+        collate_fn = getattr(dataloader, "collate_fn", None)
         if collate_fn is None:
             return cast(DatumSpec, dataset_prompt)
         prompt_batch = await asyncio.to_thread(collate_fn, [dataset_prompt])
@@ -654,15 +675,17 @@ class RolloutRestorer(_UsesRolloutParts):
         if not groups:
             return
 
-        resolved_prompts: dict[str, DatumSpec] = {}
+        resolved_prompts: dict[PromptRef, DatumSpec] = {}
         for group in groups:
-            sample_id = group.prompt_ref.sample_id
-            prompt = resolved_prompts.get(sample_id)
+            ref = group.prompt_ref
+            prompt = resolved_prompts.get(ref)
             if prompt is None:
                 prompt = await self._load_recovery_prompt(
-                    group_id=group.group_id, sample_id=sample_id
+                    group_id=group.group_id,
+                    sample_id=ref.sample_id,
+                    task_name=ref.task_name,
                 )
-                resolved_prompts[sample_id] = prompt
+                resolved_prompts[ref] = prompt
             recovery_ledger.bind_runtime_prompt(
                 cut,
                 group.group_id,

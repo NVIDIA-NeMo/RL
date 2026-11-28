@@ -17,6 +17,7 @@ from typing import Any
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -59,17 +60,19 @@ class MultipleDataloaderWrapper:
     def __init__(
         self,
         expected_num_prompts: int,
-        data_config: dict,
+        data_config: DataConfig,
         dataloaders: dict[str, StatefulDataLoader],
+        *,
+        defer_iterator_creation: bool = False,
     ):
         self.expected_num_prompts = expected_num_prompts
         self.data_config = data_config
         self.dataloaders = dataloaders
 
-        # init data iterators
-        self.data_iterators = {
-            task_name: iter(dataloader) for task_name, dataloader in dataloaders.items()
-        }
+        # The SingleController sends the wrapper to a Ray actor before iteration.
+        self.data_iterators = (
+            None if defer_iterator_creation else self._make_data_iterators()
+        )
 
         # custom dataloader function to decide how to sample the data from the dataloaders
         self.custom_dataloader_func = self._load_custom_dataloader_func()
@@ -87,10 +90,15 @@ class MultipleDataloaderWrapper:
 
         return get_method(self.data_config["custom_dataloader"])
 
+    def _make_data_iterators(self) -> dict[str, Iterator]:
+        return {task: iter(dataloader) for task, dataloader in self.dataloaders.items()}
+
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self.data_iterators is None:
+            self.data_iterators = self._make_data_iterators()
         # sample data from the dataloaders
         result, self.data_iterators = self.custom_dataloader_func(
             self.data_iterators, self.dataloaders, **self.records

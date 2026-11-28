@@ -94,6 +94,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     validate_single_controller_config,
 )
+from nemo_rl.data import DataConfig, ResponseDatasetConfig
+from nemo_rl.data import utils as data_utils
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
@@ -1962,10 +1964,189 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_multiple_dataloader_not_supported(self):
-        mc = _make_master_config(use_multiple_dataloader=True)
-        with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
+    @pytest.mark.parametrize(
+        ("max_num_epochs", "lookahead", "load_replay", "message"),
+        [
+            (1, 0, True, "max_num_epochs=null"),
+            (None, 1, True, "max_lookahead_versions=0"),
+            (None, 0, False, "load_replay_buffer=true"),
+            (None, 0, True, "num_prompts_per_dataloader"),
+        ],
+    )
+    def test_multiple_dataloader_rejects_incompatible_resume_settings(
+        self,
+        max_num_epochs: int | None,
+        lookahead: int,
+        load_replay: bool,
+        message: str,
+    ) -> None:
+        mc = _make_master_config(
+            use_multiple_dataloader=True,
+            max_num_epochs=max_num_epochs,
+            sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=lookahead),
+        )
+        mc.data["num_prompts_per_dataloader"] = 2
+        mc.data["custom_dataloader"] = (
+            "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+        )
+        mc.data["train"] = [{"dataset_name": "short"}, {"dataset_name": "long"}]
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.load_replay_buffer = load_replay
+
+        if message == "num_prompts_per_dataloader":
+            mc.data.pop("num_prompts_per_dataloader")
+        with pytest.raises(ValueError, match=message):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        "train",
+        [
+            {"dataset_name": "short"},
+            [],
+            [{"dataset_name": "short"}],
+            [
+                {"dataset_name": "short"},
+                {"dataset_name": "long"},
+                {"dataset_name": "extra"},
+            ],
+        ],
+    )
+    def test_multiple_dataloader_rejects_source_count_before_building(
+        self,
+        patched_factories: dict[str, Any],
+        train: ResponseDatasetConfig | list[ResponseDatasetConfig],
+    ) -> None:
+        mc = _make_master_config(
+            use_multiple_dataloader=True,
+            max_num_epochs=None,
+            sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
+        )
+        mc.data.update(
+            num_prompts_per_dataloader=2,
+            custom_dataloader=(
+                "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+            ),
+            train=train,
+        )
+        with pytest.raises(ValueError, match="exactly two task sources"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    @pytest.mark.parametrize("save_data_plane", [False, True])
+    def test_multiple_dataloader_rejects_msc_before_building(
+        self, patched_factories: dict[str, Any], save_data_plane: bool
+    ) -> None:
+        mc = _make_master_config(
+            use_multiple_dataloader=True,
+            max_num_epochs=None,
+            sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
+        )
+        mc.data.update(
+            num_prompts_per_dataloader=2,
+            custom_dataloader=(
+                "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+            ),
+            train=[{"dataset_name": "short"}, {"dataset_name": "long"}],
+        )
+        mc.checkpointing.enabled = True
+        mc.checkpointing.checkpoint_dir = "msc://profile/run"
+        mc.checkpointing.save_data_plane = save_data_plane
+        mc.checkpointing.load_replay_buffer = True
+        with pytest.raises(ValueError, match="POSIX checkpoint_dir; msc://"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    @pytest.mark.parametrize("same_task", [False, True])
+    def test_real_data_setup_preserves_distinct_source_tasks(
+        self, monkeypatch: pytest.MonkeyPatch, same_task: bool
+    ) -> None:
+        task_names = ("short_task", "short_task" if same_task else "long_task")
+        response_sources = [
+            SimpleNamespace(
+                task_name=task,
+                task_spec=MagicMock(),
+                processor=MagicMock(),
+                dataset=list(range(size)),
+            )
+            for task, size in zip(task_names, (2, 6), strict=True)
+        ]
+        load_source = MagicMock(side_effect=response_sources)
+        monkeypatch.setattr(data_utils, "load_response_dataset", load_source)
+        data_config: DataConfig = {
+            "use_multiple_dataloader": True,
+            "num_prompts_per_dataloader": 2,
+            "custom_dataloader": (
+                "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+            ),
+            "train": [{"dataset_name": "short"}, {"dataset_name": "long"}],
+            "max_input_seq_length": 32,
+            "shuffle": False,
+            "num_workers": 0,
+        }
+        sources, _ = data_utils.setup_response_data(
+            MagicMock(), data_config, load_validation=False
+        )
+        if same_task:
+            with pytest.raises(ValueError, match="two distinct tasks"):
+                sc_setup_mod._build_training_dataloader(
+                    sources,
+                    data_config,
+                    num_prompts_per_step=4,
+                    recovery_checkpoint_path=None,
+                )
+        else:
+            dataloader = sc_setup_mod._build_training_dataloader(
+                sources,
+                data_config,
+                num_prompts_per_step=4,
+                recovery_checkpoint_path=None,
+            )
+            assert list(dataloader.dataloaders) == list(task_names)
+            assert [len(child) for child in dataloader.dataloaders.values()] == [1, 3]
+            for task in task_names:
+                assert dataloader.dataloaders[task].dataset is sources[task]
+        assert load_source.call_count == 2
+
+    @pytest.mark.parametrize("checkpoint_enabled", [False, True])
+    def test_setup_builds_two_sources_with_step_budget(
+        self, patched_factories, checkpoint_enabled: bool
+    ) -> None:
+        mc = _make_master_config(
+            use_multiple_dataloader=True,
+            max_num_steps=5,
+            max_num_epochs=None,
+            sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
+        )
+        mc.data.update(
+            num_prompts_per_dataloader=2,
+            custom_dataloader=(
+                "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+            ),
+            train=[{"dataset_name": "short"}, {"dataset_name": "long"}],
+        )
+        sources = {"short": list(range(2)), "long": list(range(6))}
+        patched_factories["setup_response_data"].return_value = (sources, None, {}, {})
+        patched_factories["StatefulDataLoader"].side_effect = [
+            MagicMock(__len__=lambda _: 1),
+            MagicMock(__len__=lambda _: 3),
+        ]
+
+        mc.checkpointing.enabled = checkpoint_enabled
+        mc.checkpointing.load_replay_buffer = checkpoint_enabled
+        mc.checkpointing.save_data_plane = checkpoint_enabled
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert isinstance(actor_args.dataloader, sc_setup_mod.MultipleDataloaderWrapper)
+        assert list(actor_args.dataloader.dataloaders) == ["short", "long"]
+        assert [
+            call.args[0]
+            for call in patched_factories["StatefulDataLoader"].call_args_list
+        ] == [sources["short"], sources["long"]]
+        assert mc.grpo.max_num_steps == 5
 
     @pytest.mark.parametrize(
         (

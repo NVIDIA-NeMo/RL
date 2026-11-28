@@ -159,6 +159,77 @@ def test_the_ledger_reports_a_group_from_reservation_to_release() -> None:
     assert all(
         event["environment_instance_id"] == "tools/replica-0" for event in dispatched
     )
+    assert all("task_name" not in event for event in events)
+
+
+def test_same_sample_index_in_two_tasks_is_distinct_across_trace_runs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ROLLOUT_TRACE_FILENAME
+    for run in ("first", "second"):
+        trace = RolloutTrace(path)
+        ledger = RolloutRecoveryLedger()
+        ledger.set_event_sink(trace.emit)
+        for task_name in ("short", "long"):
+            group_id = f"{run}-{task_name}"
+            _reserve(
+                ledger,
+                group_id=group_id,
+                prompt_id="0",
+                prompt_payload={**_prompt(0), "task_name": task_name},
+                expected_generations=1,
+                target_step=1,
+                start_weight_version=0,
+                task_source="shared",
+            )
+            _mutate(lambda cut: ledger.mark_group_dispatched(cut, group_id))
+        trace.close()
+
+    dispatched = [
+        event for event in _events(path) if event["event"] == "attempt_dispatched"
+    ]
+    assert len(dispatched) == 4
+    assert len({event["run"] for event in dispatched}) == 2
+    assert len({event["group_id"] for event in dispatched}) == 4
+    assert all("task_name" in event for event in dispatched), (
+        "named rollout trace must retain task identity"
+    )
+    by_run = {
+        run: {
+            (event["task_name"], event["prompt_id"], event["generation_index"])
+            for event in dispatched
+            if event["run"] == run
+        }
+        for run in {event["run"] for event in dispatched}
+    }
+    assert all(
+        keys == {("short", "0", 0), ("long", "0", 0)} for keys in by_run.values()
+    )
+
+
+def test_restored_ledger_traces_durable_task_identity() -> None:
+    source = RolloutRecoveryLedger()
+    _reserve(
+        source,
+        group_id="original",
+        prompt_id="0",
+        prompt_payload={**_prompt(0), "task_name": "short"},
+        expected_generations=1,
+        target_step=1,
+        start_weight_version=0,
+        task_source="shared",
+    )
+    _mutate(lambda cut: source.mark_group_dispatched(cut, "original"))
+    restored, events = _recording_ledger(from_ledger=source)
+
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+
+    assert [
+        (event["event"], event["task_name"], event["generation_index"])
+        for event in events
+    ] == [
+        ("attempt_abandoned", "short", 0),
+    ]
 
 
 def test_a_dropped_rollout_is_reported_and_its_retry_is_a_new_attempt() -> None:

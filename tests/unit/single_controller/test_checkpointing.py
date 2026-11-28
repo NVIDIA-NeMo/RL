@@ -53,6 +53,7 @@ import pytest
 import torch
 import yaml
 from pydantic import ValidationError
+from ray import cloudpickle
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -118,10 +119,16 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     forest_execution_row_multiple,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _build_training_dataloader,
+)
 from nemo_rl.algorithms.single_controller_utils.step_assembly import (
     StepAssembly as _StepAssembly,
 )
+from nemo_rl.data import ResponseDatasetConfig
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
@@ -138,6 +145,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RecoveryTargetLevel,
     RolloutRecoveryLedger,
+    build_rollout_recovery_state,
 )
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
@@ -950,7 +958,7 @@ def _actor_master_config(
     checkpoint_must_save_by: Optional[str] = None,
     ft_save_period: Optional[int] = None,
     num_prompts_per_step: int = 2,
-    max_num_epochs: int = 1,
+    max_num_epochs: int | None = 1,
     buffer_checkpoint: bool = False,
     data_plane_checkpoint: bool = True,
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
@@ -1031,7 +1039,7 @@ def _make_actor_args(
     weight_synchronizer: Optional[_FakeWeightSynchronizer] = None,
     rollout_manager: Optional[Any] = None,
     save_state: Optional[GRPOSaveState] = None,
-    dataloader: Optional[_FakeDataloader] = None,
+    dataloader: _FakeDataloader | MultipleDataloaderWrapper | None = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
     dp_client: Optional[_FakeDPClient] = None,
     last_checkpoint_path: Optional[str] = None,
@@ -2149,14 +2157,38 @@ class TestPeriodicRolloutCheckpoint:
         assert len(list(snapshots.rglob("pending-write"))) == 1
         assert not list(snapshots.glob("snapshot_*"))
 
+    @pytest.mark.parametrize("multiple_sources", [False, True])
     @pytest.mark.parametrize("failure", [None, "persist", "resume", "publish"])
     def test_deferred_tq_persists_after_resume_and_releases_on_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: str | None,
+        multiple_sources: bool,
     ) -> None:
         actor = self._actor(tmp_path)
         events = []
-        live_cursor = {"cursor": {"offset": 1}}
-        actor._dataloader.state_dict = lambda: live_cursor
+        initial_offsets = {"short": 1, "long": 10} if multiple_sources else {"": 1}
+        live_cursors = {
+            task: {"cursor": {"offset": offset}}
+            for task, offset in initial_offsets.items()
+        }
+        if multiple_sources:
+            actor._dataloader = MultipleDataloaderWrapper(
+                expected_num_prompts=2,
+                data_config={
+                    "custom_dataloader": (
+                        "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+                    )
+                },
+                dataloaders={
+                    task: _FakeDataloader(state=cursor)
+                    for task, cursor in live_cursors.items()
+                },
+                defer_iterator_creation=True,
+            )
+        else:
+            actor._dataloader.state_dict = lambda: live_cursors[""]
         environment_snapshot = _FakeEnvironmentSnapshot()
         cuts = []
 
@@ -2165,7 +2197,8 @@ class TestPeriodicRolloutCheckpoint:
             events.append("pause")
             yield environment_snapshot
             events.append("resume")
-            live_cursor["cursor"]["offset"] = 2
+            for cursor in live_cursors.values():
+                cursor["cursor"]["offset"] += 1
             if failure == "resume":
                 raise OSError("resume failed")
 
@@ -2221,10 +2254,18 @@ class TestPeriodicRolloutCheckpoint:
         published = list(snapshots.glob("snapshot_*"))
         assert len(published) == int(failure is None)
         if published:
-            saved_cursor = torch.load(
-                published[0] / "train_dataloader.pt", weights_only=True
-            )
-            assert saved_cursor["cursor"]["offset"] == 1
+            suffixes = {
+                f"_{task}" if multiple_sources else "": offset
+                for task, offset in initial_offsets.items()
+            }
+            assert {
+                path.name for path in published[0].glob("train_dataloader*.pt")
+            } == {f"train_dataloader{suffix}.pt" for suffix in suffixes}
+            for suffix, offset in suffixes.items():
+                saved_cursor = torch.load(
+                    published[0] / f"train_dataloader{suffix}.pt", weights_only=True
+                )
+                assert saved_cursor["cursor"]["offset"] == offset
 
     def test_deferred_snapshot_serializes_recovery_state_after_resume(
         self,
@@ -5600,6 +5641,173 @@ def _make_int_dataloader() -> StatefulDataLoader:
 
 
 class TestDataloaderState:
+    @pytest.mark.parametrize("shuffle", [False, True])
+    def test_multiple_sources_resume_across_epoch_boundary(
+        self, tmp_path: Path, shuffle: bool
+    ) -> None:
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=2, max_num_epochs=None
+        )
+        mc.async_rl.sampler = InOrderSamplerConfig(max_lookahead_versions=0)
+        train: list[ResponseDatasetConfig] = [
+            {"dataset_name": "short"},
+            {"dataset_name": "long"},
+        ]
+        mc.data.update(
+            use_multiple_dataloader=True,
+            num_prompts_per_dataloader=1,
+            custom_dataloader=(
+                "examples.custom_dataloader.custom_dataloader.example_custom_dataloader"
+            ),
+            train=train,
+            shuffle=shuffle,
+            max_input_seq_length=None,
+        )
+        datasets = {
+            task: [
+                DatumSpec(
+                    message_log=[],
+                    length=1,
+                    loss_multiplier=1.0,
+                    extra_env_info=None,
+                    idx=index,
+                    task_name=task,
+                )
+                for index in range(size)
+            ]
+            for task, size in (("short", 2), ("long", 5))
+        }
+
+        def build(checkpoint: Path | None = None) -> MultipleDataloaderWrapper:
+            loader = _build_training_dataloader(
+                datasets,
+                mc.data,
+                num_prompts_per_step=2,
+                recovery_checkpoint_path=str(checkpoint) if checkpoint else None,
+            )
+            assert isinstance(loader, MultipleDataloaderWrapper)
+            return cloudpickle.loads(cloudpickle.dumps(loader))
+
+        def ids(
+            loader: MultipleDataloaderWrapper, steps: int
+        ) -> list[list[tuple[str, int]]]:
+            batches = [next(loader) for _ in range(steps)]
+            return [list(zip(batch["task_name"], batch["idx"])) for batch in batches]
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            dataloader = build()
+            prefix = ids(dataloader, 2)
+            assert all(
+                [task for task, _ in batch] == ["short", "long"] for batch in prefix
+            )
+            _run_train_pump(mc, _make_actor_args(dataloader=dataloader))
+            checkpoint = tmp_path / "checkpoints" / "step_2"
+            assert {p.name for p in checkpoint.glob("train_dataloader*.pt")} == {
+                "train_dataloader_short.pt",
+                "train_dataloader_long.pt",
+            }
+
+            uninterrupted = ids(dataloader, 6)
+            torch.manual_seed(123)
+            assert ids(build(checkpoint), 6) == uninterrupted
+
+            async def restore_without_native_metadata() -> None:
+                actor = _ACTOR_CLS(
+                    mc,
+                    _make_actor_args(
+                        dataloader=build(checkpoint),
+                        last_checkpoint_path=str(checkpoint),
+                    ),
+                    SetupTimingMetrics(),
+                )
+                attach_rollout_checkpointing(actor)
+                await actor._rollout_restorer._restore_replay_buffer()
+
+            with pytest.raises(RuntimeError, match="requires native replay metadata"):
+                asyncio.run(restore_without_native_metadata())
+
+            async def restore_native_checkpoint() -> None:
+                actor = _ACTOR_CLS(
+                    mc,
+                    _make_actor_args(dataloader=build(checkpoint)),
+                    SetupTimingMetrics(),
+                )
+                ledger = RolloutRecoveryLedger()
+                try:
+                    async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                        for task, source in datasets.items():
+                            ledger.reserve_group(
+                                cut,
+                                group_id=task,
+                                prompt_id="0",
+                                prompt_payload=source[0],
+                                expected_generations=2,
+                                target_step=2,
+                                start_weight_version=2,
+                                admitted=True,
+                            )
+                    recovery_path = checkpoint / ROLLOUT_RECOVERY_STATE_FILENAME
+                    torch.save(
+                        build_rollout_recovery_state(
+                            ledger,
+                            batch_shortfall={},
+                            steps_allowed_short=set(),
+                            sampler_stamps_target_steps=True,
+                        ),
+                        recovery_path,
+                    )
+                    torch.save(
+                        {"groups": []},
+                        checkpoint / REPLAY_BUFFER_METADATA_FILENAME,
+                    )
+                    actor._resume = ResumeSource(
+                        path=str(checkpoint),
+                        data_plane_metadata={
+                            **_data_plane_checkpoint_metadata(),
+                            "forest_training": False,
+                            "forest_execution_row_multiple": None,
+                            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                            "rollout_recovery_group_count": 2,
+                            "rollout_recovery_payload_sha256": hashlib.sha256(
+                                recovery_path.read_bytes()
+                            ).hexdigest(),
+                        },
+                    )
+                    mc.checkpointing.load_replay_buffer = True
+                    attach_rollout_checkpointing(actor)
+                    restored = await actor._rollout_restorer._restore_replay_buffer()
+                    await actor._rollout_restorer._restore_recovery_ledger(
+                        restored_replay_groups=restored
+                    )
+                    launch = AsyncMock()
+                    await actor._rollout_restorer.redispatch_restored(
+                        launch, AsyncMock()
+                    )
+                    assert launch.await_count == 2
+                    dispatched = {
+                        call.args[0]["task_name"]: call.args[0]["idx"]
+                        for call in launch.await_args_list
+                    }
+                    assert dispatched == {"short": 0, "long": 0}
+                    assert ids(actor._dataloader, 6) == uninterrupted
+                finally:
+                    actor._checkpointer.shutdown()
+
+            asyncio.run(restore_native_checkpoint())
+
+            train.reverse()
+            with pytest.raises(ValueError, match="matching data configuration"):
+                build(checkpoint)
+            train.reverse()
+            task_file = checkpoint / "train_dataloader_long.pt"
+            torch.save({}, task_file)
+            with pytest.raises(ValueError, match="nonempty dataloader state"):
+                build(checkpoint)
+            task_file.unlink()
+            with pytest.raises(FileNotFoundError, match="train_dataloader_long"):
+                build(checkpoint)
+
     def test_save_writes_dataloader_state(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
         save_state = _initial_grpo_save_state()

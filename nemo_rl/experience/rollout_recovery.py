@@ -790,6 +790,8 @@ class RolloutRecoveryLedger:
                 "environment_instance_id": attempt.environment_instance_id,
                 **fields,
             }
+        if record.prompt_ref.task_name is not None:
+            fields = {**fields, "task_name": record.prompt_ref.task_name}
         self._event_sink(
             event, group_id=record.group_id, prompt_id=record.prompt_id, **fields
         )

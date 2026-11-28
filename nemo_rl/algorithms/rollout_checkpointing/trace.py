@@ -25,9 +25,12 @@ that resume into the same log directory stay apart.
 Events are queued as they happen and a background thread appends them, so
 writing never blocks the controller's event loop; a run that is killed loses
 only the events not yet written, typically the last few milliseconds' worth.
-Rows match across runs by
-``prompt_id`` (the dataset index) and ``generation_index``; group and attempt
-IDs are new in every run.
+Within a window where each prompt occurs once, match rows across runs by
+``task_name``, ``prompt_id`` (the sample index in that task), and
+``generation_index``. Treat a missing ``task_name`` as ``None``. When a source
+cycles, align the occurrence first. For in-order traces, the ``target_step``
+on the group's reservation or admission can narrow the match. Compare only
+unambiguous matches.
 
 With token capture, each published group counts its trained tokens by the
 weight version that generated them. vLLM keeps running calls across a refit,
