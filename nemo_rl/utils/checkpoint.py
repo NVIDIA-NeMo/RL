@@ -24,6 +24,7 @@ import threading
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Any,
@@ -39,6 +40,7 @@ from typing import (
 import numpy as np
 import torch
 import yaml
+from hydra.utils import get_method
 from pydantic import BaseModel
 
 from nemo_rl.telemetry.instrumentation import (
@@ -46,7 +48,11 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     remote_trace_context,
 )
-from nemo_rl.utils.checkpoint_storage import CheckpointStorage, make_storage
+from nemo_rl.utils.checkpoint_storage import (
+    CheckpointStorage,
+    _parse_step,
+    make_storage,
+)
 from nemo_rl.utils.path_utils import (
     as_path,
     is_msc_path,
@@ -230,6 +236,8 @@ class CheckpointingConfig(BaseModel, extra="allow"):
             frontier-aligned async resume or a SingleController native TQ resume
             regenerates the buffered prompt groups on the current policy instead
             of reusing completed groups.
+        publish_hooks (list[str]): Dotted paths of callables notified once a
+            checkpoint is published (see ``CheckpointManager`` for the contract).
     """
 
     enabled: bool
@@ -246,6 +254,7 @@ class CheckpointingConfig(BaseModel, extra="allow"):
     save_optimizer: bool = True
     save_data_plane: bool = False
     load_replay_buffer: bool = True
+    publish_hooks: list[str] = []
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -261,6 +270,25 @@ _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
         "is_async",
     }
 )
+
+
+@dataclass(frozen=True)
+class PublishedCheckpoint:
+    """A checkpoint that has just been published, as passed to publish hooks.
+
+    Attributes:
+        step (int): Training step the checkpoint was saved at.
+        path (str): Published ``step_N`` directory; may be a URI such as
+            ``msc://profile/run/step_N``.
+        is_periodic (bool): Whether ``step`` is a multiple of ``save_period``.
+            Retention keeps periodic checkpoints (limited by ``keep_top_k`` if
+            set); others, such as fault-tolerance saves, are kept only while
+            among the latest ``ft_keep_latest_k`` when that is set.
+    """
+
+    step: int
+    path: str
+    is_periodic: bool
 
 
 class CheckpointManager:
@@ -280,6 +308,15 @@ class CheckpointManager:
         step_1/
             ...
     ```
+
+    Publish hooks (``checkpointing.publish_hooks``) are called as
+    ``hook(checkpoint: PublishedCheckpoint)`` once a checkpoint is published, in
+    config order on the thread that publishes it (the background finalization
+    thread for ``begin_finalization``). Hooks are not called when the write or the
+    publication fails. A hook that raises is reported as a warning and not
+    retried; the checkpoint stays published. Hooks delay the next
+    finalization and ``shutdown()``, so they should be bounded. A published
+    checkpoint may still be removed later by the retention settings.
 
     Attributes: Derived from the CheckpointingConfig.
     """
@@ -318,6 +355,9 @@ class CheckpointManager:
         self.save_period: int = config.save_period
         self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
         self.save_optimizer = config.save_optimizer
+        self._publish_hooks: list[Callable[[PublishedCheckpoint], None]] = [
+            get_method(name) for name in config.publish_hooks
+        ]
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
@@ -439,8 +479,22 @@ class CheckpointManager:
         Args:
             checkpoint_path (PathLike): Path to the temporary checkpoint directory.
         """
-        self._storage.publish(checkpoint_path)
+        self._run_publish_hooks(self._storage.publish(checkpoint_path))
         self.remove_old_checkpoints()
+
+    def _run_publish_hooks(self, published: str) -> None:
+        step = _parse_step(Path(published).name)
+        if step is None:
+            return
+        checkpoint = PublishedCheckpoint(step, published, step % self.save_period == 0)
+        for hook in self._publish_hooks:
+            try:
+                hook(checkpoint)
+            except Exception as e:
+                warnings.warn(
+                    f"Checkpoint publish hook {hook!r} failed for step {step}: {e!r}",
+                    stacklevel=2,
+                )
 
     def begin_finalization(
         self,
@@ -483,7 +537,8 @@ class CheckpointManager:
                 with _finalize_telemetry(carrier, step):
                     if wait_fn is not None:
                         wait_fn()
-                    self._storage.publish(checkpoint_path)
+                    published = self._storage.publish(checkpoint_path)
+                    self._run_publish_hooks(published)
                     # Prune old checkpoints off the critical path. Surface any
                     # failure via a done-callback so a broken delete is not
                     # silently swallowed (the discarded Future would otherwise

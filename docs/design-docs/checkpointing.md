@@ -113,3 +113,26 @@ checkpointing:
 - **Support:** Megatron policy backend; dataloader state for all algorithms (`save_dataloader_state`); async GRPO, including its replay buffer and rollout state (`replay_buffer.pt`, `rollouts.pt`), as long as `save_data_plane=false`; SingleController (async) with `checkpointing.metric_name=null` and `save_data_plane=false`. SingleController cannot snapshot its data plane to `msc://`, so a resume restores weights and the dataloader cursor and regenerates the buffered rollouts (a warning says so at setup).
 - **Trust:** resume deserializes `torch` pickles (`train_dataloader*.pt`) from the bucket; only point `msc://` at storage you control.
 
+## Checkpoint publish hooks
+
+`checkpointing.publish_hooks` lists dotted paths of functions to call once a checkpoint is published, for example to notify an external system that a new step can be evaluated or converted.
+
+```yaml
+checkpointing:
+  publish_hooks:
+    - my_package.notify.checkpoint_ready
+```
+
+```python
+from nemo_rl.utils.checkpoint import PublishedCheckpoint
+
+
+def checkpoint_ready(checkpoint: PublishedCheckpoint) -> None:
+    ...
+```
+
+`PublishedCheckpoint` has `step`, `path` and `is_periodic`; new fields may be added, so hooks keep working as it grows.
+
+- **When:** after `step_N` is published (renamed locally, or `_SUCCESS` written on `msc://`), never for a failed write or publication. `path` is the published directory and may be an `msc://` URI. `is_periodic` says whether the step is a multiple of `save_period`: retention keeps those (limited by `keep_top_k` if set), while other saves, such as fault-tolerance ones, are kept only while among the latest `ft_keep_latest_k` when that is set.
+- **Where:** in config order, on the thread that publishes the checkpoint. Every built-in training loop publishes on the background finalization thread (inside the controller actor under SingleController and SFT v2), which the next save and training exit wait for. Keep hooks bounded (use timeouts) so they cannot stall training.
+- **Failures:** an exception is reported as a warning and the checkpoint stays published. Calls are not retried or replayed, and retention (`keep_top_k`) may later delete a step a hook was told about.

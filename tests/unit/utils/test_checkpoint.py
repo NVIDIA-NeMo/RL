@@ -24,7 +24,11 @@ import torch
 import yaml
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    PublishedCheckpoint,
+)
 
 
 @pytest.fixture
@@ -1448,3 +1452,77 @@ def test_a_non_numeric_staging_name_costs_only_the_span_label(
 
     assert (checkpoint_dir / "step_final").exists()
     assert not staged.exists()
+
+
+published_by_hook: list[PublishedCheckpoint] = []
+
+
+def _record_publish(checkpoint: PublishedCheckpoint) -> None:
+    published_by_hook.append(checkpoint)
+
+
+def _failing_publish(checkpoint: PublishedCheckpoint) -> None:
+    raise RuntimeError("event API down")
+
+
+@pytest.fixture
+def hooked_manager(checkpoint_config):
+    published_by_hook.clear()
+    checkpoint_config.publish_hooks = [f"{__name__}._record_publish"]
+    return CheckpointManager(checkpoint_config)
+
+
+def test_publish_hooks_see_published_step(checkpoint_config, checkpoint_dir):
+    published_by_hook.clear()
+    checkpoint_config.publish_hooks = [
+        f"{__name__}._failing_publish",
+        f"{__name__}._record_publish",
+    ]
+    checkpoint_config.save_period = 2
+    manager = CheckpointManager(checkpoint_config)
+
+    with pytest.warns(UserWarning, match="failed for step 1: .*event API down"):
+        manager.finalize_checkpoint(manager.init_tmp_checkpoint(1, {}))
+    with pytest.warns(UserWarning, match="failed for step 2: .*event API down"):
+        manager.begin_finalization(manager.init_tmp_checkpoint(2, {}))
+        manager.shutdown()
+
+    assert published_by_hook == [
+        PublishedCheckpoint(1, str(checkpoint_dir / "step_1"), False),
+        PublishedCheckpoint(2, str(checkpoint_dir / "step_2"), True),
+    ]
+
+
+def test_unresolvable_publish_hook_fails_at_startup(checkpoint_config):
+    checkpoint_config.publish_hooks = [f"{__name__}._no_such_hook"]
+
+    with pytest.raises(ImportError, match="_no_such_hook"):
+        CheckpointManager(checkpoint_config)
+
+
+def test_publish_hooks_wait_for_async_write(hooked_manager):
+    written = threading.Event()
+    hooked_manager.begin_finalization(
+        hooked_manager.init_tmp_checkpoint(1, {}), wait_fn=written.wait
+    )
+    time.sleep(0.05)
+    assert published_by_hook == []
+
+    written.set()
+    hooked_manager.finalize_pending()
+    assert [checkpoint.step for checkpoint in published_by_hook] == [1]
+
+
+@pytest.mark.parametrize("failing", ["write", "publish"])
+def test_publish_hooks_skip_failed_checkpoint(hooked_manager, failing):
+    wait_fn = MagicMock(side_effect=OSError("shard write failed"))
+    if failing == "publish":
+        wait_fn = None
+        hooked_manager._storage.publish = MagicMock(side_effect=OSError("no rename"))
+    hooked_manager.begin_finalization(
+        hooked_manager.init_tmp_checkpoint(1, {}), wait_fn=wait_fn
+    )
+
+    with pytest.raises(RuntimeError, match="finalization failed"):
+        hooked_manager.finalize_pending()
+    assert published_by_hook == []

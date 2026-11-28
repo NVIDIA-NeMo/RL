@@ -148,6 +148,7 @@ checkpointing:
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
   save_optimizer: true
+  publish_hooks: []
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,
   # unconsumed rollouts.

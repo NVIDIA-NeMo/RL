@@ -27,6 +27,7 @@ checkpointing:
     save_period: 10
     checkpoint_must_save_by: null
     save_optimizer: true
+    publish_hooks: []
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
