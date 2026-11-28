@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -36,7 +37,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -106,8 +107,13 @@ from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import PREFIX_WRITE_LIMITS
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
+)
+from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
+    held_acks,
+    merge_cut_receipts,
 )
 from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402
     VllmProgressReader,
@@ -226,6 +232,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     """A real worker's token-capture state, minus the engine."""
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._init_token_capture_state()
+    worker.cfg = {"vllm_cfg": {}}
     worker.is_model_owner = is_model_owner
     worker._http_engine_client = None
     worker._api_server_pool = None
@@ -280,6 +287,7 @@ def _cuts(
             prefix_write_max_rows=batch_size or 256,
             prefix_write_max_tokens=batch_max_tokens or 4_194_304,
             prefix_read_max_rows=read_max_rows or 256,
+            write_limits=PREFIX_WRITE_LIMITS,
         )
     )
     worker._prefix_recovery = recovery
@@ -302,9 +310,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
 
@@ -355,9 +365,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
-            sink
-        ),
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
     asyncio.run(
@@ -386,6 +398,57 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     assert coords.weight_version == 4
     assert sink.records[0].weight_version == 4
+
+
+def test_owner_sends_child_frontends_every_capture_setting(monkeypatch):
+    """Each child frontend runs ``setup_token_capture`` with what the owner got."""
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: _MemorySink(),
+    )
+    worker = _fake_worker()
+    worker._api_server_pool = MagicMock(command=AsyncMock())
+    # Text-only capture without cuts, so no engine or prefix writer is needed.
+    owner_kwargs = {
+        "top_logprobs": 3,
+        "generation_cut_control_token": "control-token",
+        "generation_cut_control_timeout_s": 7.0,
+        "prefix_write_max_rows": 11,
+        "prefix_write_max_tokens": 13,
+        "prefix_read_max_rows": 17,
+    }
+
+    asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker, {"impl": "local"}, "stage", **owner_kwargs
+        )
+    )
+
+    ((_, dp_cfg, partition, sent),) = [
+        call.args
+        for call in worker._api_server_pool.command.await_args_list
+        if call.args[0] == "capture"
+    ]
+    assert (dp_cfg, partition) == ({"impl": "local"}, "stage")
+    # A setting left out would make each child run with its default.
+    keyword_only = {
+        name
+        for name, param in inspect.signature(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture
+        ).parameters.items()
+        # Skip what Ray's tracing adds to an actor method (_ray_trace_ctx).
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not name.startswith("_")
+    }
+    assert set(sent) == keyword_only
+    assert {name: sent[name] for name in owner_kwargs} == owner_kwargs
 
 
 def _generation_with_mock_group(*, async_engine: bool = True) -> VllmGeneration:
@@ -476,9 +539,13 @@ def test_obsolete_generation_cut_row_flush_fans_out(monkeypatch):
 def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     gen = _generation_with_mock_group()
     gen.worker_group.workers = [object(), object()]
+    # The second worker runs two HTTP frontends.
     gen.worker_group.run_all_workers_single_data.return_value = [
-        {"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1},
-        {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+        [{"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1}],
+        [
+            {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
+            {"restored_calls": 4, "restored_prefix_tokens": 9, "progress_reads": 2},
+        ],
     ]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
@@ -486,12 +553,12 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     )
 
     assert gen.get_generation_prefix_counts() == {
-        "restored_calls": 3,
-        "restored_prefix_tokens": 57,
-        "progress_reads": 1,
+        "restored_calls": 7,
+        "restored_prefix_tokens": 66,
+        "progress_reads": 3,
     }
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "get_generation_prefix_counts",
+        "get_generation_prefix_counts_per_frontend",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -1176,10 +1243,11 @@ def test_flush_is_not_queued_behind_a_running_cut():
         stale_cut_running = threading.Event()
         release_stale_cut = threading.Event()
         try:
-            # A cut still holding the control thread, as a stale one would.
-            stale_cut = asyncio.get_running_loop().run_in_executor(
-                recovery._control_executor,
-                lambda: (stale_cut_running.set(), release_stale_cut.wait(10)),
+            # A cut still holding the pipeline's write thread, as a stale one would.
+            stale_cut = asyncio.wrap_future(
+                recovery._pipeline._writers.submit(
+                    lambda: (stale_cut_running.set(), release_stale_cut.wait(10))
+                )
             )
             assert await asyncio.to_thread(stale_cut_running.wait, 5)
             await asyncio.wait_for(
@@ -1726,6 +1794,100 @@ def _active_call_inventory(
     return inventory, states
 
 
+def test_frontends_cut_their_own_calls_into_one_receipt(caplog):
+    # Each HTTP frontend holds the calls whose requests it accepted.
+    sinks = [_MemorySink(), _MemorySink()]
+    owner, child = (_worker_with_capture(sink) for sink in sinks)
+    _active_call_inventory(owner, ("c1", [11, 12]))
+    # The child also holds a call still prefilling, which it cannot cut yet.
+    _active_call_inventory(child, ("c2", [13, 14]), ("prefilling", []))
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{model_call_id}",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+            for model_call_id in ("c1", "c2", "prefilling", "not-arrived")
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        answers = [
+            held_acks(_cuts(frontend).checkpoint_cut(inventory, held_only=True))
+            for frontend in (owner, child)
+        ]
+        receipt = merge_cut_receipts(inventory, answers)
+
+    receipt.validate_for(inventory)
+    dispositions = {ack.ticket_id: ack.disposition for ack in receipt.prefixes}
+    assert dispositions == {
+        "ticket-c1": "durable_prefix",
+        "ticket-c2": "durable_prefix",
+        "ticket-prefilling": "durable_failure",
+        "ticket-not-arrived": "durable_failure",
+    }
+    # Each frontend staged only its own call's row.
+    assert [len(sink.generation_prefix_records) for sink in sinks] == [1, 1]
+    # Frontends stay quiet about each other's calls. The child logs its own
+    # uncut call; the merge warns once, only about the call no frontend holds.
+    assert "cannot cut completed model call" not in caplog.text
+    assert "generation cut checkpoint-1 left 1 of 2 model calls uncut" in caplog.text
+    assert caplog.text.count("no engine holds") == 1
+    assert (
+        "generation cut checkpoint-1: no engine holds 1 of 4 model calls; they "
+        "regenerate after a restore: ['not-arrived']"
+    ) in caplog.text
+    # A frontend's cut wins over another's failure for the same call.
+    failure = GenerationCutPrefixAck.failure(inventory.active_prefixes[0])
+    again = merge_cut_receipts(inventory, [[failure.model_dump(mode="json")], *answers])
+    assert {ack.ticket_id: ack.disposition for ack in again.prefixes} == dispositions
+
+
+def test_held_only_cut_answers_for_the_calls_this_frontend_finished(caplog):
+    worker = _worker_with_capture(_MemorySink())
+    _cuts(worker).remember_completed(
+        "finished",
+        SimpleNamespace(
+            capture_key="r0",
+            disposition="staged",
+            staging_key="terminal-key",
+            digest="a" * 64,
+        ),
+        3,
+        effective_output_limit=128,
+        terminal_finish_reason="stop",
+    )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id=f"ticket-{model_call_id}",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+            for model_call_id in ("elsewhere", "finished")
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        receipt = _cuts(worker).checkpoint_cut(inventory, held_only=True)
+
+    # Another frontend holds "elsewhere"; this one answers only for its own.
+    ((model_call_id, cut_kind),) = [
+        (ack.model_call_id, ack.cut_kind) for ack in receipt.prefixes
+    ]
+    assert (model_call_id, cut_kind) == ("finished", "terminal_completion")
+    assert "elsewhere" not in caplog.text
+
+
 def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
@@ -1911,6 +2073,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
             router_replay=False,
             sampler_top_k=0,
             **_PREFIX_BATCH_LIMITS,
+            write_limits=PREFIX_WRITE_LIMITS,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -4301,13 +4464,13 @@ def test_omni_capture_setup_rejects_video_pruning(
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
                 VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                    worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+                    worker, {"impl": "local"}, **kwargs, **_PREFIX_BATCH_LIMITS
                 )
             )
     else:
         spec = asyncio.run(
             VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker, {}, **kwargs, **_PREFIX_BATCH_LIMITS
+                worker, {"impl": "local"}, **kwargs, **_PREFIX_BATCH_LIMITS
             )
         )
         # The engine's model dtype and the HF patch size, as pinned on the sink.
@@ -4512,6 +4675,8 @@ class _BatchPrefixSink(_MemorySink):
         super().__init__()
         self.batches: list[list[int]] = []
         self.fail_after_write = False
+        # Fails every write of more than one row, so rows retry one at a time.
+        self.fail_multi_row = False
         self.before_write = lambda: None
 
     def stage_generation_prefix_batch(
@@ -4525,7 +4690,7 @@ class _BatchPrefixSink(_MemorySink):
             chunk_sequences=chunk_sequences,
             attachments=attachments,
         )
-        if self.fail_after_write:
+        if self.fail_after_write or (self.fail_multi_row and len(records) > 1):
             # Like TQTokenSink after a failed put: discard the batch, then raise.
             self.clear(keys)
             raise RuntimeError("injected batch transport failure after writes")
@@ -4739,12 +4904,14 @@ def test_worker_batch_call_without_output_limit_fails_alone():
 
 def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
     from nemo_rl.models.generation.prefix_recovery import recovery as recovery_module
+    from nemo_rl.models.generation.prefix_recovery import write_pipeline
 
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
     clock = {"now": 0.0}
-    monkeypatch.setattr(
-        recovery_module, "time", SimpleNamespace(monotonic=lambda: clock["now"])
-    )
+    # The cut and the write pipeline both compare the deadline to this clock.
+    fake_time = SimpleNamespace(monotonic=lambda: clock["now"])
+    monkeypatch.setattr(recovery_module, "time", fake_time)
+    monkeypatch.setattr(write_pipeline, "time", fake_time)
 
     def expire_during_first_write():
         clock["now"] = 10.0

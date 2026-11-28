@@ -1032,6 +1032,50 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_setup_rejects_teacher_automodel_pipeline_parallel(mock_components):
+    from nemo_rl.algorithms.distillation import setup
+
+    master_config = mock_components["master_config"]
+    master_config.teacher["automodel_cfg"] = {
+        "enabled": True,
+        "pipeline_parallel_size": 2,
+    }
+
+    with patch.object(
+        distil_mod,
+        "Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(ValueError, match="Distillation does not support"):
+            setup(master_config, mock_components["tokenizer"], MagicMock(), None)
+
+
+def test_megatron_engines_behind_dynamo_are_refused_outside_the_single_controller(
+    mock_components,
+):
+    """Distillation names the entrypoint to use before touching the config or cluster."""
+    master_config = mock_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "dynamo": True,
+        "mcore_generation_config": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.distillation.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        distil_mod.setup(
+            master_config,
+            tokenizer=MagicMock(),
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+
+
 def test_distillation_train_shuts_down_environments_after_failure():
     task_to_env = {"nemo_gym": MagicMock()}
     val_task_to_env = task_to_env

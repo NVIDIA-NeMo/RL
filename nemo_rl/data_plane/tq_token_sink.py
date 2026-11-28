@@ -62,7 +62,11 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
+    CAPTURE_CODE_TO_MODE,
+    CAPTURE_MODE_TO_CODE,
+    GENERATION_CUT_STAGING_PREFIX,
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -139,10 +143,6 @@ STAGING_FIELDS = [
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_LEN_FIELD,
 ]
-
-_MODE_TO_CODE = {"text": 0, "token_in": 1}
-_CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
-GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
 
 
 def generation_cut_staging_key(
@@ -505,11 +505,24 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
+        self._prefix_store: TQStagingStore | None = None
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
+
+    def set_prefix_writer(self, dp_client: Any) -> None:
+        """Route prefix PUTs and failed-prefix cleanup through a separate client.
+
+        Install once, before accepting cuts. Terminal writes, restore reads,
+        and ordinary cleanup retain their original client.
+        """
+        if self._prefix_store is not None:
+            raise RuntimeError("A prefix writer is already installed")
+        self._prefix_store = TQStagingStore(
+            dp_client, staging_partition=self._store._staging_partition
+        )
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -642,7 +655,7 @@ class TQTokenSink:
                 [record.parent_call_id is not None], dtype=torch.bool
             ),
             "capture_mode": torch.tensor(
-                [_MODE_TO_CODE[record.mode]], dtype=torch.int64
+                [CAPTURE_MODE_TO_CODE[record.mode]], dtype=torch.int64
             ),
             "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
             "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
@@ -760,34 +773,55 @@ class TQTokenSink:
         chunk_sequences: Sequence[int],
         attachments: Sequence[Mapping[str, Any] | None] | None = None,
     ) -> list[str]:
-        """Publish generation-cut chunks in one TQ put; return their keys in order.
+        """Publish generation-cut chunks; return their keys in order.
 
         Rows must share column names, dtypes and trailing dims (one worker's
-        cut does); otherwise this raises before writing and the caller writes
-        each row alone. A failed put discards every key of the batch, then
-        raises.
+        cut does) and go in one put; mismatched rows raise before writing and
+        the caller writes each row alone. A failed put discards
+        every key of the batch, then raises.
         """
         if not records:
             return []
         if attachments is None:
             attachments = [None] * len(records)
-        keys, encoded = [], []
-        for record, sequence, row_attachments in zip(
-            records, chunk_sequences, attachments, strict=True
-        ):
-            keys.append(
-                generation_cut_staging_key(
-                    checkpoint_id,
-                    record.capture_key,
-                    record.model_call_id,
-                    chunk_sequence=sequence,
-                )
+        keys = [
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.capture_key,
+                record.model_call_id,
+                chunk_sequence=sequence,
             )
-            encoded.append(
-                self._encode_record(
-                    record, attachments=row_attachments, generation_cut_chunk=True
-                )
+            for record, sequence in zip(records, chunk_sequences, strict=True)
+        ]
+        store = self._store if self._prefix_store is None else self._prefix_store
+        encoded = self._encode_prefix_batch(records, attachments)
+        try:
+            for indices, fields, tags in encoded:
+                store.put_many([keys[index] for index in indices], fields, tags=tags)
+        except Exception as error:
+            # A dead writer cannot discard its own partial write; the local
+            # client can.
+            self._discard_failed_writes(
+                keys,
+                store=self._store
+                if isinstance(error, PrefixWriterDiedError)
+                else store,
             )
+            raise
+        return keys
+
+    def _encode_prefix_batch(
+        self,
+        records: Sequence[StagedCallRecord],
+        attachments: Sequence[Mapping[str, Any] | None],
+    ) -> list[tuple[list[int], TensorDict, list[dict[str, Any]]]]:
+        """Encode each row, then stack the rows into one batch."""
+        rows = [
+            self._encode_record(
+                record, attachments=row_attachments, generation_cut_chunk=True
+            )
+            for record, row_attachments in zip(records, attachments, strict=True)
+        ]
         # The TensorDict takes row 0's column names, and stack_or_nest promotes
         # mismatched dtypes and nests mismatched trailing dims without raising.
         layouts = {
@@ -795,25 +829,27 @@ class TQTokenSink:
                 (name, fields[name].dtype, tuple(fields[name].shape[2:]))
                 for name in sorted(fields)
             )
-            for fields, _ in encoded
+            for fields, _ in rows
         }
         if len(layouts) > 1:
             raise ValueError("generation-prefix batch rows have different layouts")
-        fields = TensorDict(
-            {
-                name: stack_or_nest([row[name][0] for row, _ in encoded])
-                for name in encoded[0][0]
-            },
-            batch_size=[len(encoded)],
-        )
-        try:
-            self._store.put_many(keys, fields, tags=[tags for _, tags in encoded])
-        except Exception:
-            self._discard_failed_writes(keys)
-            raise
-        return keys
+        return [
+            (
+                list(range(len(rows))),
+                TensorDict(
+                    {
+                        name: stack_or_nest([row[name][0] for row, _ in rows])
+                        for name in rows[0][0]
+                    },
+                    batch_size=[len(rows)],
+                ),
+                [tags for _, tags in rows],
+            )
+        ]
 
-    def _discard_failed_writes(self, keys: Sequence[str]) -> None:
+    def _discard_failed_writes(
+        self, keys: Sequence[str], *, store: TQStagingStore | None = None
+    ) -> None:
         """Reclaim whatever a failed combined write may have left behind.
 
         TQ writes a row field by field and only then publishes readiness, so
@@ -825,7 +861,7 @@ class TQTokenSink:
         logged at ERROR for the operator; the call is still reported failed.
         """
         try:
-            self._store.clear(list(keys))
+            (self._store if store is None else store).clear(list(keys))
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure
             logging.getLogger(__name__).error(
                 "TQTokenSink could not discard %d failed writes: %s: %s; "
@@ -1277,7 +1313,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
     mode_code = int(_row_leaf(row, "capture_mode")[0].item())
     try:
-        mode = _CODE_TO_MODE[mode_code]
+        mode = CAPTURE_CODE_TO_MODE[mode_code]
     except KeyError as error:
         raise ValueError(f"unknown capture_mode code {mode_code}") from error
     routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
