@@ -106,13 +106,6 @@ LOSS_TEED_METRICS = (
 register_teed_metrics(LOSS_TEED_METRICS)
 
 
-class DraftCrossEntropyLossConfig(TypedDict):
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
-    # Tokens per FP32 vocab tile in the streaming soft-CE reduction. Defaults to
-    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE; see policy.draft.token_chunk_size.
-    token_chunk_size: NotRequired[int]
-
-
 class DraftCrossEntropyLossDataDict(TypedDict):
     teacher_logits: Tensor
     student_logits: Tensor
@@ -2315,20 +2308,10 @@ class MseValueLossFn(LossFunction):
 # =====================================================================
 
 
-class CrossTokenizerDistillationLossConfig(TypedDict):
+class CrossTokenizerDistillationLossConfig(BaseModel, extra="allow"):
     """Config for cross-tokenizer distillation loss.
 
     Attributes:
-        projection_matrix_paths: Per-teacher list of filesystem paths to the
-            .pt projection file (``None`` marks a same-tokenizer teacher: direct
-            KL, no projection). Each .pt holds either the dense top-k projection
-            (dict with 'indices' and 'likelihoods' tensors of shape
-            [V_student, top_k]) or the sparse multi-token format
-            (dict[(student_id, teacher_id)] -> count), loaded lazily on first
-            call by each worker process. Runtime-injected by
-            ``xtoken_off_policy_distillation.setup`` from
-            ``teachers[i].aligner.projection_matrix_path``; not a user loss_fn
-            key in YAML.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
             *uncommon* set (sorted L1).
@@ -2359,49 +2342,53 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             detached magnitude matches CE, then add CE; ``kl_loss_weight`` /
             ``ce_loss_scale`` are ignored in this mode. Applies to both the
             P-KL and gold-loss paths.
-        student_vocab_size: Full student tokenizer vocab size, used to size
-            the projection matrix's student-side (V_s) axis. Runtime-injected
-            by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
-            not a user knob in YAML. Sizing V_s from the configured tokenizer
-            vocab (rather than ``max(observed student_id) + 1`` from the
-            sparse projection file) keeps V_s in lockstep with
-            ``logits.shape[-1]`` when the file's highest student ids happen
-            to be absent.
-        teacher_vocab_sizes: Per-teacher list of full teacher tokenizer vocab
-            sizes, used to size each projection matrix's teacher-side (V_t) axis.
-            Runtime-injected symmetrically to ``student_vocab_size`` from each
-            ``len(teacher_tokenizer)``; not a user loss_fn key in YAML.
     """
 
-    gold_loss: bool
-    xtoken_loss: bool
-    temperature: float
-    vocab_topk: int
-    uncommon_topk: int
-    reverse_kl: bool
-    exact_token_match_only: bool
-    kl_loss_weight: float
-    ce_loss_scale: float
-    dynamic_loss_scaling: bool
-    # Multi-teacher aggregation (user loss_fn knobs). gold_loss/xtoken_loss above
-    # are the global defaults; teachers[i].gold_loss / .xtoken_loss can override
-    # them per teacher in kd_loss_mode="sum".
-    kd_loss_mode: str  # "sum" | "averaged_logits" | "select_teacher"
-    normalize_teacher_by_vocab: (
-        bool  # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j)
-    )
-    alpha: float  # softmax temperature on dynamic teacher-weight scores (sum_weights_metric)
-    sum_weights_metric: NotRequired[
-        Optional[str]
-    ]  # "ce" | "entropy" | "max_prob"; None => static teacher_weights. sum-mode only.
-    # Runtime-injected by xtoken_off_policy_distillation.setup (parallel
-    # per-teacher lists + the student vocab size); not user loss_fn keys.
-    student_vocab_size: NotRequired[int]
-    teacher_vocab_sizes: NotRequired[list[int]]
-    projection_matrix_paths: NotRequired[list[Optional[str]]]
-    teacher_weights: NotRequired[list[float]]
-    teacher_gold_loss: NotRequired[list[Optional[bool]]]
-    teacher_xtoken_loss: NotRequired[list[Optional[bool]]]
+    gold_loss: bool = False
+    xtoken_loss: bool = False
+    temperature: float = 1.0
+    vocab_topk: int = 8192
+    uncommon_topk: int = 8192
+    reverse_kl: bool = False
+    exact_token_match_only: bool = False
+    kl_loss_weight: float = 1.0
+    ce_loss_scale: float = 0.1
+    dynamic_loss_scaling: bool = True
+    # Multi-teacher aggregation. gold_loss/xtoken_loss above are the global
+    # defaults; teachers[i].gold_loss / .xtoken_loss can override them per
+    # teacher in kd_loss_mode="sum".
+    kd_loss_mode: str = "sum"  # "sum" | "averaged_logits" | "select_teacher"
+    # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j)
+    normalize_teacher_by_vocab: bool = False
+    # softmax temperature on dynamic teacher-weight scores (sum_weights_metric)
+    alpha: float = 1.0
+    # "ce" | "entropy" | "max_prob"; None => static teacher weights. sum-mode only.
+    sum_weights_metric: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_mode_combinations(self) -> "CrossTokenizerDistillationLossConfig":
+        if self.xtoken_loss and not self.gold_loss:
+            raise ValueError(
+                "xtoken_loss=True requires gold_loss=True; xtoken_loss is "
+                "a modifier inside the gold path (relaxes the exact-map "
+                "threshold and adds collision resolution) and is undefined "
+                "in the P-KL path."
+            )
+        # Dynamic teacher weighting (sum_weights_metric) and normalize_teacher_by_vocab
+        # are only applied in kd_loss_mode="sum"; reject the combo instead of
+        # silently ignoring them under the other modes.
+        if self.sum_weights_metric is not None and self.kd_loss_mode != "sum":
+            raise ValueError(
+                f"sum_weights_metric={self.sum_weights_metric!r} is only applied "
+                f"in kd_loss_mode='sum'; it is ignored by '{self.kd_loss_mode}'. "
+                "Unset one of them."
+            )
+        if self.normalize_teacher_by_vocab and self.kd_loss_mode != "sum":
+            raise ValueError(
+                "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
+                f"it is ignored by '{self.kd_loss_mode}'. Unset one of them."
+            )
+        return self
 
 
 class CrossTokenizerDistillationLossDataDict(TypedDict):
@@ -2453,10 +2440,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
       and a collision-replacement rule lets multi-token projections still
       contribute exact maps.
 
-    ``(False, True)`` is rejected in ``__init__``: xtoken_loss is a modifier
-    inside the gold path and is undefined for P-KL.
+    ``(False, True)`` is rejected by ``CrossTokenizerDistillationLossConfig``:
+    xtoken_loss is a modifier inside the gold path and is undefined for P-KL.
 
-    Multi-teacher: ``setup`` injects per-teacher metadata (projection paths,
+    Multi-teacher: ``setup`` passes per-teacher metadata (projection paths,
     weights, vocab sizes, per-teacher gold/xtoken overrides). The per-teacher KD
     terms are aggregated by ``kd_loss_mode`` (``sum`` / ``averaged_logits`` /
     ``select_teacher``) and combined with a single student CE term. A teacher
@@ -2490,70 +2477,81 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
 
-    def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
-        if cfg["xtoken_loss"] and not cfg["gold_loss"]:
-            raise ValueError(
-                "xtoken_loss=True requires gold_loss=True; xtoken_loss is "
-                "a modifier inside the gold path (relaxes the exact-map "
-                "threshold and adds collision resolution) and is undefined "
-                "in the P-KL path."
-            )
-        # Dynamic teacher weighting (sum_weights_metric) and normalize_teacher_by_vocab
-        # are only applied in kd_loss_mode="sum"; reject the combo instead of
-        # silently ignoring them under the other modes.
-        if cfg.get("sum_weights_metric") is not None and cfg["kd_loss_mode"] != "sum":
-            raise ValueError(
-                f"sum_weights_metric={cfg['sum_weights_metric']!r} is only applied "
-                f"in kd_loss_mode='sum'; it is ignored by '{cfg['kd_loss_mode']}'. "
-                "Unset one of them."
-            )
-        if cfg.get("normalize_teacher_by_vocab") and cfg["kd_loss_mode"] != "sum":
-            raise ValueError(
-                "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
-                f"it is ignored by '{cfg['kd_loss_mode']}'. Unset one of them."
-            )
+    def __init__(
+        self,
+        cfg: CrossTokenizerDistillationLossConfig,
+        *,
+        student_vocab_size: int,
+        teacher_vocab_sizes: list[int],
+        projection_matrix_paths: list[Optional[str]],
+        teacher_weights: list[float],
+        teacher_gold_loss: list[Optional[bool]],
+        teacher_xtoken_loss: list[Optional[bool]],
+    ):
+        """Initialize the loss from the user config and per-teacher metadata.
+
+        The per-teacher arguments are parallel lists with one entry per
+        ``teachers[i]``.
+
+        Args:
+            cfg: The ``loss_fn`` config block.
+            student_vocab_size: Full student tokenizer vocab size, used to size
+                the projection matrix's student-side (V_s) axis. Sizing V_s from
+                the tokenizer vocab (rather than ``max(observed student_id) + 1``
+                from the sparse projection file) keeps V_s in lockstep with
+                ``logits.shape[-1]`` when the file's highest student ids happen
+                to be absent.
+            teacher_vocab_sizes: Full teacher tokenizer vocab sizes, used to size
+                each projection matrix's teacher-side (V_t) axis.
+            projection_matrix_paths: Filesystem paths to the .pt projection file
+                (``None`` marks a same-tokenizer teacher: direct KL, no
+                projection). Each .pt holds either the dense top-k projection
+                (dict with 'indices' and 'likelihoods' tensors of shape
+                [V_student, top_k]) or the sparse multi-token format
+                (dict[(student_id, teacher_id)] -> count), loaded lazily on first
+                call by each worker process.
+            teacher_weights: Static weight of each teacher's KD term.
+            teacher_gold_loss: Per-teacher override of ``cfg.gold_loss``; ``None``
+                uses the global value.
+            teacher_xtoken_loss: Per-teacher override of ``cfg.xtoken_loss``;
+                ``None`` uses the global value.
+        """
         # averaged_logits forms a convex combination of teacher logits
         # (weight_i / sum(weights)); a zero weight-sum (all zeros, or a signed
         # set cancelling to 0) makes that division undefined. Reject it here
         # rather than fail with a deep ZeroDivisionError mid-step.
-        _weights = cfg.get("teacher_weights")
-        if (
-            cfg["kd_loss_mode"] == "averaged_logits"
-            and _weights is not None
-            and sum(_weights) == 0
-        ):
+        if cfg.kd_loss_mode == "averaged_logits" and sum(teacher_weights) == 0:
             raise ValueError(
                 "teacher_weights must not sum to zero in "
                 "kd_loss_mode='averaged_logits' (they form a convex combination "
-                f"of teacher logits); got teacher_weights={list(_weights)}."
+                f"of teacher logits); got teacher_weights={list(teacher_weights)}."
             )
         # Global loss knobs (shared across all teachers).
-        self.gold_loss = cfg["gold_loss"]
-        self.xtoken_loss = cfg["xtoken_loss"]
-        self.temperature = cfg["temperature"]
-        self.vocab_topk = cfg["vocab_topk"]
-        self.uncommon_topk = cfg["uncommon_topk"]
-        self.reverse_kl = cfg["reverse_kl"]
-        self.exact_token_match_only = cfg["exact_token_match_only"]
-        self.kl_loss_weight = cfg["kl_loss_weight"]
-        self.ce_loss_scale = cfg["ce_loss_scale"]
-        self.dynamic_loss_scaling = cfg["dynamic_loss_scaling"]
-        self.student_vocab_size = cfg["student_vocab_size"]
+        self.gold_loss = cfg.gold_loss
+        self.xtoken_loss = cfg.xtoken_loss
+        self.temperature = cfg.temperature
+        self.vocab_topk = cfg.vocab_topk
+        self.uncommon_topk = cfg.uncommon_topk
+        self.reverse_kl = cfg.reverse_kl
+        self.exact_token_match_only = cfg.exact_token_match_only
+        self.kl_loss_weight = cfg.kl_loss_weight
+        self.ce_loss_scale = cfg.ce_loss_scale
+        self.dynamic_loss_scaling = cfg.dynamic_loss_scaling
+        self.student_vocab_size = student_vocab_size
         # Multi-teacher aggregation knobs.
-        self.kd_loss_mode = cfg["kd_loss_mode"]
-        self.normalize_teacher_by_vocab = cfg["normalize_teacher_by_vocab"]
-        self.alpha = cfg["alpha"]
-        # sum_weights_metric is NotRequired -> None means static teacher_weights.
-        self.sum_weights_metric = cfg.get("sum_weights_metric")
-        # Per-teacher metadata: parallel lists (one entry per ``teachers[i]``),
-        # injected by ``xtoken_off_policy_distillation.setup``. Every teacher ships
-        # full-vocab logits (the loss derives the top-k subset student-side), so
-        # there is no per-teacher ``send_full_logits`` flag.
-        self.projection_matrix_paths = list(cfg["projection_matrix_paths"])
-        self.teacher_vocab_sizes = list(cfg["teacher_vocab_sizes"])
-        self.teacher_weights = list(cfg["teacher_weights"])
-        self.teacher_gold_loss = list(cfg["teacher_gold_loss"])
-        self.teacher_xtoken_loss = list(cfg["teacher_xtoken_loss"])
+        self.kd_loss_mode = cfg.kd_loss_mode
+        self.normalize_teacher_by_vocab = cfg.normalize_teacher_by_vocab
+        self.alpha = cfg.alpha
+        # None means static teacher_weights.
+        self.sum_weights_metric = cfg.sum_weights_metric
+        # Every teacher ships full-vocab logits (the loss derives the top-k
+        # subset student-side), so there is no per-teacher ``send_full_logits``
+        # flag.
+        self.projection_matrix_paths = list(projection_matrix_paths)
+        self.teacher_vocab_sizes = list(teacher_vocab_sizes)
+        self.teacher_weights = list(teacher_weights)
+        self.teacher_gold_loss = list(teacher_gold_loss)
+        self.teacher_xtoken_loss = list(teacher_xtoken_loss)
         # Every per-teacher list must have the same length (one entry per
         # teacher); a mismatch would otherwise surface as a deep IndexError
         # mid-training instead of a clear error here.

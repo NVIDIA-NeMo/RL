@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import math
 import os
-from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -44,9 +43,13 @@ from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
-from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    CrossTokenizerDistillationLossConfig,
+    CrossTokenizerDistillationLossFn,
+)
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
+    OffPolicyDistillationConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
@@ -150,15 +153,15 @@ def _make_master_config(
     """
     return MasterConfig.model_construct(
         **{
-            "distillation": {
-                "num_prompts_per_step": 1,
-                "max_num_steps": max_num_steps,
-                "max_num_epochs": max_num_epochs,
-                "seed": 42,
-                "val_period": val_period,
-                "val_at_start": val_at_start,
-                "val_at_end": val_at_end,
-            },
+            "distillation": OffPolicyDistillationConfig(
+                num_prompts_per_step=1,
+                max_num_steps=max_num_steps,
+                max_num_epochs=max_num_epochs,
+                seed=42,
+                val_period=val_period,
+                val_at_start=val_at_start,
+                val_at_end=val_at_end,
+            ),
             "policy": {
                 "automodel_cfg": {
                     "enabled": True,
@@ -193,22 +196,22 @@ def _make_master_config(
                     }
                 )
             ],
-            "loss_fn": {
-                "gold_loss": False,
-                "xtoken_loss": False,
-                "temperature": 1.0,
-                "vocab_topk": 8,
-                "uncommon_topk": 4,
-                "reverse_kl": False,
-                "exact_token_match_only": False,
-                "kl_loss_weight": 1.0,
-                "ce_loss_scale": 1.0,
-                "dynamic_loss_scaling": False,
-                "kd_loss_mode": "sum",
-                "sum_weights_metric": None,
-                "alpha": 1.0,
-                "normalize_teacher_by_vocab": False,
-            },
+            "loss_fn": CrossTokenizerDistillationLossConfig(
+                gold_loss=False,
+                xtoken_loss=False,
+                temperature=1.0,
+                vocab_topk=8,
+                uncommon_topk=4,
+                reverse_kl=False,
+                exact_token_match_only=False,
+                kl_loss_weight=1.0,
+                ce_loss_scale=1.0,
+                dynamic_loss_scaling=False,
+                kd_loss_mode="sum",
+                sum_weights_metric=None,
+                alpha=1.0,
+                normalize_teacher_by_vocab=False,
+            ),
             "data": {
                 "shuffle": False,
                 "num_workers": 0,
@@ -441,24 +444,21 @@ def test_empty_teachers_list_rejected_at_config_load():
     )
 
 
-def test_setup_injects_vocab_sizes_into_loss_config():
+def test_setup_passes_vocab_sizes_to_loss_fn():
     cfg = _make_master_config()
-    original_loss_cfg = deepcopy(cfg.loss_fn)
 
     _, mocks = _patched_setup_call(cfg, student_vocab=128, teacher_vocab=256)
 
     mocks["loss"].assert_called_once()
-    injected_cfg = mocks["loss"].call_args.args[0]
-    assert injected_cfg["student_vocab_size"] == 128
-    # Per-teacher metadata is injected as parallel lists (one teacher here).
-    assert injected_cfg["teacher_vocab_sizes"] == [256]
-    assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]
-    assert injected_cfg["teacher_weights"] == [1.0]
+    loss_kwargs = mocks["loss"].call_args.kwargs
+    assert loss_kwargs["student_vocab_size"] == 128
+    # Per-teacher metadata is passed as parallel lists (one teacher here).
+    assert loss_kwargs["teacher_vocab_sizes"] == [256]
+    assert loss_kwargs["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]
+    assert loss_kwargs["teacher_weights"] == [1.0]
     assert mocks["collator"].call_args.kwargs[
         "drop_first_assistant_chunk_kl_by_teacher"
     ] == [False]
-    # Original master_config not mutated by the injection.
-    assert cfg.loss_fn == original_loss_cfg
 
 
 @pytest.mark.parametrize(
@@ -544,8 +544,8 @@ def _run_train(c):
 
 
 def test_exit_on_max_steps(mock_xtoken_components):
-    mock_xtoken_components.master_config.distillation["max_num_steps"] = 3
-    mock_xtoken_components.master_config.distillation["max_num_epochs"] = 10
+    mock_xtoken_components.master_config.distillation.max_num_steps = 3
+    mock_xtoken_components.master_config.distillation.max_num_epochs = 10
 
     _run_train(mock_xtoken_components)
 
@@ -555,8 +555,8 @@ def test_exit_on_max_steps(mock_xtoken_components):
 def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
     """ft_save_period triggers checkpoint saves independent of save_period."""
     c = mock_xtoken_components
-    c.master_config.distillation["max_num_steps"] = 5
-    c.master_config.distillation["max_num_epochs"] = 1
+    c.master_config.distillation.max_num_steps = 5
+    c.master_config.distillation.max_num_epochs = 1
     c.master_config.checkpointing.enabled = True
     c.master_config.checkpointing.save_period = 100  # only the final step saves
     c.master_config.checkpointing.ft_save_period = 2
@@ -577,8 +577,8 @@ def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
 
 def test_exit_on_max_epochs(mock_xtoken_components):
     # max_num_steps high so it doesn't fire first; max_num_epochs caps the loop.
-    mock_xtoken_components.master_config.distillation["max_num_steps"] = 10_000
-    mock_xtoken_components.master_config.distillation["max_num_epochs"] = 2
+    mock_xtoken_components.master_config.distillation.max_num_steps = 10_000
+    mock_xtoken_components.master_config.distillation.max_num_epochs = 2
     # Two batches per epoch * 2 epochs = 4 student.train calls.
     mock_xtoken_components.train_dataloader = _mock_dataloader(num_batches=2)
 
@@ -588,7 +588,7 @@ def test_exit_on_max_epochs(mock_xtoken_components):
 
 
 def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
-    mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
+    mock_xtoken_components.master_config.distillation.max_num_steps = 100
     mock_xtoken_components.master_config.checkpointing.enabled = True
     mock_xtoken_components.master_config.checkpointing.metric_name = None
     mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
@@ -693,12 +693,12 @@ def test_ipc_buffer_released_for_every_teacher_on_train_failure(
 ):
     c = mock_xtoken_components
     c.student_policy.train.side_effect = RuntimeError("boom")
-    c.master_config.distillation["max_num_steps"] = 1
+    c.master_config.distillation.max_num_steps = 1
     # No validation passes, so release is driven solely by the failing train
     # step's finally (one release per teacher).
-    c.master_config.distillation["val_at_start"] = False
-    c.master_config.distillation["val_period"] = 0
-    c.master_config.distillation["val_at_end"] = False
+    c.master_config.distillation.val_at_start = False
+    c.master_config.distillation.val_period = 0
+    c.master_config.distillation.val_at_end = False
 
     # N same-vocab teachers: the release loop is teacher-type-agnostic, and
     # same-vocab teachers reuse the student tokenization (the mock batch only
@@ -914,15 +914,15 @@ def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
     assert mock_collator_cls.call_args.kwargs[
         "drop_first_assistant_chunk_kl_by_teacher"
     ] == [False, False, True]
-    # Per-teacher metadata injected as parallel lists.
-    injected_cfg = mock_loss_cls.call_args.args[0]
-    assert injected_cfg["projection_matrix_paths"] == [
+    # Per-teacher metadata passed as parallel lists.
+    loss_kwargs = mock_loss_cls.call_args.kwargs
+    assert loss_kwargs["projection_matrix_paths"] == [
         "/tmp/dummy-projection.pt",
         None,
         "/tmp/dummy-projection-2.pt",
     ]
-    assert injected_cfg["teacher_weights"] == [1.0, 0.5, 0.25]
-    assert injected_cfg["teacher_vocab_sizes"] == [24, 32, 28]
+    assert loss_kwargs["teacher_weights"] == [1.0, 0.5, 0.25]
+    assert loss_kwargs["teacher_vocab_sizes"] == [24, 32, 28]
 
 
 def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
@@ -1217,16 +1217,9 @@ def test_teacher_weight_score_masks_dropped_samples():
 def test_sum_weights_metric_rejected_outside_sum_mode(mode):
     # Dynamic weighting is only applied in kd_loss_mode="sum" (matching the
     # reference). Combining sum_weights_metric with another mode used to be
-    # silently dropped; it must now fail loudly at construction.
+    # silently dropped; it must now fail loudly at config load.
     with pytest.raises(ValueError, match="sum_weights_metric"):
-        CrossTokenizerDistillationLossFn(
-            {
-                "xtoken_loss": False,
-                "gold_loss": False,
-                "kd_loss_mode": mode,
-                "sum_weights_metric": "ce",
-            }
-        )
+        CrossTokenizerDistillationLossConfig(kd_loss_mode=mode, sum_weights_metric="ce")
 
 
 @pytest.mark.parametrize("weights", [[0.0, 0.0], [1.0, -1.0]])
@@ -1237,12 +1230,13 @@ def test_averaged_logits_rejects_zero_weight_sum(weights):
     # deep ZeroDivisionError mid-step.
     with pytest.raises(ValueError, match="must not sum to zero"):
         CrossTokenizerDistillationLossFn(
-            {
-                "xtoken_loss": False,
-                "gold_loss": False,
-                "kd_loss_mode": "averaged_logits",
-                "teacher_weights": weights,
-            }
+            CrossTokenizerDistillationLossConfig(kd_loss_mode="averaged_logits"),
+            student_vocab_size=8,
+            teacher_vocab_sizes=[8, 8],
+            projection_matrix_paths=[None, None],
+            teacher_weights=weights,
+            teacher_gold_loss=[None, None],
+            teacher_xtoken_loss=[None, None],
         )
 
 

@@ -121,7 +121,7 @@ def xtoken_non_student_seq_keys(
 # ===============================================================================
 
 
-class OffPolicyDistillationConfig(TypedDict):
+class OffPolicyDistillationConfig(BaseModel, extra="allow"):
     """Top-level distillation algo config.
 
     Attributes:
@@ -134,13 +134,13 @@ class OffPolicyDistillationConfig(TypedDict):
         val_at_end: Run validation on the final step.
     """
 
-    num_prompts_per_step: int
-    max_num_steps: int
-    max_num_epochs: int
-    seed: int
-    val_period: int
-    val_at_start: bool
-    val_at_end: bool
+    num_prompts_per_step: int = 64
+    max_num_steps: int = 5000
+    max_num_epochs: int = 1
+    seed: int = 42
+    val_period: int = 0
+    val_at_start: bool = False
+    val_at_end: bool = False
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -324,7 +324,7 @@ def setup(
                 f"({teacher_cp})."
             )
 
-    set_seed(distillation_config["seed"])
+    set_seed(distillation_config.seed)
 
     # ==========================
     #         Logger
@@ -382,7 +382,7 @@ def setup(
     # ==========================
     train_dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distillation_config["num_prompts_per_step"],
+        batch_size=distillation_config.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=collator,
         drop_last=True,
@@ -402,13 +402,13 @@ def setup(
 
     val_dataloader: Optional[StatefulDataLoader] = None
     if val_dataset is not None and (
-        distillation_config["val_period"] > 0
-        or distillation_config["val_at_start"]
-        or distillation_config["val_at_end"]
+        distillation_config.val_period > 0
+        or distillation_config.val_at_start
+        or distillation_config.val_at_end
     ):
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distillation_config["num_prompts_per_step"],
+            batch_size=distillation_config.num_prompts_per_step,
             shuffle=False,
             collate_fn=collator,
             drop_last=False,
@@ -487,7 +487,7 @@ def setup(
     for i, (teacher_policy, tc) in enumerate(zip(teacher_policies, teacher_configs)):
         teacher_dp = teacher_policy.data_parallel_size
         assert_teacher_student_batch_grid(
-            global_batch_size=distillation_config["num_prompts_per_step"],
+            global_batch_size=distillation_config.num_prompts_per_step,
             student_gbs=policy_config["train_global_batch_size"],
             teacher_gbs=tc["train_global_batch_size"],
             student_dp=student_dp,
@@ -512,28 +512,21 @@ def setup(
     # ==========================
     #         Loss
     # ==========================
-    # Inject both tokenizer vocab sizes so the projection matrix's V_s
-    # and V_t axes match `logits.shape[-1]` exactly, instead of being
-    # recovered from the highest ids that happen to appear in the sparse
-    # projection file. `len(tokenizer)` is what HF treats as the
-    # embedding / lm_head dim.
-    # Per-teacher metadata is injected as parallel lists (one entry per
-    # `teachers[i]`); the loss fn reads these lists directly. `len(tokenizer)`
-    # is the HF embedding/lm_head dim, sizing each projection matrix's V_s/V_t
-    # axes exactly. No `send_full_logits`: every teacher ships full logits and
-    # the loss derives the top-k subset student-side.
-    loss_config = {
-        **loss_config,
-        "student_vocab_size": len(student_tokenizer),
-        "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
-        "projection_matrix_paths": [
+    # `len(tokenizer)` is what HF treats as the embedding / lm_head dim, so
+    # passing both tokenizer vocab sizes makes the projection matrix's V_s and
+    # V_t axes match `logits.shape[-1]` exactly, instead of being recovered
+    # from the highest ids that happen to appear in the sparse projection file.
+    loss_fn = CrossTokenizerDistillationLossFn(
+        loss_config,
+        student_vocab_size=len(student_tokenizer),
+        teacher_vocab_sizes=[len(tok) for tok in teacher_tokenizers],
+        projection_matrix_paths=[
             teacher.aligner.projection_matrix_path for teacher in teachers
         ],
-        "teacher_weights": [t.weight for t in teachers],
-        "teacher_gold_loss": [t.gold_loss for t in teachers],
-        "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
-    }
-    loss_fn = CrossTokenizerDistillationLossFn(loss_config)
+        teacher_weights=[t.weight for t in teachers],
+        teacher_gold_loss=[t.gold_loss for t in teachers],
+        teacher_xtoken_loss=[t.xtoken_loss for t in teachers],
+    )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -650,11 +643,11 @@ def xtoken_off_policy_distillation_train(
     total_steps = off_policy_distillation_state["total_steps"]
     consumed_samples = off_policy_distillation_state["consumed_samples"]
     total_valid_tokens = off_policy_distillation_state["total_valid_tokens"]
-    val_period = distill_cfg["val_period"]
-    val_at_start = distill_cfg["val_at_start"]
-    val_at_end = distill_cfg["val_at_end"]
-    max_epochs = distill_cfg["max_num_epochs"]
-    max_steps = distill_cfg["max_num_steps"]
+    val_period = distill_cfg.val_period
+    val_at_start = distill_cfg.val_at_start
+    val_at_end = distill_cfg.val_at_end
+    max_epochs = distill_cfg.max_num_epochs
+    max_steps = distill_cfg.max_num_steps
     # Per-teacher export MBS (each teacher's own train MBS) and the
     # non-student-seq keys the worker's check_sequence_dim must skip
     # (teacher-count-dependent, so built from the loss fn).
@@ -776,7 +769,7 @@ def xtoken_off_policy_distillation_train(
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += int(metrics["global_valid_toks"])
 
-                consumed_samples += distill_cfg["num_prompts_per_step"]
+                consumed_samples += distill_cfg.num_prompts_per_step
                 timeout.mark_iteration()
 
                 # ===== Checkpointing =====
