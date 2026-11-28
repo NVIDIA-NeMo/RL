@@ -1041,13 +1041,15 @@ def mock_grpo_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader_single = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    val_dataloader_single.__iter__ = val_iter
+    val_dataloader_single.__len__ = MagicMock(return_value=10)
+    # validate() takes a dict[name -> StatefulDataLoader] for per-dataset metrics.
+    val_dataloader = {"test_dataset": val_dataloader_single}
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -7659,9 +7661,12 @@ class TestValidateFunction:
             }
         )
 
-        # Create mock dataloader that yields mock_batch
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        # Create mock dataloader that yields mock_batch. validate() takes a
+        # dict[name -> StatefulDataLoader].
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"test_dataset": single_dl}
 
         # Create mock environment
         mock_env = MagicMock(spec=EnvironmentInterface)
@@ -7707,8 +7712,8 @@ class TestValidateFunction:
         # Verify log_batched_dict_as_jsonl was called
         mock_logger.log_batched_dict_as_jsonl.assert_called_once()
 
-        # Verify the filename
-        assert logged_data["filename"] == "val_data_step5.jsonl"
+        # Verify the filename carries the dataset name
+        assert logged_data["filename"] == "val_data_test_dataset_step5.jsonl"
 
         # Verify the data structure
         assert "content" in logged_data["data"]
@@ -7747,9 +7752,11 @@ class TestValidateFunction:
             }
         )
 
-        # Create mock dataloader
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        # Create mock dataloader. validate() takes a dict[name -> StatefulDataLoader].
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"test_dataset": single_dl}
 
         # Create mock environment
         mock_env = MagicMock(spec=EnvironmentInterface)
@@ -7782,9 +7789,10 @@ class TestValidateFunction:
                             logger=None,
                         )
 
-        # Verify metrics are returned correctly
+        # Verify metrics are returned correctly: per-dataset keys plus the
+        # macro-mean accuracy kept for save-state/checkpointing.
         assert "accuracy" in val_metrics
-        assert "avg_length" in val_metrics
+        assert "validation-test_dataset_avg_length" in val_metrics
 
     def test_grouped_validation_reports_pass_k(self, mock_grpo_components):
         mock_batch = BatchedDataDict[DatumSpec](
@@ -7801,8 +7809,10 @@ class TestValidateFunction:
                 "total_reward": torch.tensor([0.0, 0.0]),
             }
         )
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"test_dataset": single_dl}
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.max_val_samples = 2
         mock_config.grpo.val_batch_size = 2
@@ -7879,12 +7889,14 @@ class TestValidateFunction:
                 }
             )
 
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(
             return_value=iter(
                 [make_batch([0, 1]), make_batch([2, 3]), make_batch([4, 5])]
             )
         )
+        single_dl.__len__ = MagicMock(return_value=3)
+        mock_dataloader = {"test_dataset": single_dl}
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.max_val_samples = max_val_samples
         mock_config.grpo.val_batch_size = 2
@@ -7923,7 +7935,9 @@ class TestValidateFunction:
         expected_avg_length = sum(
             10.0 * (i + 1) * len(wave) for i, wave in enumerate(expected_waves)
         ) / sum(len(wave) for wave in expected_waves)
-        assert val_metrics["avg_length"] == pytest.approx(expected_avg_length)
+        assert val_metrics["validation-test_dataset_avg_length"] == pytest.approx(
+            expected_avg_length
+        )
 
     @pytest.mark.parametrize(
         ("max_val_samples", "expected_sizes"),
@@ -7942,12 +7956,14 @@ class TestValidateFunction:
         def make_batch(indices):
             return BatchedDataDict[DatumSpec]({"idx": torch.tensor(indices)})
 
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(
             return_value=iter(
                 [make_batch([0, 1]), make_batch([2, 3]), make_batch([4, 5])]
             )
         )
+        single_dl.__len__ = MagicMock(return_value=3)
+        mock_dataloader = {"test_dataset": single_dl}
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.max_val_samples = max_val_samples
         mock_config.grpo.val_batch_size = 2
@@ -7990,11 +8006,18 @@ class TestValidateFunction:
 
         scored_sizes = [c.args[0] for c in policy.prepare_val_partition.call_args_list]
         assert scored_sizes == expected_sizes
+        # A single dataset keeps the historical "val" partition id.
+        assert {
+            c.kwargs["partition_id"]
+            for c in policy.prepare_val_partition.call_args_list
+        } == {"val"}
         # avg_length weighs each wave's mean by its rollout count.
         expected_avg_length = sum(
             10.0 * (i + 1) * n for i, n in enumerate(expected_sizes)
         ) / sum(expected_sizes)
-        assert val_metrics["avg_length"] == pytest.approx(expected_avg_length)
+        assert val_metrics["validation-test_dataset_avg_length"] == pytest.approx(
+            expected_avg_length
+        )
 
     def test_validation_uses_val_sampling_params_on_gym_path(
         self, mock_grpo_components
@@ -8013,8 +8036,10 @@ class TestValidateFunction:
                 "total_reward": torch.tensor([0.0, 0.0]),
             }
         )
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"test_dataset": single_dl}
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.max_val_samples = 2
         mock_config.grpo.val_batch_size = 2
@@ -8060,6 +8085,180 @@ class TestValidateFunction:
         assert sampling_params.top_k is None
         assert val_metrics["accuracy"] == pytest.approx(0.25)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
+
+    def test_validate_emits_per_dataset_prefixed_metrics_and_logs(
+        self, mock_grpo_components
+    ):
+        """validate() splits metrics per dataset and logs each under validation-<name>/."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        def make_batch(reward: float):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [
+                        [
+                            {
+                                "role": "user",
+                                "content": "q",
+                                "token_ids": torch.tensor([1, 2]),
+                            },
+                            {
+                                "role": "assistant",
+                                "content": "a",
+                                "token_ids": torch.tensor([3, 4]),
+                            },
+                        ],
+                    ],
+                    "task_name": ["math"],
+                    "extra_env_info": [{}],
+                    "loss_multiplier": torch.tensor([1.0]),
+                    "idx": torch.tensor([0]),
+                    "length": torch.tensor([4]),
+                    "total_reward": torch.tensor([reward]),
+                }
+            )
+
+        def make_loader(batch):
+            dl = MagicMock(spec=StatefulDataLoader)
+            dl.__iter__ = MagicMock(return_value=iter([batch]))
+            dl.__len__ = MagicMock(return_value=1)
+            return dl
+
+        batch_a = make_batch(1.0)
+        batch_b = make_batch(0.0)
+        mock_dataloader = {
+            "gsm8k": make_loader(batch_a),
+            "math500": make_loader(batch_b),
+        }
+
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (batch_a, {})
+
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = 1
+        mock_config.grpo.val_batch_size = 1
+        mock_config.grpo.val_num_generations_per_prompt = 1
+        mock_config.logger.num_val_samples_to_print = 1
+
+        mock_logger = MagicMock()
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=[
+                    (batch_a, {"mean_gen_tokens_per_sample": 10.0}),
+                    (batch_b, {"mean_gen_tokens_per_sample": 12.0}),
+                ],
+            ),
+            patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo.should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, validation_timings = validate(
+                mock_policy_gen,
+                mock_dataloader,
+                mock_tokenizer,
+                {"math": mock_env},
+                step=0,
+                master_config=mock_config,
+                logger=mock_logger,
+            )
+
+        assert val_metrics["validation-gsm8k_accuracy"] == 1.0
+        assert val_metrics["validation-math500_accuracy"] == 0.0
+        assert val_metrics["validation-gsm8k_avg_length"] == pytest.approx(10.0)
+        assert val_metrics["validation-math500_avg_length"] == pytest.approx(12.0)
+        # Aggregated accuracy is the macro-mean across datasets (preserved
+        # for save-state and best-checkpoint selection).
+        assert val_metrics["accuracy"] == pytest.approx(0.5)
+        logged_prefixes = {
+            call.kwargs.get("prefix") for call in mock_logger.log_metrics.call_args_list
+        }
+        assert "validation-gsm8k" in logged_prefixes
+        assert "validation-math500" in logged_prefixes
+        assert "timing/validation-gsm8k" in logged_prefixes
+        assert "timing/validation-math500" in logged_prefixes
+        assert "timing/validation" in logged_prefixes
+        assert "total_validation_time" in validation_timings
+        assert "validation-gsm8k_total_validation_time" in validation_timings
+        logged_filenames = {
+            call.args[1]
+            for call in mock_logger.log_batched_dict_as_jsonl.call_args_list
+        }
+        assert logged_filenames == {
+            "val_data_gsm8k_step0.jsonl",
+            "val_data_math500_step0.jsonl",
+        }
+
+    def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(
+        self, mock_grpo_components
+    ):
+        """When max_val_samples is None, validate iterates the entire dataloader."""
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "q",
+                            "token_ids": torch.tensor([1, 2]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "a",
+                            "token_ids": torch.tensor([3, 4]),
+                        },
+                    ],
+                ],
+                "task_name": ["math"],
+                "extra_env_info": [{}],
+                "loss_multiplier": torch.tensor([1.0]),
+                "idx": torch.tensor([0]),
+                "length": torch.tensor([4]),
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+
+        num_batches = 3
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch] * num_batches))
+        single_dl.__len__ = MagicMock(return_value=num_batches)
+        mock_dataloader = {"only": single_dl}
+
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.max_val_samples = None
+        mock_config.grpo.val_batch_size = 1
+        mock_config.grpo.val_num_generations_per_prompt = 1
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, {"mean_gen_tokens_per_sample": 10.0}),
+            ) as mock_rollout,
+            patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo.should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+                logger=None,
+            )
+
+        assert mock_rollout.call_count == num_batches
+        assert val_metrics["accuracy"] == pytest.approx(1.0)
 
     def test_setup_rejects_val_sampling_outside_gym_vllm_path(
         self, mock_grpo_components

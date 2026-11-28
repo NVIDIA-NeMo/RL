@@ -113,7 +113,7 @@ def main() -> None:
     # student_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(
-        tokenizer, config.data, env_configs=None
+        tokenizer, config.data, env_configs=None, validation_as_dict=True
     )
 
     # Validation dataset config setup. Same Gym principle as run_grpo_nemo_gym.py:
@@ -128,10 +128,11 @@ The validation set you pass in will directly be used for validation with no addi
         )
 
     if val_dataset is not None:
+        total_val_samples = sum(len(ds) for ds in val_dataset.values())
         print(
-            f"Setting `distillation.max_val_samples` and `distillation.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+            f"Setting `distillation.max_val_samples` and `distillation.val_batch_size` to the length of the validation dataset, which is {total_val_samples}"
         )
-        config.distillation.max_val_samples = len(val_dataset)
+        config.distillation.max_val_samples = total_val_samples
         config.distillation.val_batch_size = config.distillation.max_val_samples
 
     # Print config

@@ -104,13 +104,15 @@ def mock_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader_single = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    val_dataloader_single.__iter__ = val_iter
+    val_dataloader_single.__len__ = MagicMock(return_value=10)
+    # validate() takes a dict[name -> StatefulDataLoader] for per-dataset metrics.
+    val_dataloader = {"test_dataset": val_dataloader_single}
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -623,7 +625,8 @@ def test_validate_function(mock_components):
     assert isinstance(validation_timings, dict)
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
-    # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+    # Note: validate() logs per-dataset metrics itself when a logger is passed;
+    # no logger is passed here, so only the returned dicts are checked.
 
 
 def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
@@ -696,9 +699,9 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     mock_async_rollout.assert_not_called()
     mock_rollout.assert_not_called()
     assert val_metrics["accuracy"] == 1.0
-    assert val_metrics["avg_length"] == 2.0
-    assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
-    assert val_metrics["score"] == 0.5
+    assert val_metrics["validation-test_dataset_avg_length"] == 2.0
+    assert val_metrics["validation-test_dataset_mean_gen_tokens_per_sample"] == 2.0
+    assert val_metrics["validation-test_dataset_score"] == 0.5
     assert isinstance(validation_timings, dict)
 
 
@@ -763,7 +766,7 @@ def test_validate_logs_data_when_logger_provided(mock_components):
         )
 
     mock_logger.log_batched_dict_as_jsonl.assert_called_once()
-    assert logged_data["filename"] == "val_data_step5.jsonl"
+    assert logged_data["filename"] == "val_data_test_dataset_step5.jsonl"
     assert "content" in logged_data["data"]
     assert "rewards" in logged_data["data"]
 
@@ -818,8 +821,187 @@ def test_validate_works_without_logger(mock_components):
             logger=None,
         )
 
+    # Per-dataset keys plus the macro-mean accuracy kept for save-state.
+    # Per-dataset keys plus the macro-mean accuracy kept for save-state.
     assert "accuracy" in val_metrics
-    assert "avg_length" in val_metrics
+    assert "validation-test_dataset_avg_length" in val_metrics
+
+
+def test_validate_emits_per_dataset_prefixed_metrics_and_logs(mock_components):
+    """validate() splits metrics per dataset and logs each under validation-<name>/."""
+    mock_batch_a = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "q",
+                        "token_ids": torch.tensor([1, 2]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "token_ids": torch.tensor([3, 4]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_batch_b = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "q",
+                        "token_ids": torch.tensor([1, 2]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "token_ids": torch.tensor([3, 4]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([0.0]),
+        }
+    )
+
+    def make_loader(batch):
+        dl = MagicMock(spec=StatefulDataLoader)
+        dl.__iter__ = MagicMock(return_value=iter([batch]))
+        dl.__len__ = MagicMock(return_value=1)
+        return dl
+
+    mock_dataloader = {
+        "gsm8k": make_loader(mock_batch_a),
+        "math500": make_loader(mock_batch_b),
+    }
+
+    master_config = mock_components["master_config"]
+    master_config.distillation.max_val_samples = 1
+    master_config.distillation.val_batch_size = 1
+    master_config.logger.num_val_samples_to_print = 1
+
+    mock_logger = MagicMock()
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=[
+                (mock_batch_a, {"mean_gen_tokens_per_sample": 10.0}),
+                (mock_batch_b, {"mean_gen_tokens_per_sample": 12.0}),
+            ],
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_dataloader,
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=master_config,
+            logger=mock_logger,
+        )
+
+    assert val_metrics["validation-gsm8k_accuracy"] == 1.0
+    assert val_metrics["validation-math500_accuracy"] == 0.0
+    assert val_metrics["validation-gsm8k_avg_length"] == pytest.approx(10.0)
+    assert val_metrics["validation-math500_avg_length"] == pytest.approx(12.0)
+    # Aggregated accuracy is the macro-mean across datasets (preserved
+    # for save-state and best-checkpoint selection).
+    assert val_metrics["accuracy"] == pytest.approx(0.5)
+    logged_prefixes = {
+        call.kwargs.get("prefix") for call in mock_logger.log_metrics.call_args_list
+    }
+    assert "validation-gsm8k" in logged_prefixes
+    assert "validation-math500" in logged_prefixes
+    assert "timing/validation-gsm8k" in logged_prefixes
+    assert "timing/validation-math500" in logged_prefixes
+    assert "timing/validation" in logged_prefixes
+    assert "total_validation_time" in validation_timings
+    assert "validation-gsm8k_total_validation_time" in validation_timings
+    logged_filenames = {
+        call.args[1] for call in mock_logger.log_batched_dict_as_jsonl.call_args_list
+    }
+    assert logged_filenames == {
+        "val_data_gsm8k_step0.jsonl",
+        "val_data_math500_step0.jsonl",
+    }
+
+
+def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(
+    mock_components,
+):
+    """When max_val_samples is None, validate iterates the entire dataloader."""
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "q",
+                        "token_ids": torch.tensor([1, 2]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "token_ids": torch.tensor([3, 4]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+
+    num_batches = 3
+    single_dl = MagicMock(spec=StatefulDataLoader)
+    single_dl.__iter__ = MagicMock(return_value=iter([mock_batch] * num_batches))
+    single_dl.__len__ = MagicMock(return_value=num_batches)
+    mock_dataloader = {"only": single_dl}
+
+    master_config = mock_components["master_config"]
+    master_config.distillation.max_val_samples = None
+    master_config.distillation.val_batch_size = 1
+    master_config.logger.num_val_samples_to_print = 1
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(mock_batch, {"mean_gen_tokens_per_sample": 10.0}),
+        ) as mock_rollout,
+        patch(
+            "nemo_rl.algorithms.distillation.should_use_nemo_gym",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, _ = validate(
+            mock_components["student_generation"],
+            mock_dataloader,
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=master_config,
+            logger=None,
+        )
+
+    assert mock_rollout.call_count == num_batches
+    assert val_metrics["accuracy"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("student_composite", [False, True])

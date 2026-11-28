@@ -80,49 +80,50 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 def collect_trajectories(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
-    val_dataloader: StatefulDataLoader,
+    val_dataloader: dict[str, StatefulDataLoader],
     tokenizer: TokenizerType,
     val_task_to_env: dict[str, EnvironmentInterface],
     logger: Logger,
     master_config: MasterConfig,
 ) -> None:
-    """Run trajectory collection."""
+    """Run trajectory collection, writing one file per validation dataset."""
     # common config/state items
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_policy_generation(policy, policy_generation, colocated_inference)
 
-    log_filename = "trajectory_collection.jsonl"
-
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
-    for val_batch in val_dataloader:
-        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
-            policy_generation=policy_generation,
-            input_batch=val_batch,
-            tokenizer=tokenizer,
-            task_to_env=val_task_to_env,
-            max_seq_len=master_config.policy["max_total_sequence_length"],
-            generation_config=generation_config,
-            # This utility consumes the Tables below to write its trajectory JSONL.
-            log_full_result_tables=True,
-            num_generations_per_prompt=1,
-            max_rollout_turns=None,
-            greedy=False,
-        )
+    for dataset_name, dataloader in val_dataloader.items():
+        log_filename = f"trajectory_collection_{dataset_name}.jsonl"
 
-        rows_to_log: list[str] = []
-        for key, value in nemo_gym_rollout_result.rollout_metrics.items():
-            if "full_result" not in key:
-                continue
+        for val_batch in dataloader:
+            nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                policy_generation=policy_generation,
+                input_batch=val_batch,
+                tokenizer=tokenizer,
+                task_to_env=val_task_to_env,
+                max_seq_len=master_config.policy["max_total_sequence_length"],
+                generation_config=generation_config,
+                # This utility consumes the Tables below to write its trajectory JSONL.
+                log_full_result_tables=True,
+                num_generations_per_prompt=1,
+                max_rollout_turns=None,
+                greedy=False,
+            )
 
-            value: Table
-            data: list[list[str]] = value.data  # (n, 1)
-            rows_to_log.extend(v[0] for v in data)
+            rows_to_log: list[str] = []
+            for key, value in nemo_gym_rollout_result.rollout_metrics.items():
+                if "full_result" not in key:
+                    continue
 
-        logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+                value: Table
+                data: list[list[str]] = value.data  # (n, 1)
+                rows_to_log.extend(v[0] for v in data)
 
-        # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
-        # And also leverage the TimeoutChecker functionality as well
+            logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+
+            # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
+            # And also leverage the TimeoutChecker functionality as well
 
     policy_generation.finish_generation()
 
@@ -220,6 +221,7 @@ def main() -> None:
             config.data,
             env_configs=None,
             load_validation=should_load_validation,
+            validation_as_dict=True,
         )
 
     # Validation dataset config setup.
@@ -233,10 +235,11 @@ The validation set you pass in will directly be used for validation with no addi
         )
 
     if val_dataset is not None:
+        total_val_samples = sum(len(ds) for ds in val_dataset.values())
         print(
-            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {total_val_samples}"
         )
-        config.grpo.max_val_samples = len(val_dataset)
+        config.grpo.max_val_samples = total_val_samples
         config.grpo.val_batch_size = config.grpo.max_val_samples
 
     # Print config
@@ -289,6 +292,9 @@ The validation set you pass in will directly be used for validation with no addi
     trainer_owns_environment_shutdown = False
     try:
         if is_trajectory_collection:
+            assert val_dataloader is not None, (
+                "trajectory collection requires a validation dataloader"
+            )
             collect_trajectories(
                 policy=policy,
                 policy_generation=policy_generation,

@@ -26,6 +26,7 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -260,6 +261,14 @@ def main():
             add_system_prompt=config.data["add_system_prompt"],
         )
 
+    # The puzzle datasets are IterableDatasets, not AllTaskProcessedDataset;
+    # grpo.setup only iterates them, so wrap the val set as a single named
+    # dataset for per-dataset validation metrics.
+    val_dataset_dict: dict[str, AllTaskProcessedDataset] | None = (
+        # pyrefly: ignore[bad-assignment]  IterableDataset is passed through by design; see above.
+        {"sliding_puzzle_game": val_dataset} if val_dataset is not None else None
+    )
+
     with rl_init_timer.time("setup"):
         (
             policy,
@@ -275,7 +284,7 @@ def main():
             master_config,
             _teacher_worker_groups,
             _alias_to_group_alias,
-        ) = setup(config, tokenizer, dataset, val_dataset)
+        ) = setup(config, tokenizer, dataset, val_dataset_dict)
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
     rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")

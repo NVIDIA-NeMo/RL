@@ -93,7 +93,9 @@ def main() -> None:
             val_dataset,
             task_to_env,
             val_task_to_env,
-        ) = setup_response_data(tokenizer, config.data, config.env)
+        ) = setup_response_data(
+            tokenizer, config.data, config.env, validation_as_dict=True
+        )
 
         (
             student_policy,
