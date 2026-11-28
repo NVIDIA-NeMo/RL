@@ -49,7 +49,11 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, make_objective_reduction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
+from nemo_rl.algorithms.metric_utils import (
+    PERFORMANCE_PREFIX,
+    SETUP_TIMING_PREFIX,
+    TOTAL_FLOPS_KEY,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -1328,6 +1332,24 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     return critic_metrics
 
 
+def _accumulate_epoch_flops(
+    totals: dict[str, float], train_results: Optional[dict[str, Any]]
+) -> None:
+    """Add one actor epoch's FLOP count and worker GPU time into ``totals``.
+
+    ``policy_training`` sums every epoch while ``Policy.train`` resets the tracker
+    per call, so without this both rates read 1/``ppo_epochs`` of the truth.
+    ``train_elapsed_seconds``, the Megatron fallback's denominator, is last-epoch
+    only for the same reason.
+    """
+    if train_results is None:
+        return
+    for key in (TOTAL_FLOPS_KEY, "train_elapsed_seconds"):
+        value = train_results.get(key)
+        if value is not None:
+            totals[key] = totals.get(key, 0.0) + float(value)
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1857,6 +1879,7 @@ def ppo_train(
                         POLICY_GENERATION_STALE = True
 
                     print("▶ Training policy...", flush=True)
+                    epoch_flops: dict[str, float] = {}
                     for policy_epoch in range(ppo_epochs):
                         print(
                             f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...",
@@ -1875,6 +1898,9 @@ def ppo_train(
                                 loss_fn,
                                 timer=timer,
                             )
+                        _accumulate_epoch_flops(epoch_flops, train_results)
+                    if train_results is not None:
+                        train_results.update(epoch_flops)
 
                 if train_results is not None:
                     print(
@@ -2203,7 +2229,7 @@ def ppo_train(
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
-                performance_metrics, total_steps + 1, prefix="performance"
+                performance_metrics, total_steps + 1, prefix=PERFORMANCE_PREFIX
             )
             logger.log_metrics(
                 timing_metrics,
@@ -2859,12 +2885,16 @@ def async_ppo_train(
                         )
                     with timer.time("training_prep"):
                         policy.prepare_for_training()
+                    epoch_flops: dict[str, float] = {}
                     for policy_epoch in range(ppo_epochs):
                         print(f"▶ Policy epoch {policy_epoch + 1}/{ppo_epochs}...")
                         with timer.time("policy_training"):
                             train_results = policy.train(
                                 train_data, loss_fn, timer=timer
                             )
+                        _accumulate_epoch_flops(epoch_flops, train_results)
+                    if train_results is not None:
+                        train_results.update(epoch_flops)
 
                 # ---- 8. Refit once after all PPO epochs ----
                 # Warmup still advances the replay-buffer version, but skips the
@@ -3223,7 +3253,7 @@ def async_ppo_train(
                 merged_efficiency, total_wall_time, step + 1
             )
 
-            logger.log_metrics(performance_metrics, step + 1, prefix="performance")
+            logger.log_metrics(performance_metrics, step + 1, prefix=PERFORMANCE_PREFIX)
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             logger.log_metrics(

@@ -24,6 +24,7 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import TOTAL_FLOPS_KEY
 from nemo_rl.data.megatron_sft_packed import (
     MEGATRON_SFT_PACKED_BATCH_FIELDS,
     is_direct_packed_row,
@@ -90,7 +91,7 @@ def _aggregate_megatron_flops_metrics(
     Called when the Megatron worker returns total_flops directly (no FLOPTracker).
     """
     aggregated: dict = {}
-    aggregated["total_flops"] = results[0]["total_flops"]
+    aggregated[TOTAL_FLOPS_KEY] = results[0][TOTAL_FLOPS_KEY]
     aggregated["num_ranks"] = results[0].get("num_ranks", world_size)
     if "train_elapsed_seconds" in results[0]:
         aggregated["train_elapsed_seconds"] = results[0]["train_elapsed_seconds"]
@@ -1080,7 +1081,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
 
         if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results[TOTAL_FLOPS_KEY] = self.flops_tracker.total_flops
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
             gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
 
@@ -1091,7 +1092,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
-        elif results and "total_flops" in results[0]:
+        elif results and TOTAL_FLOPS_KEY in results[0]:
             aggregated_results.update(
                 _aggregate_megatron_flops_metrics(
                     results, self.worker_group.cluster.world_size()

@@ -29,10 +29,16 @@ from nemo_rl.algorithms.dpo import (
     setup,
 )
 from nemo_rl.algorithms.loss import PreferenceLossFn
+from nemo_rl.algorithms.metric_utils import (
+    TOTAL_FLOPS_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.timer import Timer
 
 
 def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -523,3 +529,47 @@ def test_setup_rejects_automodel_pipeline_parallel(mock_dpo_components):
     ):
         with pytest.raises(ValueError, match="DPO does not support"):
             setup(master_config, mock_dpo_components["tokenizer"], MagicMock(), {})
+
+
+def test_dpo_train_logs_the_flop_rates_over_the_policy_training_timer(
+    mock_dpo_components,
+):
+    """The FLOP rates reach the Logger, and over policy_training, not the step."""
+    mock_dpo_components["master_config"].dpo.max_num_steps = 1
+    mock_dpo_components["policy"].train.return_value = {
+        **mock_dpo_components["policy"].train.return_value,
+        TOTAL_FLOPS_KEY: 32e12,
+        "num_ranks": 2,
+        "theoretical_tflops": 80.0,
+    }
+
+    with patch.object(
+        Timer,
+        "get_timing_metrics",
+        side_effect=lambda *_args, **_kwargs: {
+            "policy_training": 4.0,
+            "total_step_time": 16.0,
+        },
+    ):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            mock_dpo_components["master_config"],
+            mock_dpo_components["logger"],
+            mock_dpo_components["checkpointer"],
+            _initial_dpo_save_state(),
+        )
+
+    train_metrics = [
+        call
+        for call in mock_dpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ][-1].args[0]
+
+    # 32e12 FLOP over 4s is 8 TFLOPS, so 4 per GPU across two ranks, and 10% of
+    # the 80 TFLOPS the two ranks peak at.
+    assert train_metrics[TRAIN_FLOPS_PER_GPU_KEY] == pytest.approx(4.0)
+    assert train_metrics[TRAIN_FP_UTILIZATION_KEY] == pytest.approx(0.1)

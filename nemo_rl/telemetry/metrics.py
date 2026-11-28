@@ -28,7 +28,9 @@ the rollout checkpoint dicts -- completed saves and restores under
 ``timing/rollout_checkpoint`` / ``timing/rollout_recovery``, and every snapshot
 attempt under ``rollout/checkpoint_outcome``. The first three ride the per-step
 ``train`` dicts; the setup dict arrives once, at step 0; the checkpoint dicts
-arrive once per save, restore or attempt on the wall-clock axis.
+arrive once per save, restore or attempt on the wall-clock axis. The v1 loops'
+``performance`` dict rides the step too, but is read for declared scalars
+alone — it holds no ``efficiency/*`` key.
 
 The checkpoint mapping explicitly enumerates the controller's completed phase
 keys, and a source-drift test holds it to the keys the controller logs under
@@ -48,6 +50,7 @@ import math
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from nemo_rl.algorithms.metric_utils import (
+    PERFORMANCE_PREFIX,
     ROLLOUT_CHECKPOINT_ATTEMPT_DURATION_KEY,
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -96,6 +99,9 @@ logger = logging.getLogger(__name__)
 # startup prefix teed; rollout checkpoint/recovery prefixes are dispatched
 # separately below.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = ("train", "")
+
+# Declared scalars only; this prefix holds no efficiency/* keys.
+_SCALAR_ONLY_PREFIXES: tuple[Optional[str], ...] = (PERFORMANCE_PREFIX,)
 
 # One dimensioned gauge rather than an instrument per category, so adding a
 # category needs no instrument change.
@@ -768,7 +774,8 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
     """Mirror logged metrics into OTel (no-op unless exporting).
 
     Teed prefixes: the per-step ``train`` dicts (the ``efficiency/*``
-    durations, the training scalars and the ``vllm/*`` engine deltas), the
+    durations, the training scalars and the ``vllm/*`` engine deltas), the v1
+    loops' per-step ``performance`` dict (declared scalars alone), the
     ``timing/setup`` dict at step 0, and the Single-Controller's
     ``timing/rollout_checkpoint``, ``timing/rollout_recovery`` and
     ``rollout/checkpoint_outcome`` dicts. The OTel instruments are touched only
@@ -791,10 +798,12 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
     is_setup = prefix == SETUP_TIMING_PREFIX
     is_checkpoint_outcome = prefix == ROLLOUT_CHECKPOINT_OUTCOME_PREFIX
+    is_scalar_only = prefix in _SCALAR_ONLY_PREFIXES
     checkpoint_operation = _CHECKPOINT_PREFIXES.get(prefix) if prefix else None
     if (
         not is_setup
         and not is_checkpoint_outcome
+        and not is_scalar_only
         and checkpoint_operation is None
         and prefix not in _TRAIN_PREFIXES
     ):
@@ -842,11 +851,12 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
 
     # Separate handlers so one broken family cannot silence the others: a bad
     # value in a training scalar should not cost the run its efficiency series.
-    try:
-        _tee_efficiency_metrics(telemetry.meter, metrics)
-    except Exception:
-        # Broad by intent: observability must not break a training step.
-        warn_once("efficiency", "failed to tee efficiency metrics")
+    if not is_scalar_only:
+        try:
+            _tee_efficiency_metrics(telemetry.meter, metrics)
+        except Exception:
+            # Broad by intent: observability must not break a training step.
+            warn_once("efficiency", "failed to tee efficiency metrics")
 
     try:
         _tee_scalars(telemetry.meter, metrics)

@@ -20,6 +20,11 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.loss import NLLLossFn
+from nemo_rl.algorithms.metric_utils import (
+    TOTAL_FLOPS_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+)
 from nemo_rl.algorithms.sft import (
     MasterConfig,
     SFTConfig,
@@ -34,6 +39,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.timer import Timer
 
 
 def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -818,3 +824,47 @@ def test_sft_train_keeps_repacking_legacy_online_message_batches(mock_components
     assert "message_log" not in trained_batch and torch.equal(
         trained_batch["input_ids"][0, :3], torch.tensor([1, 2, 3])
     )
+
+
+def test_sft_train_logs_the_flop_rates_over_the_policy_training_timer(mock_components):
+    """The FLOP rates reach the Logger, and over policy_training, not the step."""
+    mock_components["master_config"].sft.max_num_steps = 1
+    mock_components["policy"].train.return_value = {
+        "loss": torch.tensor(0.5),
+        "grad_norm": torch.tensor(1.0),
+        "all_mb_metrics": {"global_valid_toks": [10]},
+        TOTAL_FLOPS_KEY: 32e12,
+        "num_ranks": 2,
+        "theoretical_tflops": 80.0,
+    }
+
+    with patch.object(
+        Timer,
+        "get_timing_metrics",
+        side_effect=lambda *_args, **_kwargs: {
+            "policy_training": 4.0,
+            "total_step_time": 16.0,
+        },
+    ):
+        sft_train(
+            mock_components["policy"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["master_config"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _initial_sft_save_state(),
+        )
+
+    train_metrics = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ][-1].args[0]
+
+    # 32e12 FLOP over 4s is 8 TFLOPS, so 4 per GPU across two ranks, and 10% of
+    # the 80 TFLOPS the two ranks peak at.
+    assert train_metrics[TRAIN_FLOPS_PER_GPU_KEY] == pytest.approx(4.0)
+    assert train_metrics[TRAIN_FP_UTILIZATION_KEY] == pytest.approx(0.1)

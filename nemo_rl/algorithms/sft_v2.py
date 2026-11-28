@@ -30,7 +30,11 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX, SetupTimingMetrics
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    TOTAL_FLOPS_KEY,
+    SetupTimingMetrics,
+)
 from nemo_rl.algorithms.sft import SFTConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -438,7 +442,7 @@ class SFTSingleControllerActor:
                 metrics[key] = np.sum(values).item()
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
-        for key in ("total_flops", "num_ranks", "theoretical_tflops"):
+        for key in (TOTAL_FLOPS_KEY, "num_ranks", "theoretical_tflops"):
             if key in train_results:
                 metrics[key] = train_results[key]
         return metrics

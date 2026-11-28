@@ -27,6 +27,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.metric_utils import (
+    TOTAL_FLOPS_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+)
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -909,9 +914,9 @@ def sft_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
-            if "total_flops" in train_results:
+            if TOTAL_FLOPS_KEY in train_results:
                 total_tflops = (
-                    train_results["total_flops"]
+                    train_results[TOTAL_FLOPS_KEY]
                     / timing_metrics["policy_training"]
                     / 1e12
                 )
@@ -919,12 +924,15 @@ def sft_train(
                 print(
                     f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
                 )
+                metrics[TRAIN_FLOPS_PER_GPU_KEY] = total_tflops / num_ranks
                 if "theoretical_tflops" in train_results:
                     theoretical_tflops = train_results["theoretical_tflops"]
                     print(
                         f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
                     )
-                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+                    metrics[TRAIN_FP_UTILIZATION_KEY] = (
+                        total_tflops / theoretical_tflops
+                    )
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)

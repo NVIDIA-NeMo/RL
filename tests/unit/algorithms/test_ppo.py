@@ -14,6 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,6 +30,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.metric_utils import TOTAL_FLOPS_KEY
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
@@ -824,6 +826,7 @@ def _run_mock_ppo_train(
     overlong_filtering: bool = False,
     truncated_samples: tuple[bool, bool] = (False, False),
     prompt_history: bool = False,
+    train_result_extras: dict[str, Any] | None = None,
 ):
     """Run the real PPO loop with deterministic in-process collaborators."""
     from nemo_rl.algorithms import ppo as ppo_mod
@@ -904,8 +907,10 @@ def _run_mock_ppo_train(
     policy.prepare_for_lp_inference.side_effect = lambda: events.append("policy_lp")
     policy.offload_to_cpu.side_effect = lambda: events.append("policy_offload")
     policy.prepare_for_training.side_effect = lambda: events.append("policy_train_prep")
+    # A fresh dict per call, as Policy.train returns: the loop may update the
+    # result it kept, and a shared dict would carry that into the next epoch.
     policy.train.side_effect = lambda *_args, **_kwargs: (
-        events.append("policy_train") or train_result
+        events.append("policy_train") or {**train_result, **(train_result_extras or {})}
     )
     policy.get_logprobs.return_value = {"logprobs": torch.zeros(2, sequence_length)}
     policy.get_reference_policy_logprobs.return_value = {
@@ -947,8 +952,14 @@ def _run_mock_ppo_train(
     monkeypatch.setattr(ppo_mod, "TimeoutChecker", DummyTimeoutChecker)
     monkeypatch.setattr(ppo_mod, "MemoryTracker", DummyMemoryTracker)
     monkeypatch.setattr(ppo_mod, "maybe_gpu_profile_step", lambda *_args: None)
+    perf_train_results: list[dict[str, Any]] = []
+
+    def capture_performance_metrics(train_results, *_args, **_kwargs):
+        perf_train_results.append(train_results)
+        return {}
+
     monkeypatch.setattr(
-        ppo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+        ppo_mod, "print_performance_metrics", capture_performance_metrics
     )
     monkeypatch.setattr(
         ppo_mod, "print_efficiency_summary", lambda *_args, **_kwargs: {}
@@ -1116,6 +1127,7 @@ def _run_mock_ppo_train(
         refit=refit,
         replay_actor=replay_actor,
         events=events,
+        perf_train_results=perf_train_results,
     )
 
 
@@ -1196,6 +1208,30 @@ def test_ppo_dynamic_sampling_uses_whole_prompt_triviality():
     assert is_batch_complete is True
     assert result.size == 4
     torch.testing.assert_close(result["filtered_reward"], rewards[:4])
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_sums_the_flop_count_over_actor_epochs(monkeypatch, async_mode):
+    """policy_training spans every epoch, so the FLOP count has to as well."""
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=2,
+        seq_logprob_error_threshold=None,
+        train_result_extras={
+            TOTAL_FLOPS_KEY: 8e12,
+            "train_elapsed_seconds": 1.5,
+            "num_ranks": 4,
+        },
+    )
+
+    assert harness.policy.train.call_count == 2
+    reported = harness.perf_train_results[-1]
+    # Two epochs of 8e12 FLOP over 1.5 s each. Keeping the last epoch alone
+    # would report 8e12 against a denominator that covers both.
+    assert reported[TOTAL_FLOPS_KEY] == pytest.approx(16e12)
+    assert reported["train_elapsed_seconds"] == pytest.approx(3.0)
 
 
 def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):

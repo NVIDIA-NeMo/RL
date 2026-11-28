@@ -26,6 +26,10 @@ from nemo_rl.telemetry.vocabulary import (
 #: Prefix every algorithm logs its setup timings under.
 SETUP_TIMING_PREFIX = "timing/setup"
 
+#: Prefix the v1 loops log ``print_performance_metrics`` output under. Named here
+#: because the OTel tee reads it too.
+PERFORMANCE_PREFIX = "performance"
+
 #: Single-Controller snapshot-attempt dict names, shared with the OTel tee; not in
 #: ``rollout_checkpoint.py``, which imports the GRPO stack.
 ROLLOUT_CHECKPOINT_OUTCOME_PREFIX = "rollout/checkpoint_outcome"
@@ -86,6 +90,35 @@ TRAINING_TEED_METRICS = (
 )
 
 register_teed_metrics(TRAINING_TEED_METRICS)
+
+
+# FLOP tracker output keys. Several modules write them, so they live here.
+TRAIN_FLOPS_PER_GPU_KEY = "train_flops_per_gpu"
+TRAIN_FP_UTILIZATION_KEY = "train_fp_utilization"
+TOTAL_FLOPS_KEY = "total_flops"
+
+#: Teed FLOP rows. A step with no count reports nothing, not zero.
+FLOPS_TEED_METRICS = (
+    TeedMetric(
+        TRAIN_FLOPS_PER_GPU_KEY,
+        "rl.flops.per_gpu",
+        unit="{TFLOP}/s",
+        description="Achieved training throughput per GPU.",
+    ),
+    TeedMetric(
+        TRAIN_FP_UTILIZATION_KEY,
+        "rl.flops.utilization",
+        description="Achieved TFLOPS over the device's theoretical peak, 0-1 (MFU).",
+    ),
+    TeedMetric(
+        TOTAL_FLOPS_KEY,
+        "rl.flops.per_step",
+        unit="{FLOP}",
+        description="FLOPs in one training step's last optimizer epoch, summed over ranks.",
+    ),
+)
+
+register_teed_metrics(FLOPS_TEED_METRICS)
 
 
 @dataclass

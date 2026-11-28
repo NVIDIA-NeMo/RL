@@ -74,7 +74,7 @@ from nemo_rl.algorithms.loss.utils import (
     rescale_loss_metrics,
 )
 from nemo_rl.algorithms.loss.wrapper import StreamingObjectiveLoss
-from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY, TOTAL_FLOPS_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
 )
@@ -1864,7 +1864,7 @@ class MegatronPolicyWorkerImpl(
                 finally:
                     self.mcore_state.cfg.model.seq_length = _orig_seq
 
-                metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
+                metrics[TOTAL_FLOPS_KEY] = flops_per_sample * gbs * num_global_batches
                 metrics["num_ranks"] = torch.distributed.get_world_size()
             except Exception as e:
                 warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
