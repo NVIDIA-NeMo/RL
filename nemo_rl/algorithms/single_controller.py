@@ -186,7 +186,7 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
 )
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -4520,42 +4520,24 @@ class SingleControllerActor:
                 )
 
     async def _check_env_health(self, timeout_s: float) -> list[str]:
-        """Ask each environment actor that exposes a health check whether it is whole.
+        """Ask every NeMo-Gym actor whether its servers are alive.
 
         Returns the problems found, empty when everything is well. It *reports* rather
         than raises so the caller can route the verdict through ``stall_action``, the
-        same way the stall path does. Raising here bypassed ``stall_action`` entirely:
-        under the documented default (``"warn"``, which promises to "only report"), and
-        with ``gym_subprocess_check`` defaulting to true, an unhealthy environment killed
-        the run -- a run-ending path switched on by default, in a feature whose whole
-        posture is inert-by-default.
+        same way the stall path does.
 
-        Each probe is bounded. ``NemoGym`` is an asyncio actor, so a *wedged* environment
-        -- precisely the case this check exists to catch -- left the await hanging
-        forever, the pump never ticked again, and stall detection was dead exactly when
-        it was needed. A probe that does not answer within one tick IS the unhealthy
-        signal; it is not a reason to stop watching.
+        Each probe is bounded. A probe that does not answer within one tick IS the
+        unhealthy signal; it is not a reason to stop watching.
 
-        Environments without the method are skipped rather than treated as unhealthy;
-        only NeMo-Gym has subprocess servers to lose.
+        The NeMo-Gym entry of the environment handles is read with
+        ``as_nemo_gym_shard_set``, the way the rollout code reads it, and every actor
+        of the set is asked; see ``NemoGymShardSet.check_health``. Other environments
+        are not asked: only NeMo-Gym has subprocess servers to lose.
         """
-        problems: list[str] = []
-        for env_name, handle in self._env_handles.items():
-            health_check = getattr(handle, "health_check", None)
-            if health_check is None:
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._ray_get(health_check.remote()), timeout=timeout_s
-                )
-            except asyncio.TimeoutError:
-                problems.append(
-                    f"environment {env_name!r} did not answer its health check within "
-                    f"{timeout_s}s"
-                )
-            except Exception as error:
-                problems.append(f"environment {env_name!r} reported unhealthy: {error}")
-        return problems
+        nemo_gym = self._env_handles.get("nemo_gym")
+        if nemo_gym is None:
+            return []
+        return await as_nemo_gym_shard_set(nemo_gym).check_health(timeout_s)
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""

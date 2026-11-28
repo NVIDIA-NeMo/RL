@@ -31,6 +31,7 @@ import ray.exceptions
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.models.generation.fleet_health import (
@@ -115,6 +116,26 @@ async def _run_pump(pump, ticks: int):
 async def _run_ticks(ctrl, ticks: int):
     """Run the watchdog for a bounded number of ticks, then cancel it."""
     return await _run_pump(ctrl._stall_watchdog_pump(), ticks)
+
+
+async def _run_full_ticks(ctrl, ticks: int):
+    """Run the watchdog until ``ticks`` ticks have finished, then cancel it.
+
+    A tick logs its metrics first, so the metrics of the tick after ``ticks`` mean
+    that tick ``ticks`` ran to its end. Unlike ``_run_ticks``, the result does not
+    depend on how soon the process is scheduled.
+    """
+    task = asyncio.ensure_future(ctrl._stall_watchdog_pump())
+    # The bound only ends a pump that stopped ticking.
+    async with asyncio.timeout(5.0):
+        while len(ctrl._logger.metrics) <= ticks and not task.done():
+            await asyncio.sleep(0.001)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return task
 
 
 async def _run_probe_ticks(ctrl, ticks: int):
@@ -590,7 +611,7 @@ class TestEnvHealthCheck:
             gym_subprocess_check=True,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
         assert calls, "health_check should have been polled"
 
     def test_an_unhealthy_environment_is_named_in_the_error(self):
@@ -637,7 +658,7 @@ class TestEnvHealthCheck:
             env_handles={"nemo_gym": _Handle()},
         )
         # Must complete its ticks rather than blowing up.
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
         out = capsys.readouterr().out
         assert "environment health" in out
         assert "nemo_gym" in out
@@ -667,23 +688,46 @@ class TestEnvHealthCheck:
             gym_subprocess_check=True,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 4))
+        asyncio.run(_run_full_ticks(ctrl, 4))
         # The pump kept ticking despite the environment never answering.
         assert len(ctrl._logger.metrics) >= 2, (
             "watchdog stopped ticking while an environment was wedged"
         )
         assert never_resolves, "the health check was never actually polled"
 
-    def test_environments_without_a_health_check_are_skipped(self):
+    def test_environments_other_than_nemo_gym_are_not_asked(self):
         """Only NeMo-Gym has subprocess servers to lose; math envs must not trip this."""
+        asked = []
+
+        class _Handle:
+            health_check = SimpleNamespace(
+                remote=lambda: _completed(asked.append("math"))
+            )
+
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            # Any reported problem would end the pump with an error.
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={"math": _Handle()},
+        )
+        asyncio.run(_run_full_ticks(ctrl, 2))
+        assert asked == [], "an environment other than nemo_gym was asked"
+
+    def test_a_nemo_gym_entry_without_a_health_check_is_reported(self):
+        """An entry that cannot be asked is a problem, not a healthy environment."""
         ctrl = _make_controller(
             stats=RolloutStats(),
             inflight=0,
             stall_timeout_s=1000.0,
             gym_subprocess_check=True,
-            env_handles={"math": SimpleNamespace()},
+            env_handles={"nemo_gym": SimpleNamespace()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        problems = asyncio.run(ctrl._check_env_health(timeout_s=5.0))
+        assert len(problems) == 1, problems
+        assert "instance 'nemo_gym' reported unhealthy" in problems[0]
 
     def test_the_check_can_be_disabled(self):
         class _Handle:
@@ -695,10 +739,45 @@ class TestEnvHealthCheck:
             stats=RolloutStats(),
             inflight=0,
             stall_timeout_s=1000.0,
+            # Any reported problem would end the pump with an error.
+            stall_action="abort",
             gym_subprocess_check=False,
             env_handles={"nemo_gym": _Handle()},
         )
-        asyncio.run(_run_ticks(ctrl, 2))
+        asyncio.run(_run_full_ticks(ctrl, 2))
+
+    def test_an_unhealthy_actor_of_the_second_shard_is_named_by_its_label(self):
+        """The pump reads a shard set under "nemo_gym" and asks each of its actors.
+
+        The shard set has no health check of its own, and only the actor of the
+        second shard is unhealthy. The tests of ``NemoGymShardSet.check_health`` in
+        ``tests/unit/environments/test_nemo_gym_utils.py`` cover how the actors are
+        asked.
+        """
+        healthy = SimpleNamespace(health_check=SimpleNamespace(remote=_completed))
+        unhealthy = SimpleNamespace(
+            health_check=SimpleNamespace(
+                remote=lambda: _failed(
+                    RuntimeError("Process `search` finished unexpectedly!")
+                )
+            )
+        )
+        ctrl = _make_controller(
+            stats=RolloutStats(),
+            inflight=0,
+            stall_timeout_s=1000.0,
+            stall_action="abort",
+            gym_subprocess_check=True,
+            env_handles={
+                "nemo_gym": NemoGymShardSet(
+                    handles={"tools": [healthy], "search": [unhealthy]}
+                )
+            },
+        )
+        with pytest.raises(
+            RuntimeError, match="'nemo_gym' instance 'search' reported unhealthy"
+        ):
+            asyncio.run(_run_full_ticks(ctrl, 2))
 
 
 def _completed(_value=None):

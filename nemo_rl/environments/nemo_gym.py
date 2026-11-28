@@ -39,6 +39,7 @@ from nemo.lens.resources.attributes import (
     extend_otel_resource_attributes,
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from ray.exceptions import RayTaskError
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -3595,6 +3596,51 @@ class NemoGymShardSet:
             except Exception as error:
                 print(f"Failed to release the NeMo-Gym placement group: {error}")
             self.placement_group = None
+
+    async def check_health(self, timeout_s: float) -> list[str]:
+        """Ask every actor of the set whether its Gym servers are alive.
+
+        The actors are asked concurrently and each call has its own timeout. The check
+        therefore takes at most ``timeout_s`` however many actors stay silent, and an
+        actor that fails or stays silent does not keep the others from being asked.
+
+        Args:
+            timeout_s: Seconds each actor has to answer.
+
+        Returns:
+            One message per actor that raised or did not answer in time, in the order of
+            ``all_handles``. Each message names the actor by its instance label. The
+            list is empty when every actor answered without raising.
+        """
+
+        async def check_actor(actor: Any) -> str | None:
+            """Return the problem found on one actor, or None when it is healthy."""
+            label = self.instance_label(actor)
+            try:
+                await asyncio.wait_for(actor.health_check.remote(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                return (
+                    f"environment 'nemo_gym' instance {label!r} did not answer its "
+                    f"health check within {timeout_s}s"
+                )
+            except Exception as error:
+                reason = str(error)
+                if isinstance(error, RayTaskError) and isinstance(
+                    error.cause, BaseException
+                ):
+                    # Ray's text is the remote traceback, and Gym's poll() error ends
+                    # with up to 64 KiB of the dead server's output. Keep one line.
+                    reason = str(error.cause).partition("\n")[0]
+                return (
+                    f"environment 'nemo_gym' instance {label!r} reported unhealthy: "
+                    f"{reason}"
+                )
+            return None
+
+        results = await asyncio.gather(
+            *(check_actor(actor) for actor in self.all_handles)
+        )
+        return [problem for problem in results if problem is not None]
 
 
 def _shard_instances(plan: ShardPlan) -> List[tuple[ShardSpec, int]]:
