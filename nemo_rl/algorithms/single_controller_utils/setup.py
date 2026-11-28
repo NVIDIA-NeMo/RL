@@ -159,6 +159,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
+from nemo_rl.models.policy.shared_prefix import validate_shared_prefix_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.models.value.tq_value import TQValue
@@ -1322,6 +1323,7 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    validate_shared_prefix_config(master_config)
     generation_config = master_config.policy["generation"]
     # Normalize the optional request count once before partitions/workers start.
     top_logprobs = generation_config.setdefault("top_logprobs", 0)

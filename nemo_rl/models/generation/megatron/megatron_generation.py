@@ -404,9 +404,15 @@ class MegatronGeneration(GenerationInterface):
 
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
+        # This policy only generates. Turning the trainer's option off keeps the
+        # option's worker setup checks from running on the inference layout.
         self._policy_config = {
             **deepcopy(config),
             "megatron_cfg": self.effective_megatron_cfg(config),
+            "sequence_packing": {
+                **deepcopy(config["sequence_packing"]),
+                "share_prefixes": False,
+            },
         }
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)

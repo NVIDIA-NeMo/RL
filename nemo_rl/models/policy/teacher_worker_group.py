@@ -201,6 +201,9 @@ class TeacherWorkerGroup:
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
+        # Teacher batches are packed without sharing prompts. Turning the student's
+        # option off keeps its setup checks from running on a teacher.
+        cfg["sequence_packing"]["share_prefixes"] = False
         # A student `pretrained_checkpoint` rides along on the copied config and
         # would be loaded as the teacher's own weights. Resume keeps student
         # weights out of the config for the same reason (`weights_path=None`
@@ -367,7 +370,7 @@ class TeacherWorkerGroup:
             dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
             ]["logprob_mb_tokens"]
-        dp_metas, _ = shard_meta_for_dp(
+        dp_metas = shard_meta_for_dp(
             teacher_meta,
             dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
             batch_size=None,

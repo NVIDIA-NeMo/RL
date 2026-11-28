@@ -130,7 +130,7 @@ class TestTQValueFanout:
             ) as mock_packing,
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = v.get_values_from_meta(meta)
@@ -178,7 +178,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             if dispatch == "get_values":
@@ -219,7 +219,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = v.train_from_meta(meta, loss_fn="LF")
@@ -257,7 +257,7 @@ class TestTQValueFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ),
         ):
             out = v.train_from_meta(meta, loss_fn="LF")
@@ -282,7 +282,7 @@ class TestPadTargetIsolation:
         )
         with patch(
             "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-            return_value=([meta, meta], None),
+            return_value=[meta, meta],
         ) as mock_shard:
             v.get_values_from_meta(meta)
 
@@ -304,7 +304,7 @@ class TestPadTargetIsolation:
         )
         with patch(
             "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-            return_value=([meta, meta], None),
+            return_value=[meta, meta],
         ) as mock_shard:
             v.get_values_from_meta(meta)
 
@@ -362,7 +362,7 @@ class TestTQValueSplitFanout:
             patch.object(TQValue, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.value.tq_value.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as shard,
             patch(
                 "nemo_rl.models.value.tq_value.trace_context_kwargs",

@@ -260,6 +260,9 @@ class SequencePackingConfig(TypedDict):
     fuse_loss: NotRequired[bool]
     pair_grouping_key: NotRequired[Literal["pair_index"]]
     max_sequences_per_bin: NotRequired[int]
+    # Run a prompt once per forward for all the rows that share it, instead of
+    # once per row. Omit or set false to pack every row with its own prompt.
+    share_prefixes: NotRequired[bool]
 
 
 class RewardModelConfig(TypedDict):

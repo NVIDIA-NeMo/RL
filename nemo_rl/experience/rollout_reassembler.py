@@ -50,6 +50,11 @@ from nemo_rl.data.captured_media import (
     verify_media_geometry,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
+    prompt_hash,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     AGENT_NAME_TAG,
@@ -1455,6 +1460,13 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        # Read by shared-prefix execution (policy.sequence_packing.share_prefixes).
+        # Only a verified row with no loss inside its prompt may share it.
+        for tag, row in zip(tags, rows, strict=True):
+            shares_prompt = row.valid and not any(row.token_mask[: row.prompt_len])
+            prompt_length = row.prompt_len if shares_prompt else 0
+            tag[PROMPT_LENGTH_TAG] = prompt_length
+            tag[PROMPT_HASH_TAG] = prompt_hash(row.token_ids[:prompt_length])
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

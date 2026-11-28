@@ -4046,6 +4046,21 @@ class TestSetup:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
         mock_spinup.assert_not_called()
 
+    def test_unsupported_share_prefixes_config_fails_before_setup_factories(
+        self, patched_factories
+    ):
+        """``policy.sequence_packing.share_prefixes`` is checked before any cluster starts."""
+        mc = _make_master_config()
+        mc.policy["sequence_packing"] = {"enabled": False, "share_prefixes": True}
+
+        with pytest.raises(
+            ValueError, match="share_prefixes requires policy.sequence_packing.enabled"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_megatron_fleet_health_rejected_with_clean_backend_error(self):
         """megatron + generation_fleet_health fails naming the backend.
 

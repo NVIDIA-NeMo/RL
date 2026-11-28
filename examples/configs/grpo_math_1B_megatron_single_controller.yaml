@@ -222,6 +222,12 @@ policy:
   megatron_cfg:
     enabled: true
 
+  # Uncomment to run a prompt once per forward for all the rows that share it.
+  # Requires token_capture.enabled: true, top_p: 1.0 and top_k: null. Setup rejects the
+  # other unsupported settings; docs/design-docs/shared-prefix-execution.md lists them.
+  # sequence_packing:
+  #   share_prefixes: true
+
   generation:
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:

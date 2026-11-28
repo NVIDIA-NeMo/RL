@@ -243,11 +243,7 @@ def test_check_consumption_status_only_true_when_all_consumed() -> None:
 
 
 def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
-    """Sum of shard sizes == total, and pairwise disjoint.
-
-    ``shard_meta_for_dp`` returns ``(list[KVBatchMeta], unsorted_indices)``;
-    here we only care about the metas.
-    """
+    """Sum of shard sizes == total, and pairwise disjoint."""
     client = NoOpDataPlaneClient()
     register_train_partition(client, num_samples=8)
     fb = _final_batch(8)
@@ -258,7 +254,7 @@ def test_shard_meta_for_dp_partitions_keys_disjointly() -> None:
         partition_id="train",
     )
 
-    shards, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
+    shards = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
     assert len(shards) == 4
     assert sum(len(s.sample_ids) for s in shards) == len(meta.sample_ids)
     seen: set[str] = set()
@@ -279,7 +275,7 @@ def test_shard_meta_for_dp_keeps_partition_id() -> None:
         dp_client=client,
         partition_id="train",
     )
-    shards, _ = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
+    shards = shard_meta_for_dp(meta, dp_world=2, batch_size=4)
     for s in shards:
         assert s.partition_id == meta.partition_id
         assert s.task_name == meta.task_name

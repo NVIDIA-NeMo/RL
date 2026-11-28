@@ -1,0 +1,16 @@
+# Shared arm of the shared-prefix test pair: the dense arm with
+# policy.sequence_packing.share_prefixes on, so each forward runs a prompt once
+# for the rows that start with it. See docs/design-docs/shared-prefix-execution.md.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix.yaml
+defaults: ./grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture.yaml
+policy:
+  sequence_packing:
+    share_prefixes: true
+checkpointing:
+  checkpoint_dir: results/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix
+logger:
+  log_dir: logs/grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix
+  wandb:
+    name: grpo-nano-v2-12b-1n8g-megatron-single-controller-token_capture-shared-prefix

@@ -75,6 +75,11 @@ from nemo_rl.models.megatron.router_replay import (
     set_router_replay_backward,
     set_router_replay_forward,
 )
+from nemo_rl.models.megatron.shared_prefix.logprobs import (
+    prepare_shared_prefix_loss_input,
+    shared_prefix_next_token_logprobs,
+)
+from nemo_rl.models.megatron.shared_prefix.microbatches import SharedPrefixParams
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
@@ -173,6 +178,7 @@ def model_forward(
     loss_mask_cp_sharded: Optional[torch.Tensor] = None,
     media_token_validity_mask: Optional[torch.Tensor] = None,
     model_slices_context_parallel_inputs: bool = False,
+    shared_prefix_params: Optional[SharedPrefixParams] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -196,6 +202,7 @@ def model_forward(
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        shared_prefix_params: Parameters for a shared-prefix pack (optional)
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -228,6 +235,8 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
+    if shared_prefix_params is not None:
+        additional_kwargs.update(shared_prefix_params.model_kwargs())
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
@@ -357,6 +366,7 @@ def forward_with_post_processing_fn(
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
+    shared_prefix_params = processed_mb.shared_prefix_params
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -395,6 +405,7 @@ def forward_with_post_processing_fn(
                 loss_mask_cp_sharded=loss_mask_cp_sharded,
                 media_token_validity_mask=media_token_validity_mask,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                shared_prefix_params=shared_prefix_params,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -469,6 +480,7 @@ def forward_with_post_processing_fn(
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
             prepacked_loss_mask=loss_mask_cp_sharded,
+            shared_prefix_params=shared_prefix_params,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         assert original_seq_length is not None
@@ -480,6 +492,7 @@ def forward_with_post_processing_fn(
             cu_seqlens=(
                 None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
             ),
+            shared_prefix_params=shared_prefix_params,
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -653,6 +666,7 @@ class LossPostProcessor:
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
         prepacked_loss_mask: Optional[torch.Tensor] = None,
+        shared_prefix_params: Optional[SharedPrefixParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -667,6 +681,7 @@ class LossPostProcessor:
             global_valid_toks: Global valid token count for loss normalization
             prepacked_loss_mask: CP-local target-aligned mask when MCore returned
                 per-token losses for a direct packed row
+            shared_prefix_params: Parameters for a shared-prefix pack (optional)
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -725,7 +740,13 @@ class LossPostProcessor:
 
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-        if self.prepare_fn is not None:
+        if shared_prefix_params is not None:
+            prepare_loss_input_wrapped = partial(
+                prepare_shared_prefix_loss_input,
+                shared_prefix_params=shared_prefix_params,
+                chunk_size=logprob_chunk_size,
+            )
+        elif self.prepare_fn is not None:
             prepare_loss_input_wrapped = self.prepare_fn
         else:
             prepare_loss_input_wrapped = partial(
@@ -900,6 +921,7 @@ class LogprobsPostProcessor:
         cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
         cu_seqlens: Optional[torch.Tensor | CpuIntTuple] = None,
+        shared_prefix_params: Optional[SharedPrefixParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -913,18 +935,28 @@ class LogprobsPostProcessor:
             original_seq_length: Sequence width before dense padding was applied
             cu_seqlens: Unpadded packed-sequence boundaries; needed to replay the
                 sampler's support on packed sequences
+            shared_prefix_params: Parameters for a shared-prefix pack (optional)
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
         cu_seqlens_padded_cpu = None
-        if self.cfg["sequence_packing"]["enabled"]:
+        if self.cfg["sequence_packing"]["enabled"] and shared_prefix_params is None:
             assert cu_seqlens_padded is not None
             cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
         def processor_fn_inner(output_tensor):
-            if self.use_fused_linear_logprobs:
+            if shared_prefix_params is not None:
+                token_logprobs = shared_prefix_next_token_logprobs(
+                    output_tensor,
+                    shared_prefix_params,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                    chunk_size=self.cfg.get("logprob_chunk_size", None),
+                )
+            elif self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif replays_sampler_support(self.sampling_params):

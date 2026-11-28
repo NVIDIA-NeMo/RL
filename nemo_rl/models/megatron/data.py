@@ -47,6 +47,11 @@ from nemo_rl.models.megatron.hybridep import (
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
+from nemo_rl.models.megatron.shared_prefix.microbatches import (
+    SharedPrefixParams,
+    build_shared_prefix_microbatch,
+    shared_prefix_tree_sizes,
+)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -111,6 +116,8 @@ class ProcessedMicrobatch:
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, in the model's own token layout. None when the
             batch needs no correction and the model should derive its own.
+        shared_prefix_params: SharedPrefixParams of a shared-prefix pack (None
+            if the microbatch is not a pack)
     """
 
     data_dict: BatchedDataDict[Any]
@@ -128,6 +135,7 @@ class ProcessedMicrobatch:
     loss_mask_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    shared_prefix_params: Optional[SharedPrefixParams] = None
 
 
 def _validate_direct_packed_microbatch(
@@ -268,8 +276,20 @@ def make_processed_microbatch_iterator(
                 context_parallel_size=get_context_parallel_world_size(),
             )
 
+        # The tree ids are read on the host: on the GPU this would wait for the device.
+        tree_sizes = shared_prefix_tree_sizes(data_dict)
+
         # Move to GPU
         data_dict = data_dict.to("cuda")
+
+        if tree_sizes is not None:
+            yield build_shared_prefix_microbatch(
+                data_dict,
+                tree_sizes=tree_sizes,
+                padding_multiple=cfg["make_sequence_length_divisible_by"],
+                exclude_sequence_padding_from_expert_bias=create_packed_seq_padding_mask,
+            )
+            continue
 
         # Process the microbatch
         processed_inputs = process_microbatch(

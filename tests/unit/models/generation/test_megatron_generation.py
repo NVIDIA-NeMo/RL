@@ -309,6 +309,32 @@ def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None
 
 
 @pytest.mark.mcore
+def test_refit_destination_policy_turns_off_share_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inference-only policy of non-colocated generation never trains.
+
+    The worker setup checks of the trainer's ``share_prefixes`` option would otherwise
+    run against the generation layout (inference TP/SP, generation CUDA graphs).
+    """
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = False
+    config["sequence_packing"]["share_prefixes"] = True
+    monkeypatch.setattr(lm_policy, "Policy", MagicMock())
+    monkeypatch.setattr(
+        MegatronGeneration, "init_cluster_placement_groups", MagicMock()
+    )
+    monkeypatch.setattr(MegatronGeneration, "prepare_for_generation", MagicMock())
+
+    MegatronGeneration(config=config, tokenizer=MagicMock(), cluster=MagicMock())
+
+    policy_config = lm_policy.Policy.call_args.kwargs["config"]
+    assert policy_config["sequence_packing"]["share_prefixes"] is False
+    # The caller's (trainer's) config is untouched.
+    assert config["sequence_packing"]["share_prefixes"] is True
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize("refit_transport", [None, "mcore"])
 def test_megatron_generation_dispatches_refit_transport(refit_transport):
     generation = object.__new__(MegatronGeneration)

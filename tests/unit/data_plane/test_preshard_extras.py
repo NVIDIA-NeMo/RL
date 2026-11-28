@@ -122,14 +122,14 @@ def _meta(n: int) -> KVBatchMeta:
 
 def test_shard_meta_for_dp_partitions_keys_disjointly():
     n, dp = 8, 4
-    metas, _ = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
+    metas = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
     assert len(metas) == dp
     flat = [k for m in metas for k in m.sample_ids]
     assert sorted(flat) == sorted(_meta(n).sample_ids)  # same set, no dups, no minting
 
 
 def test_shard_meta_for_dp_preserves_partition_id():
-    metas, _ = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
+    metas = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
     assert all(m.partition_id == "train" for m in metas)
 
 
@@ -137,7 +137,7 @@ def test_shard_meta_for_dp_preserves_tag_row_identity():
     meta = _meta(8)
     meta.tags = [{"row": sample_id} for sample_id in meta.sample_ids]
 
-    metas, _ = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
+    metas = shard_meta_for_dp(meta, dp_world=4, batch_size=8)
 
     for shard in metas:
         assert shard.tags is not None
@@ -157,7 +157,7 @@ def test_shard_meta_for_dp_permutes_tags_with_sample_ids():
     # Tag each sample with its own id so a mispairing is directly visible.
     meta.tags = [{"owner": sid} for sid in meta.sample_ids]
 
-    metas, _ = shard_meta_for_dp(meta, dp_world=dp, batch_size=n)
+    metas = shard_meta_for_dp(meta, dp_world=dp, batch_size=n)
 
     for shard in metas:
         assert shard.tags is not None
@@ -168,22 +168,8 @@ def test_shard_meta_for_dp_permutes_tags_with_sample_ids():
 
 def test_shard_meta_for_dp_leaves_tags_none_when_absent():
     """Text-only runs write no tags; sharding must not invent an empty list."""
-    metas, _ = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
+    metas = shard_meta_for_dp(_meta(4), dp_world=2, batch_size=4)
     assert all(m.tags is None for m in metas)
-
-
-def test_shard_meta_for_dp_unsorted_round_trip():
-    """unsorted_indices must reconstruct the input order from DP-rank concat."""
-    n, dp = 8, 4
-    metas, unsorted = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
-    if unsorted is None:
-        # No reorder happened — DP-rank concat IS the original order.
-        return
-    # Build a tensor whose row i is i; permute via dispatch order; reorder back.
-    flat = [k for m in metas for k in m.sample_ids]
-    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
-    restored = aggregated[torch.tensor(unsorted)]
-    assert restored.tolist() == list(range(n))
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

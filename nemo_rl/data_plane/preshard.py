@@ -28,6 +28,13 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.packing.shared_prefix.plan import plan_shared_prefix_shards
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_TREE_IDS,
+)
+from nemo_rl.data_plane.grouping import row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -48,7 +55,7 @@ def shard_meta_for_dp(
     batch_size: Optional[int] = None,
     sequence_packing_args: Optional[dict[str, Any]] = None,
     dynamic_batching_args: Optional[dict[str, Any]] = None,
-) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
+) -> list[KVBatchMeta]:
     """Pure key-list split: assign ``meta.sample_ids`` to ``dp_world`` ranks.
 
     Seq-len-aware on top of ``shard_by_batch_size``. No I/O, no key
@@ -61,6 +68,10 @@ def shard_meta_for_dp(
     shard's ``extra_info`` so the ``*_presharded`` worker can reattach
     packing as it does on the legacy fan-out path.
 
+    With ``sequence_packing_args["share_prefixes"]``, forwards run a shared
+    prompt once (see :func:`_shard_meta_with_shared_prefixes`). A batch with
+    a row that lacks a prompt tag is packed without sharing.
+
     Args:
         meta: Full-batch ``KVBatchMeta`` with ``sequence_lengths`` populated.
         dp_world: Number of DP ranks.
@@ -69,11 +80,7 @@ def shard_meta_for_dp(
         dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
 
     Returns:
-        ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` is
-        the inverse permutation that maps DP-rank-order outputs back to
-        original ``meta.sample_ids`` order (feed to
-        ``BatchedDataDict.reorder_data`` post-aggregation); ``None`` if
-        no reorder occurred.
+        One ``KVBatchMeta`` per DP rank, in rank order.
     """
     n = len(meta.sample_ids)
     if n == 0:
@@ -90,6 +97,20 @@ def shard_meta_for_dp(
         )
 
     seq_lens = list(meta.sequence_lengths)
+    tags = meta.tags
+    if (
+        sequence_packing_args is not None
+        and sequence_packing_args.get("share_prefixes")
+        and tags is not None
+        and all(PROMPT_LENGTH_TAG in tag and PROMPT_HASH_TAG in tag for tag in tags)
+    ):
+        return _shard_meta_with_shared_prefixes(
+            meta,
+            dp_world=dp_world,
+            batch_size=batch_size,
+            sequence_packing_args=sequence_packing_args,
+        )
+
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row
@@ -136,11 +157,9 @@ def shard_meta_for_dp(
 
     base_extra: dict[str, Any] = dict(meta.extra_info or {})
     out: list[KVBatchMeta] = []
-    flat_idx: list[int] = []
     for shard in sharded:
         # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard[META_IDX].tolist()
-        flat_idx.extend(idx_list)
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
@@ -162,15 +181,63 @@ def shard_meta_for_dp(
         # ``KVBatchMeta`` later cannot go missing on the presharded path.
         # Only ``extra_info`` is per-shard rather than per-sample.
         out.append(replace(meta.subset(idx_list), extra_info=rank_extra))
+    return out
 
-    # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
-    # When workers' results are concatenated in DP-rank order, row `j` of
-    # the aggregate corresponds to original index `flat_idx[j]`. To restore
-    # original meta.sample_ids order, the caller does aggregated.reorder_data(
-    # unsorted_indices) — same contract as `_shard_for_logprob`.
-    unsorted: Optional[list[int]] = None
-    if flat_idx != list(range(n)):
-        unsorted = [0] * n
-        for new_pos, old_idx in enumerate(flat_idx):
-            unsorted[old_idx] = new_pos
-    return out, unsorted
+
+def _shard_meta_with_shared_prefixes(
+    meta: KVBatchMeta,
+    *,
+    dp_world: int,
+    batch_size: Optional[int],
+    sequence_packing_args: dict[str, Any],
+) -> list[KVBatchMeta]:
+    """Split ``meta`` among the ranks into forwards that run a shared prompt once.
+
+    Rows of one prompt group that start with the same prompt run that prompt
+    once per forward. ``plan_shared_prefix_shards`` plans those forwards from
+    the ``GROUP_ID_TAG``, ``PROMPT_LENGTH_TAG`` and ``PROMPT_HASH_TAG`` row
+    tags.
+
+    Args:
+        meta: Full-batch ``KVBatchMeta`` whose rows all carry the three tags.
+        dp_world: Number of DP ranks.
+        batch_size: Total samples; ``None`` for the logprob path, GBS for train.
+        sequence_packing_args: Packing config dict with ``bound_by_full_length``.
+
+    Returns:
+        One ``KVBatchMeta`` per DP rank, in rank order. Each ``extra_info``
+        carries the packing metadata of ordinary sequence packing and
+        ``SHARED_PREFIX_TREE_IDS``, one tree id per row.
+    """
+    tags = meta.tags
+    sequence_lengths = meta.sequence_lengths
+    # shard_meta_for_dp checked both before it called this function.
+    assert tags is not None and sequence_lengths is not None
+    shards = plan_shared_prefix_shards(
+        sequence_lengths=sequence_lengths,
+        group_ids=row_group_ids(meta),
+        prompt_lengths=[tag[PROMPT_LENGTH_TAG] for tag in tags],
+        prompt_hashes=[tag[PROMPT_HASH_TAG] for tag in tags],
+        num_shards=dp_world,
+        batch_size=batch_size,
+        max_tokens_per_microbatch=sequence_packing_args["max_tokens_per_microbatch"],
+        sequence_length_pad_multiple=sequence_packing_args[
+            "sequence_length_pad_multiple"
+        ],
+        algorithm=sequence_packing_args["algorithm"],
+        bound_by_full_length=sequence_packing_args["bound_by_full_length"],
+        largest_first=sequence_packing_args.get("microbatch_order") == "largest_first",
+    )
+    return [
+        replace(
+            meta.subset(shard.row_indices),
+            extra_info={
+                **(meta.extra_info or {}),
+                MICRO_BATCH_INDICES: shard.micro_batch_indices,
+                MICRO_BATCH_LENGTHS: shard.micro_batch_lengths,
+                ELEM_COUNTS_PER_GB: shard.elem_counts_per_gb,
+                SHARED_PREFIX_TREE_IDS: shard.tree_ids,
+            },
+        )
+        for shard in shards
+    ]

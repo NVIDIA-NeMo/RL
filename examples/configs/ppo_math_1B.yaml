@@ -270,6 +270,10 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    # Run a prompt once per forward for all the rows that share it, instead of once
+    # per row. Requires the single-controller path with token capture and the
+    # Megatron backend. See docs/design-docs/shared-prefix-execution.md.
+    share_prefixes: false
 
   make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0

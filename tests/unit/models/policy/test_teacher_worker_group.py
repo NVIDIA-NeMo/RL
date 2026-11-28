@@ -308,6 +308,23 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
     assert policy_config["pretrained_checkpoint"]["path"] == "/ckpt/sft"
 
 
+def test_teacher_worker_group_turns_off_the_student_share_prefixes(monkeypatch):
+    """Teacher batches are packed without sharing prompts."""
+    policy_config = {
+        "model_name": "/ckpt/student",
+        "megatron_cfg": {"enabled": True},
+        "automodel_cfg": {"enabled": False},
+        "sequence_packing": {"enabled": False, "share_prefixes": True},
+        "dynamic_batching": {"enabled": False},
+    }
+
+    cfg = _build_teacher_cfg(monkeypatch, policy_config, megatron_cfg_overrides={})
+
+    assert cfg["sequence_packing"]["share_prefixes"] is False
+    # The student's own config is untouched.
+    assert policy_config["sequence_packing"]["share_prefixes"] is True
+
+
 def _disable_opd_full(teacher) -> None:
     """Set the opd_full attributes to the state __init__ gives them when off.
 

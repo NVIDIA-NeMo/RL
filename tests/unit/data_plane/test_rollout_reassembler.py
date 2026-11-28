@@ -54,7 +54,15 @@ from nemo_rl.data.multimodal_utils import (  # noqa: E402
     reassemble_packed_multimodal,
     row_shapes_key,
 )
+from nemo_rl.data.packing.shared_prefix.row_metadata import (  # noqa: E402
+    PROMPT_HASH_TAG,
+    PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_TREE_IDS,
+    prompt_hash,
+)
+from nemo_rl.data_plane.preshard import shard_meta_for_dp  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
+    AGENT_NAME_TAG,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_FIELDS,
@@ -667,6 +675,131 @@ def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions
     rows = _fetch_rows(tq_client, rollout_ids)
     sample_mask = torch.as_tensor(rows["sample_mask"]).flatten()
     assert sample_mask.tolist() == [0.0, 0.0]  # published as placeholders, not dropped
+
+
+def test_finalize_group_stamps_prompt_tags_on_every_row(tq_client, partitions):
+    """Every row carries its prompt length and prompt hash as row tags."""
+    group_id = "grp_prompt_tags"
+    rollout_ids = [f"{group_id}_g{index}" for index in range(3)]
+    two_calls, two_calls_row = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    one_call, one_call_row = _stage_fixture(
+        tq_client, "single_call", rollout_id=rollout_ids[1]
+    )
+
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [two_calls, one_call, None],  # third rollout lost its receipt -> placeholder
+        [1.0, 0.5, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+
+    assert finalized.meta is not None
+    tags = finalized.meta.tags
+    prompt_lengths = [tag[PROMPT_LENGTH_TAG] for tag in tags]
+    assert prompt_lengths == [two_calls_row.prompt_len, one_call_row.prompt_len, 0]
+    # Each hash covers the prompt tokens of the row as published.
+    input_ids = _fetch_rows(tq_client, rollout_ids)["input_ids"]
+    for index, tag in enumerate(tags):
+        published = torch.as_tensor(input_ids[index]).flatten().tolist()
+        assert tag[PROMPT_HASH_TAG] == prompt_hash(published[: prompt_lengths[index]])
+    # Both verified rows start with the same prompt, so their hashes match.
+    assert tags[0][PROMPT_HASH_TAG] == tags[1][PROMPT_HASH_TAG]
+    # The prompt metadata travels as tags only: the partition gains no column.
+    assert not [name for name in finalized.meta.fields if "shared_prefix" in name]
+
+
+def test_finalize_group_does_not_share_a_prompt_that_carries_loss(
+    tq_client, partitions, monkeypatch
+):
+    """A row whose prompt covers a generated token gets prompt length 0."""
+    group_id = "grp_prompt_loss"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    staged = [
+        _stage_fixture(tq_client, "single_call", rollout_id=rollout_id)
+        for rollout_id in rollout_ids
+    ]
+    finalizer = _finalizer(tq_client)
+    finalize_rollout = finalizer.finalize_rollout
+
+    def finalize_with_long_prompt(rollout_id, receipt, **kwargs):
+        row = finalize_rollout(rollout_id, receipt, **kwargs)
+        if rollout_id == rollout_ids[1]:
+            row = replace(row, prompt_len=row.prompt_len + 1)
+        return row
+
+    monkeypatch.setattr(finalizer, "finalize_rollout", finalize_with_long_prompt)
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt for receipt, _ in staged],
+        [1.0, 0.0],
+        mask_sample=[False] * 2,
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+
+    assert finalized.meta is not None
+    assert finalized.valid_row_count == 2
+    tags = finalized.meta.tags
+    assert [tag[PROMPT_LENGTH_TAG] for tag in tags] == [staged[0][1].prompt_len, 0]
+    assert tags[1][PROMPT_HASH_TAG] == prompt_hash([])
+
+
+def test_finalize_group_stamps_agent_and_prompt_tags_together(tq_client, partitions):
+    """With grpo.agent_overrides, a row carries the agent tag and both prompt tags.
+
+    The driver plans one tree from the prompt tags, and each row keeps its agent tag.
+    """
+    agent = "rubric_judge_agent"
+    group_id = "grp_agent_and_prompt_tags"
+    rollout_ids = [f"{group_id}_g{index}" for index in range(3)]
+    receipts = []
+    rows = []
+    for rollout_id in rollout_ids:
+        receipt, row = _stage_fixture(
+            tq_client, "worked_example", rollout_id=rollout_id
+        )
+        receipt["capture_key"] = rollout_id
+        receipts.append(receipt)
+        rows.append(row)
+    finalized = _finalizer(tq_client, stamp_agent_names=True).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0, 1.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=9,
+        prompt_idx=3,
+        reward_log_contexts=[RewardLogContext(agent, None)] * 3,
+    )
+
+    meta = finalized.meta
+    assert meta is not None
+    assert [tag[AGENT_NAME_TAG] for tag in meta.tags] == [agent] * 3
+    assert [tag[PROMPT_LENGTH_TAG] for tag in meta.tags] == [
+        row.prompt_len for row in rows
+    ]
+    assert len({tag[PROMPT_HASH_TAG] for tag in meta.tags}) == 1
+
+    (shard,) = shard_meta_for_dp(
+        meta,
+        dp_world=1,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "sequence_length_pad_multiple": 1,
+            "max_tokens_per_microbatch": 256,
+            "share_prefixes": True,
+            "bound_by_full_length": False,
+        },
+    )
+    assert sorted(shard.sample_ids) == sorted(meta.sample_ids)
+    assert list(shard.extra_info[SHARED_PREFIX_TREE_IDS]) == [0, 0, 0]
+    assert [tag[AGENT_NAME_TAG] for tag in shard.tags] == [agent] * 3
 
 
 # ---------------------------------------------------------------------------

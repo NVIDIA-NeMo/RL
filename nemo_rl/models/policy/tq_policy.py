@@ -66,6 +66,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.shared_prefix import bound_by_full_length
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
@@ -197,6 +198,23 @@ class TQPolicy(TQDriverMixin, Policy):
                 "setup_data_plane", cfg=dp_cfg
             )
         )
+
+    def _packing_args(
+        self,
+        mb_tokens_key: str,
+    ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+        """Add the ``share_prefixes`` choice to the stage's sequence-packing arguments.
+
+        ``shard_meta_for_dp`` reads the two added keys to plan forwards that run a
+        shared prompt once.
+        """
+        spa, dba = super()._packing_args(mb_tokens_key)
+        if spa is not None and self.cfg["sequence_packing"].get("share_prefixes"):
+            spa["share_prefixes"] = True
+            spa["bound_by_full_length"] = bound_by_full_length(
+                self.cfg, budget_key=mb_tokens_key
+            )
+        return spa, dba
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -461,7 +479,7 @@ class TQPolicy(TQDriverMixin, Policy):
             want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
+            metas = shard_meta_for_dp(
                 lp_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
@@ -579,7 +597,7 @@ class TQPolicy(TQDriverMixin, Policy):
             want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
-            dp_metas, _ = shard_meta_for_dp(
+            dp_metas = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=batch_size,
@@ -732,7 +750,7 @@ class TQPolicy(TQDriverMixin, Policy):
             want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
-            dp_metas, _ = shard_meta_for_dp(
+            dp_metas = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,

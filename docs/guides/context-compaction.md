@@ -171,6 +171,8 @@ Captured-rollout length metrics are emitted after tensor verification, with one 
 
 The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, PPO with GAE, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
 
+Forest training works with shared-prefix execution (`policy.sequence_packing.share_prefixes`). The rows of a prompt group that start with the same prompt run that prompt once per forward. The rows of an invalid rollout and the execution-padding rows run as ordinary packed sequences. See [Forest training](../design-docs/shared-prefix-execution.md#forest-training).
+
 Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration of those older capture formats. Source normalization and token/media digest versions are unchanged by the summary representation.
 
 ## Validation

@@ -78,6 +78,12 @@ from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
 )
+from nemo_rl.data.packing.shared_prefix.row_metadata import (
+    PROMPT_LENGTH_TAG,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+    SHARED_PREFIX_TREE_IDS,
+)
+from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -828,6 +834,35 @@ class MegatronPolicyWorkerImpl(
         """Return the route layout from the initialized Megatron model config."""
         return router_replay_layout(self._get_model_config())
 
+    def _attach_or_repack_with_order(
+        self,
+        data: BatchedDataDict[Any],
+        meta: KVBatchMeta,
+    ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
+        """Attach the driver's packing plan and, when it shares prompts, two columns.
+
+        A tree is one prompt with its completions. The columns hold each row's
+        tree id and prompt length. They are tensors, so ``BatchedDataDict.slice``
+        keeps them with their rows.
+        """
+        data, row_order = super()._attach_or_repack_with_order(data, meta)
+        extra = meta.extra_info or {}
+        if SHARED_PREFIX_TREE_IDS not in extra:
+            return data, row_order
+        tree_ids = extra[SHARED_PREFIX_TREE_IDS]
+        prompt_lengths = [tags[PROMPT_LENGTH_TAG] for tags in meta.tags or ()]
+        if len(tree_ids) != data.size or len(prompt_lengths) != data.size:
+            raise ValueError(
+                "A shared-prefix plan needs one tree id and one prompt length per "
+                f"fetched row, got {len(tree_ids)} tree ids and "
+                f"{len(prompt_lengths)} prompt lengths for {data.size} rows."
+            )
+        data[SHARED_PREFIX_TREE_IDS] = torch.tensor(tree_ids, dtype=torch.long)
+        data[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor(
+            prompt_lengths, dtype=torch.long
+        )
+        return data, row_order
+
     def validate_forest_execution_padding(self) -> None:
         """Reject unqualified dummy-sensitive routers in the actual loaded model.
 
@@ -1217,6 +1252,19 @@ class MegatronPolicyWorkerImpl(
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        if self.cfg["sequence_packing"].get("share_prefixes"):
+            # Deferred: loads Megatron's shared-prefix modules, an optional dependency.
+            from nemo_rl.models.megatron.shared_prefix.setup import (
+                validate_shared_prefix_model,
+            )
+
+            validate_shared_prefix_model(
+                self.megatron_cfg.model,
+                policy_cfg=self.cfg,
+                mtp_enabled=self.mtp_enabled,
+                model_prepares_inputs=self.delegate_pack_to_model
+                or self.model_slices_context_parallel_inputs,
+            )
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.

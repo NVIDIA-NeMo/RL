@@ -123,7 +123,7 @@ class TQValue(TQDriverMixin, Value):
             include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
+            metas = shard_meta_for_dp(
                 value_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
@@ -178,7 +178,7 @@ class TQValue(TQDriverMixin, Value):
             include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
-            dp_metas, _ = shard_meta_for_dp(
+            dp_metas = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=batch_size,
@@ -238,7 +238,7 @@ class TQValue(TQDriverMixin, Value):
             include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
+            metas = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,

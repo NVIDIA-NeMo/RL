@@ -213,7 +213,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             out = p.train_microbatches_from_meta(meta)
@@ -242,7 +242,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta, train_fields=train_fields)
@@ -259,7 +259,7 @@ class TestTQPolicySplitFanout:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta)
@@ -358,7 +358,7 @@ class TestTQPolicyOPDFullColumn:
             patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
             patch(
                 "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
-                return_value=([meta, meta], None),
+                return_value=[meta, meta],
             ) as mock_shard,
         ):
             p.train_microbatches_from_meta(meta)

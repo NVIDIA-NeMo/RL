@@ -852,6 +852,16 @@ def setup(
             logger, checkpointer, grpo_save_state, master_config,
             teacher_worker_groups, alias_to_group_alias.
     """
+    sequence_packing_config = master_config.policy.get("sequence_packing")
+    if sequence_packing_config is not None and sequence_packing_config.get(
+        "share_prefixes"
+    ):
+        raise ValueError(
+            "policy.sequence_packing.share_prefixes needs the single-controller GRPO "
+            "path with data_plane.enabled and token_capture.enabled; use "
+            "examples/run_grpo_single_controller.py or set it to false."
+        )
+
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
 

@@ -134,6 +134,21 @@ def pytest_collection_modifyitems(config, items):
                 "Cannot run mcore tests: megatron.core is not available.\n"
                 "Please run tests with: uv run --extra mcore --group test pytest ..."
             )
+        # The Megatron lanes set this: a Megatron-LM without the shared-prefix modules
+        # fails the lane with one message, and the GPU oracle fails instead of skipping.
+        if os.environ.get("NRL_REQUIRE_SHARED_PREFIX_TESTS") == "1":
+            try:
+                import megatron.core.datasets.shared_prefix  # noqa: F401
+                from megatron.core.models.hybrid.shared_prefix import (  # noqa: F401
+                    validate_shared_prefix_config,
+                )
+            except ImportError as error:
+                raise ImportError(
+                    "NRL_REQUIRE_SHARED_PREFIX_TESTS=1 but the installed Megatron-LM "
+                    "lacks megatron.core.datasets.shared_prefix or "
+                    "megatron.core.models.hybrid.shared_prefix."
+                    "validate_shared_prefix_config."
+                ) from error
         # Include only mcore tests
         new_items = [item for item in new_items if item.get_closest_marker("mcore")]
     else:
