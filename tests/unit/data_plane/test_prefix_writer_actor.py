@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU coverage of prefix transport, durability barriers and cleanup routing."""
+"""CPU coverage of the cut-row transport, durability barriers and cleanup routing."""
 
 import asyncio
 import threading
@@ -26,14 +26,18 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.generation_cut_rows import GenerationCutRow
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 from nemo_rl.data_plane.prefix_writer_actor import (
     PrefixWriterActor,
     PrefixWriterDiedError,
+    PrefixWriterPool,
     PrefixWriterService,
     RayPrefixWriterClient,
     create_prefix_writer,
+    create_prefix_writer_pool,
     from_bytes,
+    split_generation_cut_rows,
     to_bytes,
 )
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink
@@ -68,15 +72,45 @@ def _fields() -> TensorDict:
     )
 
 
-def _put(**update: Any) -> dict[str, Any]:
-    """Keyword arguments of one service ``put_samples`` call."""
-    return {
-        "sample_ids": ["__generation_cut__/s/a/c/0", "__generation_cut__/s/b/d/0"],
-        "partition_id": "staging",
-        "columns": {name: to_bytes(tensor) for name, tensor in _fields().items()},
-        "tags": [{"a": 1}, {"b": 2}],
-        **update,
-    }
+def _rows() -> list[GenerationCutRow]:
+    """Two text calls' first cut rows."""
+    from nemo_gym.token_id_capture.staging.capture import ActiveCall
+    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+    rows = []
+    for index, generated in enumerate(([20, 21], [30, 31, 32])):
+        admission = CaptureAdmission(
+            capture_key=f"rollout-{index}:0", model_call_id=f"call-{index}", mode="text"
+        )
+        logprobs = [-0.5] * len(generated)
+        rows.append(
+            GenerationCutRow(
+                call=ActiveCall(admission=admission, weight_version=1),
+                prompt_token_ids=[1, 2],
+                generated_token_ids=generated,
+                generated_logprobs=logprobs,
+                chunk_token_ids=generated,
+                chunk_logprobs=logprobs,
+                first_chunk=True,
+                chunk_sequence=0,
+            )
+        )
+    return rows
+
+
+def _in_process_writer(data: Any, monkeypatch: pytest.MonkeyPatch) -> PrefixWriterPool:
+    """A one-writer pool whose actor is a ``PrefixWriterService`` over ``data`` here."""
+    service = PrefixWriterService(data)
+    actor = SimpleNamespace(
+        configure_generation_cut_sink=SimpleNamespace(
+            remote=service.configure_generation_cut_sink
+        ),
+        stage_generation_cut_rows=SimpleNamespace(
+            remote=service.stage_generation_cut_rows
+        ),
+    )
+    monkeypatch.setattr("ray.get", lambda reference: reference)
+    return PrefixWriterPool([RayPrefixWriterClient(actor, writer_pid=99)])
 
 
 def test_byte_columns_round_trip_exactly() -> None:
@@ -98,19 +132,29 @@ def test_byte_columns_round_trip_exactly() -> None:
     assert torch.equal(restored.view(torch.int32), bits)
 
 
-def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
+def test_service_returns_only_after_tq_acknowledges_the_rows() -> None:
+    """The actor builds the same rows and digests the worker would, then waits for TQ."""
     entered, release = threading.Event(), threading.Event()
-    client = MagicMock()
 
     def put(**kwargs: object) -> None:
         entered.set()
         assert release.wait(5)
 
-    client.put_samples.side_effect = put
-    batch = _put()
+    client = SimpleNamespace(
+        put_samples=MagicMock(spec=lambda **kwargs: None, side_effect=put)
+    )
+    service = PrefixWriterService(client)
+    service.configure_generation_cut_sink(
+        staging_partition="staging", capture_media=False, media_pixel_dtype=None
+    )
+    rows = _rows()
     replies = []
     thread = threading.Thread(
-        target=lambda: replies.append(PrefixWriterService(client).put_samples(**batch))
+        target=lambda: replies.append(
+            service.stage_generation_cut_rows(
+                rows, checkpoint_id="cut", attachments=[None, None]
+            )
+        )
     )
     thread.start()
     try:
@@ -120,14 +164,28 @@ def test_service_ack_waits_for_tq_and_preserves_keys_and_tags() -> None:
         release.set()
         thread.join(5)
     assert not thread.is_alive()
-    assert replies == [None]
+    [staged] = replies
+    local = TQTokenSink(
+        SimpleNamespace(put_samples=MagicMock(spec=lambda **kwargs: None)),
+        staging_partition="staging",
+    )
+    assert staged == local.stage_generation_cut_rows(rows, checkpoint_id="cut")
     call = client.put_samples.call_args.kwargs
-    assert call["sample_ids"] == batch["sample_ids"]
-    assert call["tags"] == batch["tags"]
+    assert call["sample_ids"] == [row.staging_key for row in staged]
+    assert call["partition_id"] == "staging"
+
+
+def test_service_refuses_rows_before_its_sink_is_configured() -> None:
+    with pytest.raises(RuntimeError, match="not configured"):
+        PrefixWriterService(MagicMock()).stage_generation_cut_rows(
+            _rows(), checkpoint_id="cut", attachments=[None, None]
+        )
 
 
 def test_client_refuses_a_closed_writer(monkeypatch: pytest.MonkeyPatch) -> None:
-    actor = SimpleNamespace(put_samples=SimpleNamespace(remote=MagicMock()))
+    actor = SimpleNamespace(
+        stage_generation_cut_rows=SimpleNamespace(remote=MagicMock())
+    )
     client = RayPrefixWriterClient(actor, writer_pid=99)
     kill = MagicMock()
     monkeypatch.setattr("ray.kill", kill)
@@ -135,36 +193,40 @@ def test_client_refuses_a_closed_writer(monkeypatch: pytest.MonkeyPatch) -> None
     client.close()
     kill.assert_called_once_with(actor, no_restart=True)
     with pytest.raises(RuntimeError, match="closed"):
-        client.put_samples(
-            sample_ids=["anything"], partition_id="staging", fields=_fields(), tags=[]
+        PrefixWriterPool([client]).stage_generation_cut_rows(
+            _rows(), checkpoint_id="cut"
         )
+    actor.stage_generation_cut_rows.remote.assert_not_called()
 
 
-def test_client_orders_failed_write_cleanup(
+def test_client_sends_attachments_as_byte_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = MagicMock()
-    service = PrefixWriterService(data)
-    actor = SimpleNamespace(
-        put_samples=SimpleNamespace(remote=service.put_samples),
-        clear_samples=SimpleNamespace(remote=service.clear_samples),
-    )
-    monkeypatch.setattr("ray.get", lambda result: result)
+    """Rows cross without their tensors; the tensors cross as NumPy buffers."""
+    sent = {}
+
+    def stage(rows: Any, *, checkpoint_id: str, attachments: Any) -> list[Any]:
+        sent.update(rows=rows, attachments=attachments)
+        return []
+
+    actor = SimpleNamespace(stage_generation_cut_rows=SimpleNamespace(remote=stage))
+    monkeypatch.setattr("ray.get", lambda reference: reference)
     client = RayPrefixWriterClient(actor, writer_pid=99)
-    batch = _put()
-    client.put_samples(
-        sample_ids=batch["sample_ids"],
-        partition_id="staging",
-        fields=_fields(),
-        tags=batch["tags"],
+    routes = torch.arange(12, dtype=torch.int16).reshape(2, 3, 2)
+    first, second = _rows()
+    client.submit_generation_cut_rows(
+        [replace(first, attachments={"routes": routes}), second], checkpoint_id="cut"
     )
-    client.clear_samples(sample_ids=batch["sample_ids"], partition_id="staging")
-    assert data.method_calls[0][0] == "put_samples"
-    assert data.method_calls[1][0] == "clear_samples"
+    assert [row.attachments for row in sent["rows"]] == [None, None]
+    columns, none = sent["attachments"]
+    assert none is None
+    assert torch.equal(from_bytes(*columns["routes"]), routes)
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_native_cut_uses_prefix_client_and_terminal_remains_local(fail: bool) -> None:
+def test_native_cut_uses_prefix_client_and_terminal_remains_local(
+    fail: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     recovery, memory, _, inventory = _batch_worker_fixture([2, 3], batch_size=2)
 
     def client() -> SimpleNamespace:
@@ -175,7 +237,7 @@ def test_native_cut_uses_prefix_client_and_terminal_remains_local(fail: bool) ->
 
     local, prefix = client(), client()
     sink = TQTokenSink(local, staging_partition="staging")
-    sink.set_prefix_writer(prefix)
+    sink.set_prefix_writer(_in_process_writer(prefix, monkeypatch))
     recovery = PrefixRecovery(replace(recovery._parts, sink=sink))
     if fail:
         prefix.put_samples.side_effect = RuntimeError("injected failed PUT")
@@ -186,8 +248,11 @@ def test_native_cut_uses_prefix_client_and_terminal_remains_local(fail: bool) ->
         prefix.put_samples.assert_called()
         local.put_samples.assert_not_called()
         if fail:
+            # The writer's sink discards its failed PUT, and the worker's
+            # client clears the whole batch too, since other writers' shares
+            # may have landed.
             prefix.clear_samples.assert_called()
-            local.clear_samples.assert_not_called()
+            local.clear_samples.assert_called()
     finally:
         asyncio.run(recovery.aclose())
         recovery.shutdown()
@@ -206,8 +271,8 @@ def test_client_marks_a_dead_writer_and_stops_calling_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actor = SimpleNamespace(
-        put_samples=SimpleNamespace(remote=MagicMock()),
-        clear_samples=SimpleNamespace(remote=MagicMock()),
+        configure_generation_cut_sink=SimpleNamespace(remote=MagicMock()),
+        stage_generation_cut_rows=SimpleNamespace(remote=MagicMock()),
         get_data_plane_snapshot=SimpleNamespace(remote=MagicMock()),
     )
     client = RayPrefixWriterClient(actor, writer_pid=99)
@@ -216,27 +281,22 @@ def test_client_marks_a_dead_writer_and_stops_calling_it(
         raise ray.exceptions.RayActorError()
 
     monkeypatch.setattr("ray.get", actor_died)
-    batch = _put()
     with pytest.raises(PrefixWriterDiedError, match="pid 99"):
-        client.put_samples(
-            sample_ids=batch["sample_ids"],
-            partition_id="staging",
-            fields=_fields(),
-            tags=batch["tags"],
+        PrefixWriterPool([client]).stage_generation_cut_rows(
+            _rows(), checkpoint_id="cut"
         )
-    actor.put_samples.remote.reset_mock()
+    actor.stage_generation_cut_rows.remote.reset_mock()
     with pytest.raises(PrefixWriterDiedError):
-        client.put_samples(
-            sample_ids=batch["sample_ids"],
-            partition_id="staging",
-            fields=_fields(),
-            tags=batch["tags"],
+        PrefixWriterPool([client]).stage_generation_cut_rows(
+            _rows(), checkpoint_id="cut"
         )
     with pytest.raises(PrefixWriterDiedError):
-        client.clear_samples(sample_ids=batch["sample_ids"], partition_id="staging")
+        client.configure_generation_cut_sink(
+            staging_partition="staging", capture_media=False, media_pixel_dtype=None
+        )
     assert asyncio.run(client.get_data_plane_snapshot()) is None
-    actor.put_samples.remote.assert_not_called()
-    actor.clear_samples.remote.assert_not_called()
+    actor.stage_generation_cut_rows.remote.assert_not_called()
+    actor.configure_generation_cut_sink.remote.assert_not_called()
     actor.get_data_plane_snapshot.remote.assert_not_called()
 
 
@@ -248,13 +308,9 @@ def test_dead_writer_fails_the_whole_cut_and_discards_locally() -> None:
         clear_samples=MagicMock(spec=lambda **kwargs: None),
     )
     writer = SimpleNamespace(
-        put_samples=MagicMock(
-            spec=lambda **kwargs: None,
-            side_effect=PrefixWriterDiedError("writer died"),
-        ),
-        clear_samples=MagicMock(
-            spec=lambda **kwargs: None,
-            side_effect=PrefixWriterDiedError("writer died"),
+        configure_generation_cut_sink=MagicMock(),
+        stage_generation_cut_rows=MagicMock(
+            side_effect=PrefixWriterDiedError("writer died")
         ),
     )
     sink = TQTokenSink(local, staging_partition="staging")
@@ -263,11 +319,10 @@ def test_dead_writer_fails_the_whole_cut_and_discards_locally() -> None:
     try:
         with pytest.raises(PrefixWriterDiedError, match="writer died"):
             asyncio.run(recovery.run_cut(inventory))
-        writer.put_samples.assert_called()
+        writer.stage_generation_cut_rows.assert_called()
         local.put_samples.assert_not_called()
         # The partial write is discarded through the local client.
         local.clear_samples.assert_called()
-        writer.clear_samples.assert_not_called()
         for state, generated in zip(states, [2, 3], strict=True):
             _assert_rolled_back(state, generated)
     finally:
@@ -352,13 +407,18 @@ def test_worker_setup_installs_only_prefix_transport(
         renderer=SimpleNamespace(get_tokenizer=lambda: object())
     )
     client = SimpleNamespace()
-    writer = SimpleNamespace(snapshot=lambda: {}, close=MagicMock())
+    writer = SimpleNamespace(
+        snapshot=lambda: {},
+        close=MagicMock(),
+        configure_generation_cut_sink=MagicMock(),
+    )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *args, **kwargs: client
     )
     create = AsyncMock(return_value=writer)
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.create_prefix_writer", create
+        "nemo_rl.models.generation.vllm.vllm_worker_async.create_prefix_writer_pool",
+        create,
     )
     try:
         asyncio.run(
@@ -369,16 +429,23 @@ def test_worker_setup_installs_only_prefix_transport(
                 generation_cut_control_token="secret",
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4096,
+                prefix_writers=1,
                 prefix_read_max_rows=1,
             )
         )
         if writer_enabled:
             assert worker._prefix_writer is writer
-            assert worker._capture_sink._prefix_store._dp_client is writer
+            assert worker._capture_sink._prefix_writer is writer
+            assert (
+                writer.configure_generation_cut_sink.call_args.kwargs[
+                    "staging_partition"
+                ]
+                == "staging"
+            )
             create.assert_awaited_once()
         else:
             assert worker._prefix_writer is None
-            assert worker._capture_sink._prefix_store is None
+            assert worker._capture_sink._prefix_writer is None
             create.assert_not_awaited()
         assert worker._prefix_recovery._pipeline is not None
         assert worker._capture_sink._store._dp_client is client
@@ -392,6 +459,7 @@ def test_worker_setup_installs_only_prefix_transport(
                         generation_cut_control_token="secret",
                         prefix_write_max_rows=256,
                         prefix_write_max_tokens=4096,
+                        prefix_writers=1,
                         prefix_read_max_rows=1,
                     )
                 )
@@ -416,7 +484,7 @@ def test_worker_setup_stops_the_pipeline_when_the_writer_fails_to_start(
         lambda *args, **kwargs: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.create_prefix_writer",
+        "nemo_rl.models.generation.vllm.vllm_worker_async.create_prefix_writer_pool",
         AsyncMock(side_effect=RuntimeError("writer startup failed")),
     )
     with pytest.raises(RuntimeError, match="writer startup failed"):
@@ -428,6 +496,7 @@ def test_worker_setup_stops_the_pipeline_when_the_writer_fails_to_start(
                 generation_cut_control_token="secret",
                 prefix_write_max_rows=256,
                 prefix_write_max_tokens=4096,
+                prefix_writers=1,
                 prefix_read_max_rows=1,
             )
         )
@@ -448,7 +517,9 @@ def test_close_unblocks_pending_call_without_ack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, stopped = threading.Event(), threading.Event()
-    actor = SimpleNamespace(put_samples=SimpleNamespace(remote=MagicMock()))
+    actor = SimpleNamespace(
+        stage_generation_cut_rows=SimpleNamespace(remote=MagicMock())
+    )
     client = RayPrefixWriterClient(actor, writer_pid=99)
 
     def get(reference: object) -> object:
@@ -462,11 +533,8 @@ def test_close_unblocks_pending_call_without_ack(
 
     def put() -> None:
         try:
-            client.put_samples(
-                sample_ids=_put()["sample_ids"],
-                partition_id="staging",
-                fields=_fields(),
-                tags=[{}, {}],
+            PrefixWriterPool([client]).stage_generation_cut_rows(
+                _rows(), checkpoint_id="cut"
             )
         except RuntimeError as error:
             errors.append(str(error))
@@ -505,19 +573,20 @@ def test_writer_reports_only_a_metrics_client_snapshot() -> None:
 
 
 def test_worker_reports_the_writer_snapshot_beside_its_own() -> None:
-    """Prefix PUTs run on the writer actor's client, so its counters must be reported."""
+    """Prefix PUTs run on the writer actors' clients, so their counters must be reported."""
     worker = _fake_worker()
     worker._capture_dp_client = MagicMock(spec=MetricsDataPlaneClient)
     worker._capture_dp_client.snapshot.return_value = {"n_ops": 1}
     worker._api_server_pool = None
 
-    async def writer_snapshot() -> dict[str, int]:
-        return {"n_ops": 2}
+    async def writer_snapshots() -> list[dict[str, int]]:
+        return [{"n_ops": 2}, {"n_ops": 3}]
 
-    worker._prefix_writer = SimpleNamespace(get_data_plane_snapshot=writer_snapshot)
+    worker._prefix_writer = SimpleNamespace(get_data_plane_snapshots=writer_snapshots)
     assert asyncio.run(worker.get_data_plane_snapshots()) == [
         {"n_ops": 1},
         {"n_ops": 2},
+        {"n_ops": 3},
     ]
 
 
@@ -536,3 +605,107 @@ def test_worker_shutdown_closes_writer_once(monkeypatch: pytest.MonkeyPatch) -> 
     assert asyncio.run(worker.shutdown())
     assert worker._prefix_writer is None
     writer.close.assert_called_once()
+
+
+def _sized_rows(sizes: list[int]) -> list[GenerationCutRow]:
+    """Rows whose prompts hold ``sizes`` tokens, each with two generated tokens."""
+    template = _rows()[0]
+    return [
+        replace(template, prompt_token_ids=[1] * size, chunk_sequence=index)
+        for index, size in enumerate(sizes)
+    ]
+
+
+def test_split_balances_build_cost_and_keeps_row_order() -> None:
+    rows = _sized_rows([10, 100, 30, 40, 70])
+    assert split_generation_cut_rows(rows, 2) == [[1, 2], [0, 3, 4]]
+    assert split_generation_cut_rows(rows, 1) == [[0, 1, 2, 3, 4]]
+    # More writers than rows: the extra ones get nothing.
+    assert split_generation_cut_rows(rows[:1], 3) == [[0], [], []]
+
+
+def _recording_writer(
+    name: str, events: list[str], *, fails: Exception | None = None
+) -> SimpleNamespace:
+    """A writer that answers its share with ``<name>/<chunk_sequence>`` per row."""
+
+    def submit(rows: list[GenerationCutRow], *, checkpoint_id: str) -> Any:
+        events.append(f"submit {name}")
+        return rows
+
+    def result(rows: list[GenerationCutRow]) -> list[Any]:
+        events.append(f"result {name}")
+        if fails is not None:
+            raise fails
+        return [f"{name}/{row.chunk_sequence}" for row in rows]
+
+    return SimpleNamespace(submit_generation_cut_rows=submit, result=result)
+
+
+def test_pool_starts_every_share_before_waiting_and_returns_rows_in_order() -> None:
+    events: list[str] = []
+    pool = PrefixWriterPool(
+        [_recording_writer("a", events), _recording_writer("b", events)]
+    )
+    staged = pool.stage_generation_cut_rows(
+        _sized_rows([10, 100, 30, 40, 70]), checkpoint_id="cut"
+    )
+    assert events == ["submit a", "submit b", "result a", "result b"]
+    assert staged == ["b/0", "a/1", "a/2", "b/3", "b/4"]
+
+
+@pytest.mark.parametrize("dead", [False, True], ids=["failed", "dead"])
+def test_pool_waits_for_every_share_before_raising(dead: bool) -> None:
+    events: list[str] = []
+    pool = PrefixWriterPool(
+        [
+            _recording_writer("a", events, fails=ValueError("bad row")),
+            _recording_writer(
+                "b", events, fails=PrefixWriterDiedError("gone") if dead else None
+            ),
+        ]
+    )
+    with pytest.raises(PrefixWriterDiedError if dead else ValueError):
+        pool.stage_generation_cut_rows(_sized_rows([10, 20]), checkpoint_id="cut")
+    # Neither share is still writing when the caller discards the batch.
+    assert events == ["submit a", "submit b", "result a", "result b"]
+
+
+def test_failed_pool_batch_is_discarded_through_the_local_client() -> None:
+    """A share that landed is cleared when another share of its batch fails."""
+    local = SimpleNamespace(
+        put_samples=MagicMock(spec=lambda **kwargs: None),
+        clear_samples=MagicMock(spec=lambda **kwargs: None),
+    )
+    events: list[str] = []
+    sink = TQTokenSink(local, staging_partition="staging")
+    sink._prefix_writer = PrefixWriterPool(
+        [
+            _recording_writer("a", events),
+            _recording_writer("b", events, fails=ValueError("bad row")),
+        ]
+    )
+    with pytest.raises(ValueError, match="bad row"):
+        sink.stage_generation_cut_rows(_sized_rows([10, 20]), checkpoint_id="cut")
+    assert len(local.clear_samples.call_args.kwargs["sample_ids"]) == 2
+
+
+def test_pool_factory_closes_the_writers_it_made_when_one_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = [MagicMock(spec=RayPrefixWriterClient) for _ in range(2)]
+    outcomes = iter([made[0], RuntimeError("no CPU"), made[1]])
+
+    async def create(config: Any) -> Any:
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.prefix_writer_actor.create_prefix_writer", create
+    )
+    with pytest.raises(RuntimeError, match="no CPU"):
+        asyncio.run(create_prefix_writer_pool({"impl": "transfer_queue"}, count=3))
+    for writer in made:
+        writer.close.assert_called_once_with()

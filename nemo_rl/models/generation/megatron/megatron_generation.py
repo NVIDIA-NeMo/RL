@@ -704,6 +704,7 @@ class MegatronGeneration(GenerationInterface):
         generation_cut_control_timeout_s: float | None = None,
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
+        prefix_writers: int,
         prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.

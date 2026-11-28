@@ -70,6 +70,9 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MediaColumnSpec,
     media_tensor_digests,
 )
+from nemo_rl.data_plane.generation_cut_rows import (  # noqa: E402
+    stage_generation_cut_rows,
+)
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_FIELD,
@@ -138,6 +141,7 @@ pytestmark = pytest.mark.nemo_gym
 _PREFIX_BATCH_LIMITS = {
     "prefix_write_max_rows": 256,
     "prefix_write_max_tokens": 4_194_304,
+    "prefix_writers": 1,
     "prefix_read_max_rows": 256,
 }
 
@@ -206,6 +210,9 @@ class _MemorySink:
             self.clear(written)
             raise
         return written
+
+    def stage_generation_cut_rows(self, rows, *, checkpoint_id):
+        return stage_generation_cut_rows(self, rows, checkpoint_id=checkpoint_id)
 
     def clear(self, staging_keys: list[str]) -> None:
         self.cleared_generation_prefix_keys.extend(staging_keys)
@@ -423,6 +430,7 @@ def test_owner_sends_child_frontends_every_capture_setting(monkeypatch):
         "generation_cut_control_timeout_s": 7.0,
         "prefix_write_max_rows": 11,
         "prefix_write_max_tokens": 13,
+        "prefix_writers": 19,
         "prefix_read_max_rows": 17,
     }
 
@@ -2072,7 +2080,9 @@ def _record_cut_constraints(state, sampling_params) -> None:
             prefix_row_extras=lambda state: None,
             router_replay=False,
             sampler_top_k=0,
-            **_PREFIX_BATCH_LIMITS,
+            prefix_write_max_rows=256,
+            prefix_write_max_tokens=4_194_304,
+            prefix_read_max_rows=256,
             write_limits=PREFIX_WRITE_LIMITS,
         )
     ).on_sampling_params(object(), sampling_params)
@@ -4909,7 +4919,11 @@ def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
     recovery, sink, states, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
     clock = {"now": 0.0}
     # The cut and the write pipeline both compare the deadline to this clock.
-    fake_time = SimpleNamespace(monotonic=lambda: clock["now"])
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock["now"],
+        perf_counter_ns=time.perf_counter_ns,
+        thread_time_ns=time.thread_time_ns,
+    )
     monkeypatch.setattr(recovery_module, "time", fake_time)
     monkeypatch.setattr(write_pipeline, "time", fake_time)
 

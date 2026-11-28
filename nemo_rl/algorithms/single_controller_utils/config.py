@@ -842,6 +842,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     prefix_write_max_rows: Annotated[int, Field(gt=0)] = 256
     # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
     prefix_write_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
+    # Writer actors per generation owner that build and write a cut's rows in
+    # parallel, each needing one free CPU on its generation node. Only with
+    # target_level: prefix on a TransferQueue data plane, where the rows are
+    # built in writer actors rather than in the generation worker.
+    prefix_writers: Annotated[int, Field(gt=0)] = 1
     # Rows per TQ read at restore. 1 = each restore reads on its own.
     prefix_read_max_rows: Annotated[int, Field(gt=0)] = 256
 

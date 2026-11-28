@@ -1568,6 +1568,16 @@ def setup_single_controller(
             "token_capture.defer_routed_experts_to_policy requires "
             "policy.router_replay.enabled=true"
         )
+    if master_config.rollout_recovery.prefix_writers > 1 and not (
+        generation_prefix_cuts_enabled
+        and dp_config is not None
+        and dp_config["impl"] == "transfer_queue"
+    ):
+        raise ValueError(
+            "rollout_recovery.prefix_writers > 1 applies only to "
+            "rollout_recovery.target_level='prefix' with "
+            "data_plane.impl='transfer_queue'; elsewhere no writer actor runs"
+        )
     if snapshots_enabled:
         if not master_config.checkpointing.enabled:
             raise ValueError(
@@ -2574,6 +2584,7 @@ def setup_single_controller(
             prefix_write_max_tokens=(
                 master_config.rollout_recovery.prefix_write_max_tokens
             ),
+            prefix_writers=master_config.rollout_recovery.prefix_writers,
             prefix_read_max_rows=master_config.rollout_recovery.prefix_read_max_rows,
         )
         if capture_media and media_columns is None:

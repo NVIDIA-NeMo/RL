@@ -86,8 +86,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # and a resumed row trains with it. Score centering needs token-level IS on full
 # logits, so this turns off the config's GSPO and the fused linear logprobs.
 # Two HTTP frontends: the restored calls include one that the frontend Gym's
-# cut reached had to ask the other frontend to cut.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.vllm_cfg.http_api_server_count=2 ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4 ++loss_fn.force_on_policy_ratio=false loss_fn.sequence_level_importance_ratios=false loss_fn.normalization=global_token_mean loss_fn.reference_policy_kl_penalty=0 grpo.skip_reference_policy_logprobs_calculation=true policy.sequence_packing.enabled=false ++policy.megatron_cfg.use_fused_linear_logprobs=false policy.logprob_chunk_size=128
+# cut reached had to ask the other frontend to cut. Two writer actors per
+# frontend split each cut write between them.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh ++policy.generation.vllm_cfg.http_api_server_count=2 ++rollout_recovery.prefix_writers=2 ++policy.generation.top_logprobs=4 ++loss_fn.score_centering=true ++policy.generation.sampler_replay.enabled=true ++policy.generation.top_k=4 ++loss_fn.force_on_policy_ratio=false loss_fn.sequence_level_importance_ratios=false loss_fn.normalization=global_token_mean loss_fn.reference_policy_kl_penalty=0 grpo.skip_reference_policy_logprobs_calculation=true policy.sequence_packing.enabled=false ++policy.megatron_cfg.use_fused_linear_logprobs=false policy.logprob_chunk_size=128
 # The same active-decode recovery with MoE router replay, on a tiny random MoE:
 # each restored call must stage the routes it restored for training.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh

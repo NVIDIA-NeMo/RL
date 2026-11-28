@@ -62,7 +62,12 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
-from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
+from nemo_rl.data_plane.generation_cut_rows import (
+    GenerationCutRow,
+    StagedGenerationCut,
+    stage_generation_cut_rows,
+)
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterPool
 from nemo_rl.data_plane.schema import (
     CAPTURE_CODE_TO_MODE,
     CAPTURE_MODE_TO_CODE,
@@ -505,24 +510,28 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
-        self._prefix_store: TQStagingStore | None = None
+        self._prefix_writer: PrefixWriterPool | None = None
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
 
-    def set_prefix_writer(self, dp_client: Any) -> None:
-        """Route prefix PUTs and failed-prefix cleanup through a separate client.
+    def set_prefix_writer(self, writer: PrefixWriterPool) -> None:
+        """Build and write generation-cut rows in the prefix writer actors.
 
-        Install once, before accepting cuts. Terminal writes, restore reads,
-        and ordinary cleanup retain their original client.
+        Install once, before accepting cuts. Each actor gets its own sink with
+        this one's partition and media settings. Terminal writes, restore
+        reads, and cleanup keep this sink's client.
         """
-        if self._prefix_store is not None:
+        if self._prefix_writer is not None:
             raise RuntimeError("A prefix writer is already installed")
-        self._prefix_store = TQStagingStore(
-            dp_client, staging_partition=self._store._staging_partition
+        writer.configure_generation_cut_sink(
+            staging_partition=self._store._staging_partition,
+            capture_media=self._capture_media,
+            media_pixel_dtype=self._media_pixel_dtype,
         )
+        self._prefix_writer = writer
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -765,6 +774,38 @@ class TQTokenSink:
         }
         return field_dict, tags
 
+    def stage_generation_cut_rows(
+        self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
+    ) -> list[StagedGenerationCut]:
+        """Build and write one batch of generation-cut rows, in the writer actors if any.
+
+        Raises:
+            PrefixWriterDiedError: a writer actor is gone.
+            Exception: the batch failed. Either way this sink has discarded
+                whatever the batch may have written.
+        """
+        if self._prefix_writer is None:
+            return stage_generation_cut_rows(self, rows, checkpoint_id=checkpoint_id)
+        try:
+            return self._prefix_writer.stage_generation_cut_rows(
+                rows, checkpoint_id=checkpoint_id
+            )
+        except Exception:
+            # Other writers' shares may have landed, and a dead writer cannot
+            # discard its own partial write; this client clears them all.
+            self._discard_failed_writes(
+                [
+                    generation_cut_staging_key(
+                        checkpoint_id,
+                        row.call.admission.capture_key,
+                        row.call.admission.model_call_id,
+                        chunk_sequence=row.chunk_sequence,
+                    )
+                    for row in rows
+                ]
+            )
+            raise
+
     def stage_generation_prefix_batch(
         self,
         records: Sequence[StagedCallRecord],
@@ -793,20 +834,14 @@ class TQTokenSink:
             )
             for record, sequence in zip(records, chunk_sequences, strict=True)
         ]
-        store = self._store if self._prefix_store is None else self._prefix_store
         encoded = self._encode_prefix_batch(records, attachments)
         try:
             for indices, fields, tags in encoded:
-                store.put_many([keys[index] for index in indices], fields, tags=tags)
-        except Exception as error:
-            # A dead writer cannot discard its own partial write; the local
-            # client can.
-            self._discard_failed_writes(
-                keys,
-                store=self._store
-                if isinstance(error, PrefixWriterDiedError)
-                else store,
-            )
+                self._store.put_many(
+                    [keys[index] for index in indices], fields, tags=tags
+                )
+        except Exception:
+            self._discard_failed_writes(keys)
             raise
         return keys
 
@@ -847,9 +882,7 @@ class TQTokenSink:
             )
         ]
 
-    def _discard_failed_writes(
-        self, keys: Sequence[str], *, store: TQStagingStore | None = None
-    ) -> None:
+    def _discard_failed_writes(self, keys: Sequence[str]) -> None:
         """Reclaim whatever a failed combined write may have left behind.
 
         TQ writes a row field by field and only then publishes readiness, so
@@ -861,7 +894,7 @@ class TQTokenSink:
         logged at ERROR for the operator; the call is still reported failed.
         """
         try:
-            (self._store if store is None else store).clear(list(keys))
+            self._store.clear(list(keys))
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure
             logging.getLogger(__name__).error(
                 "TQTokenSink could not discard %d failed writes: %s: %s; "

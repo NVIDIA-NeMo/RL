@@ -299,6 +299,10 @@ rollout_recovery:
   prefix_write_max_rows: 256
   # Tokens per TQ write at a checkpoint cut; a larger row is written alone.
   prefix_write_max_tokens: 4194304
+  # Writer actors per generation owner that build and write a cut's rows in
+  # parallel, each on one free CPU of its generation node. Values above 1 need
+  # target_level: prefix and data_plane.impl: transfer_queue.
+  prefix_writers: 1
   # Rows per TQ read at restore. 1 = each restore reads on its own.
   prefix_read_max_rows: 256
 

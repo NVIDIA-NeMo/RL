@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prefix-only TQ writes in an isolated, serial CPU Ray actor.
+"""Generation-cut rows built and written in an isolated, serial CPU Ray actor.
 
-Cut transactions and encoding stay in the generation worker. Owned numeric
-columns cross the actor boundary, and a caller receives its keys only after
-TQ acknowledges the write. Terminal writes use their original local client.
+Cut transactions stay in the generation worker. Each frozen call's inputs
+cross the actor boundary, its attachments as NumPy buffers; the actor builds
+Gym's records, encodes and writes them, and a caller receives the keys only
+after TQ acknowledges the write. Terminal writes use their original local client.
 """
 
 from __future__ import annotations
@@ -25,14 +26,19 @@ import logging
 import os
 import sys
 import threading
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from tensordict import TensorDict
 
+from nemo_rl.data_plane.generation_cut_rows import (
+    GenerationCutRow,
+    StagedGenerationCut,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.observability import is_metrics_client
 
@@ -80,30 +86,53 @@ def from_bytes(
 
 
 class PrefixWriterService:
-    """Execute one PUT or failed-write cleanup at a time in the writer actor."""
+    """Build and write one batch of generation-cut rows at a time in the writer actor."""
 
     def __init__(self, client: Any) -> None:
         self._client = client
+        self._sink: Any = None
 
-    def put_samples(
+    def configure_generation_cut_sink(
         self,
         *,
-        sample_ids: list[str],
-        partition_id: str,
-        columns: dict[str, tuple[Any, ...]],
-        tags: list[dict[str, Any]],
+        staging_partition: str,
+        capture_media: bool,
+        media_pixel_dtype: torch.dtype | None,
     ) -> None:
-        """Write one batch; returns once TQ acknowledges it."""
-        fields = TensorDict(
-            {name: from_bytes(*column) for name, column in columns.items()},
-            batch_size=[len(sample_ids)],
-        )
-        self._client.put_samples(
-            sample_ids=sample_ids, partition_id=partition_id, fields=fields, tags=tags
+        """Set up the sink cut rows are written with, matching the worker's."""
+        # Deferred: tq_token_sink imports this module.
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+
+        self._sink = TQTokenSink(
+            self._client,
+            staging_partition=staging_partition,
+            capture_media=capture_media,
+            media_pixel_dtype=media_pixel_dtype,
         )
 
-    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
-        self._client.clear_samples(sample_ids=sample_ids, partition_id=partition_id)
+    def stage_generation_cut_rows(
+        self,
+        rows: list[GenerationCutRow],
+        *,
+        checkpoint_id: str,
+        attachments: list[dict[str, tuple[Any, ...]] | None],
+    ) -> list[StagedGenerationCut]:
+        """Build and write one batch; returns once TQ acknowledges it.
+
+        ``attachments`` are the rows' attachments as ``to_bytes`` columns.
+        """
+        if self._sink is None:
+            raise RuntimeError("The generation-cut sink is not configured")
+        rows = [
+            replace(
+                row,
+                attachments=None
+                if columns is None
+                else {name: from_bytes(*column) for name, column in columns.items()},
+            )
+            for row, columns in zip(rows, attachments, strict=True)
+        ]
+        return self._sink.stage_generation_cut_rows(rows, checkpoint_id=checkpoint_id)
 
     def get_data_plane_snapshot(self) -> dict[str, Any] | None:
         if not is_metrics_client(self._client):
@@ -173,36 +202,43 @@ class RayPrefixWriterClient:
                 self._dead = True
             raise self._died_error() from error
 
-    def put_samples(
+    def configure_generation_cut_sink(
         self,
         *,
-        sample_ids: list[str],
-        partition_id: str,
-        fields: TensorDict,
-        tags: list[dict[str, Any]],
+        staging_partition: str,
+        capture_media: bool,
+        media_pixel_dtype: torch.dtype | None,
     ) -> None:
+        """Give the actor a sink with the worker sink's partition and media settings."""
         self._require_open()
-        columns = {}
-        for name, tensor in fields.items():
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError("Prefix writer requires flat tensor columns")
-            columns[name] = to_bytes(tensor)
         self._get(
-            self._actor.put_samples.remote(
-                sample_ids=list(sample_ids),
-                partition_id=partition_id,
-                columns=columns,
-                tags=[dict(tag) for tag in tags],
+            self._actor.configure_generation_cut_sink.remote(
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=media_pixel_dtype,
             )
         )
 
-    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+    def submit_generation_cut_rows(
+        self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
+    ) -> Any:
+        """Start the actor building and writing one batch; ``result`` waits for it."""
         self._require_open()
-        self._get(
-            self._actor.clear_samples.remote(
-                sample_ids=list(sample_ids), partition_id=partition_id
-            )
+        attachments = [
+            None
+            if row.attachments is None
+            else {name: to_bytes(tensor) for name, tensor in row.attachments.items()}
+            for row in rows
+        ]
+        return self._actor.stage_generation_cut_rows.remote(
+            [replace(row, attachments=None) for row in rows],
+            checkpoint_id=checkpoint_id,
+            attachments=attachments,
         )
+
+    def result(self, reference: Any) -> list[StagedGenerationCut]:
+        """The written rows of a batch ``submit_generation_cut_rows`` started."""
+        return self._get(reference)
 
     async def get_data_plane_snapshot(self) -> dict[str, Any] | None:
         """The writer client's data-plane counters.
@@ -228,6 +264,130 @@ class RayPrefixWriterClient:
             self._closed = True
         ray.kill(self._actor, no_restart=True)
         G_LOGGER.info("prefix_writer event=closed writer_pid=%d", self._writer_pid)
+
+
+def _build_cost(row: GenerationCutRow) -> int:
+    """Building a row's records is linear in its call's prompt and generated tokens."""
+    return len(row.prompt_token_ids) + len(row.generated_token_ids)
+
+
+def split_generation_cut_rows(
+    rows: Sequence[GenerationCutRow], count: int
+) -> list[list[int]]:
+    """The indices of each of ``count`` writers' share of ``rows``.
+
+    Largest row first, each to the writer with the least work so far; a share
+    keeps the rows' order.
+    """
+    shares: list[list[int]] = [[] for _ in range(count)]
+    loads = [0] * count
+    for index in sorted(range(len(rows)), key=lambda i: -_build_cost(rows[i])):
+        writer = loads.index(min(loads))
+        shares[writer].append(index)
+        loads[writer] += _build_cost(rows[index])
+    return [sorted(share) for share in shares]
+
+
+class PrefixWriterPool:
+    """The sink's writer actors; each batch of cut rows is split across them.
+
+    Every writer builds and writes its share at the same time. A batch returns
+    only after every share is acknowledged. If any share fails, every started
+    share is still awaited and the batch raises, so the caller can discard all
+    of its keys with nothing left writing.
+    """
+
+    def __init__(self, writers: Sequence[RayPrefixWriterClient]) -> None:
+        if not writers:
+            raise ValueError("A prefix writer pool needs at least one writer")
+        self._writers = list(writers)
+
+    def configure_generation_cut_sink(
+        self,
+        *,
+        staging_partition: str,
+        capture_media: bool,
+        media_pixel_dtype: torch.dtype | None,
+    ) -> None:
+        """Give every writer a sink with the worker sink's settings."""
+        for writer in self._writers:
+            writer.configure_generation_cut_sink(
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=media_pixel_dtype,
+            )
+
+    def stage_generation_cut_rows(
+        self, rows: Sequence[GenerationCutRow], *, checkpoint_id: str
+    ) -> list[StagedGenerationCut]:
+        """Build and write one batch across the writers; return its rows in order.
+
+        Raises:
+            PrefixWriterDiedError: a writer is gone; reported before any other
+                share's failure, since it fails every later cut too.
+            Exception: another share failed.
+        """
+        started = []
+        errors: list[Exception] = []
+        for writer, share in zip(
+            self._writers,
+            split_generation_cut_rows(rows, len(self._writers)),
+            strict=True,
+        ):
+            if not share:
+                continue
+            try:
+                reference = writer.submit_generation_cut_rows(
+                    [rows[index] for index in share], checkpoint_id=checkpoint_id
+                )
+            except Exception as error:
+                errors.append(error)
+            else:
+                started.append((writer, share, reference))
+        staged: list[Any] = [None] * len(rows)
+        for writer, share, reference in started:
+            try:
+                for index, row in zip(share, writer.result(reference), strict=True):
+                    staged[index] = row
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise next(
+                (error for error in errors if isinstance(error, PrefixWriterDiedError)),
+                errors[0],
+            )
+        return staged
+
+    async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Each live writer's data-plane counters, with observability on."""
+        snapshots = await asyncio.gather(
+            *(writer.get_data_plane_snapshot() for writer in self._writers)
+        )
+        return [snapshot for snapshot in snapshots if snapshot is not None]
+
+    def close(self) -> None:
+        for writer in self._writers:
+            writer.close()
+
+
+async def create_prefix_writer_pool(
+    config: DataPlaneConfig, *, count: int
+) -> PrefixWriterPool:
+    """Create ``count`` writers on this node; on any failure, close the rest."""
+    results = await asyncio.gather(
+        *(create_prefix_writer(config) for _ in range(count)), return_exceptions=True
+    )
+    writers = [
+        result for result in results if isinstance(result, RayPrefixWriterClient)
+    ]
+    failure = next(
+        (result for result in results if isinstance(result, BaseException)), None
+    )
+    if failure is not None:
+        for writer in writers:
+            writer.close()
+        raise failure
+    return PrefixWriterPool(writers)
 
 
 async def create_prefix_writer(config: DataPlaneConfig) -> RayPrefixWriterClient:

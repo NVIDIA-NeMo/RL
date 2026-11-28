@@ -100,6 +100,7 @@ class TestRestartShardTokenCapture:
         "generation_cut_control_timeout_s": None,
         "prefix_write_max_rows": 256,
         "prefix_write_max_tokens": 4_194_304,
+        "prefix_writers": 1,
         "prefix_read_max_rows": 256,
     }
 

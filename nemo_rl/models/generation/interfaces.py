@@ -713,6 +713,7 @@ class GenerationInterface(ABC):
         generation_cut_control_timeout_s: float | None = None,
         prefix_write_max_rows: int,
         prefix_write_max_tokens: int,
+        prefix_writers: int,
         prefix_read_max_rows: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
@@ -742,6 +743,8 @@ class GenerationInterface(ABC):
             prefix_write_max_rows: Maximum rows per TQ write at a checkpoint cut.
             prefix_write_max_tokens: Maximum tokens per TQ write at a checkpoint
                 cut; a single larger row is written alone.
+            prefix_writers: Writer actors per serving worker that build and
+                write a cut's rows in parallel, on a TransferQueue data plane.
             prefix_read_max_rows: Maximum rows per TQ read at restore; 1 reads
                 each restore on its own.
 
