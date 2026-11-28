@@ -24,6 +24,7 @@ where vLLM is installed.
 import asyncio
 import copy
 import logging
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from logging import Filter as LoggingFilter
@@ -436,15 +437,18 @@ class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
 
 
 class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-    """The render step for NeMo RL's chat engine in Dynamo's frontend.
+    """The render step of NeMo RL's chat path under Dynamo.
 
     Runs only the shared step (:meth:`_render_chat_call`): the frontend reads
-    the TQ prefix and splices, and the engine captures. Media is always
-    processed here, never served from a processor cache, since the engine runs
-    on the pixels the frontend sends.
+    the TQ prefix and splices, and the engine captures. A render worker in the
+    frontend renders every call with it, for the prompt's token layout
+    (:meth:`render_for_frontend`). An engine renders a media call again with
+    it, through ``render_chat``, to process the media itself. Media is read
+    through vLLM's processor-only cache when one is configured.
     """
 
-    # The render the overridden preprocess_chat is asked for, and its result.
+    # What render_for_frontend asks the overridden preprocess_chat for, and its
+    # result. An engine's calls overlap, so it reads neither.
     _admission: Any = None
     _rendered: Any = None
 
@@ -695,7 +699,7 @@ class ChatServer:
     serving_tokenization: NeMoRLServingTokenization
 
 
-def register_parser_plugins(cfg: dict[str, Any]) -> None:
+def register_parser_plugins(cfg: Mapping[str, Any]) -> None:
     """Import the tool and reasoning parser plugins ``policy.generation`` names."""
     maybe_tool_parser_plugin = cfg["vllm_cfg"].get("tool_parser_plugin")
     if maybe_tool_parser_plugin:
@@ -706,12 +710,15 @@ def register_parser_plugins(cfg: dict[str, Any]) -> None:
         ReasoningParserManager.import_reasoning_parser(maybe_reasoning_parser_plugin)
 
 
-def serving_chat_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The chat serving's settings and default chat-template kwargs.
+def serving_chat_settings(
+    cfg: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The chat serving's settings and the renderer's.
 
     One copy for every host of the chat path, so each renders and parses
     alike. Returns the ``OpenAIServingChat`` kwargs (template loaded,
-    ``default_chat_template_kwargs`` normalized) and those template kwargs.
+    ``default_chat_template_kwargs`` normalized) and the ``OnlineRenderer``
+    kwargs built from them.
     """
     serving_chat_default_kwargs: dict[str, Any] = {
         "response_role": "assistant",
@@ -749,10 +756,26 @@ def serving_chat_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str
         serving_chat_kwargs["default_chat_template_kwargs"] = (
             _legacy_chat_template_kwargs
         )
-    default_chat_template_kwargs: dict[str, Any] = (
-        serving_chat_kwargs["default_chat_template_kwargs"] or {}
-    )
-    return serving_chat_kwargs, default_chat_template_kwargs
+    renderer_kwargs: dict[str, Any] = {
+        "request_logger": serving_chat_kwargs["request_logger"],
+        "chat_template": serving_chat_kwargs["chat_template"],
+        "chat_template_content_format": serving_chat_kwargs[
+            "chat_template_content_format"
+        ],
+        "enable_auto_tools": serving_chat_kwargs["enable_auto_tools"],
+        # Keep the renderer's parser consistent with any parser overrides
+        # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
+        "tool_parser": serving_chat_kwargs.get("tool_parser"),
+        "reasoning_parser": serving_chat_kwargs.get("reasoning_parser"),
+        # vLLM merges these into every render, with request-supplied keys
+        # winning (preprocess_chat's default_template_kwargs). The renderer
+        # is shared by /v1/chat/completions and /tokenize, so setting it
+        # here keeps the two endpoints rendering identical prompts.
+        "default_chat_template_kwargs": (
+            serving_chat_kwargs["default_chat_template_kwargs"] or {}
+        ),
+    }
+    return serving_chat_kwargs, renderer_kwargs
 
 
 def build_chat_server(
@@ -782,25 +805,11 @@ def build_chat_server(
     )
     openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
-    serving_chat_kwargs, default_chat_template_kwargs = serving_chat_settings(cfg)
+    serving_chat_kwargs, renderer_kwargs = serving_chat_settings(cfg)
     online_renderer = NeMoRLOnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
-        request_logger=serving_chat_kwargs["request_logger"],
-        chat_template=serving_chat_kwargs["chat_template"],
-        chat_template_content_format=serving_chat_kwargs[
-            "chat_template_content_format"
-        ],
-        enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
-        # Keep the renderer's parser consistent with any parser overrides
-        # passed to OpenAIServingChat via http_server_serving_chat_kwargs.
-        tool_parser=serving_chat_kwargs.get("tool_parser"),
-        reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
-        # vLLM merges these into every render, with request-supplied keys
-        # winning (preprocess_chat's default_template_kwargs). The renderer
-        # is shared by /v1/chat/completions and /tokenize, so setting it
-        # here keeps the two endpoints rendering identical prompts.
-        default_chat_template_kwargs=default_chat_template_kwargs,
+        **renderer_kwargs,
         host=host,
         model_stop_token_ids=model_stop_token_ids(model_config, cfg),
     )
@@ -825,7 +834,7 @@ def build_chat_server(
         # ServingTokenization reads its own copy in preprocess_chat rather
         # than the renderer's, so /tokenize would otherwise render with {}
         # and diverge from /v1/chat/completions under multi-turn.
-        default_chat_template_kwargs=default_chat_template_kwargs,
+        default_chat_template_kwargs=renderer_kwargs["default_chat_template_kwargs"],
     )
     openai_serving_tokenization = NeMoRLServingTokenization(
         **serving_tokenization_kwargs

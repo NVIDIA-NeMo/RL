@@ -38,7 +38,6 @@ workers are built from them meanwhile (:class:`ChatEngineFactory`).
 from __future__ import annotations
 
 import asyncio
-import base64
 import importlib
 import logging
 import threading
@@ -78,11 +77,11 @@ CALL_KEY = "nemo_rl"
 
 
 class ForwardedMedia(TypedDict):
-    """A media call's render, in the template's coordinates."""
+    """A media call's request, which the engine renders again to process its media."""
 
-    # The render's multimodal input, pickled then base64-encoded.
-    inputs: str
-    # The template's token ids, which the input's placeholders index.
+    # The chat request the frontend rendered, messages included.
+    body: dict[str, Any]
+    # The frontend's template ids, which the engine's render must match.
     template_token_ids: list[int]
 
 
@@ -406,10 +405,9 @@ class NemoRLChatEngine:
                 finish_reason="stop",
             )
         media: Optional[ForwardedMedia] = None
-        if rendered.multimodal is not None:
+        if rendered.has_media:
             media = ForwardedMedia(
-                inputs=base64.b64encode(rendered.multimodal).decode(),
-                template_token_ids=rendered.template_token_ids,
+                body=body, template_token_ids=rendered.template_token_ids
             )
         wire: ForwardedCall = {
             "prepared_prompt": plan.to_json(),

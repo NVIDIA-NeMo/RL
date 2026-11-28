@@ -81,7 +81,7 @@ def _rendered(**fields) -> RenderedCall:
             "admission": None,
             "serving_admission": None,
             "verify_retained_media": False,
-            "multimodal": None,
+            "has_media": False,
             "request": {"model": "model", "max_tokens": None},
             "request_max_tokens": None,
             "reasoning_ended": None,
@@ -325,6 +325,20 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
     assert choice["finish_reason"] == "tool_calls"
     assert chunk["nvext"] == {"nemo_rl": router.engine_data["result"]}
     assert chunk["usage"]["prompt_tokens"] == 6
+
+
+def test_a_media_call_forwards_the_request_it_rendered() -> None:
+    pool, router = _Pool(_rendered(has_media=True)), _Router()
+
+    _serve(pool, router, _call({}))
+
+    # The engine renders this body again and must get these template ids.
+    (body,) = pool.bodies
+    (routed,) = router.requests
+    assert routed["extra_args"][chat_engine.CALL_KEY]["multimodal"] == {
+        "body": body,
+        "template_token_ids": [1, 3, 4],
+    }
 
 
 def test_a_token_in_call_splices_the_prefix_staged_in_tq() -> None:

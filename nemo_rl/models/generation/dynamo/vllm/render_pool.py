@@ -39,7 +39,6 @@ import json
 import logging
 import multiprocessing
 import os
-import pickle
 import shutil
 import tempfile
 import threading
@@ -88,8 +87,8 @@ class RenderedCall:
     admission: Any
     serving_admission: Any
     verify_retained_media: bool
-    # The rendered engine input's multimodal part (pickled), or None for text.
-    multimodal: Optional[bytes]
+    # Whether the call has media, which the engine then processes itself.
+    has_media: bool
     # The chat request as rendered (parsers may adjust it), without messages:
     # the engine builds its SamplingParams from it, as the native server does.
     request: dict[str, Any]
@@ -141,7 +140,7 @@ class _Worker:
 
         cfg = spec["generation"]
         chat_server.register_parser_plugins(cfg)
-        # This worker decodes the call's videos; the engine runs its pixels.
+        # Decodes videos with the engine's loader, so both lay them out alike.
         register_vllm_video_loader(cfg)
         # The engine's own args, with the weight-free snapshot Dynamo fetched.
         # Sleep mode is the engine's memory management, and vLLM's CPU platform
@@ -162,21 +161,9 @@ class _Worker:
         )
         renderer = renderer_from_config(vllm_config)
         self.tokenizer = renderer.tokenizer
-        serving_chat_kwargs, default_chat_template_kwargs = (
-            chat_server.serving_chat_settings(cfg)
-        )
+        serving_chat_kwargs, renderer_kwargs = chat_server.serving_chat_settings(cfg)
         self.online_renderer = chat_server.FrontendRenderer(
-            model_config=self.model_config,
-            renderer=renderer,
-            request_logger=None,
-            chat_template=serving_chat_kwargs["chat_template"],
-            chat_template_content_format=serving_chat_kwargs[
-                "chat_template_content_format"
-            ],
-            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
-            tool_parser=serving_chat_kwargs.get("tool_parser"),
-            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
-            default_chat_template_kwargs=default_chat_template_kwargs,
+            model_config=self.model_config, renderer=renderer, **renderer_kwargs
         )
         # As vLLM's API server does at startup: compiles the chat template and
         # warms the multimodal processor, so the first render does neither.
@@ -262,16 +249,6 @@ class _Worker:
                     self.serving_chat._effective_chat_template_kwargs(chat)
                 )
             }
-        multimodal = None
-        if rendered.engine_prompt.get("mm_kwargs"):
-            multimodal = pickle.dumps(
-                {
-                    key: value
-                    for key, value in rendered.engine_prompt.items()
-                    if key != "prompt_token_ids"
-                },
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
         return RenderedCall(
             template_token_ids=list(rendered.engine_prompt["prompt_token_ids"]),
             history_token_ids=rendered.history_token_ids,
@@ -279,7 +256,7 @@ class _Worker:
             admission=rendered.admission,
             serving_admission=rendered.serving_admission,
             verify_retained_media=rendered.verify_retained_media,
-            multimodal=multimodal,
+            has_media=bool(rendered.engine_prompt.get("mm_kwargs")),
             request=chat.model_dump(mode="json", exclude={"messages"}),
             request_max_tokens=rendered.request_max_tokens,
             reasoning_ended=rendered.reasoning_ended,

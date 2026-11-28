@@ -18,9 +18,11 @@
 request kinds served, how errors reach the driver, and the endpoint's
 registration. A backend implements four methods over its worker's engine
 (``serve_rollout``, ``start``, ``abort`` and ``kv_event_sources``);
-``vllm.adapter.DynamoVllmAdapter`` is the vLLM one. The engine only ever receives
-token IDs: NeMo RL's rollouts on ``/v1/completions``, and NeMo-Gym's chat calls
-once NeMo RL's chat engine in the frontend has rendered them. This module imports no generation backend.
+``vllm.adapter.DynamoVllmAdapter`` is the vLLM one. The engine receives token
+IDs: NeMo RL's rollouts on ``/v1/completions``, and NeMo-Gym's chat calls once
+NeMo RL's chat engine in the frontend has rendered them. A chat call with media
+also carries its request, which the backend renders again to process the media.
+This module imports no generation backend.
 """
 
 from __future__ import annotations

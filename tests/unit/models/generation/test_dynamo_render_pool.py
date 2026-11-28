@@ -169,7 +169,7 @@ def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     assert rendered.required_prefix_token_ids == [1, 2, 3]
     assert rendered.request_max_tokens == 64
     assert "messages" not in rendered.request
-    assert (rendered.admission, rendered.multimodal) == (None, None)
+    assert (rendered.admission, rendered.has_media) == (None, False)
     # The reply through vLLM's own reasoning and tool parsers.
     (choice,) = reply["choices"]
     assert choice["finish_reason"] == "tool_calls"
