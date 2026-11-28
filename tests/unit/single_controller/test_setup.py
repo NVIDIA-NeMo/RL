@@ -188,9 +188,9 @@ def _make_master_config(
         }
         policy_config["model_name"] = "test-model"
     if backend == "sglang":
-        # The field SGLangGeneration.validate_settings reads, at an accepted value.
         generation_config["sglang_cfg"] = {
-            "sglang_fault_tolerance_config": {"use_fault_tolerance": False}
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+            "quantization": {"scheme": "bf16"},
         }
     master_config = MasterConfig.model_construct(
         data_plane={

@@ -145,6 +145,48 @@ policy:
 
 These native kernels use vLLM's layerwise reload during weight refit. Use `refit_transport: null` with collective or IPC refit. NCCL Reshard and other explicit refit transports are not supported. Native layerwise refit also does not support an FP8 KV cache or a co-trained MTP drafter.
 
+### SGLang MXFP8 rollout and refit
+
+Use a Megatron policy and Blackwell GPUs (SM100 or newer) for the converter and
+workers that quantize weights. Set `policy.automodel_cfg.enabled=false` and
+`policy.megatron_cfg.enabled=true`. The policy trains from its original HF
+checkpoint. SGLang starts each rollout engine from serialized E4M3 weights
+and their UE8M0 scales. On each refit Megatron sends updated weights and
+scales using the same precision policy. An HF config override alone supplies
+neither the initial scales nor the checkpoint's high-precision module list.
+
+Start with `examples/configs/grpo_math_1B_sglang.yaml`. Run the converter on
+one GPU before launching training. Pass the same recipe and precision overrides
+to both commands. Use an output path on storage shared by all rollout workers.
+
+```bash
+recipe=examples/configs/grpo_math_1B_sglang.yaml
+overrides=(
+    policy.model_name=Qwen/Qwen3-0.6B
+    policy.automodel_cfg.enabled=false
+    policy.megatron_cfg.enabled=true
+    policy.generation.sglang_cfg.quantization.scheme=mxfp8
+    +policy.generation.sglang_cfg.quantization.converted_model_path=/shared/qwen3-0.6b-mxfp8
+)
+uv run --extra sglang python examples/converters/convert_hf_to_mxfp8.py --config "$recipe" "${overrides[@]}"
+uv run python examples/run_grpo.py --config "$recipe" "${overrides[@]}"
+```
+
+For a local HF source, omit `converted_model_path` to use the same computed
+output path in conversion and startup. Set `quantization.cache_root` or
+`NRL_MXFP8_CACHE` to choose its parent (default `~/.cache/nemo_rl/mxfp8`).
+The key includes the source path, model configuration, converter version and
+effective precision policy. For a Hugging Face repo ID, specify
+`converted_model_path` explicitly.
+
+Under `policy.generation.sglang_cfg.quantization`, use
+`extra_high_precision_layers_hf` or `modules_to_not_convert` for HF-name
+substrings that should stay in high precision. Use
+`num_layers_at_start_in_bf16` and `num_layers_at_end_in_bf16` to keep whole
+decoder layers in BF16. Convert into a new directory when the policy changes.
+
+### FP8 training configuration
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```yaml
