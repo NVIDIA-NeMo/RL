@@ -39,6 +39,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    reject_turn_priority_without_nemo_gym,
     set_nemo_gym_log_dir,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
@@ -1486,7 +1487,9 @@ def test_prioritize_later_turns_sets_the_engine_policy_and_gyms_turn_priority(
         "extra_body": {"min_tokens": 1},
         "priority_by_turn": True,
     }
-    assert user_vllm_model == {"extra_body": {"min_tokens": 1}}
+    assert env["nemo_gym"]["policy_model"] == {
+        "responses_api_models": {"vllm_model": {"extra_body": {"min_tokens": 1}}}
+    }
 
 
 def test_prioritize_later_turns_off_leaves_gym_and_the_engine_alone(
@@ -1561,6 +1564,38 @@ def test_prioritize_later_turns_writes_only_gym_fields(detected_uv_dirs, dynamo)
     vllm_model = _build_policy_model(config)
     assert vllm_model["priority_by_turn"] is True
     assert set(vllm_model) - set(VLLMModelConfig.model_fields) == set()
+
+
+@pytest.mark.parametrize("prioritize_later_turns", [True, False])
+def test_prioritize_later_turns_without_nemo_gym_rollouts(prioritize_later_turns):
+    # Both keys set, but nothing sends a priority: NeMo RL's own rollouts send none.
+    config = _turn_priority_config(
+        {"should_use_nemo_gym": False},
+        vllm_kwargs={"scheduling_policy": "priority"},
+    )
+    config.policy["generation"]["vllm_cfg"]["prioritize_later_turns"] = (
+        prioritize_later_turns
+    )
+
+    if prioritize_later_turns:
+        with pytest.raises(
+            ValueError, match="prioritize_later_turns requires NeMo-Gym rollouts"
+        ):
+            reject_turn_priority_without_nemo_gym(config)
+    else:
+        reject_turn_priority_without_nemo_gym(config)
+
+
+def test_prioritize_later_turns_with_nemo_gym_rollouts_is_accepted():
+    config = _turn_priority_config(
+        {"should_use_nemo_gym": True},
+        vllm_kwargs={"scheduling_policy": "priority"},
+    )
+    config.policy["generation"]["vllm_cfg"].update(
+        async_engine=True, expose_http_server=True
+    )
+
+    reject_turn_priority_without_nemo_gym(config)
 
 
 def test_prioritize_later_turns_rejects_another_scheduling_policy() -> None:

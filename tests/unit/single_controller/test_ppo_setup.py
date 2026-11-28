@@ -697,6 +697,24 @@ class TestPPOValidation:
             with pytest.raises(ValueError, match="length_penalty requires"):
                 validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize("use_gym", [False, True])
+    def test_prioritize_later_turns_requires_gym(self, use_gym):
+        mc = _make_master_config()
+        mc.env = {"should_use_nemo_gym": use_gym}
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+            "prioritize_later_turns": True,
+        }
+        mc.policy["generation"]["vllm_kwargs"] = {"scheduling_policy": "priority"}
+        if use_gym:
+            validate_single_controller_config(mc)
+        else:
+            with pytest.raises(
+                ValueError, match="prioritize_later_turns requires NeMo-Gym"
+            ):
+                validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_absent_length_penalty(self, algorithm: str):
         # GRPO with length_penalty: null, and PPO (whose config has no such

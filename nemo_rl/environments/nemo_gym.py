@@ -538,6 +538,25 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     return True
 
 
+def reject_turn_priority_without_nemo_gym(
+    master_config: NemoGymCompatibleConfig,
+) -> None:
+    """Refuse ``prioritize_later_turns`` when NeMo Gym does not run the rollouts.
+
+    Only Gym's policy model server sends a per-call priority; NeMo RL's own
+    rollouts send none, so every request would get 0 and the switch would do nothing.
+    """
+    generation_config = master_config.policy["generation"]
+    if not (generation_config.get("vllm_cfg") or {}).get("prioritize_later_turns"):
+        return
+    if not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or set "
+            "policy.generation.vllm_kwargs.scheduling_policy=priority on its own."
+        )
+
+
 def set_nemo_gym_log_dir(env_config: dict[str, Any], log_dir: str) -> None:
     """Point NeMo Gym's server logs at ``<log_dir>/nemo_gym``.
 

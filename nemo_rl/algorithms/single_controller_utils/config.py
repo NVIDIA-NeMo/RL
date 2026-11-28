@@ -69,7 +69,10 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.call_selection import resolve_selection_policy
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    reject_turn_priority_without_nemo_gym,
+    should_use_nemo_gym,
+)
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     is_nemo_gym_task,
@@ -1576,6 +1579,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         raise ValueError(
             "grpo.length_penalty requires env.should_use_nemo_gym=true on SingleController"
         )
+
+    reject_turn_priority_without_nemo_gym(master_config)
 
     if (
         master_config.grpo is not None

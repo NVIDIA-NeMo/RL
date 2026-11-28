@@ -368,15 +368,18 @@ def test_turn_priority_serves_dynamos_engines_the_priority_scheduling_policy() -
     validate_vllm_async_actor_settings(config)
 
 
-@pytest.mark.parametrize("vllm_kwargs", [None, {}, {"scheduling_policy": "fcfs"}])
-def test_turn_priority_without_nemo_gym_setup_is_rejected(
-    vllm_kwargs: dict | None,
+@pytest.mark.parametrize(
+    "vllm_kwargs, found",
+    [(None, "None"), ({}, "None"), ({"scheduling_policy": "fcfs"}, "'fcfs'")],
+)
+def test_turn_priority_without_the_priority_policy_is_rejected(
+    vllm_kwargs: dict | None, found: str
 ) -> None:
     config: dict = {"vllm_cfg": {"prioritize_later_turns": True}}
     if vllm_kwargs is not None:
         config["vllm_kwargs"] = vllm_kwargs
 
-    with pytest.raises(ValueError, match="prioritize_later_turns requires NeMo-Gym"):
+    with pytest.raises(ValueError, match=f"scheduling_policy='priority'.*got {found}"):
         validate_vllm_async_actor_settings(cast(VllmConfig, config))
 
 

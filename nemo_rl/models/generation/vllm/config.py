@@ -399,16 +399,12 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             "through the async engine's HTTP server; it requires async_engine: true "
             "and expose_http_server: true."
         )
-    if (
-        vllm_cfg.get("prioritize_later_turns")
-        and (config.get("vllm_kwargs") or {}).get("scheduling_policy") != "priority"
-    ):
+    scheduling_policy = (config.get("vllm_kwargs") or {}).get("scheduling_policy")
+    if vllm_cfg.get("prioritize_later_turns") and scheduling_policy != "priority":
         raise ValueError(
-            "policy.generation.vllm_cfg.prioritize_later_turns requires NeMo-Gym "
-            "rollouts (env.should_use_nemo_gym=true): Gym's policy model server sends "
-            "each model call's priority, and NeMo RL's own rollouts send none. Set it "
-            "to false. To schedule by priorities another client sends, set "
-            "policy.generation.vllm_kwargs.scheduling_policy=priority instead."
+            "policy.generation.vllm_cfg.prioritize_later_turns requires "
+            "policy.generation.vllm_kwargs.scheduling_policy='priority', which "
+            f"NeMo-Gym setup sets; got {scheduling_policy!r}."
         )
     budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
     if budget_ms is None:
