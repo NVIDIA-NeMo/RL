@@ -2483,6 +2483,15 @@ def _create_freeze_parameter_patterns_pre_wrap_hook(
                         param.requires_grad_(False)
                         n_frozen += 1
 
+        if torch.distributed.is_initialized():
+            # Pipeline stages hold different layers, e.g. MTP only on the last one.
+            counts = torch.tensor(
+                [n_matched, n_frozen], device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            n_matched, n_frozen = counts.tolist()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             print(
                 f"Freeze patterns matched {n_matched} parameters; newly froze "
