@@ -89,6 +89,8 @@ See the [TP2 SingleController example with token capture](../../examples/configs
 
 Set `policy.generation.vllm_cfg.prioritize_later_turns: true` to schedule the later turns of rollouts already in flight before the first turns of new ones when the engine is saturated. NeMo RL runs vLLM with `vllm_kwargs.scheduling_policy: priority`, and turns on `priority_by_turn` in Gym's `policy_model` vLLM model server, which sends each model call's request `priority` as minus the number of assistant messages in its history. vLLM schedules a smaller priority first and preempts it last.
 
+The engine's total work does not change, only its order: the first calls of new rollouts wait longer and are preempted first. The priority counts the assistant messages in each call's prompt, not the rollout's progress, so a harness that compacts its history, or a sub-agent with a fresh history, starts again from 0. Model servers that `_copy` `policy_model`, such as judges and user simulators, inherit `priority_by_turn`: a judge call with no assistant history goes out at 0, behind the later turns of other rollouts. Callers that reach the engine through `policy_base_url` directly, without Gym's vLLM model server, always send 0.
+
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `policy.generation.vllm_cfg.prioritize_later_turns` | `false` | Serve vLLM with priority scheduling and have Gym send each model call's turn priority. |

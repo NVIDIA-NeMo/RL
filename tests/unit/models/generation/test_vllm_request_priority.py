@@ -19,10 +19,15 @@ from typing import Any
 
 import pytest
 
-from nemo_rl.models.generation.vllm.chat_server import NeMoRLChatCompletionRequest
-from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
-
 pytestmark = pytest.mark.vllm
+pytest.importorskip("vllm")
+
+from nemo_rl.models.generation.vllm.chat_server import (  # noqa: E402
+    NeMoRLChatCompletionRequest,
+)
+from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
+    _AsyncLLMHTTPClient,
+)
 
 
 @pytest.mark.parametrize("priority", [0, -3])
