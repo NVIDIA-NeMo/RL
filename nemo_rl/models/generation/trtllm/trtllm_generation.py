@@ -31,10 +31,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-from nemo_rl.models.generation.disagg_layout import (
-    plan_engines,
-    resolve_disagg_layout,
-)
+from nemo_rl.models.generation import disagg_layout
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -44,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     replica_width,
+    resolve_disagg_layout,
     resolve_disagg_server_config,
     role_engine_config,
     role_tensor_parallel_size,
@@ -247,11 +245,7 @@ class TrtllmGeneration(GenerationInterface):
             f"layout expects {self._engine_tps}; every per-engine kwarg would "
             "land on the wrong engine."
         )
-        self._engine_owner_indices: list[int] = []
-        offset = 0
-        for width in engine_widths:
-            self._engine_owner_indices.append(offset)
-            offset += width
+        self._engine_owner_indices = disagg_layout.engine_owner_indices(engine_widths)
 
         # Owner of each replica's first engine: the DP leaders the worker group
         # would otherwise derive per engine, which is only right while a replica
@@ -317,18 +311,26 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     def _plan_engines(self, world_size: int) -> tuple[list[str], list[int], int]:
-        """Per-engine ``(role, width)`` and the replica count; see :func:`plan_engines`."""
-        disagg = self._disagg_cfg
-        prefill_tp = decode_tp = self.tp_size
-        if disagg.enabled:
-            prefill_tp = role_tensor_parallel_size(self.cfg, "prefill")
-            decode_tp = role_tensor_parallel_size(self.cfg, "decode")
-        return plan_engines(
+        """Per-engine ``(role, TP width)``, in engine order, plus the replica count.
+
+        The layout rule is :func:`disagg_layout.plan_engines`; a TRT-LLM engine
+        is ``tensor_parallel_size`` GPUs wide (PP is always 1).
+        """
+        enabled = self._disagg_cfg.enabled
+        return disagg_layout.plan_engines(
             world_size,
-            layout=disagg,
+            layout=self._disagg_cfg,
             aggregated_width=self.tp_size,
-            prefill_width=prefill_tp,
-            decode_width=decode_tp,
+            prefill_width=(
+                role_tensor_parallel_size(self.cfg, "prefill")
+                if enabled
+                else self.tp_size
+            ),
+            decode_width=(
+                role_tensor_parallel_size(self.cfg, "decode")
+                if enabled
+                else self.tp_size
+            ),
             backend_cfg_key="trtllm_cfg",
         )
 
@@ -339,7 +341,8 @@ class TrtllmGeneration(GenerationInterface):
 
         ``RayWorkerBuilder`` hands every worker the same config, and a worker
         cannot tell its role from its TP width -- both roles may share one. So
-        the driver attaches a map keyed by :meth:`_engine_key` and each worker
+        the driver attaches a map keyed by :func:`disagg_layout.engine_key` and each
+        worker
         looks up its own entry, then reads that role's engine config, which
         :func:`resolve_role_overrides` already resolved.
 
@@ -363,7 +366,7 @@ class TrtllmGeneration(GenerationInterface):
             role_counts[role] = ordinal + 1
             # Every engine gets an entry: the worker treats a missing key as a
             # driver/worker mismatch, so absence must never read as "no role".
-            engine_roles[self._engine_key(pg_idx, bundles)] = {
+            engine_roles[disagg_layout.engine_key(pg_idx, bundles)] = {
                 "role": role,
                 "ordinal": ordinal,
             }
@@ -371,19 +374,6 @@ class TrtllmGeneration(GenerationInterface):
         cfg = dict(self.cfg)
         cfg["trtllm_cfg"] = {**self.cfg["trtllm_cfg"], "_engine_roles": engine_roles}
         return cast(TrtllmConfig, cfg)
-
-    @staticmethod
-    def _engine_key(pg_idx: int, local_bundle_indices: list[int]) -> str:
-        """Stable id for the engine occupying these bundles.
-
-        Both sides of the worker boundary compute this from the same
-        ``(pg_idx, local_bundle_indices)`` tuple, so the worker can look up its
-        own role without the driver needing per-worker init
-        kwargs. Keying on the tuple rather than deriving a global ordinal keeps
-        it correct for both the unified-PG and per-node-PG layouts, whose local
-        bundle indices mean different things.
-        """
-        return f"{pg_idx}:" + ",".join(str(i) for i in local_bundle_indices)
 
     # ------------------------------------------------------------------ #
     #  Placement helpers (simplified from VllmGeneration)
@@ -444,22 +434,8 @@ class TrtllmGeneration(GenerationInterface):
                 for nid in sorted(node_bundles):
                     flat.extend(node_bundles[nid])
 
-            if len(flat) < sum(engine_tps):
-                raise ValueError(
-                    f"Engine layout needs {sum(engine_tps)} bundles but the "
-                    f"unified placement group has {len(flat)}."
-                )
-
-            tied_groups: list[tuple[int, list[int]]] = []
-            cursor = 0
-            for tp in engine_tps:
-                # The first value is a placement-group index.
-                # A unified cluster has exactly one PG (index 0).
-                tied_groups.append((0, flat[cursor : cursor + tp]))
-                cursor += tp
+            tied_groups = disagg_layout.slice_engines_on_unified_pg(flat, engine_tps)
         else:
-            tied_groups = []
-            engine_idx = 0
             # Consume placement groups in topology order, not creation order. Ray
             # picks the physical node behind each per-node PG, so consecutive
             # pg_idx values can land in different NVLink domains -- and engines
@@ -467,47 +443,12 @@ class TrtllmGeneration(GenerationInterface):
             # prefill and decode engines on opposite sides of the fabric and
             # push its KV handoff onto InfiniBand. Only the *order* changes;
             # every PG is still used exactly once.
-            for pg_idx in cluster.get_topology_sorted_pg_indices():
-                pg = placement_groups[pg_idx]
-                if pg.bundle_count == 0:
-                    continue
-                cursor = 0
-                while engine_idx < len(engine_tps):
-                    tp = engine_tps[engine_idx]
-                    if cursor + tp > pg.bundle_count:
-                        break
-                    tied_groups.append((pg_idx, list(range(cursor, cursor + tp))))
-                    cursor += tp
-                    engine_idx += 1
-                if cursor != pg.bundle_count:
-                    # Every engine here fits a node (this branch only runs when
-                    # it does), but the greedy fill left too little room for the
-                    # next one, so it would be split across nodes. An engine is
-                    # one tied worker group keyed by a single pg_idx and cannot
-                    # be. Stopping early instead would leave these GPUs idle and
-                    # silently run fewer engines than the config asks for.
-                    free = pg.bundle_count - cursor
-                    width = replica_width(self.cfg)
-                    if engine_idx < len(engine_tps):
-                        why = (
-                            f"engine {engine_idx} needs TP{engine_tps[engine_idx]} "
-                            f"but only {free} GPU(s) are left on it"
-                        )
-                    else:
-                        why = f"{free} GPU(s) are left over with no engines to place"
-                    raise ValueError(
-                        f"Engine layout does not tile placement group {pg_idx} "
-                        f"({pg.bundle_count} GPUs): {why}. An engine that fits in "
-                        f"a node is never split across nodes. Engine widths in "
-                        f"order: {engine_tps}. Two layouts always tile: give "
-                        f"every role tensor_parallel_size == "
-                        f"GPUs per node (one engine per node), or make the replica "
-                        f"width ({width}) divide GPUs per node (whole "
-                        f"replicas per node). Engines are placed replica by "
-                        f"replica to keep each replica's KV handoff local, so "
-                        f"some mixed-TP layouts that would fit with a "
-                        f"different packing are rejected."
-                    )
+            tied_groups = disagg_layout.tile_engines_on_per_node_pgs(
+                pg_bundle_counts=[pg.bundle_count for pg in placement_groups],
+                pg_order=cluster.get_topology_sorted_pg_indices(),
+                engine_widths=engine_tps,
+                replica_width_gpus=replica_width(self.cfg),
+            )
 
         if not tied_groups:
             raise ValueError(

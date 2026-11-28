@@ -39,6 +39,13 @@ tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-automodel-trtllm.sh
 tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async.sh
 # Prefill/decode disaggregation with the SWE pivot single-step environment.
 tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh
+# Its vLLM sibling: the same environment and layout behind the vLLM backend's
+# prefill/decode disaggregation (NixlConnector), so the two paths are compared
+# like for like.
+tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1.sh
+# vLLM prefill/decode disaggregation on the SingleController entrypoint, which
+# refits with rollouts in flight on every step.
+tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-gym-single-controller.sh
 
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated.sh
 # Same recipe with the shard-to-shard (nccl_reshard) refit into TRT-LLM's EP slots.

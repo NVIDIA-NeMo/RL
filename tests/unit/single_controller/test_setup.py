@@ -1127,6 +1127,19 @@ class TestSetup:
         patched_factories["_build_generation"].assert_called_once()
         patched_factories["_build_trainer"].assert_called_once()
 
+    def test_disaggregation_on_a_backend_that_ignores_it_fails_before_setup_factories(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="megatron")
+        mc.policy["generation"]["disaggregation"] = {"enabled": True}
+
+        with pytest.raises(
+            ValueError, match="disaggregation.enabled is only supported"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
 
@@ -2910,6 +2923,8 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
             turn_checkpointing_enabled=False,
+            # No PD disaggregation frontends in this config.
+            forward_session_id_as_conversation_id=False,
             generation_prefix_cuts_enabled=False,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,

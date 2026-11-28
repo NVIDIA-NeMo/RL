@@ -181,14 +181,15 @@ def test_generation_flattens_frontend_snapshots() -> None:
 
     snapshots = [{"calls": 2}, {"calls": 3}, {"calls": 5}]
     group = SimpleNamespace(run_all_workers_single_data=Mock(return_value="refs"))
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.worker_group = group
+    # Without PD disaggregation the per-engine fan-out is the grid dispatch.
+    generation._disagg_cfg = SimpleNamespace(enabled=False)
     with patch(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         return_value=[snapshots[:2], [], snapshots[2:]],
     ):
-        assert (
-            VllmGeneration.get_data_plane_snapshots(SimpleNamespace(worker_group=group))
-            == snapshots
-        )
+        assert generation.get_data_plane_snapshots() == snapshots
     group.run_all_workers_single_data.assert_called_once_with(
         "get_data_plane_snapshots",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],

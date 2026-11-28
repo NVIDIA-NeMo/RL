@@ -24,11 +24,12 @@ where vLLM is installed.
 import asyncio
 import copy
 import logging
+import random
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from logging import Filter as LoggingFilter
 from logging import LogRecord
-from typing import Any, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import torch
 from fastapi import FastAPI, Request
@@ -66,7 +67,11 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.models.generation.capture_context import resolve_capture_input
 from nemo_rl.models.generation.gym_call import GymCallResult, GymRequestFields
-from nemo_rl.models.generation.openai_server_utils import turn_end_token_ids
+from nemo_rl.models.generation.openai_server_utils import (
+    decode_token_ids_b64,
+    encode_token_ids_b64,
+    turn_end_token_ids,
+)
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _full_generator_signature,
     _RestoredPrefixTerminal,
@@ -103,20 +108,70 @@ from nemo_rl.models.generation.vllm.utils import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _gym_prefix_from_messages(messages: Any) -> Optional[list[int]]:
+    """The on-policy prefix NeMo-Gym encodes on the newest assistant message.
+
+    Gym attaches ``prompt_token_ids`` and ``generation_token_ids`` to the
+    assistant messages it relays back; the newest such message's ids are the
+    exact tokens the model produced up to that turn, which the splice keeps.
+    """
+    for message in reversed(list(messages or [])):
+        if isinstance(message, dict) and "prompt_token_ids" in message:
+            return list(message["prompt_token_ids"]) + list(
+                message["generation_token_ids"]
+            )
+    return None
+
+
+def _supplied_prompt_token_ids(request: Any) -> Optional[list[int]]:
+    """Prompt ids a PD-disaggregation leg carries, in any of their spellings.
+
+    The frontend relays them as vLLM's own ``kv_transfer_params.prompt_token_ids``
+    or, with ``decode_tokids_b64``, as NeMo RL's top-level ``prompt_token_ids_b64``;
+    a plain top-level ``prompt_token_ids`` list is accepted too.
+    """
+    encoded = getattr(request, "prompt_token_ids_b64", None)
+    if encoded:
+        return decode_token_ids_b64(encoded)
+    ids = getattr(request, "prompt_token_ids", None)
+    if ids:
+        return list(ids)
+    params = getattr(request, "kv_transfer_params", None)
+    if isinstance(params, dict) and params.get("prompt_token_ids"):
+        return list(params["prompt_token_ids"])
+    return None
+
+
+def _is_prefill_leg(request: Any) -> bool:
+    """Whether this request is a disaggregation frontend's prefill leg."""
+    params = getattr(request, "kv_transfer_params", None)
+    return bool(isinstance(params, dict) and params.get("do_remote_decode"))
+
+
 class NeMoRLOpenAIChatRequestMixin:
     # Declared by the request models this mixes into.
     required_prefix_token_ids: Optional[list[int]]
     messages: Any
+    if TYPE_CHECKING:
+        # Only the chat request declares it; a runtime annotation here would
+        # make it a required field of the tokenize request as well.
+        kv_transfer_params: Optional[dict[str, Any]]
 
     def model_post_init(self, context):
-        # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
-        if self.required_prefix_token_ids is None:
-            for message in reversed(self.messages):
-                if "prompt_token_ids" in message:
-                    self.required_prefix_token_ids = (
-                        message["prompt_token_ids"] + message["generation_token_ids"]
-                    )
-                    break
+        supplied = _supplied_prompt_token_ids(self)
+        if supplied is not None:
+            # PD disaggregation: the leg carries the final engine prompt ids
+            # (vllm_disagg_frontend). Hand them to vLLM's renderer through
+            # kv_transfer_params, where it takes them from and skips
+            # templating, and derive no prefix: the ids are already spliced,
+            # and a second splice would corrupt them.
+            params = dict(getattr(self, "kv_transfer_params", None) or {})
+            params["prompt_token_ids"] = supplied
+            self.kv_transfer_params = params
+            self.required_prefix_token_ids = None
+        elif self.required_prefix_token_ids is None:
+            # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
+            self.required_prefix_token_ids = _gym_prefix_from_messages(self.messages)
 
         return super().model_post_init(context)
 
@@ -125,6 +180,19 @@ class NeMoRLOpenAIChatRequestMixin:
 class NeMoRLChatCompletionRequest(
     NeMoRLOpenAIChatRequestMixin, GymRequestFields, ChatCompletionRequest
 ):
+    # PD disaggregation (vllm_disagg_frontend): the engine prompt ids, already
+    # rendered and spliced, as a JSON list or one base64 int32 string. Moved
+    # into kv_transfer_params["prompt_token_ids"] at validation time, which is
+    # where vLLM's renderer takes them from.
+    prompt_token_ids: Optional[list[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    # Answer with prompt_token_ids_b64 instead of the int list
+    # (disagg_frontend.decode_tokids_b64).
+    return_prompt_token_ids_b64: Optional[bool] = None
+    # PD disaggregation: reasoning_ended from the render that produced the
+    # supplied ids. A leg that carries ids is not rendered here, and the
+    # spliced ids cannot answer it (see reasoning_ended).
+    template_reasoning_ended: Optional[bool] = None
     # Set when the call resumes from the tokens a checkpoint cut saved.
     _restored_prefix_terminal: _RestoredPrefixTerminal | None = PrivateAttr(
         default=None
@@ -239,6 +307,11 @@ class NeMoRLOpenAIServingMixin:
         single_tool_call = getattr(request, "parallel_tool_calls", None) is False
         if single_tool_call:
             request.parallel_tool_calls = None
+        # PD disaggregation: a leg that carries the engine prompt ids (the
+        # prefill leg under frontend_tokenize, every decode leg) is not
+        # rendered: vLLM's renderer takes the ids out of kv_transfer_params
+        # and feeds them to the engine. Read before the render removes them.
+        supplied_prompt_ids = _supplied_prompt_token_ids(request)
         try:
             conversation, (engine_prompt,) = await super().preprocess_chat(
                 request=request, messages=messages, **render_kwargs
@@ -251,13 +324,31 @@ class NeMoRLOpenAIServingMixin:
             if single_tool_call:
                 request.parallel_tool_calls = False
 
+        if supplied_prompt_ids is not None:
+            if list(engine_prompt["prompt_token_ids"]) != supplied_prompt_ids:
+                # vLLM renders the messages instead when it cannot take the ids
+                # (echo, non-text content). A decode leg's KV was computed for
+                # the supplied ids, so any other prompt would decode on KV for
+                # a different sequence.
+                raise VLLMValidationError(
+                    "vLLM did not take the supplied prompt_token_ids for this "
+                    "request (echo and multimodal messages are rendered "
+                    "instead), so the prompt would not match the prefilled "
+                    "sequence.",
+                    parameter="kv_transfer_params.prompt_token_ids",
+                )
+            # The ids are already spliced.
+            request.required_prefix_token_ids = None
+
         ended = None
         if isinstance(request, ChatCompletionRequest):
-            ended = reasoning_ended(
-                request,
-                self._request_parser(request, render_kwargs),
-                engine_prompt["prompt_token_ids"],
-            )
+            ended = getattr(request, "template_reasoning_ended", None)
+            if supplied_prompt_ids is None or ended is None:
+                ended = reasoning_ended(
+                    request,
+                    self._request_parser(request, render_kwargs),
+                    engine_prompt["prompt_token_ids"],
+                )
 
         # Token capture: the admission is built once by the host and resolved
         # here, before branching; the ``ng_capture`` dict is never mutated.
@@ -361,18 +452,27 @@ class NeMoRLOpenAIServingMixin:
         if host._capture_media and admission is not None:
             skip_mm_cache = True
 
+        render_kwargs = dict(
+            default_template=default_template,
+            default_template_content_format=default_template_content_format,
+            default_template_kwargs=default_template_kwargs,
+            tool_dicts=tool_dicts,
+            parser=parser,
+            skip_mm_cache=skip_mm_cache,
+        )
+        if (
+            _is_prefill_leg(request)
+            and host._tokenize_shadow_rate > 0
+            and random.random() < host._tokenize_shadow_rate
+            and (supplied := _supplied_prompt_token_ids(request)) is not None
+        ):
+            # PD disaggregation: a sample of the frontend-rendered prefill legs
+            # is recomputed from the messages they also carry.
+            await self._shadow_check_supplied_prompt_ids(
+                request, messages, supplied, render_kwargs
+            )
         rendered = await self._render_chat_call(
-            request,
-            messages,
-            dict(
-                default_template=default_template,
-                default_template_content_format=default_template_content_format,
-                default_template_kwargs=default_template_kwargs,
-                tool_dicts=tool_dicts,
-                parser=parser,
-                skip_mm_cache=skip_mm_cache,
-            ),
-            admission=admission,
+            request, messages, render_kwargs, admission=admission
         )
         if isinstance(request, NeMoRLChatCompletionRequest):
             # The request's SamplingParams carry it to the engine client.
@@ -396,6 +496,74 @@ class NeMoRLOpenAIServingMixin:
             max_model_len=self.model_config.max_model_len,
         )
         return rendered.conversation, [rendered.engine_prompt]
+
+    async def _shadow_check_supplied_prompt_ids(
+        self,
+        request: Any,
+        messages: list[dict[str, Any]],
+        supplied: list[int],
+        render_kwargs: dict[str, Any],
+    ) -> None:
+        """Recompute frontend-supplied prompt ids from the messages and compare.
+
+        Runs the engine's own render and splice on a copy of the request that
+        carries no supplied ids, so a frontend whose rendering drifted from
+        the engine's is caught in the logs rather than silently training on
+        off-policy tokens. Starts no capture and never fails serving.
+        """
+        try:
+            params = {
+                k: v
+                for k, v in (request.kv_transfer_params or {}).items()
+                if k != "prompt_token_ids"
+            }
+            shadow = request.model_copy(
+                update={
+                    "kv_transfer_params": params or None,
+                    "required_prefix_token_ids": _gym_prefix_from_messages(messages),
+                    "prompt_token_ids": None,
+                    "prompt_token_ids_b64": None,
+                    "template_reasoning_ended": None,
+                    "ng_capture": None,
+                }
+            )
+            rendered = await self._render_chat_call(
+                shadow, copy.deepcopy(messages), render_kwargs, admission=None
+            )
+            plan = await prepare_prompt(
+                rendered,
+                # No admission, so nothing is read from TQ.
+                resolve_prefix=lambda _admission: [],
+                turn_end_token_ids=turn_end_token_ids(
+                    self._model_stop_token_ids, self.renderer.tokenizer
+                ),
+                max_model_len=self.model_config.max_model_len,
+                # The frontend does not clamp the output budget either.
+                measure_only=True,
+                tokenizer=self.renderer.tokenizer,
+            )
+            recomputed = list(plan.prompt_token_ids)
+        except Exception as e:  # noqa: BLE001 - shadow must never fail serving
+            LOGGER.error("frontend-tokenize shadow recompute failed: %s", e)
+            return
+        if recomputed == list(supplied):
+            return
+        diff = next(
+            (i for i, (a, b) in enumerate(zip(supplied, recomputed)) if a != b),
+            min(len(supplied), len(recomputed)),
+        )
+        lo, hi = max(0, diff - 8), diff + 8
+        LOGGER.error(
+            "frontend-tokenize SHADOW MISMATCH: supplied %d ids, recomputed %d, "
+            "first divergence at %d; supplied[%d:%d]=%s vs recomputed=%s",
+            len(supplied),
+            len(recomputed),
+            diff,
+            lo,
+            hi,
+            list(supplied[lo:hi]),
+            recomputed[lo:hi],
+        )
 
 
 @dataclass(frozen=True)
@@ -911,6 +1079,11 @@ def register_routes(
         # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
         # with min_p and the repetition penalty off; the trainer replays none of
         # them, nor the penalties or logit bias a request may therefore not set.
+        prefill_leg = _is_prefill_leg(request)
+        if prefill_leg:
+            # The prefill leg generates one token nobody trains on; token
+            # capture completes on the decode leg, the one Gym reads.
+            request.ng_capture = None
         try:
             # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
             if (
@@ -953,6 +1126,18 @@ def register_routes(
 
         if isinstance(generator, ChatCompletionResponse):
             content = model_dump_chat_response_with_dynamic_message_fields(generator)
+            if (
+                request.return_prompt_token_ids_b64
+                and content.get("prompt_token_ids") is not None
+            ):
+                # The disagg frontend relays the string verbatim to the
+                # decode leg instead of re-serializing an int array.
+                content["prompt_token_ids_b64"] = encode_token_ids_b64(
+                    content.pop("prompt_token_ids")
+                )
+            if prefill_leg and request._template_reasoning_ended is not None:
+                # The frontend hands the decode leg this render's verdict.
+                content["template_reasoning_ended"] = request._template_reasoning_ended
             # Token capture: stage the delta and ride the coords on the
             # response; strips logprobs/ids (no-op when capture is off).
             content = await save_capture(host, request, content)

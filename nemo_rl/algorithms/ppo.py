@@ -88,6 +88,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
 )
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     sampler_replay_enabled,
@@ -95,11 +96,16 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig
+from nemo_rl.models.generation.trtllm.config import replica_width
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
+    validate_vllm_disaggregation_for_refit,
+    vllm_replica_width,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -400,11 +406,27 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    validate_disagg_entrypoint(
+        generation_config, uses_nemo_gym=should_use_nemo_gym(master_config)
+    )
     configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
+        async_ppo = ppo_config.async_ppo
+        validate_vllm_disaggregation_for_refit(
+            vllm_config,
+            in_flight_weight_updates=bool(
+                async_ppo is not None
+                and async_ppo.enabled
+                and async_ppo.in_flight_weight_updates
+            ),
+            recompute_kv_cache_after_weight_updates=bool(
+                async_ppo is not None
+                and async_ppo.recompute_kv_cache_after_weight_updates
+            ),
+        )
         refit_transport = vllm_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             raise ValueError(
@@ -716,15 +738,15 @@ def setup(
                     )
 
                 if generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
+                    # Under PD disaggregation the unit to keep inside one NVLink
+                    # domain is the whole replica, not one engine.
+                    gpus_per_instance = vllm_replica_width(
+                        cast(VllmConfig, generation_config)
                     )
                 elif generation_config["backend"] == "trtllm":
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    gpus_per_instance = replica_width(
+                        cast(TrtllmConfig, generation_config)
+                    )
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -2932,7 +2954,12 @@ def async_ppo_train(
                             master_config=master_config,
                             logger=logger,
                         )
-                        policy_generation.finish_generation()
+                        # Under vLLM PD this reset needs every engine idle, but
+                        # rollouts are still in flight here, so it would stall and fail.
+                        if not uses_vllm_disagg_frontends(
+                            master_config.policy["generation"]
+                        ):
+                            policy_generation.finish_generation()
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

@@ -4517,6 +4517,28 @@ def test_setup_rejects_megatron_router_replay_before_side_effects(
     mock_logger.assert_not_called()
 
 
+def test_setup_rejects_disaggregation_without_nemo_gym_before_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["disaggregation"] = {"enabled": True}
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(ValueError, match="disaggregation.enabled requires NeMo-Gym"),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
+
+
 def test_setup_rejects_agent_overrides_before_side_effects(mock_grpo_components):
     """Only the SingleController advantage stage applies grpo.agent_overrides."""
     from nemo_rl.algorithms.grpo import setup
@@ -5191,6 +5213,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         turn_checkpointing_enabled=False,
         # A TensorRT-LLM server checks no bearer token on its OpenAI routes.
         policy_api_key=None,
+        # Only vLLM PD disaggregation frontends key requests by conversation.
+        forward_session_id_as_conversation_id=False,
     )
     validate_coverage.assert_called_once_with(
         nemo_gym_shard_set, {"train": dataset, "validation": None}

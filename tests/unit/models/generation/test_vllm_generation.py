@@ -486,7 +486,9 @@ def test_async_vllm_worker_reserves_distinct_ports_in_range(
         DEFAULT_GENERATION_PORT_RANGE_HIGH,
     )
 
-    def initialize_base(worker: Any, worker_config: VllmConfig, *args: Any) -> None:
+    def initialize_base(
+        worker: Any, worker_config: VllmConfig, *args: Any, **kwargs: Any
+    ) -> None:
         worker.cfg = worker_config
         worker.is_model_owner = True
 
@@ -1495,6 +1497,8 @@ def _fake_chat_request():
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
+        # Set only on a PD disaggregation prefill leg.
+        return_prompt_token_ids_b64=None,
         # NeMoRLChatCompletionRequest's private defaults for a call that
         # restores no generation prefix.
         _restored_generation_token_ids=(),
@@ -6157,6 +6161,44 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_forwards_kv_transfer_rejections() -> None:
+    """vLLM 0.29's serving layer frees a rejected request's pinned KV through
+    the engine client; the call touches engine state, so it must run on the
+    engine loop like generate/abort, not on the HTTP thread's loop."""
+    engine_loop = asyncio.get_running_loop()
+    calls = []
+
+    class FakeEngine:
+        model_config = renderer = input_processor = vllm_config = None
+
+        async def notify_kv_transfer_request_rejected(
+            self, request_id, kv_transfer_params, *, data_parallel_rank=None
+        ):
+            calls.append(
+                (
+                    request_id,
+                    kv_transfer_params,
+                    data_parallel_rank,
+                    asyncio.get_running_loop(),
+                )
+            )
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop, flat_logprobs=False)
+    params = {"do_remote_prefill": True, "remote_block_ids": [1, 2]}
+
+    def notify_from_http_thread():
+        return asyncio.run(
+            client.notify_kv_transfer_request_rejected(
+                "req-1", params, data_parallel_rank=0
+            )
+        )
+
+    await asyncio.to_thread(notify_from_http_thread)
+
+    assert calls == [("req-1", params, 0, engine_loop)]
 
 
 def test_sync_worker_finishes_queued_batches_before_resetting_the_prefix_cache():

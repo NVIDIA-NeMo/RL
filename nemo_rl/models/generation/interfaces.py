@@ -14,11 +14,19 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    NotRequired,
+    Optional,
+    TypedDict,
+    Union,
+)
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, PositiveInt
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
@@ -201,13 +209,13 @@ class DisaggConfig(BaseModel, extra="allow"):
     enabled: bool = False
 
     # Engines per replica; independent, so the P:D ratio is free.
-    num_prefill_engines: int = 1
-    num_decode_engines: int = 1
+    num_prefill_engines: PositiveInt = 1
+    num_decode_engines: PositiveInt = 1
 
     # Frontend servers per replica, each its own actor with a distinct URL. The
     # rollout client shards conversations across them by session, so one
     # frontend's CPU stops being the replica's throughput ceiling.
-    num_frontend_workers: int = 1
+    num_frontend_workers: PositiveInt = 1
 
     # Render and tokenize on the frontends instead of the prefill adapter,
     # which is one thread per engine and scales only by adding GPUs.
@@ -219,7 +227,9 @@ class DisaggConfig(BaseModel, extra="allow"):
     # Like every service port it must stay below 9000, the ephemeral floor on
     # some DGX/GB200 nodes; the default band is virtual_cluster's
     # DEFAULT_DISAGG_FRONTEND_PORT_RANGE_*.
-    frontend_base_port: int = DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+    frontend_base_port: Annotated[int, Field(ge=1, le=65535)] = (
+        DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+    )
 
 
 class ColocationConfig(TypedDict):

@@ -454,6 +454,31 @@ class TestValidateAndPrepareConfig:
         assert result.is_generation_colocated is False
         # NCCL_CUMEM_ENABLE should be set when not colocated
         assert os.environ.get("NCCL_CUMEM_ENABLE") == "1"
+        # Aggregated engines keep NCCL's default transport, so the trainer does too.
+        assert "NCCL_NET_PLUGIN" not in os.environ
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_generation_disaggregated_vllm_shares_the_nccl_transport(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """The trainer adopts the NCCL_NET_PLUGIN of disaggregated vLLM engines."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        mock_config["generation"]["backend"] = "vllm"
+        mock_config["generation"]["colocated"]["enabled"] = False
+        mock_config["generation"]["disaggregation"] = {"enabled": True}
+        mock_config["generation"]["vllm_cfg"] = {"tensor_parallel_size": 2}
+        validate_and_prepare_config(mock_config, None, 0)
+        assert os.environ.get("NCCL_NET_PLUGIN") == "none"
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")

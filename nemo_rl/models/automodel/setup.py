@@ -317,6 +317,7 @@ def validate_and_prepare_config(
     is_generation_colocated = None
     rollout_backend = None
     sampling_params = None
+    generation_cfg = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
@@ -335,6 +336,22 @@ def validate_and_prepare_config(
     # Keep the explicit ``is False`` guard: SFT/DPO have no generation config.
     if is_generation_colocated is False:
         os.environ["NCCL_CUMEM_ENABLE"] = "0" if rollout_backend == "sglang" else "1"
+        # Same communicator, same transport: see configure_refit_environment
+        # in nemo_rl/models/megatron/setup.py.
+        peer_env: dict[str, str] = {}
+        if rollout_backend == "vllm":
+            from nemo_rl.models.generation.vllm.config import (
+                VllmConfig,
+                vllm_refit_peer_env,
+            )
+
+            peer_env = vllm_refit_peer_env(cast(VllmConfig, generation_cfg))
+        trainer_env = cast(
+            dict[str, str], (config.get("automodel_cfg") or {}).get("env_vars") or {}
+        )
+        for key, value in peer_env.items():
+            if key not in trainer_env:
+                os.environ[key] = value
 
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles

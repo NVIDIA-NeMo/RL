@@ -125,7 +125,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.disagg_layout import resolve_disagg_layout
+from nemo_rl.models.generation.disagg_layout import validate_disagg_entrypoint
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -147,6 +147,9 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
+    validate_vllm_disaggregation_for_refit,
+    vllm_replica_width,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -898,33 +901,24 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-
-    # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM backend implements it today: every other backend would
-    # silently ignore the block and serve aggregated, so refuse to start.
-    if (
-        resolve_disagg_layout(generation_config).enabled
-        and generation_config["backend"] != "trtllm"
-    ):
-        raise ValueError(
-            "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
-            "false, or switch the backend."
-        )
-    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
-    # the whole fleet would come up and fail at the first rollout instead.
-    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
-        master_config
-    ):
-        raise ValueError(
-            "policy.generation.disaggregation.enabled requires NeMo-Gym "
-            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
-            "through the NeMo-Gym entrypoint."
+        async_grpo = grpo_config.async_grpo
+        validate_vllm_disaggregation_for_refit(
+            cast(VllmConfig, generation_config),
+            in_flight_weight_updates=bool(
+                async_grpo is not None
+                and async_grpo.enabled
+                and async_grpo.in_flight_weight_updates
+            ),
+            recompute_kv_cache_after_weight_updates=bool(
+                async_grpo is not None
+                and async_grpo.recompute_kv_cache_after_weight_updates
+            ),
         )
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
+    validate_disagg_entrypoint(generation_config, uses_nemo_gym=enable_nemo_gym)
 
     _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
@@ -1191,6 +1185,9 @@ def setup(
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
             turn_checkpointing_enabled=False,
+            forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+                generation_config
+            ),
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -1426,9 +1423,10 @@ def setup(
                         policy_config
                     )
                 elif generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
+                    # Under PD disaggregation the unit to keep inside one NVLink
+                    # domain is the whole replica, not one engine.
+                    gpus_per_instance = vllm_replica_width(
+                        cast(VllmConfig, generation_config)
                     )
                 elif generation_config["backend"] == "trtllm":
                     # Under PD disaggregation the unit to keep inside one NVLink
@@ -6484,9 +6482,14 @@ def async_grpo_train(
                         # Save-bound steps need the GPUs for checkpointing,
                         # so the engine must stand down; otherwise a colocated
                         # engine keeps serving (backend's call).
-                        policy_generation.finish_generation(
-                            release_gpu=saving_this_step
-                        )
+                        # Under vLLM PD this reset needs every engine idle, but
+                        # rollouts are still in flight here, so it would stall and fail.
+                        if not uses_vllm_disagg_frontends(
+                            master_config.policy["generation"]
+                        ):
+                            policy_generation.finish_generation(
+                                release_gpu=saving_this_step
+                            )
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )

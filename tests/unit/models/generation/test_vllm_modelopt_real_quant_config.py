@@ -168,8 +168,14 @@ def _install_fake_vllm_worker(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "vllm.distributed.parallel_state", parallel_state_module
     )
+    # The backend reads a prefill/decode KV connector; a plain engine has none.
+    kv_transfer_module = types.ModuleType("vllm.distributed.kv_transfer")
+    kv_transfer_module.has_kv_transfer_group = lambda: False
+    kv_transfer_module.get_kv_transfer_group = lambda: None
+    monkeypatch.setitem(sys.modules, "vllm.distributed.kv_transfer", kv_transfer_module)
     modules["vllm"].distributed = modules["vllm.distributed"]
     modules["vllm.distributed"].parallel_state = parallel_state_module
+    modules["vllm.distributed"].kv_transfer = kv_transfer_module
     modules["vllm"].v1 = modules["vllm.v1"]
     modules["vllm.v1"].worker = modules["vllm.v1.worker"]
     modules["vllm.v1.worker"].gpu_worker = gpu_worker_module

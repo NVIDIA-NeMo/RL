@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.weight_sync.membership import plan_refit_membership
 from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
     NcclReshardWeightSynchronizer,
@@ -70,6 +71,9 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
     from nemo_rl.models.generation.vllm import vllm_generation
 
     gen = SimpleNamespace(
+        # A fleet without prefill/decode disaggregation.
+        _disagg_cfg=DisaggConfig(),
+        _assert_shard_restart_allowed=lambda what: None,
         cfg={"vllm_cfg": {"async_engine": False}},
         worker_group=SimpleNamespace(
             workers=workers,
@@ -248,6 +252,9 @@ class TestBothCommunicatorFamilies:
 
         calls = []
         generation = SimpleNamespace(
+            # A fleet without prefill/decode disaggregation.
+            _disagg_cfg=DisaggConfig(),
+            _assert_shard_restart_allowed=lambda what: None,
             cfg={"vllm_cfg": {"async_engine": True}},
             dp_size=8,
             vllm_dp_size=4,
