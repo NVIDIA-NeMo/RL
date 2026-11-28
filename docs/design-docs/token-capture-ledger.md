@@ -113,7 +113,7 @@ For vLLM:
 
 - `manifest` = the fetched `CallRecord` list, deduped by `model_call_id`;
 - `terminal_model_call_id` = the row Gym's `resolve_terminal(records, scored_response, declared_response_id=...)` attributes: the harness's declared response id, the scored response's own `id`, and the response's content fingerprints each independently name a row through `CallRecord.response_id` and the recorded fingerprints; agreeing witnesses attribute, disagreeing witnesses attribute nothing;
-- `capture_poisoned` = any failure row present, or no row for the terminal request.
+- `capture_poisoned` = a failure row present whose reason is outside Gym's `UNSERVED_CALL_FAILURE_REASONS` (the reasons of a call that served no completion), or no row for the terminal request.
 
 MInf and vLLM both produce committed `manifest` rows that point directly to canonical TQ records.
 

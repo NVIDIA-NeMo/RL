@@ -401,6 +401,39 @@ def test_receipt_assembly_ignores_uncommitted_call_failures_off_the_terminal_cha
     assert receipt["terminal_model_call_id"] == "c2"
 
 
+def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names() -> None:
+    """Gym lists the failure reasons of a call that served no completion in
+    ``UNSERVED_CALL_FAILURE_REASONS``, among them the inference engine's
+    refusal of a prompt that no longer fits the context window. No such call
+    can be a lineage parent, so none of these rows poisons the verified chain."""
+    # Deferred: collection also runs in shards without nemo_gym.
+    from nemo_gym.token_id_capture import (
+        ENGINE_REFUSED_CALL_REASON,
+        UNSERVED_CALL_FAILURE_REASONS,
+    )
+
+    # The engine's refusal stays under test whatever else the set holds.
+    assert ENGINE_REFUSED_CALL_REASON in UNSERVED_CALL_FAILURE_REASONS
+    env = _capture_env()
+    manifest = {
+        "capture_key": "r0",
+        "records": [
+            _manifest_record("c1"),
+            _manifest_record("c2", parent="c1"),
+        ],
+        "failures": [
+            {"model_call_id": f"unserved-{index}", "reason": reason}
+            for index, reason in enumerate(sorted(UNSERVED_CALL_FAILURE_REASONS))
+        ],
+    }
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id="resp-c2", reward=1.0
+    )
+    assert receipt["capture_poisoned"] is False
+    assert receipt["failure_reason"] is None
+    assert receipt["terminal_model_call_id"] == "c2"
+
+
 def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted() -> (
     None
 ):

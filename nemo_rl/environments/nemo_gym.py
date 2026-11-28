@@ -2398,15 +2398,19 @@ Depending on your data shape, you may want to change these values."""
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
         chain.
 
-        Poisoning is fail-closed with one carve-out. A failure row whose
-        reason is ``request_finished_without_staged_coordinates`` is a call
-        that never returned a completion (the ledger commit precedes the
-        response leaving the server) and can never be a lineage parent (an
-        uncommitted call has no row to resolve against) — e.g. the doomed
-        final call of a rollout that exhausted the model's context window,
-        or a call cancelled mid-flight when the harness ends the session at
-        its budget. Such rows are structurally off-chain and do not poison;
-        if the *terminal* request itself died this way, the
+        Poisoning is fail-closed with one carve-out. A call with a failure
+        row whose reason is in Gym's ``UNSERVED_CALL_FAILURE_REASONS``, and
+        no other failure row, returned no completion the inference engine
+        generated. Its row is either ``engine_refused_request`` (the engine
+        refused the request and the Model Server passed the refusal on to
+        the agent) or ``request_finished_without_staged_coordinates`` (the
+        request finished without worker commit coordinates, e.g. a call
+        cancelled mid-flight when the harness ends the session at its
+        budget, or a context-window refusal that the Model Server answered
+        with an empty completion of its own). Such a call can never be a
+        lineage parent (it has no committed ledger row, or the agent never
+        received its completion), so its row is structurally off-chain and
+        does not poison; if the *terminal* request itself died this way, the
         missing-terminal-row check below still masks the rollout. Every
         other failure reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
@@ -2419,7 +2423,7 @@ Depending on your data shape, you may want to change these values."""
         from cleanup ownership.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.token_id_capture import UNSERVED_CALL_FAILURE_REASONS
         from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import CallRecord
         from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
@@ -2471,7 +2475,7 @@ Depending on your data shape, you may want to change these values."""
         poisoning_failures = [
             failure
             for failure in failures
-            if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+            if str(failure.get("reason") or "") not in UNSERVED_CALL_FAILURE_REASONS
         ]
         failure_reason = None
         if poisoning_failures:
