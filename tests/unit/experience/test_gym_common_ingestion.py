@@ -123,7 +123,6 @@ def call(index: int, items: list[dict], *, parent: int | None = None) -> CallRec
 @pytest.mark.parametrize(
     "item_type",
     [
-        "custom_tool_call",
         "computer_call",
         "local_shell_call",
         "apply_patch_call",
@@ -188,6 +187,29 @@ def test_refusal_and_tool_results_keep_supported_selection() -> None:
         }
     }
     assert select_captured_calls(records, result)[0] == records
+
+
+def test_custom_tool_call_selects_its_call_and_validates_input() -> None:
+    """A returned custom tool call selects the captured call with the same input."""
+    tool_call = {
+        "type": "custom_tool_call",
+        "id": "custom",
+        "call_id": "tool",
+        "name": "exec",
+        "input": "print(1)",
+    }
+    final = message("done") | {"id": "final"}
+    records = [call(1, [tool_call]), call(2, [final], parent=1)]
+    output = [
+        tool_call,
+        {"type": "custom_tool_call_output", "call_id": "tool", "output": "1"},
+        final,
+    ]
+    result = {"response": {"id": "response-2", "output": output}}
+    assert select_captured_calls(records, result)[0] == records
+    output[0] = tool_call | {"input": "print(2)"}
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        select_captured_calls(records, result)[0]
 
 
 def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract() -> (

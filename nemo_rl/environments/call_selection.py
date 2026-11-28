@@ -85,7 +85,13 @@ def _output_items(
             ):
                 # Gym's generation boundary includes types that capture cannot
                 # yet fingerprint. Never silently discard these from history.
-                if item_type not in (None, "message", "reasoning", "function_call"):
+                if item_type not in (
+                    None,
+                    "message",
+                    "reasoning",
+                    "function_call",
+                    "custom_tool_call",
+                ):
                     raise ValueError(
                         "Unsupported generated output item: "
                         f"type={item_type!r}, item_id={item.get('id')!r}, "
