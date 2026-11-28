@@ -1,0 +1,244 @@
+# Copyright (c) 2020-2021, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Branch-local copy of NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml
+# at d0878a142525ff79366ca96fbc0b306cd8d64670. Only the manual-dispatch
+# PR lookup differs; membership checks and runner routing stay unchanged.
+on:
+  workflow_call:
+    inputs:
+      default_runner_prefix:
+        description: "The default runner prefix to use"
+        required: false
+        default: ""
+        type: string
+      non_nvidia_runner_prefix:
+        description: "The runner prefix to use for non-NVIDIA users"
+        required: false
+        default: ""
+        type: string
+      default_test_data_path:
+        description: "The default test data path to use"
+        required: false
+        default: ""
+        type: string
+      non_nvidia_test_data_path:
+        description: "The test data path to use for non-NVIDIA users"
+        required: false
+        default: ""
+        type: string
+      default_registry:
+        description: "The default registry to use"
+        required: false
+        default: ""
+        type: string
+      non_nvidia_registry:
+        description: "The registry to use for non-NVIDIA users"
+        required: false
+        default: ""
+        type: string
+      workflow_ref:
+        description: "The ref to use for the workflow"
+        required: false
+        default: main
+        type: string
+      sso_users_filename:
+        description: "Filename of SSO users JSON"
+        required: false
+        default: "users_sso.json"
+        type: string
+    outputs:
+      is_ci_workload:
+        description: "Whether it is triggered by schedule event"
+        value: ${{ jobs.pre-flight.outputs.is_ci_workload }}
+      force_run_all:
+        description: "Whether label `force-run-all` is set"
+        value: ${{ jobs.pre-flight.outputs.force_run_all }}
+      docs_only:
+        description: "Whether only docs are changed"
+        value: ${{ jobs.pre-flight.outputs.docs_only }}
+      base_ref:
+        description: "Base reference"
+        value: ${{ jobs.pre-flight.outputs.base_ref }}
+      is_deployment_workflow:
+        description: "Whether it is triggered by deployment workflow"
+        value: ${{ jobs.pre-flight.outputs.is_deployment_workflow }}
+      is_merge_group:
+        description: "Whether event is a merge_queue"
+        value: ${{ github.event_name == 'merge_group' }}
+      is_member:
+        description: "Whether the user is a member of NVIDIA SSO"
+        value: ${{ jobs.pre-flight.outputs.is_member }}
+      runner_prefix:
+        description: "The runner prefix to use"
+        value: ${{ jobs.pre-flight.outputs.runner_prefix }}
+      test_data_path:
+        description: "The test data path to use"
+        value: ${{ jobs.pre-flight.outputs.test_data_path }}
+      registry:
+        description: "The registry to use"
+        value: ${{ jobs.pre-flight.outputs.registry }}
+    secrets:
+      NVIDIA_MANAGEMENT_ORG_PAT:
+        required: false
+jobs:
+  pre-flight:
+    runs-on: ubuntu-latest
+    outputs:
+      is_ci_workload: ${{ steps.is_ci_workload.outputs.main }}
+      force_run_all: ${{ steps.force_run_all.outputs.main }}
+      docs_only: ${{ steps.docs_only.outputs.main == 'true' }}
+      base_ref: ${{ steps.base-ref.outputs.base }}
+      is_deployment_workflow: ${{ steps.is-deployment-workflow.outputs.main == 'true' }}
+      is_member: ${{ steps.check-sso.outputs.is_member || 'false' }}
+      runner_prefix: ${{ steps.select_runner.outputs.runner_prefix || '' }}
+      test_data_path: ${{ steps.select_runner.outputs.test_data_path || '' }}
+      registry: ${{ steps.select_runner.outputs.registry || '' }}
+    env:
+      TESTS_TO_RUN: ${{ inputs.test_to_run }}
+      EVENT_NAME: ${{ github.event_name }}
+      HAS_LABEL: ${{ github.event.label.name == 'Run CICD' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Get PR info
+        id: get-pr-info
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+
+      - name: Get PR info for manual dispatch
+        id: dispatch-pr-info
+        if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: ./.github/actions/pr-info
+
+      - name: Is deployment workflow
+        id: is-deployment-workflow
+        if: startsWith(github.ref, 'refs/heads/deploy-release/')
+        run: |
+          echo "main=true" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Determine base reference
+        id: base-ref
+        run: |
+          echo "base=${{ (startsWith(github.ref, 'refs/heads/pull-request/') && fromJSON((steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info)).base.ref) || 'HEAD~1' }}" | tee -a $GITHUB_OUTPUT
+
+      - name: Get changed files
+        id: changed-files
+        uses: step-security/changed-files@2e07db73e5ccdb319b9a6c7766bd46d39d304bad # v47.0.5
+        with:
+          base_sha: ${{ steps.base-ref.outputs.base }}
+          files_yaml: |
+            doc:
+              - '**.md'
+              - docs/**
+            src:
+              - '!**.md'
+              - '!docs/**'
+
+      - name: Check if PR has docs-only label
+        shell: bash
+        id: docs_only_label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            PR_NUMBER=${{ fromJSON((steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info) || '{}').number }}
+            HAS_DOCS_ONLY_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "docs-only")')
+          else
+            HAS_DOCS_ONLY_LABEL=false
+          fi
+
+          if [[ "$HAS_DOCS_ONLY_LABEL" == "true" ]] ; then
+            echo "main=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "main=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if docs only
+        shell: bash
+        id: docs_only
+        env:
+          DOCS_ONLY: ${{ steps.changed-files.outputs.doc_any_changed == 'true' && steps.changed-files.outputs.src_any_changed == 'false' }}
+          DOCS_ONLY_LABEL: ${{ steps.docs_only_label.outputs.main == 'true' }}
+        run: |
+          if [[ "$DOCS_ONLY" == "true" || "$DOCS_ONLY_LABEL" == "true" ]]; then
+            echo "main=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "main=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if this is a CI workload
+        shell: bash
+        id: is_ci_workload
+        run: |
+          branch_name=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+
+          if [[ "$branch_name" =~ ^bump-ci-container || "$EVENT_NAME" == "schedule" || "$branch_name" == "main" || "$branch_name" == "dev" ]]; then
+            is_ci_workload=true
+          else
+            is_ci_workload=false
+          fi
+
+          echo "main=$is_ci_workload" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check if force-run-all is set
+        shell: bash
+        id: force_run_all
+        env:
+          HAS_FORCE_RUN_ALL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'force-run-all') }}
+        run: |
+          if [[ "$HAS_FORCE_RUN_ALL_LABEL" == "true" || "$EVENT_NAME" == "schedule" ]]; then
+            force_run_all=true
+          else
+            force_run_all=false
+          fi
+
+          echo "main=$force_run_all" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Checkout NVIDIA-NeMo/FW-CI-templates
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: ${{ inputs.workflow_ref }}
+          path: ci-templates
+
+      - name: Check NVIDIA SSO membership
+        id: check-sso
+        uses: ./ci-templates/.github/actions/check-nvidia-sso
+        if: ${{ inputs.default_runner_prefix != '' }}
+        with:
+          username: ${{ fromJSON((steps.dispatch-pr-info.outputs.pr-info || steps.get-pr-info.outputs.pr-info) || '{}').user.login || github.actor }}
+          github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
+          sso_users_filename: ${{ inputs.sso_users_filename }}
+
+      - name: Select runner and test data path
+        id: select_runner
+        shell: bash
+        env:
+          IS_MEMBER: ${{ steps.check-sso.outputs.is_member }}
+          IS_CI_WORKLOAD: ${{ steps.is_ci_workload.outputs.main }}
+        if: ${{ inputs.default_runner_prefix != '' }}
+        run: |
+          if [[ "$IS_MEMBER" == "true" || "$IS_CI_WORKLOAD" == "true" ]]; then
+            echo "runner_prefix=${{ inputs.default_runner_prefix }}" | tee -a "$GITHUB_OUTPUT"
+            echo "test_data_path=${{ inputs.default_test_data_path }}" | tee -a "$GITHUB_OUTPUT"
+            echo "registry=${{ inputs.default_registry }}" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "runner_prefix=${{ inputs.non_nvidia_runner_prefix }}" | tee -a "$GITHUB_OUTPUT"
+            echo "test_data_path=${{ inputs.non_nvidia_test_data_path }}" | tee -a "$GITHUB_OUTPUT"
+            echo "registry=${{ inputs.non_nvidia_registry }}" | tee -a "$GITHUB_OUTPUT"
+          fi

@@ -99,6 +99,7 @@ runs:
         submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
         ref: ${{ inputs.test-commit-sha }}
+        fetch-depth: ${{ inputs.script == 'L1_Functional_Tests_GB200_Nixl_TQ_Recovery_Bisect' && '0' || '1' }}
 
     - name: Wait before retrying checkout
       if: steps.checkout.outcome == 'failure'
@@ -116,6 +117,19 @@ runs:
         submodules: "recursive"
         path: ${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl
         ref: ${{ inputs.test-commit-sha }}
+        fetch-depth: ${{ inputs.script == 'L1_Functional_Tests_GB200_Nixl_TQ_Recovery_Bisect' && '0' || '1' }}
+
+    - name: Prepare historical NIXL revisions
+      if: inputs.script == 'L1_Functional_Tests_GB200_Nixl_TQ_Recovery_Bisect'
+      shell: bash -e -u -o pipefail {0}
+      working-directory: ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl
+      run: |
+        git fetch --no-tags origin 249c394db1df268f15c7161d4cc1131c8588310e 6331e5bf6f40910e48ae1e4411c2125ab45882fd
+        git cat-file -e 249c394db1df268f15c7161d4cc1131c8588310e^{commit}
+        git cat-file -e 6331e5bf6f40910e48ae1e4411c2125ab45882fd^{commit}
+        test "$(git rev-parse --is-shallow-repository)" = false
+        base=$(git merge-base 249c394db1df268f15c7161d4cc1131c8588310e 6331e5bf6f40910e48ae1e4411c2125ab45882fd)
+        git rev-list --first-parent "$base..6331e5bf6f40910e48ae1e4411c2125ab45882fd"
 
     - name: Override Megatron-LM commit
       if: inputs.megatron-lm-commit != ''
@@ -237,7 +251,7 @@ runs:
         }
 
         run_shard
-        if ! tail -n 1 err.log | grep -q "Finished successfully."; then
+        if [[ "${{ inputs.script }}" != L1_Functional_Tests_GB200_Nixl_TQ_Recovery_Bisect ]] && ! tail -n 1 err.log | grep -q "Finished successfully."; then
           patterns_file="${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/.github/scripts/known-flake-patterns.txt"
           flake_line=$(grep -m 1 -E -f <(grep -vE '^[[:space:]]*(#|$)' "$patterns_file") err.log | cut -c1-300 || true)
           if [[ -n "$flake_line" ]]; then
@@ -300,6 +314,14 @@ runs:
         path: |
           ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/unit/environments/nemo_gym_test_data/actual_test_nemo_gym_sanity.json
         if-no-files-found: ignore
+
+    - name: Upload historical NIXL results
+      if: always() && inputs.script == 'L1_Functional_Tests_GB200_Nixl_TQ_Recovery_Bisect'
+      uses: actions/upload-artifact@v6
+      with:
+        name: nixl-bisect-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ github.workspace }}/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl/tests/functional/nixl-bisect.*
+        if-no-files-found: warn
 
     - name: Container shutdown
       if: always()

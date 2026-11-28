@@ -11,6 +11,7 @@ BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
 #   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
 #   mooncake_gdr    mooncake_cpu with GDR clients (use_gdr=true), SSD under pressure
 #   nixl_ssd        nixl with its units' SSD tier under memory pressure
+#   nixl_no_ssd     nixl with its units' SSD tier disabled
 # The mooncake_cpu and nixl SSD tiers are on by default and spill only under
 # memory pressure. mooncake_units and nixl run the defaults (path: null, the
 # node's NVMe) and fail if anything was spilled; mooncake_cpu and nixl_ssd set
@@ -62,15 +63,19 @@ case "$VARIANT" in
             'max(data["data_plane/mooncake/disk_evictions_total"]) == 0'
         )
         ;;
-    nixl)
+    nixl|nixl_no_ssd)
         BACKEND=nixl
         TEST_NAME=grpo_dp_nixl_tq_recovery
-        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics). The
-        # default SSD tier is on but the put area is not full: no spill.
-        VARIANT_CHECKS=(
-            'max(data["data_plane/nixl/retired_mb_sum"]) == 0'
-            'max(data["data_plane/nixl/ssd_spills_sum"]) == 0'
-        )
+        VARIANT_CHECKS=('max(data["data_plane/nixl/retired_mb_sum"]) == 0')
+        if [[ "$VARIANT" == "nixl_no_ssd" ]]; then
+            TEST_NAME=grpo_dp_nixl_no_ssd_tq_recovery
+            VARIANT_OVERRIDES=(data_plane.nixl.ssd.enabled=false)
+            # The adapter emits SSD counters only when the tier is enabled.
+            VARIANT_CHECKS+=('"data_plane/nixl/ssd_spills_sum" not in data')
+        else
+            # The default put area should not fill during this test.
+            VARIANT_CHECKS+=('max(data["data_plane/nixl/ssd_spills_sum"]) == 0')
+        fi
         ;;
     nixl_ssd)
         BACKEND=nixl
