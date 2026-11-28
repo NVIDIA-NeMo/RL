@@ -1410,6 +1410,7 @@ class AutomodelPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 
@@ -1420,6 +1421,9 @@ class AutomodelPolicyWorkerImpl(
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
+        - With return_logsumexp=True, additionally returns "logsumexp" [B, S]
+          (full-vocab, fp32) so callers can form TRUE log-probs as
+          topk_logits - logsumexp (SDPO K+1 tail buckets).
         """
         self._raise_if_pipeline_parallel("get_topk_logits")
         topk_batch_size = (
@@ -1433,6 +1437,7 @@ class AutomodelPolicyWorkerImpl(
 
         out_topk_vals = []
         out_topk_idx = []
+        out_lse = []
         self.model.eval()
 
         # Create top-k post-processor
@@ -1441,6 +1446,7 @@ class AutomodelPolicyWorkerImpl(
             tp_mesh=self.tp_mesh,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
+            return_logsumexp=return_logsumexp,
         )
 
         with torch.no_grad():
@@ -1467,7 +1473,7 @@ class AutomodelPolicyWorkerImpl(
 
                 with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                    _topk_out, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         prepared=prepared,
                         post_processing_fn=topk_post_processor,
@@ -1475,6 +1481,11 @@ class AutomodelPolicyWorkerImpl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
+                    if return_logsumexp:
+                        vals, idx, lse = _topk_out
+                    else:
+                        vals, idx = _topk_out
+                        lse = None
 
                 # skip keeping the topk values for the dummy batches
                 if batch_idx >= iterator_len:
@@ -1484,6 +1495,8 @@ class AutomodelPolicyWorkerImpl(
                 # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
+                if lse is not None:
+                    out_lse.append(lse.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
@@ -1493,6 +1506,8 @@ class AutomodelPolicyWorkerImpl(
         ret["topk_indices"] = pad_and_concat(
             out_topk_idx, target_len=seq_dim_size
         ).cpu()
+        if return_logsumexp:
+            ret["logsumexp"] = pad_and_concat(out_lse, target_len=seq_dim_size).cpu()
         return ret
 
     def get_full_logits_ipc(

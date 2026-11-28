@@ -38,6 +38,7 @@ from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.opd import get_opd_full_config
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
+from nemo_rl.algorithms.sdpo import MasterConfig as SDPOMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig as SingleControllerMasterConfig,
@@ -220,6 +221,9 @@ def _check_required_keys(config_file: str, config: DictConfig) -> None:
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
+    elif "sdpo" in config_dict:
+        master_config_class = SDPOMasterConfig
+        config_type = "sdpo"
     elif "grpo" in config_dict:
         master_config_class = GRPOMasterConfig
         config_type = "grpo"

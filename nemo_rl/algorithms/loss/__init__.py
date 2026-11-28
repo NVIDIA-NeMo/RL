@@ -30,6 +30,11 @@ from nemo_rl.algorithms.loss.loss_functions import (
     NLLLossFn,
     PreferenceLossDataDict,
     PreferenceLossFn,
+    SDPOHybridLossConfig,
+    SDPOHybridLossFn,
+    SDPOLossConfig,
+    SDPOLossDataDict,
+    SDPOLossFn,
 )
 from nemo_rl.algorithms.loss.loss_input import (
     prepare_loss_input,
@@ -60,6 +65,11 @@ __all__ = [
     "NLLLossFn",
     "PreferenceLossDataDict",
     "PreferenceLossFn",
+    "SDPOHybridLossConfig",
+    "SDPOHybridLossFn",
+    "SDPOLossConfig",
+    "SDPOLossDataDict",
+    "SDPOLossFn",
     "prepare_loss_input",
     "prepare_packed_loss_input",
     "SequencePackingFusionLossWrapper",

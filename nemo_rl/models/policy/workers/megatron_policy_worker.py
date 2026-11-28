@@ -3454,6 +3454,11 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
+        if "topk_gather_indices" in data:
+            raise NotImplementedError(
+                "topk_gather_indices (gather-at-indices mode, used by the SDPO "
+                "trust-region teacher) is only implemented for the Automodel backend."
+            )
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
