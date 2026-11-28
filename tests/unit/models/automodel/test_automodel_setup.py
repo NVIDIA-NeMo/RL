@@ -1229,6 +1229,45 @@ class TestSetupModelAndOptimizer:
             id(param) for param in model.layer0.parameters()
         }
 
+    @pytest.mark.parametrize("force_hf", [True, False])
+    @patch("nemo_rl.models.automodel.setup.ModelRegistry")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    def test_force_hf_moe_model_keeps_autocast(
+        self,
+        mock_get_rank,
+        mock_registry,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+        force_hf,
+    ):
+        """force_hf loads the HF implementation of a custom-registered MoE arch."""
+        mock_get_rank.return_value = 0
+        mock_registry.model_arch_name_to_cls = {"CustomMoeForCausalLM": torch.nn.Module}
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {"mlp.experts.0.weight": torch.zeros(1)}
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.architectures = ["CustomMoeForCausalLM"]
+        mock_config["automodel_cfg"]["automodel_kwargs"] = {"force_hf": force_hf}
+
+        result = setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+            is_vlm=False,
+            init_optimizer=False,
+        )
+
+        assert result.is_moe_model is True
+        assert result.is_hf_model is force_hf
+        # Autocast stays off only for the custom (non-HF) MoE implementation.
+        assert result.autocast_enabled is force_hf
+
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     def test_restore_from_without_lora_enabled_raises(
         self,
