@@ -16,7 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import numpy as np
 import torch
@@ -35,7 +35,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -196,6 +196,17 @@ def setup(
     checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+
+    # DPO runs microbatches of 2 * train_micro_batch_size (chosen/rejected pairs).
+    automodel_cfg = policy_config.get("automodel_cfg")
+    if (
+        automodel_cfg is not None
+        and automodel_cfg["enabled"]
+        and cast(AutomodelConfig, automodel_cfg)["pipeline_parallel_size"] > 1
+    ):
+        raise ValueError(
+            "DPO does not support policy.automodel_cfg.pipeline_parallel_size > 1."
+        )
 
     # Make sure we are not using dynamic batching or sequence packing.
     # Anything that changes the order of data within a batch is currently incompatible with DPO.

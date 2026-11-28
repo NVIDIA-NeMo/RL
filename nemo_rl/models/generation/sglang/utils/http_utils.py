@@ -15,6 +15,7 @@
 import asyncio
 import json
 import logging
+from typing import Any
 
 import httpx
 import ray
@@ -250,9 +251,23 @@ class HttpClient:
         self._post_actor_idx = 0
         self._distributed_post_enabled = False
 
-    async def aclose(self) -> None:
-        """Close local HTTP resources and kill distributed POST actors."""
-        self.shutdown()
+    async def aclose_local(self) -> None:
+        """Close this process's ``httpx`` client; shared POST actors stay up."""
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def aclose(self) -> None:
+        """Close local HTTP resources and kill distributed POST actors."""
+        self.shutdown()
+        await self.aclose_local()
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Pickle the limits and POST actor handles, not the loop-bound client.
+
+        ``httpx.AsyncClient`` binds to the event loop that created it and does
+        not pickle; the copy recreates one lazily in ``_get_client``.
+        """
+        state = self.__dict__.copy()
+        state["_client"] = None
+        return state

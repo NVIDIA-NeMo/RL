@@ -500,6 +500,33 @@ def test_rollout_pump_charges_shortfall_as_the_sampler_decides(
     assert ctrl._buffer_capacity._value == 2
 
 
+def test_rollout_pump_accumulates_time_held_at_the_admission_gate() -> None:
+    manager = _ScriptedRolloutManager([])
+    ctrl = _pump_controller(
+        manager, [_batch("a"), _batch("b")], on_dropped_prompt="shrink"
+    )
+    # A zero window holds the second batch until the trainer moves.
+    ctrl._sampler = ReadyFirstSampler(ctrl._buffer, max_staleness_versions=0)
+
+    async def exercise() -> None:
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        # Wait until the pump parks, so a slow runner cannot shorten the timed hold.
+        async with asyncio.timeout(5.0):
+            while ctrl._admission_gate_wait_started is None:
+                assert not pump.done(), "the pump never waited at the gate"
+                await asyncio.sleep(0.005)
+        await asyncio.sleep(0.05)
+        ctrl._trainer_version = 1
+        await asyncio.wait_for(pump, timeout=5.0)
+
+    asyncio.run(exercise())
+
+    assert manager.prompts_seen == ["a", "b"]
+    assert ctrl._admission_gate_wait_started is None
+    # The hold covers the 0.05 s sleep; the margin absorbs sleep jitter.
+    assert ctrl._admission_gate_wait_seconds >= 0.04
+
+
 class _ScriptedRolloutManager:
     """Returns a scripted outcome per call, recording which prompt each one saw."""
 

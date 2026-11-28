@@ -57,6 +57,7 @@ def mock_config():
             "cpu_offload": False,
             "tensor_parallel_size": 1,
             "context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
             "expert_parallel_size": 1,
             "sequence_parallel": False,
             "activation_checkpointing": False,
@@ -794,11 +795,14 @@ class TestSetupDistributed:
         tp_dim.size.return_value = 1
         cp_dim = MagicMock()
         cp_dim.size.return_value = 1
+        pp_dim = MagicMock()
+        pp_dim.size.return_value = 1
 
         mock_mesh.__getitem__ = lambda self, key: {
             "dp": dp_dim,
             "tp": tp_dim,
             "cp": cp_dim,
+            "pp": pp_dim,
         }[key]
         return mock_mesh
 
@@ -1003,6 +1007,39 @@ class TestSetupDistributed:
     @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_pipeline_parallel_divides_data_parallel(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+    ):
+        """PP ranks are not data-parallel replicas: DP = world / (pp * tp * cp)."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        mock_config["automodel_cfg"]["pipeline_parallel_size"] = 2
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 2
+
+        setup_distributed(mock_config, mock_runtime_config)
+        parallelism = mock_mesh_context.build.call_args[0][1]
+        assert parallelism.pp_size == 2
+
+        # DP is 4 with PP=2, which dp_replicate_size=8 cannot divide.
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 8
+        with pytest.raises(ValueError, match="dp_replicate_size"):
+            setup_distributed(mock_config, mock_runtime_config)
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
         self,
         mock_torch_dist,
@@ -1020,6 +1057,38 @@ class TestSetupDistributed:
 
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
+
+
+@pytest.mark.automodel
+def test_build_pipeline_config_sets_nemo_rl_runtime_fields():
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    from nemo_rl.models.automodel.pipeline_parallel import pipeline_loss_fn
+    from nemo_rl.models.automodel.setup import build_pipeline_config
+
+    fsdp2_config = SimpleNamespace(
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+    )
+    config = {
+        "train_micro_batch_size": 2,
+        "max_total_sequence_length": 128,
+        "automodel_cfg": {"pipeline": {"microbatches_per_step": 4}},
+    }
+
+    pipeline_config = build_pipeline_config(config, fsdp2_config)
+
+    assert pipeline_config.pp_schedule == "1F1B"
+    assert pipeline_config.pp_microbatch_size == 2
+    assert pipeline_config.pp_batch_size == 8
+    assert pipeline_config.layers_per_stage is None
+    assert pipeline_config.dtype == torch.float32
+    assert pipeline_config.scale_grads_in_schedule is False
+    assert pipeline_config.pp_seq_len == 128
+    assert pipeline_config.loss_fn is pipeline_loss_fn
 
 
 @pytest.mark.automodel
@@ -1058,6 +1127,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=1,
+            pp_size=1,
         )
 
     @pytest.fixture
@@ -1776,6 +1846,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1820,6 +1891,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=2,  # TP enabled
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         mock_model = MagicMock()
@@ -1864,6 +1936,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
         )
 
         # Set model_type to gemma3 to trigger validation
@@ -1905,6 +1978,7 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,
+            pp_size=1,
         )
 
         mock_runtime_config.model_config.model_type = "gemma4_unified"

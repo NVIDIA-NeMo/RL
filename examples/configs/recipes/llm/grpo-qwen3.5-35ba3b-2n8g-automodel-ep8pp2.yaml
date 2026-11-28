@@ -1,0 +1,20 @@
+defaults: ./grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-2n8g-automodel-ep8pp2
+policy:
+  hf_config_overrides:
+    text_config:
+      # PP > 1 does not support MTP.
+      mtp_num_hidden_layers: 0
+  automodel_cfg:
+    # PP2 leaves dp * cp * tp = 8 ranks per stage, so EP drops to 8.
+    expert_parallel_size: 8
+    pipeline_parallel_size: 2
+    defer_fsdp_grad_sync: false
+    pipeline:
+      microbatches_per_step: 16
+  dynamic_batching:
+    enabled: false
+logger:
+  wandb:
+    name: grpo-qwen3.5-35ba3b-2n8g-automodel-ep8pp2
