@@ -2183,8 +2183,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_response_id = nemo_gym_result.get("terminal_response_id")
         if not (isinstance(terminal_response_id, str) and terminal_response_id):
             # A harness that reports no terminal id still gets its manifest
-            # fetched; receipt assembly attributes the terminal from the
-            # scored response, falling back to heuristic selection.
+            # fetched; an unattributable returned response masks the rollout.
             terminal_response_id = None
         scored_response = nemo_gym_result.get("response")
         if not isinstance(scored_response, dict):
@@ -2381,14 +2380,20 @@ Depending on your data shape, you may want to change these values."""
            fingerprints. Agreeing witnesses attribute; a declared id that
            matches no row masks and never falls back; disagreeing witnesses
            attribute nothing.
-        2. Heuristic fallback (``select_terminal_call``): with no witness,
-           the manifest's explicit parent links infer the terminal
-           (fail-closed: ambiguity masks).
+        2. Heuristic fallback (``select_terminal_call``): with no witness
+           and no returned result to attribute, the manifest's explicit
+           parent links infer the terminal (fail-closed: ambiguity masks).
+           When the harness did return a scored response and no witness
+           joins it to a captured completion, the result is unattributable:
+           the reward's attempt is unknown, so the receipt masks with
+           ``terminal_attribution_failed`` instead of authorizing a chain
+           on structure/admission order.
 
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
         selections stamp the last stage attempted; ``None`` when no stage ran
-        because a manifest row failed to parse) and the witness trail in
+        because a manifest row failed to parse, or when attribution abstained
+        on a returned result and no fallback ran) and the witness trail in
         ``terminal_attribution_reason``. A row that fails ``CallRecord``
         validation masks the rollout (``invalid_manifest_row``) and is
         dropped from the shipped manifest, so the finalizer can still
@@ -2461,6 +2466,10 @@ Depending on your data shape, you may want to change these values."""
                 # cannot confirm masks and never falls back to the heuristic.
                 terminal_selection = "declared"
                 selection_reason = None
+            elif scored_response is not None:
+                # A returned result no witness joins to a captured completion
+                # names no attempt: mask instead of authorizing a chain.
+                selection_reason = "terminal_attribution_failed"
             else:
                 terminal_selection = "heuristic"
                 selection = select_terminal_call(parsed_records)
