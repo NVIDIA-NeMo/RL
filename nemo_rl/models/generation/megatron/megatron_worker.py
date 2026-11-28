@@ -21,7 +21,7 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
 import requests
@@ -36,6 +36,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
@@ -43,9 +44,7 @@ from megatron.core.inference.quantization.utils import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_inference_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
 from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
@@ -553,6 +552,15 @@ class MegatronGenerationMixin:
         # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
+
+        if not any(
+            field.name == "finish_reason" for field in fields(DynamicInferenceRequest)
+        ):
+            raise RuntimeError(
+                "Megatron generation requires engine-provided finish_reason metadata "
+                "to report truncation correctly. Upgrade Megatron-Core to a version "
+                "with DynamicInferenceRequest.finish_reason support."
+            )
 
         from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.contexts.dynamic_context import (
@@ -1312,7 +1320,20 @@ class MegatronGenerationMixin:
         data: BatchedDataDict[GenerationDatumSpec],
         result: list,
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Pack DynamicInferenceRequest results into a GenerationOutputSpec batch."""
+        """Pack completed engine replies, including their authoritative truncated flags."""
+        for index, request in enumerate(result):
+            if getattr(request, "status", None) == Status.FAILED:
+                raise RuntimeError(
+                    "Megatron generation request "
+                    f"{getattr(request, 'request_id', None)!r} at batch index {index} "
+                    "failed in the inference engine. See the engine logs for details."
+                )
+        finish_reasons = [getattr(request, "finish_reason", None) for request in result]
+        if any(reason not in ("stop", "length") for reason in finish_reasons):
+            raise RuntimeError(
+                "Megatron returned missing or unsupported finish_reason metadata: "
+                f"{finish_reasons}. Expected 'stop' or 'length' for completed generation."
+            )
         input_lengths = data["input_lengths"]
         input_ids = data["input_ids"]
         batch_size = input_ids.size(0)
@@ -1380,6 +1401,11 @@ class MegatronGenerationMixin:
             )
 
         out_dict = {
+            "truncated": torch.tensor(
+                [reason == "length" for reason in finish_reasons],
+                dtype=torch.bool,
+                device=input_ids.device,
+            ),
             "output_ids": output_ids_padded,
             "logprobs": logprobs_padded,
             "generation_lengths": generation_lengths,
@@ -1404,6 +1430,7 @@ class MegatronGenerationMixin:
                 - logprobs: Log probabilities for tokens
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - truncated: Whether the engine ended generation at a length limit
         """
         prompts, multi_modal_data_list, sampling_params = (
             self._prepare_data_for_generation(data, greedy)
@@ -1480,8 +1507,6 @@ class MegatronGenerationMixin:
         sampling_params: list[SamplingParams],
     ) -> list:
         """Submit requests through the persistent inference client (rank 0 only)."""
-        from megatron.core.inference.inference_request import DynamicInferenceRequest
-
         dist_rank = torch.distributed.get_rank()
         assert dist_rank == 0, (
             "Only rank 0 creates a client to communicate with the coordinator"
