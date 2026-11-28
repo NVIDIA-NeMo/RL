@@ -1,8 +1,8 @@
 # Context compaction with framework-owned training rows
 
-This opt-in SingleController GRPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
+This opt-in SingleController GRPO and PPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
 
-The underlying mechanism is **forest training**: selected captured calls become training paths with one reward and advantage per logical rollout. Compaction is one use case; branches and independent context roots use the same reconstruction.
+The underlying mechanism is **forest training**: selected captured calls become training paths with one reward per logical rollout. GRPO shares one advantage across the rollout's rows, while PPO runs GAE on each row. Compaction is one use case; branches and independent context roots use the same reconstruction.
 The walkthrough below uses the default `returned_history` selection policy.
 
 The editable SVG figures below are adapted from Terry Kong’s review illustrations: [data flow](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-data-flow.html), [calls to rows](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-calls-to-rows.html), [compaction guards](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html), and [batch size](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-cc-batch-size.html). The reference figures retain his layout and visual conventions, updated for the implementation described here; the three introductory figures expand the same example step by step. Token IDs and row counts in the figures are illustrative.
@@ -33,7 +33,7 @@ Now the harness rewrites its next context before call 3, then rejects call 4 and
 
 ![Complete capture graph, accepted-history selection, backward endpoint walks and two reconstructed training rows.](../assets/context-compaction/selecting-training-rows.svg)
 
-RL selects calls using the returned history, finds endpoints in that selected graph, and reconstructs two rows. Those rows belong to one logical rollout with one reward and advantage. The rewritten prompt is conditioning context, not a newly generated span eligible for loss in call 3.
+RL selects calls using the returned history, finds endpoints in that selected graph, and reconstructs two rows. Those rows belong to one logical rollout with one reward; GRPO shares one advantage across them, while PPO runs GAE on each row. The rewritten prompt is conditioning context, not a newly generated span eligible for loss in call 3.
 
 ### Detailed ownership and validation rules
 
@@ -89,7 +89,7 @@ The existing ledger tracks exact attempted call IDs. A missing worker acknowledg
 
 This figure describes the native recency client. Other harnesses choose their own compaction policies. The uncaught guard-rejection path shown here is a current limitation, not a recommended recovery policy.
 
-Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens, with one optimizer step and unchanged configured global batch size. Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
+Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens, with one optimizer step and unchanged configured global batch size (a Forest PPO critic uses the step's row count). Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
 
 Completed attempt receipts retain unselected records for cleanup. Before publication, the fixed selection determines exact canonical row and padding IDs. A lost canonical-write acknowledgement preserves source staging; the controller owns the exact publication cleanup keys. Foreign scope and invalid trainable selection fail before publication.
 
@@ -97,14 +97,14 @@ Completed attempt receipts retain unselected records for cleanup. Before publica
 
 ## Configuration and supported scope
 
-Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on the SingleController GRPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
+Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on a SingleController GRPO or PPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
 
 `token_capture.selection_policy` controls training membership:
 
 - `returned_history` (default) matches ordinary returned history or call references to capture records. It preserves the existing evidence requirements and excludes calls absent from that history.
 - `all_captured` includes recorded calls across abandoned retries and independent branches. Unscored leaves with `failed` or `unknown` status, or an `incomplete` status with a non-length finish reason such as `content_filter`, are excluded.
   These calls remain selected if they have children or are the scored call, so completion checks can mask the rollout. Missing required completion metadata remains an error. Length-limited calls remain eligible, subject to the existing logical-rollout `overlong_filtering` policy. This policy does not require the full execution history, but still requires an attributable scored terminal through `terminal_response_id` or the returned response's identity/content. Capture order is not a terminal witness.
-  For `A → B` and `A → C`, both branches train; it does not choose the latest sibling. Shared `A` contributes loss once, and both rows share the rollout's reward and advantage.
+  For `A → B` and `A → C`, both branches train; it does not choose the latest sibling. Shared `A` contributes loss once, and both rows share the rollout's reward; GRPO also shares its advantage, while PPO runs GAE on each row.
 
 Both policies reuse capture validation, completion checks, forest reconstruction, and once-only loss ownership for shared ancestors. Pending calls, lost capture evidence, and failed selected executions still mask the logical rollout. A failure record does not acknowledge a pending worker's writes or transfer them to cleanup.
 Failed parents and failed scored calls remain invalid. Neither policy infers agent roles. `all_captured` requires `forest_training: true`; it does not enable per-agent rewards or remove the execution restrictions below.
@@ -137,7 +137,6 @@ policy:
 grpo:
   calculate_advantages_on_gpu: false
 loss_fn:
-  token_level_loss: null
   normalization: global_token_mean
   sequence_level_importance_ratios: false
 async_rl:
@@ -153,7 +152,7 @@ The learner must use non-interleaved Megatron with fixed batches or ordinary seq
 
 `g` labels the prompt group, `r` a rollout within that group, and `s` a reconstructed training segment (physical row) within that rollout. For example, `g1·r0·s1` is the second segment of rollout `r0` in prompt group `g1`.
 
-The figure illustrates fixed-batch padding, computed per prompt group using data-parallel size and compatible microbatch sizes. With packing, the row count only needs to be divisible by the data-parallel size; the existing packer balances the resulting bins. Logical rewards and advantages remain per rollout; padding has no reward vote or loss. Packing preserves separate attention contexts for the rows and does not share prefix computation. Model-specific packing restrictions still apply.
+The figure illustrates fixed-batch padding, computed per prompt group using data-parallel size and compatible microbatch sizes. With packing, the row count only needs to be divisible by the data-parallel size; the existing packer balances the resulting bins. Logical rewards remain per rollout; GRPO shares one advantage across the rollout's rows, while PPO runs GAE on each row. Padding has no reward vote or loss. Packing preserves separate attention contexts for the rows and does not share prefix computation. Model-specific packing restrictions still apply.
 
 Optional `grpo.advantage_clip_low` and `grpo.advantage_clip_high` clamp each logical rollout's advantage before it is broadcast to its rows. Filtered owners and execution padding retain zero advantages, even when zero lies outside the configured clipping interval.
 
@@ -164,11 +163,13 @@ The masked-sequence count includes every row excluded by the rollout decision.
 
 Optional `token_capture.min_valid_fraction_per_group` compares the fraction of verified logical rollouts with the configured minimum. Each rollout counts once, regardless of segment count, and execution padding is excluded. A group below the minimum is discarded and the controller seeks a replacement within its existing replacement budget. The default, `None`, disables this group-level filter.
 
-Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
+With PPO, the critic scores every physical row and GAE runs per row with that row's own values; every row of a logical rollout carries the rollout's reward. The logical rollout still decides validity as above. GAE and advantage whitening exclude rows masked from the loss, including execution padding. The critic trains on all of a step's rows as one optimizer step, and execution padding is sized for both the policy's and the critic's data-parallel and microbatch shapes. Forest PPO requires `ppo.value_training_mode: whole_batch`. Each physical row is its own GAE episode: the reward sits on the row's last response token and values do not bootstrap across rows, which matters when `gae_lambda < 1`.
+
+Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 Captured-rollout length metrics are emitted after tensor verification, with one observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned generated tokens across its rows; `max_gen_tokens_per_turn` is the largest actual model generation, and `total_tokens_per_sample` is its longest verified context chain. Rewritten input, shared-prefix copies, and execution padding do not count as generated output. Environment masking does not erase verified generations; unverifiable owners contribute zero. These are generation statistics before learner-side filtering, not counts of tokens ultimately used in the loss.
 
-The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
+The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, PPO with GAE, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
 
 Both repositories must use the paired capture schema v3 revision, including the `ReplaySummary` representation on this route. Earlier experimental v3 ledgers that persisted `ReplayContext.items` are rejected, as are prior v2 staged checkpoints; there is no automatic migration of those older capture formats. Source normalization and token/media digest versions are unchanged by the summary representation.
 

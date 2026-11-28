@@ -80,17 +80,21 @@ def test_campaign_stage_is_tagged_on_driver_and_worker():
     assert _worker_resource_attributes(None, None)["nv.dl.campaign.stage"] == "RL"
 
 
-def test_build_resource_attributes_automodel_tp():
+def test_build_resource_attributes_automodel_tp_pp():
     cfg = _FakeMasterConfig(
         policy={
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
-            "automodel_cfg": {"enabled": True, "tensor_parallel_size": 4},
+            "automodel_cfg": {
+                "enabled": True,
+                "tensor_parallel_size": 4,
+                "pipeline_parallel_size": 2,
+            },
         }
     )
     attrs = _build_resource_attributes(cfg, "grpo")
     assert attrs["nv.dl.topology.size.tp"] == 4
-    assert "nv.dl.topology.size.pp" not in attrs
+    assert attrs["nv.dl.topology.size.pp"] == 2
 
 
 def test_the_disabled_backends_settings_are_never_reported():
@@ -118,8 +122,7 @@ def test_the_disabled_backends_settings_are_never_reported():
     attrs = _build_resource_attributes(cfg, "dpo")
     assert attrs["nv.dl.topology.size.tp"] == 1
     assert attrs["nv.dl.training.config.optimizer"] == "torch.optim.AdamW"
-    # Automodel has no pipeline dimension, and recompute granularity is a
-    # megatron setting, so neither has anything to report here.
+    # Neither the disabled Megatron PP size nor its recompute granularity leaks in.
     assert "nv.dl.topology.size.pp" not in attrs
     assert "nv.dl.training.config.recompute_granularity" not in attrs
 

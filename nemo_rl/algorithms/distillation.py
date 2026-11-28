@@ -65,13 +65,16 @@ from nemo_rl.models.generation.interfaces import (
     sampler_replay_enabled,
     should_use_async_rollouts,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    reject_megatron_dynamo_outside_single_controller,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.utils import configure_lora_refit
@@ -259,11 +262,25 @@ def setup(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
+    # The teacher's get_topk_logits has no pipeline-parallel implementation.
+    teacher_automodel_cfg = teacher_config.get("automodel_cfg")
+    if (
+        teacher_automodel_cfg is not None
+        and teacher_automodel_cfg["enabled"]
+        and cast(AutomodelConfig, teacher_automodel_cfg)["pipeline_parallel_size"] > 1
+    ):
+        raise ValueError(
+            "Distillation does not support "
+            "teacher.automodel_cfg.pipeline_parallel_size > 1."
+        )
+
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
     checkpoint_engine_config = None
     configure_lora_refit(policy_config)
+    # Refuse before any cluster, logger or data side effect.
+    reject_megatron_dynamo_outside_single_controller(generation_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(
             policy_config, entry_point="distillation"

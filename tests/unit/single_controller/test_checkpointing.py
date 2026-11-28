@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -80,6 +81,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.rollout_checkpointing import snapshots as snapshots_module
 from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     capture_reward_settings,
@@ -113,6 +115,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
+    forest_execution_row_multiple,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
@@ -129,6 +132,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointNotReady,
     GymCheckpointOperationError,
 )
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -723,6 +727,13 @@ class _FakeRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
+    # Snapshot and restore ask the manager for its multi-harness routes; this
+    # one has none, and refuses a checkpoint saved with some as the real one does.
+    def multi_harness_routes_state(self) -> None:
+        return None
+
+    require_unchanged_multi_harness = RolloutManager.require_unchanged_multi_harness
+
     def set_tally_step_provider(self, provider: Any) -> None:
         self.tally_step_provider = provider
 
@@ -798,6 +809,7 @@ class _FakeTQBuffer:
         self.target_step_list = [
             group["target_step"] for group in self._metadata_state["groups"]
         ]
+        self.ready_list: list[bool] = []
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
@@ -822,13 +834,13 @@ class _FakeTQBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[dict[str, Any]]] = None,
+        already_claimed_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         self.metadata_state_dict_calls.append(saved_capacity)
         state = dict(self._metadata_state)
         state["groups"] = [
+            *(already_claimed_groups or []),
             *self._metadata_state["groups"],
-            *(additional_groups or []),
         ]
         return state
 
@@ -1197,6 +1209,97 @@ def test_forest_checkpoint_metadata_compatibility(
             validate_forest_checkpoint_metadata(
                 metadata, forest_training=mode, execution_row_multiple=multiple
             )
+
+
+def _forest_consumer(**cfg: Any) -> dict[str, Any]:
+    """A fixed-batch Megatron trainer or critic config as Forest row sizing reads it."""
+    return {
+        "megatron_cfg": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": False},
+        **cfg,
+    }
+
+
+@pytest.mark.parametrize(
+    ("critic", "current"),
+    [
+        ({}, 12),
+        ({"dp_size": 3}, 36),
+        ({"train_micro_batch_size": 5}, 20),
+        ({"logprob_batch_size": 5}, 60),
+    ],
+)
+def test_forest_ppo_checkpoint_pins_the_critic_row_multiple(
+    tmp_path: Path, critic: dict[str, int], current: int
+) -> None:
+    """A PPO checkpoint saves the policy/critic lcm; a critic reshape fails resume."""
+    mc = _actor_master_config(tmp_path, max_num_steps=1, data_plane_checkpoint=True)
+    mc.token_capture.forest_training = True
+    algo_cfg = PPOConfig.model_construct()
+    # Policy and reference forwards: DP 2 x lcm(train 2, logprob 2) = 4.
+    policy = _forest_consumer(train_micro_batch_size=2, logprob_batch_size=2)
+
+    def row_multiple(*, dp_size: int = 1, **cfg: int) -> int:
+        # Critic: DP x lcm(train MBS, logprob_batch_size when set); 1 x 3 by default.
+        value = _forest_consumer(**({"train_micro_batch_size": 3} | cfg))
+        ppo_mc = mc.model_copy(
+            update={"policy": policy, "value": value, "ppo": algo_cfg}
+        )
+        return forest_execution_row_multiple(
+            ppo_mc, algo_cfg, policy_dp=2, value_dp=dp_size
+        )
+
+    policy_only = forest_execution_row_multiple(
+        mc.model_copy(update={"policy": policy}), algo_cfg, policy_dp=2
+    )
+    assert policy_only == 4
+    saved = row_multiple()
+    assert saved == math.lcm(policy_only, 3) == 12
+    dp_client = _FakeDPClient()
+
+    async def _save() -> None:
+        actor = _ACTOR_CLS(
+            mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
+        )
+        actor._rollout_manager.execution_row_multiple = saved
+        try:
+            await actor._rollout_snapshots._save_data_plane_checkpoint(
+                str(tmp_path / "tmp_step_1"),
+                actor._rollout_snapshots._data_plane_checkpoint_metadata(
+                    train_steps=1,
+                    trainer_version=1,
+                    current_epoch=0,
+                ),
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+    asyncio.run(_save())
+    metadata = dp_client.save_calls[0]["metadata"]
+    assert metadata["forest_training"] is True
+    assert metadata["forest_execution_row_multiple"] == 12
+
+    actor = _ACTOR_CLS(
+        mc,
+        _make_actor_args(
+            last_checkpoint_path=str(tmp_path), data_plane_checkpoint_metadata=metadata
+        ),
+        SetupTimingMetrics(),
+    )
+    actor._rollout_manager.execution_row_multiple = row_multiple(**critic)
+    assert actor._rollout_manager.execution_row_multiple == current
+    try:
+        if current == saved:
+            actor._rollout_restorer._validate_forest_checkpoint_metadata()
+        else:
+            with pytest.raises(
+                ValueError,
+                match=f"forest execution padding mismatch: saved=12, current={current}",
+            ):
+                actor._rollout_restorer._validate_forest_checkpoint_metadata()
+    finally:
+        actor._checkpointer.shutdown()
 
 
 def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
@@ -3139,6 +3242,9 @@ class TestPeriodicRolloutCheckpoint:
 
         async def sample_twice() -> None:
             await actor._log_rollout_throughput_metrics(emit=False)
+            actor._admission_gate_wait_seconds = 7.0
+            actor._admission_gate_wait_started = 15.0
+            actor._buffer.ready_list = [True, False, True]
             actor._rollout_completion_durations_s.extend([2.0, 4.0])
             actor._rollout_queue_wait_durations_s.extend([1.0, 3.0])
             await actor._log_rollout_throughput_metrics()
@@ -3169,6 +3275,8 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["group_completion_seconds_p50"] == pytest.approx(2.0)
         assert logged["group_completion_seconds_p95"] == pytest.approx(4.0)
         assert logged["group_queue_wait_seconds_p95"] == pytest.approx(3.0)
+        assert logged["admission_gate_wait_seconds_total"] == pytest.approx(12.0)
+        assert logged["buffer_ready_groups"] == 2
         assert "rollout_throughput_metrics=" not in capsys.readouterr().out
 
     @pytest.mark.parametrize(
