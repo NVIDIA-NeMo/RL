@@ -10,7 +10,7 @@ when_to_use: >-
 
 Input: the original PR number `N` (already merged). Optional: a release branch name; otherwise use the newest `origin/rX.Y.Z`.
 
-Release flow since r0.8.0: PRs merge into the release branch first, and a label auto cherry-picks them back to main. A manual cp is needed when a PR was merged into main instead of the release branch first. (Up to r0.7.0 it was the reverse: main first, auto cp to release.)
+Release flow since r0.8.0: PRs merge into the release branch first, and a `/cherrypick to=main` comment on them has Autobot backport them to main. A manual cp is needed when a PR was merged into main instead of the release branch first. Commenting `/cherrypick to=rX.Y.Z` on the main PR is the automated alternative to this skill. (Up to r0.7.0 it was the reverse: main first, auto cp to release.)
 
 The user invoking this skill authorizes the cherry-pick commit, push, PR, label, and `/ok to test` — no pause-before-commit for the clean path. Do not assign reviewers; the user does.
 
@@ -57,7 +57,7 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
      - Conflict: append the conflict, e.g. `... first. There's a conflict in `<file>` (<why, e.g. depends on #M which is not in <rel>>).`
    - Proof: `N/A: cherry-pick of #<N>.` Upstream: `None`, unless the original needed one.
 
-6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`); release branches have no `Set CI label` workflow, so the label must be set by hand. Do not copy `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such as `r0.8.0`. Then post `/ok to test <full head sha>` as an issue comment.
+6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`); release branches have no `Set CI label` workflow, so the label must be set by hand. Do not copy release labels such as `r0.8.0`. Then post `/ok to test <full head sha>` as an issue comment.
 
 7. **Report**: PR number (bare `#N`), base, commit sha, labels, that `/ok to test` was posted, and the worktree path (`git worktree remove <path>` to clean up).
 

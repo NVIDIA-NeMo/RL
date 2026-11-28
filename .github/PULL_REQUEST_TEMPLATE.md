@@ -21,6 +21,7 @@
   - `CI:L1`: dependency or container changes (`pyproject.toml`, `uv.lock`, `Dockerfile`) or broad core changes. Builds a new image and runs unit and functional tests.
   - `CI:docs`: docs-only changes. Runs doc tests only.
 - `/ok to test <full-commit-sha>`: start CI for that commit. Post again after each push.
+- `/nightly-ci test-case=<test>`: run NVIDIA's nightly CI for the PR head; eligible teams only.
 - `/review`: automated review comments. Add `mode=strict` for a stricter review, `reset=true` for a fresh full review.
 - `/resolve-conflict`: Autobot merges `main` into this PR and resolves the conflicts. PRs from forks must allow edits by maintainers.
 - Locally: `/review-pr-team <pr-number>` for a team review before you ask for human review.

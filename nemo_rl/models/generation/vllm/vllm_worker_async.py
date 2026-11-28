@@ -18,11 +18,12 @@ import copy
 import gc
 import logging
 import secrets
+import socket
 import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -438,6 +439,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._http_engine_client = None
         # API server pool for multiple HTTP API servers
         self._api_server_pool = None
+        # With several HTTP frontends, each also listens on a loopback control
+        # URL so the one Gym's cut call reaches can ask the others for theirs.
+        self._peer_control_url: str | None = None
+        self._generation_cut_peer_urls: list[str] = []
 
         # Token capture state
         self._init_token_capture_state()
@@ -528,8 +533,6 @@ class VllmAsyncGenerationWorkerImpl(
         is never closed and re-opened, so there is zero gap where another process
         could steal the port.
         """
-        import socket
-
         from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -816,7 +819,11 @@ class VllmAsyncGenerationWorkerImpl(
                 self._setup_vllm_server()
             )
             if self._api_server_pool is not None:
-                await self._api_server_pool.command("start")
+                child_urls = await self._api_server_pool.command("start")
+                assert self._peer_control_url is not None
+                control_urls = [self._peer_control_url, *child_urls]
+                await self._api_server_pool.command("peers", control_urls)
+                self.set_generation_cut_peers(control_urls)
 
     def announce_dynamo_chat_settings_to(self, queue: RayQueue) -> None:
         """Have this engine send ``queue`` its chat settings before it loads.
@@ -907,10 +914,6 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
-        if generation_prefix_cuts_enabled and self._api_server_pool is not None:
-            raise ValueError(
-                "Multiple HTTP API servers do not support generation-prefix cuts"
-            )
         if self._prefix_writer is not None:
             raise RuntimeError(
                 "Token capture with a prefix writer is already installed"
@@ -1066,11 +1069,19 @@ class VllmAsyncGenerationWorkerImpl(
                 "capture",
                 dp_cfg,
                 staging_partition,
-                capture_media,
-                top_logprobs,
-                prefix_write_max_rows,
-                prefix_write_max_tokens,
-                prefix_read_max_rows,
+                {
+                    "capture_media": capture_media,
+                    "media_family": media_family,
+                    "top_logprobs": top_logprobs,
+                    "generation_prefix_cuts_enabled": generation_prefix_cuts_enabled,
+                    "generation_cut_control_token": generation_cut_control_token,
+                    "generation_cut_control_timeout_s": (
+                        generation_cut_control_timeout_s
+                    ),
+                    "prefix_write_max_rows": prefix_write_max_rows,
+                    "prefix_write_max_tokens": prefix_write_max_tokens,
+                    "prefix_read_max_rows": prefix_read_max_rows,
+                },
             )
         if not capture_media:
             return None
@@ -1089,6 +1100,12 @@ class VllmAsyncGenerationWorkerImpl(
         if not is_metrics_client(self._capture_dp_client):
             return None
         return self._capture_dp_client.snapshot(reset_step_window=True)
+
+    def set_generation_cut_peers(self, control_urls: Sequence[str]) -> None:
+        """Keep the other HTTP frontends' control URLs, given every frontend's."""
+        self._generation_cut_peer_urls = [
+            url for url in control_urls if url != self._peer_control_url
+        ]
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
@@ -1782,12 +1799,25 @@ class VllmAsyncGenerationWorkerImpl(
         uvicorn_logger.addFilter(No200Filter())
 
         if reserved_sock is not None:
-            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            sockets = [reserved_sock]
+            if self.cfg["vllm_cfg"].get("http_api_server_count", 1) > 1:
+                # Frontends share reserved_sock, so a request to it reaches any
+                # one of them; this socket reaches this frontend alone.
+                control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                control_sock.bind(("127.0.0.1", 0))
+                control_sock.listen(128)
+                control_sock.setblocking(False)
+                self._peer_control_url = (
+                    f"http://127.0.0.1:{control_sock.getsockname()[1]}"
+                )
+                sockets.append(control_sock)
+
+            # Hand the pre-bound listening sockets directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
             def _run_with_socket() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+                loop.run_until_complete(server.serve(sockets=sockets))
 
             thread = threading.Thread(target=_run_with_socket, daemon=True)
         else:
@@ -2283,12 +2313,27 @@ class VllmAsyncGenerationWorkerImpl(
         Returns once the delete is done: TQ must not clear rows while the
         snapshot is saved.
         """
-        await self._prefix_recovery.flush(epoch)
+        if self._api_server_pool is None:
+            await self._prefix_recovery.flush(epoch)
+        else:
+            await asyncio.gather(
+                self._prefix_recovery.flush(epoch),
+                self._api_server_pool.command("flush", epoch),
+            )
         return True
 
     def get_generation_prefix_counts(self) -> dict[str, int]:
         """Generation-prefix restore and progress-read counts; see PrefixRecovery."""
         return self._prefix_recovery.counts()
+
+    async def get_generation_prefix_counts_per_frontend(
+        self,
+    ) -> list[dict[str, int]]:
+        """Each HTTP frontend's generation-prefix counts, this one first."""
+        counts = [self.get_generation_prefix_counts()]
+        if self._api_server_pool is not None:
+            counts.extend(await self._api_server_pool.command("counts"))
+        return counts
 
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""

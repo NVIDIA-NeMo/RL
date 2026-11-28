@@ -3412,6 +3412,113 @@ def test_grpo_train_dynamic_sampling_with_loo_keeps_prompt_group_intact(
     torch.testing.assert_close(captured_rewards[0], expected_training_rewards)
 
 
+def test_grpo_train_dynamic_sampling_reports_trained_rows_as_reward(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+) -> None:
+    """`reward` and the jsonl dump use the trained rows; `unfiltered_reward` is pre-filter."""
+    uniform_prompt = torch.tensor([1, 2, 3])
+    diverse_prompt = torch.tensor([7, 8, 9])
+    two_prompt_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [{"role": "user", "content": "uniform", "token_ids": uniform_prompt}],
+                [{"role": "user", "content": "diverse", "token_ids": diverse_prompt}],
+            ],
+            "task_name": ["math", "math"],
+            "extra_env_info": [{}, {}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": torch.tensor([0, 1]),
+            "length": torch.tensor([3, 3]),
+        }
+    )
+    train_dataloader = MagicMock(spec=StatefulDataLoader)
+    train_dataloader.__iter__ = lambda _self: iter([two_prompt_batch] * 2)
+    train_dataloader.__len__ = MagicMock(return_value=2)
+    # The uniform prompt's group is dropped and the diverse prompt's group is kept.
+    generated_rewards = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    trained_rewards = generated_rewards[2:]
+    # The loop reports the pre-filter rewards cut to the training batch size.
+    unfiltered_rewards = generated_rewards[: len(trained_rewards)]
+
+    def fake_rollout(*_args: Any, **kwargs: Any) -> tuple[BatchedDataDict, dict]:
+        rollout_batch = kwargs["input_batch"]
+        for message_log in rollout_batch["message_log"]:
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        rollout_batch["total_reward"] = generated_rewards.clone()
+        return rollout_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+    monkeypatch.setattr(
+        grpo_mod, "should_use_async_rollouts", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+    monkeypatch.setattr(grpo_mod, "MemoryTracker", MagicMock)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.batch_multiplier = 2
+    master_config.grpo.num_generations_per_prompt = 2
+    master_config.grpo.dynamic_sampling_max_gen_batches = 1
+    master_config.grpo.use_dynamic_sampling = True
+
+    grpo_mod.grpo_train(
+        mock_grpo_components["policy"],
+        _mock_policy_generation(),
+        train_dataloader,
+        mock_grpo_components["val_dataloader"],
+        mock_grpo_components["tokenizer"],
+        mock_grpo_components["loss_fn"],
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+        mock_grpo_components["logger"],
+        mock_grpo_components["checkpointer"],
+        _initial_grpo_save_state(),
+        master_config,
+    )
+
+    train_metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "unfiltered_reward"
+    )
+    assert train_metrics["reward"] == pytest.approx(trained_rewards.mean().item())
+    assert train_metrics["unfiltered_reward"] == pytest.approx(
+        unfiltered_rewards.mean().item()
+    )
+    assert "filtered_reward" not in train_metrics
+
+    (train_dump,) = [
+        call.args[0]
+        for call in mock_grpo_components[
+            "logger"
+        ].log_batched_dict_as_jsonl.call_args_list
+        if call.args[1].startswith("train_data_step")
+    ]
+    assert train_dump["rewards"] == trained_rewards.tolist()
+    assert "filtered_rewards" not in train_dump
+
+
 @pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_grpo_train_dynamic_sampling_std_excludes_masked_rows(
     monkeypatch: pytest.MonkeyPatch,
@@ -4524,6 +4631,34 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_megatron_engines_behind_dynamo_are_refused_outside_the_single_controller(
+    mock_grpo_components,
+):
+    """Legacy GRPO names the entrypoint to use before touching the config or cluster."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "dynamo": True,
+        "mcore_generation_config": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
 
 
 def test_setup_hands_the_vllm_http_server_api_key_to_nemo_gym(monkeypatch) -> None:
@@ -8539,6 +8674,16 @@ class TestAggregateRolloutMetrics:
         assert result["min_completion_rate"] == pytest.approx(0.5)
         assert result["max_completion_rate"] == pytest.approx(0.6)
 
+    def test_harness_group_counts_summed(self):
+        metrics = {
+            "swe/pi_agent/num_groups": [1, 0, 1],
+            "swe/pi_agent/reward/mean": [1, 0, 1],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        # Counts add up over a step's groups; other per-group values average.
+        assert result["swe/pi_agent/num_groups"] == 2
+        assert result["swe/pi_agent/reward/mean"] == pytest.approx(2 / 3)
+
     def test_total_turns_summed(self):
         metrics = {"total_turns": [10, 20, 30]}
         result = aggregate_rollout_metrics(metrics)
@@ -8754,7 +8899,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     if draft is not None:
         config.policy["draft"] = draft
@@ -8772,7 +8917,7 @@ def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     [
         ({"grpo": {"seq_logprob_error_threshold": None}}, "requires seq_logprob"),
         ({"loss_fn": {"force_on_policy_ratio": False}}, "force_on_policy_ratio"),
-        ({"loss_fn": {"token_level_loss": False}}, "token_level_loss"),
+        ({"loss_fn": {"normalization": "sequence_mean"}}, "normalization"),
         ({"loss_fn": {"use_kl_in_reward": True}}, "advantage estimator"),
         ({"loss_fn": {"positive_example_nll_weight": 0.1}}, "NLL"),
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
@@ -8788,7 +8933,7 @@ def test_single_forward_rejects_unsupported_configs(
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
-    config.loss_fn.token_level_loss = True
+    config.loss_fn.normalization = "global_token_mean"
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
     config.policy["draft"] = {"enabled": False}
     for section, values in override.items():
