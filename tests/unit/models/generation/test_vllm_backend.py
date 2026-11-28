@@ -4116,9 +4116,9 @@ def test_mtp_drafter_refit_enabled_warns_once_without_drafter(caplog):
 
 @pytest.mark.vllm
 def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
-    """Trip-wire: both installed vLLM model runners assign the proposer under a name
+    """Trip-wire: the installed vLLM model runner assigns the proposer under a name
     ``_get_drafter_model`` looks at, so a future rename fails here, not as 0% MTP
-    acceptance in a nightly."""
+    acceptance in a nightly. vLLM 0.34 removed the legacy ``gpu_model_runner``."""
     import inspect
 
     from nemo_rl.models.generation.vllm.speculator_runtime import (
@@ -4126,11 +4126,10 @@ def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
     )
 
     pytest.importorskip("vllm")
-    from vllm.v1.worker import gpu_model_runner as legacy_runner_module
     from vllm.v1.worker.gpu import model_runner as v2_runner_module
 
     known = tuple(attr for attr, _ in DRAFTER_OWNER_ATTRS)
-    for module in (legacy_runner_module, v2_runner_module):
+    for module in (v2_runner_module,):
         source = inspect.getsource(module.GPUModelRunner)
         assigned = {
             attr for attr in ("drafter", "speculator") if f"self.{attr} = " in source
@@ -4917,10 +4916,19 @@ def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
 @pytest.mark.vllm
 def test_vllm_exposes_the_tied_embedding_detector_the_refit_filter_relies_on():
     """If upstream renames it, `_tied_embedding_aliases` silently returns {} and
-    tied-embedding refits regress to the 0.29 alias assertion."""
+    tied-embedding refits regress to the 0.29 alias assertion.
+
+    vLLM 0.34 removed the alias assertion itself (`_check_skipped_aliases`) but
+    still skips the aliases through the same detector, so only the detector is
+    required there.
+    """
+    from importlib.metadata import version
+
+    from packaging.version import Version
     from vllm.model_executor.models.utils import (  # noqa: F401
         AutoWeightsLoader,
         _get_tied_embedding_params,
     )
 
-    assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")
+    if Version(version("vllm")) < Version("0.34"):
+        assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")

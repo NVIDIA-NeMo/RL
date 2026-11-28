@@ -78,6 +78,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
+    _engine_defaults_pinned_to_vllm_033,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -1072,6 +1073,37 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+@pytest.mark.parametrize(
+    ("vllm_version", "expected"),
+    [
+        ("0.33.0", {"numa_bind": False}),
+        ("0.34.0", {"numa_bind": False, "enable_extensible_kv_cache": False}),
+    ],
+)
+def test_engine_defaults_pinned_to_vllm_033_follow_installed_vllm(
+    monkeypatch, vllm_version, expected
+):
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.importlib.metadata.version",
+        lambda name: vllm_version,
+    )
+
+    assert _engine_defaults_pinned_to_vllm_033({}) == expected
+
+
+def test_engine_defaults_pinned_to_vllm_033_yield_to_user_vllm_kwargs(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.importlib.metadata.version",
+        lambda name: "0.34.0",
+    )
+
+    pinned = _engine_defaults_pinned_to_vllm_033(
+        {"numa_bind": True, "enable_extensible_kv_cache": True}
+    )
+
+    assert pinned == {}
 
 
 basic_lora_test_config: LoRAConfig = {
@@ -4664,8 +4696,10 @@ def test_vllm_http_server(cluster, tokenizer):
         d.pop("ec_transfer_params", None)
         # vLLM 0.29 added `completion_tokens_details` to UsageInfo.
         d.get("usage", {}).pop("completion_tokens_details", None)
+        # vLLM 0.34 omits `prompt_tokens_details` and `annotations` when they are None.
+        d.get("usage", {}).pop("prompt_tokens_details", None)
         message = d["choices"][0]["message"]
-        for key in ("reasoning", "reasoning_content"):
+        for key in ("reasoning", "reasoning_content", "annotations"):
             message.pop(key, None)
         message.pop("generation_log_probs", None)
 

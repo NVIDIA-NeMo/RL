@@ -450,6 +450,15 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         )
 
 
+def _installed_vllm_release() -> tuple[int, ...]:
+    """The installed vLLM's ``(major, minor)`` release tuple."""
+    from importlib.metadata import version
+
+    from packaging.version import Version
+
+    return tuple(Version(version("vllm")).release[:2])
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -470,8 +479,23 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     branch or adding a native-name mapping branch) still take the required
     edit, where matching the whole body as one snippet would silently no-op.
 
+    The required edit gives every LayerScale parameter the checkpoint did not
+    supply the configured identity factor instead of dummy-init noise. On 0.33
+    that is ``config.initializer_factor`` for ``ls{1,2}``; on 0.34 it is
+    ``config.layerscale_value`` for ``layer_scale{1,2}.lambda1``. Both default
+    to 1.0 when the config omits them. Folded checkpoints, which carry no
+    LayerScale tensors at all, depend on it.
+
     Refit calls ``load_weights`` once per size-limited batch, so names loaded
     by any earlier call are remembered on the module and never re-filled.
+
+    vLLM 0.34 rewrote ``RadioModel`` to mirror the Transformers ``RadioModel``
+    (``encoder.layer.N.layer_scale{1,2}.lambda1``, loaded through
+    ``AutoWeightsLoader`` with a name mapper that already routes legacy
+    ``ls{1,2}`` names). Dummy loading still leaves ``lambda1`` as noise for
+    folded checkpoints, so the same fill is anchored on that loader's tail
+    (``old_snippet_034``/``new_snippet_034``); the 0.33 anchors stay for the
+    NGC-based container, which runs its base image's vLLM.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/radio.py")
@@ -489,11 +513,26 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 """
     skip_new = ""
 
-    # Edit 2 (required): give every LayerScale parameter the checkpoint did not
-    # supply the configured identity factor instead of dummy-init noise.
-    # RadioConfig defaults initializer_factor=1.0, and getattr keeps this safe
-    # for configs that omit it. This is the edit that matters for the folded
-    # checkpoints we train on, which contain no ls1/ls2 tensors whatsoever.
+    # Edit 2 (required): fill missing LayerScale weights using the identity field for each loader layout.
+    old_snippet_034 = """        return loaded
+
+    def _extract_final(
+"""
+    new_snippet_034 = """        initializer_factor = getattr(self.config, "layerscale_value", 1.0)
+        # Refit calls load_weights once per batch. Remember every LayerScale name
+        # any batch has loaded, so a later batch does not reset it to the factor.
+        ever_loaded_ls = getattr(self, "_nemo_rl_loaded_layerscale", set())
+        ever_loaded_ls.update(n for n in loaded if n.endswith(".lambda1"))
+        self._nemo_rl_loaded_layerscale = ever_loaded_ls
+        for ls_name, ls_param in self.named_parameters():
+            if ls_name.endswith(".lambda1") and ls_name not in ever_loaded_ls:
+                ls_param.data.fill_(initializer_factor)
+                loaded.add(ls_name)
+        return loaded
+
+    def _extract_final(
+"""
+    # vLLM 0.33 and older: the hand-written loader's tail.
     old_snippet = """                loaded_params.add(vllm_key)
 
         return loaded_params
@@ -517,6 +556,13 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if "ls_param.data.fill_(initializer_factor)" in content:
             logger.info("vLLM RADIO LayerScale loader patch already applied.")
+            return
+
+        if content.count(old_snippet_034) == 1:
+            write_back(content.replace(old_snippet_034, new_snippet_034, 1))
+            logger.info(
+                "Successfully patched vLLM RADIO LayerScale loading (0.34 loader)."
+            )
             return
 
         updated = content
@@ -565,7 +611,15 @@ def _patch_vllm_radio_native_loader(logger) -> None:
     names onto vLLM's keys and write q/k/v as shards of the fused
     ``QKVParallelLinear``. Legacy names keep the stock code path, so the
     LayerScale loader patch and its anchors are unaffected.
+
+    vLLM 0.34's ``RadioModel`` maps native names itself (``hf_to_vllm_mapper``
+    plus stacked q/k/v loading), so this patch is skipped there.
     """
+    if _installed_vllm_release() >= (0, 34):
+        logger.info(
+            "vLLM >= 0.34 loads native RADIO names; native loader patch skipped."
+        )
+        return
     try:
         radio_file = _get_vllm_file("model_executor/models/radio.py")
         vl_file = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
@@ -717,13 +771,13 @@ def _patch_vllm_radio_native_loader(logger) -> None:
 def _patch_vllm_radio_final_layernorm(logger) -> None:
     """Make vLLM's Super Omni final vision LayerNorm match the Megatron scoring path.
 
-    vLLM 0.33 builds the layer itself, but runs it in the LLM dtype after the
+    vLLM 0.34 builds the layer itself, but runs it in the LLM dtype after the
     BF16 cast, applies it even when no checkpoint weights were loaded, and only
     reads the ``vision_projector.`` weight names. This patch runs it in FP32
     before the cast, turns it on only once both affine parameters have loaded
     (so dummy startup + refit stays a no-op until then), and also reads the bare
     ``vision_final_layernorm.`` names.
-    Supports stock vLLM 0.33 source or this patch's complete output; unexpected
+    Supports stock vLLM 0.34 source or this patch's complete output; unexpected
     source layouts fail before writing rather than being skipped.
     References: RL #4036.
     """
@@ -760,13 +814,10 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 """,
         ),
         (
-            """        return x
-
-    def extract_feature_dynamic(
+            """    def extract_feature_dynamic(
+        self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
 """,
-            """        return x
-
-    def _apply_vision_final_layernorm(
+            """    def _apply_vision_final_layernorm(
         self, vit_embeds: torch.Tensor
     ) -> torch.Tensor:
         if not self._vision_final_layernorm_enabled:
@@ -776,6 +827,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
 
     def extract_feature_dynamic(
+        self, pixel_values: torch.Tensor, imgs_sizes: list[tuple[int, int]]
 """,
         ),
         (
@@ -853,7 +905,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
+                "Final vision LayerNorm patch requires the vLLM 0.34 model source "
                 f"or its fully patched equivalent: {file_to_patch}"
             )
         for old, new in replacements:

@@ -12,19 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise the patched vLLM RADIO loader on legacy, native and hybrid names."""
+"""Exercise the patched vLLM RADIO loader on legacy, native and hybrid names.
+
+vLLM 0.34's RadioModel maps native names itself and the patch skips, so these
+tests only run against older vLLM.
+"""
 
 import ast
+import importlib.metadata
 import inspect
 import logging
 from pathlib import Path
 
 import pytest
 import torch
+from packaging.version import Version
 
 from nemo_rl.models.generation.vllm import patches
 
-pytestmark = pytest.mark.vllm
+
+def _installed_vllm_is_at_least_034() -> bool:
+    try:
+        installed = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return tuple(Version(installed).release[:2]) >= (0, 34)
+
+
+pytestmark = [
+    pytest.mark.vllm,
+    pytest.mark.skipif(
+        _installed_vllm_is_at_least_034(),
+        reason="vLLM >= 0.34 loads native RADIO names itself; the patch skips",
+    ),
+]
 
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _VL_SOURCE = "model_executor/models/nano_nemotron_vl.py"

@@ -2804,9 +2804,17 @@ def test_registered_w4a16_dense_method_uses_marlin_weight_only(monkeypatch):
     assert kernel_args["bias"] is None
 
 
-def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(monkeypatch):
+@pytest.mark.parametrize("vllm_retires_input_scales", [False, True])
+def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(
+    monkeypatch, vllm_retires_input_scales
+):
     fake_vllm = _install_fake_registered_vllm_modelopt(monkeypatch)
     monkeypatch.setattr(vllm_modelopt, "_registered", False)
+    monkeypatch.setattr(
+        vllm_modelopt,
+        "_vllm_retires_unused_input_scales",
+        lambda: vllm_retires_input_scales,
+    )
     register_nemo_modelopt_nvfp4()
     config = fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config(
         {"quant_algo": "W4A16_NVFP4", "group_size": 16}
@@ -2825,8 +2833,14 @@ def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(monkeypatch
         params_dtype=torch.bfloat16,
     )
 
-    assert not hasattr(layer, "w13_input_scale")
-    assert not hasattr(layer, "w2_input_scale")
+    if vllm_retires_input_scales:
+        # vLLM >= 0.34 retires the placeholders itself; layerwise reload must
+        # not wait for scales the W4A16 checkpoint never ships.
+        assert layer.w13_input_scale.weight_loader_numel == 0
+        assert layer.w2_input_scale.weight_loader_numel == 0
+    else:
+        assert not hasattr(layer, "w13_input_scale")
+        assert not hasattr(layer, "w2_input_scale")
     assert fake_vllm.events == [
         (
             "native_create_weights",
@@ -2838,6 +2852,9 @@ def test_registered_w4a16_moe_create_weights_keeps_checkpoint_layout(monkeypatch
 
 
 def test_registered_w4a16_moe_preserves_kernel_during_reload(monkeypatch):
+    monkeypatch.setattr(
+        vllm_modelopt, "_vllm_retires_unused_input_scales", lambda: False
+    )
     fake_vllm = _install_fake_registered_vllm_modelopt(monkeypatch)
     monkeypatch.setattr(vllm_modelopt, "_registered", False)
     register_nemo_modelopt_nvfp4()
