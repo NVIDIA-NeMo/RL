@@ -39,6 +39,7 @@ from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
+    driver_env_for_workers,
 )
 
 
@@ -106,10 +107,11 @@ def _check_dp_leader_worker_indices(
 
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
+    driver_env = driver_env_for_workers()
     initializer_env_vars = {
-        key: env_vars[key] if key in env_vars else os.environ[key]
+        key: env_vars[key] if key in env_vars else driver_env[key]
         for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
-        if key in env_vars or key in os.environ
+        if key in env_vars or key in driver_env
     }
 
     return add_hf_modules_cache_to_pythonpath(initializer_env_vars)
@@ -555,6 +557,10 @@ class RayWorkerGroup:
         for k, v in os.environ.items():
             if k not in env_vars:
                 env_vars[k] = v
+
+        # Excluded names must retain their worker-local values.
+        for key in os.environ.get("NRL_WORKER_ENV_EXCLUDE", "").split(","):
+            env_vars.pop(key.strip(), None)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(

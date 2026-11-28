@@ -160,7 +160,7 @@ svg .ok{fill:var(--green);fill-opacity:.1;stroke:var(--green);stroke-width:1.5}<
 <path class="edge" d="M480 486 L480 508"/>
 <rect class="ok" x="16" y="512" width="928" height="66" rx="8"/>
 <text class="lbl-b" x="30" y="534">One optimizer step: normalize accumulated gradients by the global valid loss-token count N.</text>
-<text class="lbl" x="30" y="554">One advantage per logical rollout, copied to its rows. Padding contributes no loss tokens.</text>
+<text class="lbl" x="30" y="554">GRPO: one advantage per logical rollout, copied to its rows. PPO: GAE per row. Padding contributes no loss tokens.</text>
 
 
 <text class="note" x="16" y="600">13 real rows + 3 padding rows still represent six logical rollouts, not 16 independent reward samples.</text>

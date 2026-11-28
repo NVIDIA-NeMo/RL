@@ -767,6 +767,23 @@ def test_selected_snapshot_must_have_cut_every_active_call() -> None:
         )
 
 
+def test_selected_snapshot_must_restore_a_call_another_frontend_cut() -> None:
+    cuts = [{"model_call_id": "call-a"}, {"model_call_id": "call-b"}]
+    log = "\n".join(
+        [
+            "(VllmAsyncGenerationWorker pid=1) INFO generation cut rollout-1: HTTP "
+            "frontend http://127.0.0.1:2 cut 2 model calls: ['call-b', 'call-c']",
+            "generation cut rollout-1: HTTP frontend http://127.0.0.1:3 cut 0 "
+            "model calls: []",
+        ]
+    )
+
+    _SNAPSHOT_HELPER._require_peer_frontend_cut(cuts, log)
+    # Every selected call was cut by the frontend Gym's cut reached.
+    with pytest.raises(AssertionError, match="cut by another HTTP frontend"):
+        _SNAPSHOT_HELPER._require_peer_frontend_cut(cuts[:1], log)
+
+
 @pytest.mark.parametrize("prefix_routes", ["kept", "dropped", "none", None], ids=str)
 def test_verify_completion_requires_the_restored_routes_to_be_kept(
     tmp_path: Path, prefix_routes: str | None

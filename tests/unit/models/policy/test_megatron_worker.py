@@ -342,19 +342,55 @@ def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
         SimpleNamespace(
             hf_param_names=(safe_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
     ]
 
     assert _collect_local_refit_hf_names(tasks) == {safe_name}
+
+
+@pytest.mark.parametrize("projection", ["fc1", "fc2"])
+@pytest.mark.parametrize("transpose_on_export", [False, True])
+def test_local_refit_names_keep_transposed_grouped_experts_on_bridge_path(
+    projection: str, transpose_on_export: bool
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    hf_name = f"model.layers.0.mlp.experts.{'gate_up_proj' if projection == 'fc1' else 'down_proj'}"
+    mapping_cls = FusedGatedExpertMapping if projection == "fc1" else FusedExpertMapping
+    mapping = mapping_cls(
+        f"decoder.layers.0.mlp.experts.linear_{projection}.weight0",
+        hf_name,
+        transpose_on_export=transpose_on_export,
+    )
+    assert mapping.local_hf_param_specs()
+    task = SimpleNamespace(
+        mapping=mapping,
+        hf_param_names=(hf_name,),
+        local_hf_param_specs=mapping.local_hf_param_specs,
+    )
+
+    assert _collect_local_refit_hf_names([task]) == (
+        set() if transpose_on_export else {hf_name}
+    )
 
 
 def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
@@ -405,10 +441,12 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(expert0,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(unsafe,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
     ]
@@ -2486,7 +2524,8 @@ def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
     assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
-def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch, hook_enabled):
     """Params offloaded by colocated generation must be onloaded before the save walks them."""
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -2501,7 +2540,10 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     worker.optimizer = object()
     worker.scheduler = None
     worker.optimizer_cpu_offload = False
-    worker.should_disable_forward_pre_hook = False
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    worker.disable_forward_pre_hook = lambda: events.append("disable_hook")
+    worker.enable_forward_pre_hook = lambda: events.append("enable_hook")
     worker.checkpointing_context = None
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
@@ -2533,6 +2575,9 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert events.index("move_model_cuda") < events.index("mcore_save")
     assert events.index("move_optimizer_cuda") < events.index("mcore_save")
     assert events.index("synchronize") < events.index("mcore_save")
+    assert [event for event in events if event.endswith("_hook")] == (
+        ["disable_hook", "enable_hook"] if hook_enabled else []
+    )
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
@@ -3513,6 +3558,30 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("hook_enabled", [False, True])
+def test_use_reference_model_preserves_forward_pre_hook_state(hook_enabled) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.should_disable_forward_pre_hook = True
+    worker._forward_pre_hook_enabled = lambda: hook_enabled
+    hook_events = []
+    worker.disable_forward_pre_hook = lambda: hook_events.append("disable")
+    worker.enable_forward_pre_hook = lambda: hook_events.append("enable")
+    worker.model = SimpleNamespace(state_dict=lambda: {})
+    worker.reference_state_dict = {}
+    worker._apply_state_dict_to_model = lambda *_args, **_kwargs: None
+    worker.sampling_params = None
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+
+    with worker.use_reference_model():
+        pass
+
+    assert hook_events == (["disable", "enable"] if hook_enabled else [])
 
 
 @pytest.mark.parametrize("init_reference_model", [False, True])
@@ -6922,6 +6991,60 @@ class TestWarmupFirstPass:
             # The same objects: CUDA graphs captured on them stay valid.
             assert tracker.states[name] is g
             assert torch.equal(g.get_state(), saved[name])
+
+    @pytest.mark.parametrize("is_leader", [True, False])
+    def test_logprob_pass_feeds_every_model_parallel_rank(self, monkeypatch, is_leader):
+        import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+        def get_logprobs(*, data, require_router_replay, keep_on_gpu=False):
+            # Stub of get_logprobs' return contract: without keep_on_gpu only the
+            # replica leader gets logprobs. The real gating is tested in
+            # TestReplicatedLogprobResult (test_megatron_split_state.py).
+            if not keep_on_gpu and not is_leader:
+                return {}
+            return {"logprobs": torch.full(data["input_ids"].shape, -0.5)}
+
+        seen = {}
+        worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+        worker.cfg = {
+            "max_total_sequence_length": 32,
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {"empty_unused_memory_level": 0},
+        }
+        worker.model = MagicMock(name="model")
+        worker.timer = MagicMock(name="step_timer")
+        worker._trainer_warmup_skip_reason = lambda: None
+        worker._apply_packing_prep = lambda data: data
+        worker.prepare_for_lp_inference = MagicMock()
+        worker.get_logprobs = get_logprobs
+        worker.prepare_for_training = MagicMock()
+        worker.begin_train_step = MagicMock()
+        worker.train_microbatch = MagicMock(
+            side_effect=lambda data: seen.update(prev=data["prev_logprobs"].clone())
+        )
+        worker.abort_train_step = MagicMock()
+        monkeypatch.setattr(
+            worker_module, "get_cuda_rng_tracker", lambda: _GeneratorRngTracker({})
+        )
+        monkeypatch.setattr(worker_module, "get_model_config", MagicMock())
+        monkeypatch.setattr(worker_module, "reset_model_temporary_tensors", MagicMock())
+        monkeypatch.setattr(worker_module, "clear_aux_losses_tracker", MagicMock())
+        monkeypatch.setattr(worker_module, "MTPLossLoggingHelper", MagicMock())
+        monkeypatch.setattr(
+            torch.cuda, "get_rng_state", lambda: torch.zeros(8, dtype=torch.uint8)
+        )
+        monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+        summary = worker.warmup_first_pass(
+            MagicMock(name="loss_fn"),
+            train_fields=("input_ids", "input_lengths", "sample_mask", "prev_logprobs"),
+            run_logprobs=True,
+            seqlens=[16],
+        )
+
+        assert "logprobs_s" in summary
+        assert torch.all(seen["prev"] == -0.5)
 
     @pytest.mark.parametrize(
         ("attrs", "reason"),

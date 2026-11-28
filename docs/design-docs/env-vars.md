@@ -13,6 +13,7 @@ There are a number of ways to pass environment variables to Ray workers in NeMo 
 - Set via `export` in shell or `os.environ` in Python.
 - Useful for controlling environment variables from a high level. If not overwritten by higher priority methods, all workers will inherit these environment variables.
 - Example: `export HF_TOKEN=<your_token>`
+- Set `NRL_WORKER_ENV_EXCLUDE` to a comma-separated list of names that the driver should not forward, so workers keep the values from their own node or container. It must be set before Ray is initialized. A value set for an excluded name in YAML `env_vars` or Dynamo `frontend_args.extra_env` is dropped too. Example: `export NRL_WORKER_ENV_EXCLUDE="POD_NAME,AWS_ROLE_ARN"`
 
 ### 3. YAML Configuration `env_vars` (high)
 - Set in YAML config files under `policy.megatron_cfg.env_vars` or `policy.automodel_cfg.env_vars`.

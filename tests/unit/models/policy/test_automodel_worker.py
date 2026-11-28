@@ -112,6 +112,7 @@ def create_test_config(
             "activation_checkpointing": activation_checkpointing,
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
+            "pipeline_parallel_size": 1,
             "custom_parallel_plan": custom_parallel_plan,
             "expert_parallel_size": expert_parallel_size,
             "lora_cfg": {
@@ -343,6 +344,7 @@ def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, e
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Sequential(experts)
     worker.optimizer = None
+    worker.pipeline = None
     worker.move_to_cpu = lambda model: model
     token_probs_at_empty_cache = []
 
@@ -1038,6 +1040,8 @@ class TestAutomodelLoraParamsGenerator:
 
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = model
+        worker.pipeline = None
+        worker._weight_exporter = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1074,6 +1078,8 @@ class TestAutomodelLoraParamsGenerator:
     def test_prepare_refit_info_contains_only_factor_metadata(self):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
+        worker._weight_exporter = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1090,6 +1096,8 @@ class TestAutomodelLoraParamsGenerator:
     def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
+        worker._weight_exporter = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1118,6 +1126,8 @@ class TestAutomodelLoraParamsGenerator:
     def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
+        worker._weight_exporter = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
         worker.lora_refit_mode = "native"
@@ -1142,6 +1152,8 @@ class TestAutomodelLoraParamsGenerator:
     def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
+        worker.pipeline = None
+        worker._weight_exporter = None
         worker.draft_model = None
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
@@ -1177,6 +1189,8 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
     worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = RouterModel()
+    worker.pipeline = None
+    worker._weight_exporter = None
     worker.dtype = torch.bfloat16
     worker.draft_model = None
     worker.lora_enabled = False
@@ -1403,6 +1417,36 @@ def test_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
     assert worker.reference_model_state_dict == {"ref": "state"}
+
+
+def _check_tq_coordinates(rank: int, world_size: int) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    # PP=2, DP=1: both pipeline stages of the single DP rank are replicas.
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.device_mesh = init_device_mesh(
+        "cuda",
+        (2, 1, 1, 1, 1),
+        mesh_dim_names=("pp", "dp_replicate", "dp_shard", "cp", "tp"),
+    )
+    coords = worker._local_coords()
+    assert coords == {
+        "tensor_parallel": 0,
+        "context_parallel": 0,
+        "pipeline_parallel": rank,
+    }
+    # Exactly one rank of the DP replica writes back to TQ.
+    leaders = [None] * world_size
+    torch.distributed.all_gather_object(leaders, worker._is_replica_leader())
+    assert leaders == [True, False]
+    replica_group = worker._get_replica_group()
+    assert torch.distributed.get_process_group_ranks(replica_group) == [0, 1]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_tq_coordinates_include_pipeline_stage(distributed_test_runner):
+    distributed_test_runner(_check_tq_coordinates, world_size=2)
 
 
 def _base_setup_impl(request, cluster):

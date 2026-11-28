@@ -3,6 +3,8 @@
 # decode. It compares an uninterrupted reference run with a hard-kill/restore
 # run, where the restored attempt must reuse the exact durable prefix and
 # generate only the remaining suffix before the rollout is finalized/trained.
+# Cut rows always go through the prefix write pipeline and, on TransferQueue,
+# its writer actor; the run checks that both started.
 
 set -eou pipefail
 
@@ -36,9 +38,10 @@ GYM_ROOT=$PROJECT_ROOT/3rdparty/Gym-workspace/Gym
 SENTINEL_EVENT="NeMo RL prefix recovery parity sentinel"
 
 # Cuttable Workplace prompts per step, one per list length.
-# Above ~500 the model overruns its list (stray tags, a second list) and hits a
-# near-tied token where runs diverge; keep every list in the well-behaved range.
-LIST_LENGTHS=(${SC_PREFIX_RECOVERY_LIST_LENGTHS:-150 250 350 450})
+# At 450 the closing reply's first token is near-tied between the list and a
+# stray <tool_call>, so runs diverge before the cut; keep every list at 350 or
+# below.
+LIST_LENGTHS=(${SC_PREFIX_RECOVERY_LIST_LENGTHS:-150 200 250 350})
 NUM_PROMPTS=${#LIST_LENGTHS[@]}
 NUM_GENERATIONS=${SC_PREFIX_RECOVERY_NUM_GENERATIONS:-2}
 # Qwen tokenizes each digit separately, so "N\n" costs at most digits + 1 tokens.
@@ -61,6 +64,14 @@ TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 # later, so require a recoverable prefix in every Workplace prompt group rather
 # than in every sibling at once.
 MIN_PREFIX_CUT_GROUPS=${#LIST_LENGTHS[@]}
+SELECT_FLAGS=(--min-cut-groups "$MIN_PREFIX_CUT_GROUPS")
+# With several HTTP frontends, restore a call that a frontend other than the one
+# Gym's cut reached cut, so the cut's fan-out is what the restore checks.
+for override in "$@"; do
+    if [[ "$override" =~ vllm_cfg\.http_api_server_count=([0-9]+)$ ]] && [[ "${BASH_REMATCH[1]}" -gt 1 ]]; then
+        SELECT_FLAGS+=(--require-peer-frontend-cut)
+    fi
+done
 POLICY_MAX_NEW_TOKENS=0
 for list_length in "${LIST_LENGTHS[@]}"; do
     list_budget=$((list_length * LIST_TOKENS_PER_ITEM + LIST_OUTPUT_SLACK_TOKENS))
@@ -214,10 +225,13 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
     "$SNAPSHOT_TIMEOUT_S" \
     "$SELECTED_BACKUP" \
     "$SENTINEL_EVENT" \
-    --min-cut-groups "$MIN_PREFIX_CUT_GROUPS"
+    "${SELECT_FLAGS[@]}"
 
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
+# The selected snapshot holds cut rows, so they went through these paths.
+grep -q "generation-prefix write pipeline started" "$PHASE1_LOG"
+grep -q "prefix_writer event=ready" "$PHASE1_LOG"
 restore_selected_snapshot "$SELECTION_FILE" "$SELECTED_BACKUP" "$CHECKPOINT_DIR"
 
 # Avoid cutting the replacement request again while verifying that it consumes
