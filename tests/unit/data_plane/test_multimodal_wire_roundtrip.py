@@ -310,7 +310,7 @@ def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
             pass
 
     pol = object.__new__(_StubTQPolicy)
-    pol.cfg = {}
+    pol.cfg = {"make_sequence_length_divisible_by": 1}
     pol._router_replay_enabled = False
     pol._opd_full_field = None  # opd_full off, as __init__ leaves it
     pol._opd_full_teacher_index_field = None
@@ -424,7 +424,7 @@ def test_prev_logprob_dispatch_ships_the_sampler_head_under_replay(monkeypatch, 
     )
     captured: dict[str, KVBatchMeta] = {}
     pol = _stub_tq_policy(monkeypatch, captured)
-    pol.cfg = {"generation": {"sampler_replay": {"enabled": replay}}}
+    pol.cfg["generation"] = {"sampler_replay": {"enabled": replay}}
 
     pol.get_logprobs_from_meta(meta)
     pol.get_reference_policy_logprobs_from_meta(meta)

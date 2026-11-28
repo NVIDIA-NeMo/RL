@@ -16,6 +16,42 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 `run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml); the PPO one at [examples/configs/ppo_math_1B_megatron_single_controller.yaml](../../examples/configs/ppo_math_1B_megatron_single_controller.yaml).
 
+### AutoModel full-batch baseline
+
+AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2, TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` at any `max_lookahead_versions`, and a streaming threshold equal to `grpo.num_prompts_per_step`.
+Packing, dynamic batching, CPU offload, HSDP, LoRA, draft training, VLM, PPO, distillation, dynamic sampling, and token capture are not enabled in this stage.
+Both prompt-drop budgets must be zero.
+Explicit unsupported settings fail at setup.
+
+Expert parallelism uses the existing AutoModel MoE path; SC does not impose EP=1.
+Configure `policy.automodel_cfg.expert_parallel_size` and a compatible dispatcher for the model and allocated training GPUs.
+The same full-batch lifecycle and gradient clipping operate on AutoModel's expert mesh.
+
+One full-batch dispatch still runs multiple backend forward/backward passes.
+The optimizer and scheduler advance once, in `finish_train_step`.
+A failed dispatch or commit ends the run, which is then restarted from a checkpoint; in this stage `abort_train_step` is exercised only by unit tests.
+The existing synchronous AutoModel training path retains its broader configuration support.
+
+Run the checkpoint/resume integration smoke on two GPUs:
+
+```bash
+bash tests/functional/automodel_sc_full_batch_smoke.sh
+```
+
+The script runs the AutoModel SC exemplar with a small batch on one training GPU and one rollout GPU.
+It saves after step 1 and resumes through step 4.
+Append normal config overrides for a local model path or W&B logging; set the `EXP_DIR` environment variable to a fresh parent directory to choose where both launches write logs and checkpoints.
+
+For numerical parity against `train()`, run the two-GPU unit test in the AutoModel environment:
+
+```bash
+cd tests
+uv run --extra automodel pytest unit/models/policy/test_automodel_split_parity.py \
+  --automodel-only --hf-gated
+```
+
+See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md) for the lifecycle, numerical primitives, forward-padding contract, and training comparison curves.
+
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):
@@ -485,7 +521,8 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   A group in which no rollout carried media (an all-text prompt in a mixed dataset) is published with empty media rows in the partition's pinned pixel dtype and patch width, so its keys can share a train fetch with media keys.
   Compaction, mixed image/video conversations, native audio, video token pruning, static tiling (`image_num_patches`), other processor families, and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo Gym rollouts; multimodal/VLM MOPD is not yet supported. See [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
-- Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
+- Train backend: Megatron supports the configurations described in this guide.
+  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline); the streaming and broader sampler options elsewhere in this guide do not apply to AutoModel yet.
 - Generation backend: vLLM, Megatron and SGLang generation are supported.
   - vLLM: non-colocated only. It can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md).
   - Megatron: both non-colocated and colocated modes.

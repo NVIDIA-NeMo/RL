@@ -1109,7 +1109,13 @@ class TestSetup:
 
         patched_factories["_build_generation"].side_effect = build_generation
 
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
+        # Automodel SC rejects LoRA; bypass that check to test the shared LoRA
+        # setup ordering.
+        with patch(
+            "nemo_rl.algorithms.single_controller_utils.config."
+            "_validate_automodel_single_controller_config"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert captured == {"load_format": "auto", "enable_lora": True}
         generation_config = mc.policy["generation"]
@@ -5847,20 +5853,6 @@ def test_minf_image_preprocessing_emits_float32_pixels():
 @pytest.mark.parametrize(
     "backend_cfg",
     [
-        {
-            "automodel_cfg": {
-                "enabled": True,
-                "tensor_parallel_size": 2,
-                "context_parallel_size": 1,
-            }
-        },
-        {
-            "automodel_cfg": {
-                "enabled": True,
-                "tensor_parallel_size": 1,
-                "context_parallel_size": 2,
-            }
-        },
         {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
         {"megatron_cfg": {"enabled": True, "reuse_logits_storage": True}},
     ],

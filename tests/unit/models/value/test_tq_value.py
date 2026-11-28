@@ -111,6 +111,7 @@ def _make_tq_value(*, megatron_enabled: bool = True) -> tuple[TQValue, MagicMock
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
         "megatron_cfg": {"enabled": megatron_enabled},
+        "make_sequence_length_divisible_by": 1,
     }
     wg = MagicMock()
     v.worker_group = wg
