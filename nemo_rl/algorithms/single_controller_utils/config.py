@@ -985,7 +985,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     matches any number of levels.
 
     SingleController has no validation loop, so checkpoint selection must use
-    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``checkpointing.save.metric_name=None`` or a ``train:<name>`` metric. Inherited
     ``val:<name>`` settings are rejected during setup. Unknown keys are
     forbidden because a misspelled interval, retention, or restore option can
     silently disable the durability behavior the operator intended.
@@ -1871,8 +1871,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
-        and master_config.checkpointing.enabled
-        and master_config.checkpointing.save_optimizer
+        and master_config.checkpointing.save.enabled
+        and master_config.checkpointing.save.save_optimizer
         and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
         and cast(MegatronConfig, policy_megatron_cfg)
@@ -1883,7 +1883,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
             "is incompatible with PPO critic warmup when optimizer checkpointing "
             "is enabled. Set ckpt_assume_constant_structure=false, "
-            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+            "ppo.policy_training_start_step=0, or checkpointing.save.save_optimizer=false."
         )
 
     sampler_name = async_config.sampler.name
@@ -2319,20 +2319,20 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         # TIS corrects generation staleness; a forced ratio stays exact with one
         # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
-    # Top-k retention keys off checkpointing.metric_name, but SC has no
+    # Top-k retention keys off checkpointing.save.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
     # never be collected and top-k would silently degrade to a no-op.
-    metric_name = master_config.checkpointing.metric_name
+    metric_name = master_config.checkpointing.save.metric_name
     if (
-        master_config.checkpointing.enabled
+        master_config.checkpointing.save.enabled
         and metric_name is not None
         and not metric_name.startswith("train:")
     ):
         raise ValueError(
-            f"checkpointing.metric_name={metric_name!r} is not usable on the "
+            f"checkpointing.save.metric_name={metric_name!r} is not usable on the "
             "SingleController path: it has no validation loop yet, so only "
             "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
-            "'train:loss') or set checkpointing.metric_name=null."
+            "'train:loss') or set checkpointing.save.metric_name=null."
         )
 
     token_capture_config = master_config.token_capture

@@ -240,7 +240,7 @@ class SFTSingleControllerActor:
         # wall clock in __init__, so a driver-built one would count the
         # cluster and policy setup against the training budget.
         self._timeout = TimeoutChecker(
-            timeout=master_config.checkpointing.checkpoint_must_save_by,
+            timeout=master_config.checkpointing.save.checkpoint_must_save_by,
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
@@ -455,7 +455,7 @@ class SFTSingleControllerActor:
         return self._owner_call("sft_dataloader_state_dict")
 
     def _should_save(self, *, save_by_timeout: bool) -> bool:
-        config = self._master_config.checkpointing
+        config = self._master_config.checkpointing.save
         ft_save_period = config.ft_save_period
         steps = self._save_state.total_steps
         return bool(config.enabled) and (
@@ -466,19 +466,19 @@ class SFTSingleControllerActor:
         )
 
     def _checkpoint_metric(self, metrics: dict[str, Any]) -> dict[str, float]:
-        """Read checkpointing.metric_name out of one step's training metrics.
+        """Read checkpointing.save.metric_name out of one step's training metrics.
 
         Called every step rather than only on a save so a name that no step
         produces fails on step 1 instead of at the first checkpoint.
         """
-        metric_name = self._master_config.checkpointing.metric_name
+        metric_name = self._master_config.checkpointing.save.metric_name
         if metric_name is None:
             return {}
         # setup_sft_v2 already rejected anything but a train: name.
         key = metric_name.split(":", 1)[1]
         if key not in metrics:
             raise ValueError(
-                f"checkpointing.metric_name={metric_name!r} names a training "
+                f"checkpointing.save.metric_name={metric_name!r} names a training "
                 f"metric this step did not produce. Available: {sorted(metrics)}."
             )
         return {metric_name: float(metrics[key])}
@@ -562,7 +562,7 @@ def setup_sft_v2(
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
     setup_started = time.monotonic()
     set_seed(master_config.sft.seed)
-    pretrained_checkpoint = master_config.checkpointing.pretrained_checkpoint
+    pretrained_checkpoint = master_config.checkpointing.load.pretrained_checkpoint
     if pretrained_checkpoint is not None:
         master_config.policy["pretrained_checkpoint"] = pretrained_checkpoint
     if master_config.data.get("backend") != "energon":
@@ -614,11 +614,11 @@ def setup_sft_v2(
         raise ValueError("SFTv2 reads no validation source. Set data.validation=null.")
     # Same reason: only train metrics exist here, so a val: name would leave
     # keep_top_k ranking every checkpoint on a metric that is never written.
-    metric_name = master_config.checkpointing.metric_name
+    metric_name = master_config.checkpointing.save.metric_name
     if metric_name is not None and not metric_name.startswith("train:"):
         raise ValueError(
             "SFTv2 can rank checkpoints on training metrics only. Set "
-            "checkpointing.metric_name to null or 'train:<metric>'; got "
+            "checkpointing.save.metric_name to null or 'train:<metric>'; got "
             f"{metric_name!r}."
         )
     max_sequence_length = master_config.data["max_input_seq_length"]

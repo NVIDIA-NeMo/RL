@@ -148,6 +148,7 @@ from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
+    CheckpointSaveConfig,
     PretrainedCheckpointConfig,
 )
 from nemo_rl.utils.logger import LoggerConfig
@@ -1872,7 +1873,7 @@ class TestSaveTrigger:
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1", "step_2"}
 
     def test_ft_save_period_triggers_saves(self, tmp_path):
-        # checkpointing.ft_save_period ORs into the save trigger like on
+        # checkpointing.save.ft_save_period ORs into the save trigger like on
         # every other algorithm; silently ignoring it would break crash
         # recovery for users who configured it.
         mc = _actor_master_config(
@@ -4940,7 +4941,9 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
         checkpointing=CheckpointingConfig.model_construct(
-            metric_name=None, save_data_plane=False
+            save=CheckpointSaveConfig.model_construct(
+                metric_name=None, save_data_plane=False
+            )
         ),
         data_plane={},
     )
@@ -5128,7 +5131,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
-        actor._master_config.checkpointing.metric_name = "train:loss"
+        actor._master_config.checkpointing.save.metric_name = "train:loss"
         # Seed it so the delattr in the warmup branch is observable; the bare
         # namespace never had the attribute, so the assertion would be vacuous.
         setattr(actor._save_state, "train:loss", 1.23)
@@ -5144,7 +5147,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
-        actor._master_config.checkpointing.metric_name = "train:loss"
+        actor._master_config.checkpointing.save.metric_name = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
             asyncio.run(
@@ -5438,7 +5441,7 @@ class TestSetupResumeWiring:
     ):
         ckpt_dir = tmp_path / "ckpts"
         mc = _setup_master_config(str(ckpt_dir))
-        mc.checkpointing.save_period = 1
+        mc.checkpointing.save.save_period = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
@@ -5581,7 +5584,7 @@ class TestSetupResumeWiring:
         pretrained = PretrainedCheckpointConfig(
             path="/some/ckpt", format="megatron_bridge"
         )
-        mc.checkpointing.pretrained_checkpoint = pretrained
+        mc.checkpointing.load.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 

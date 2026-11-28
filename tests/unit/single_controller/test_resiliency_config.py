@@ -50,7 +50,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _build_retry_policy,
     setup_single_controller,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointSaveConfig,
+)
 
 
 def _all_sampler_names() -> list[str]:
@@ -91,7 +94,7 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         env={"should_use_nemo_gym": True},
         checkpointing=CheckpointingConfig.model_construct(
-            enabled=False, metric_name=None
+            save=CheckpointSaveConfig.model_construct(enabled=False, metric_name=None)
         ),
     )
 
@@ -472,7 +475,9 @@ class TestWrongPathFaultToleranceIsRejected:
             # Read by the metric_name check upstream #3429 added to this same
             # validator, which runs before the wrong-path check under test.
             checkpointing=CheckpointingConfig.model_construct(
-                enabled=False, metric_name=None
+                save=CheckpointSaveConfig.model_construct(
+                    enabled=False, metric_name=None
+                )
             ),
         )
 

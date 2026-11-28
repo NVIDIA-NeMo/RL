@@ -112,7 +112,7 @@ def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
 
 
 def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
-    """Fail when checkpointing.metric_name still uses the bare-name format.
+    """Fail when checkpointing.save.metric_name still uses the bare-name format.
 
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
@@ -121,12 +121,16 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     if not isinstance(checkpointing, dict):
         return
 
-    metric_name = checkpointing.get("metric_name")
+    # A flat metric_name wins over the nested one, as in CheckpointingConfig.
+    save = checkpointing.get("save")
+    metric_name = checkpointing.get(
+        "metric_name", save.get("metric_name") if isinstance(save, dict) else None
+    )
     if metric_name is None or metric_name.startswith(("train:", "val:")):
         return
 
     raise ValueError(
-        f"checkpointing.metric_name={metric_name!r} must start with 'train:' or 'val:', "
+        f"checkpointing.save.metric_name={metric_name!r} must start with 'train:' or 'val:', "
         f"followed by the name in the matching metrics dictionary. The bare-name format "
         f"is gone, and the name after the prefix depends on the algorithm: SFT "
         f"'val:val_loss', DPO/RM 'val:validation-<dataset>_loss' (default "

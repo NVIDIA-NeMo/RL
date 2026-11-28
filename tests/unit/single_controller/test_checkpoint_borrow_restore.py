@@ -54,7 +54,11 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     RolloutRecoveryLedger,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointLoadConfig,
+    CheckpointSaveConfig,
+)
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
 from tests.unit.single_controller._rollout_checkpoints import (
     attach_rollout_checkpointing,
@@ -238,7 +242,10 @@ def _controller(
     )
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
-        checkpointing=CheckpointingConfig.model_construct(load_replay_buffer=True),
+        checkpointing=CheckpointingConfig.model_construct(
+            save=CheckpointSaveConfig.model_construct(),
+            load=CheckpointLoadConfig.model_construct(load_replay_buffer=True),
+        ),
         token_capture=SimpleNamespace(enabled=False, forest_training=False),
         loss_fn=SimpleNamespace(resolved_normalization="global_token_mean"),
     )

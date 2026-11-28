@@ -35,7 +35,11 @@ from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+    CheckpointSaveConfig,
+)
 from nemo_rl.utils.logger import LoggerConfig
 
 
@@ -1006,10 +1010,12 @@ def _run_mock_ppo_train(
         },
         loss_fn=_make_loss_config(),
         checkpointing=CheckpointingConfig.model_construct(
-            enabled=checkpoint_path is not None,
-            checkpoint_must_save_by=None,
-            save_period=100,
-            metric_name=None,
+            save=CheckpointSaveConfig.model_construct(
+                enabled=checkpoint_path is not None,
+                checkpoint_must_save_by=None,
+                save_period=100,
+                metric_name=None,
+            )
         ),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
@@ -1614,7 +1620,9 @@ def _make_noncolocated_setup_config(
             segment_size=segment_size,
         ),
         checkpointing=CheckpointingConfig.model_construct(
-            enabled=False, save_optimizer=False
+            save=CheckpointSaveConfig.model_construct(
+                enabled=False, save_optimizer=False
+            )
         ),
     )
 
@@ -2493,7 +2501,9 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
-        checkpointing=CheckpointingConfig.model_construct(checkpoint_must_save_by=None),
+        checkpointing=CheckpointingConfig.model_construct(
+            save=CheckpointSaveConfig.model_construct(checkpoint_must_save_by=None)
+        ),
     )
 
 
@@ -2828,7 +2838,9 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     config.ppo.num_prompts_per_step = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
     config.checkpointing = CheckpointingConfig.model_construct(
-        checkpoint_must_save_by=None, ft_save_period=None
+        save=CheckpointSaveConfig.model_construct(
+            checkpoint_must_save_by=None, ft_save_period=None
+        )
     )
     policy = MagicMock()
     generation = MagicMock()
@@ -2885,7 +2897,9 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     config.ppo.skip_reference_policy_logprobs_calculation = False
     config.ppo.adv_estimator = GAEConfig(name="raw_reward", normalize_advantages=False)
     config.checkpointing = CheckpointingConfig.model_construct(
-        checkpoint_must_save_by=None, ft_save_period=None
+        save=CheckpointSaveConfig.model_construct(
+            checkpoint_must_save_by=None, ft_save_period=None
+        )
     )
 
     replay_actor = MagicMock()
