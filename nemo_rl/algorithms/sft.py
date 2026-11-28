@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -132,6 +132,20 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     telemetry: Optional[TelemetryConfig] = None
+
+    @model_validator(mode="after")
+    def _require_data_num_workers(self) -> "MasterConfig":
+        # setup() passes data["num_workers"] to the train/validation
+        # StatefulDataLoaders, so a config without the key passes validation
+        # and then crashes with a bare KeyError after the dataset loads (#1547).
+        if "num_workers" not in self.data:
+            raise ValueError(
+                "data.num_workers is required for SFT: setup() passes it to the "
+                "train/validation dataloaders. Set e.g. data.num_workers: 0 to "
+                "load data in the main process, or inherit it from "
+                "examples/configs/sft.yaml."
+            )
+        return self
 
 
 def _uses_direct_megatron_sft_packing(

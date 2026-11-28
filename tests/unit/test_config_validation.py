@@ -492,6 +492,27 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
     )
 
 
+def test_sft_master_config_requires_data_num_workers() -> None:
+    """SFT setup() indexes data["num_workers"] for the dataloaders.
+
+    A config without the key used to pass validation and then crash with a
+    bare KeyError after the dataset had loaded (#1547). Require it at
+    validation so the failure is fast and names the key.
+    """
+    config = load_config_with_inheritance(configs_dir / "sft.yaml")
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    del config_dict["data"]["num_workers"]
+    with pytest.raises(ValidationError, match="data.num_workers"):
+        SFTMasterConfig.model_validate(config_dict)
+
+    # The issue's example resolves with the key (via defaults: sft.yaml).
+    openmath_config = load_config_with_inheritance(
+        configs_dir / "sft_openmathinstruct2.yaml"
+    )
+    openmath_dict = OmegaConf.to_container(openmath_config, resolve=True)
+    SFTMasterConfig.model_validate(openmath_dict)
+
+
 def test_base_exemplars_pin_flash_attention_to_fa2():
     # flash-attn-4 is installed in the mcore extra; without an explicit pin TE
     # would pick FA4 for every Megatron run. Only batch-invariant recipes use 4.
