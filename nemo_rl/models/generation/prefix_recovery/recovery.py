@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import torch
 
+from nemo_rl.data_plane.prefix_writer_actor import PrefixWriterDiedError
 from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
     SAMPLER_TOPK_LOGPROBS_FIELD,
@@ -54,6 +55,13 @@ from nemo_rl.models.generation.prefix_recovery.routes import (
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
     _RequestCaptureState,
+)
+from nemo_rl.models.generation.prefix_recovery.write_pipeline import (
+    CutWrites,
+    PrefixWrite,
+    PrefixWritePipeline,
+    WriteSettled,
+    estimate_prefix_row_bytes,
 )
 from nemo_rl.models.generation.score_centering import extract_score_centering_slice
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
@@ -176,11 +184,6 @@ class PrefixRecovery:
         # the latest snapshot that deleted them.
         self._obsolete_keys: list[str] = []
         self._flushed_epoch = 0
-        # A dedicated thread keeps completions' TQ writes from consuming the
-        # threads needed to create the checkpoint cut.
-        self._control_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="nrl-generation-cut-control"
-        )
         # Obsolete chunk rows are deleted here, off the serving loop.
         self._cleanup_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-generation-cut-cleanup"
@@ -192,11 +195,33 @@ class PrefixRecovery:
             if parts.prefix_read_max_rows > 1
             else None
         )
+        # Cuts run on the pipeline's own preparation thread, so completions'
+        # TQ writes never hold the threads that create a cut.
+        self._pipeline = PrefixWritePipeline(
+            limits=parts.write_limits,
+            max_batch_rows=parts.prefix_write_max_rows,
+            max_batch_tokens=parts.prefix_write_max_tokens,
+            sink=parts.sink,
+            prepare=lambda inventory, deadline, held_only: self._cut_writes(
+                inventory, deadline=deadline, held_only=held_only
+            ),
+        )
+        LOGGER.info(
+            "generation-prefix write pipeline started: max_batch_payload_bytes=%d "
+            "max_buffered_payload_bytes=%d",
+            parts.write_limits.max_batch_payload_bytes,
+            parts.write_limits.max_buffered_payload_bytes,
+        )
 
     @property
     def control_token(self) -> str | None:
         """The bearer token the cut route requires; None refuses every cut."""
         return self._parts.control_token
+
+    @property
+    def control_timeout_s(self) -> float | None:
+        """How long a cut may take from its arrival; None waits indefinitely."""
+        return self._parts.control_timeout_s
 
     # ---- A call's life --------------------------------------------------
 
@@ -325,37 +350,49 @@ class PrefixRecovery:
         Returns:
             ``restored_calls`` and their total ``restored_prefix_tokens``, plus
             ``progress_reads``, ``progress_read_calls`` and the microseconds
-            they waited for and held the engine's output lock.
+            they waited for and held the engine's output lock, and the write
+            pipeline's ``pipeline_*`` counts (see :meth:`PrefixWritePipeline.counts`).
         """
         with self._lock:
-            return {
+            counts = {
                 "restored_calls": self._restored_calls,
                 "restored_prefix_tokens": self._restored_tokens,
                 **self._counts,
             }
+        counts.update(
+            (f"pipeline_{name}", value)
+            for name, value in self._pipeline.counts().items()
+        )
+        return counts
 
     def shutdown(self) -> None:
         # Waiting for a wedged TQ write here would make actor shutdown hang.
-        for executor in (self._control_executor, self._cleanup_executor):
-            executor.shutdown(wait=False, cancel_futures=True)
+        self._pipeline.close(wait=False)
+        self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
 
     # ---- A checkpoint cut -----------------------------------------------
 
-    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         """Cut every call Gym's inventory names, off the serving loop.
 
         ``deadline`` is a ``time.monotonic()`` bound from a caller that waits
         on one of its own (the Dynamo frontend). Without it the cut gets
         ``control_timeout_s`` from its arrival here.
+
+        With ``held_only``, for one engine's share of a cut that a coordinator
+        merges, the receipt leaves out calls this process has no record of:
+        another engine holds them, and the merge fails any call no engine cut.
         """
         if deadline is None:
             # Measured from arrival so time queued behind a stale cut counts.
             timeout_s = self._parts.control_timeout_s
             deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        return await asyncio.get_running_loop().run_in_executor(
-            self._control_executor,
-            functools.partial(self.checkpoint_cut, inventory, deadline=deadline),
+        future = self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
         )
+        return await asyncio.shield(asyncio.wrap_future(future))
 
     def _record_progress(
         self, states: list[_RequestCaptureState], *, deadline: float | None
@@ -434,6 +471,21 @@ class PrefixRecovery:
                 logprobs_container=progress.logprobs,
             )
         return route_pieces
+
+    def _held_prefixes(self, inventory: Any) -> list[Any]:
+        """The inventory's calls this process holds live or finished state for."""
+        # The live registry first: a finishing call is remembered as completed
+        # before it leaves the registry, so it is found in one or the other.
+        live = [
+            self._registry.get_by_model_call_id(prefix.model_call_id) is not None
+            for prefix in inventory.active_prefixes
+        ]
+        with self._lock:
+            return [
+                prefix
+                for prefix, held in zip(inventory.active_prefixes, live)
+                if held or prefix.model_call_id in self._completed
+            ]
 
     @staticmethod
     def _failed_ack(prefix: Any, *, reason: str, uncut: Counter[str]) -> Any:
@@ -774,13 +826,24 @@ class PrefixRecovery:
             num_candidates=top_k,
         )
 
-    def checkpoint_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
-        """Stage a stable prefix for every call named by Gym's frozen inventory.
+    def checkpoint_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
+        """Run one cut through the write pipeline and wait for its receipt."""
+        return self._pipeline.submit(
+            inventory, deadline=deadline, held_only=held_only
+        ).result()
+
+    def _cut_writes(
+        self, inventory: Any, *, deadline: float | None, held_only: bool
+    ) -> CutWrites:
+        """Prepare transactions, then seal their rows after durable write replies.
 
         ``deadline`` is a ``time.monotonic()`` bound. Gym stops waiting for the
         receipt at its own control deadline, so calls not reached by then are
         acknowledged as failures (they regenerate after restore) instead of
-        holding the single cut-control thread for the next checkpoint.
+        holding the cut-control or pipeline preparation thread for the next
+        checkpoint.
         """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutReceipt,
@@ -791,24 +854,27 @@ class PrefixRecovery:
             cached_receipt = self._receipts.get(receipt_key)
         if cached_receipt is not None:
             return cached_receipt
+        prefixes = (
+            self._held_prefixes(inventory) if held_only else inventory.active_prefixes
+        )
         active_states = [
             state
-            for prefix in inventory.active_prefixes
+            for prefix in prefixes
             if (state := self._registry.get_by_model_call_id(prefix.model_call_id))
             is not None
         ]
         route_pieces = self._record_progress(active_states, deadline=deadline)
         # Why each uncut call was left uncut; Gym counts them per checkpoint.
         uncut: Counter[str] = Counter()
-        acknowledgements = self._cut_batched(
-            inventory, uncut, route_pieces=route_pieces, deadline=deadline
+        acknowledgements = yield from self._cut_batched(
+            inventory, prefixes, uncut, route_pieces=route_pieces, deadline=deadline
         )
         if uncut:
             LOGGER.info(
                 "generation cut %s left %d of %d model calls uncut: %s",
                 inventory.checkpoint_id,
                 uncut.total(),
-                len(inventory.active_prefixes),
+                len(prefixes),
                 dict(sorted(uncut.items())),
             )
         receipt = GenerationCutReceipt(
@@ -828,12 +894,13 @@ class PrefixRecovery:
     def _cut_batched(
         self,
         inventory: Any,
+        prefixes: Sequence[Any],
         uncut: Counter[str],
         *,
         route_pieces: dict[str, list[Any]],
         deadline: float | None,
-    ) -> list[Any]:
-        """Cut every call of the inventory, writing their rows in batches.
+    ) -> CutWrites:
+        """Cut ``prefixes``, the inventory's calls, writing their rows in batches.
 
         Each call's cut stays frozen until its batch is written and every
         acknowledgement in the batch is built. A batch holds at most
@@ -846,6 +913,9 @@ class PrefixRecovery:
         failed batch write is retried one row per write, so one bad row fails
         only its own call. Past ``deadline`` no further write starts, and the
         calls not yet written are acknowledged as failures.
+
+        A batch also stays within ``max_batch_payload_bytes`` (estimated),
+        unless one row alone is larger; that row is written alone.
         """
         max_rows = self._parts.prefix_write_max_rows
         max_tokens = self._parts.prefix_write_max_tokens
@@ -859,6 +929,8 @@ class PrefixRecovery:
         acknowledgements: list[Any] = []
         pending: list[tuple[Generator[Any, Any, Any], Any, int, Any, Any]] = []
         pending_tokens = 0
+        pending_bytes = 0
+        byte_limit = self._parts.write_limits.max_batch_payload_bytes
         late: list[Any] = []
 
         def past_deadline() -> bool:
@@ -874,47 +946,56 @@ class PrefixRecovery:
             )
 
         def release_pending() -> None:
-            nonlocal pending_tokens
+            nonlocal pending_tokens, pending_bytes
             for transaction, _, _, _, prefix in pending:
                 transaction.close()
                 late.append(prefix)
             pending.clear()
             pending_tokens = 0
+            pending_bytes = 0
 
-        def stage(batch: list[tuple[Any, Any, int, Any, Any]]) -> list[str | None]:
-            """Write a batch; if its write fails, write each row alone."""
-            keys: list[str | None] = []
-            try:
-                keys.extend(
-                    sink.stage_generation_prefix_batch(
-                        [record for _, record, _, _, _ in batch],
-                        checkpoint_id=checkpoint_id,
-                        chunk_sequences=[sequence for _, _, sequence, _, _ in batch],
-                        attachments=[attachments for _, _, _, attachments, _ in batch],
-                    )
-                )
-                return keys
-            except Exception:
-                # The sink has already discarded the batch's keys.
-                if len(batch) == 1:
-                    fail(batch[0][4])
-                    return [None]
-                LOGGER.warning(
-                    "generation-prefix batch of %d rows failed; writing each alone",
-                    len(batch),
-                    exc_info=True,
-                )
-            keys = []
-            for row in batch:
+        def write_alone(
+            batch: list[tuple[Any, Any, int, Any, Any]], error: BaseException
+        ) -> list[str | None]:
+            """After a failed batch write, write each row alone once."""
+            if isinstance(error, PrefixWriterDiedError):
+                # Every later write fails too: fail the whole cut loudly
+                # instead of acknowledging each call as a failure.
+                raise error
+            # The sink has already discarded the batch's keys.
+            if len(batch) == 1:
                 if past_deadline():
-                    late.append(row[4])
-                    keys.append(None)
+                    late.append(batch[0][4])
                 else:
-                    keys += stage([row])
+                    fail(batch[0][4])
+                return [None]
+            LOGGER.warning(
+                "generation-prefix batch of %d rows failed; writing each alone",
+                len(batch),
+                exc_info=error,
+            )
+            keys: list[str | None] = []
+            for _, record, sequence, attachments, prefix in batch:
+                if past_deadline():
+                    late.append(prefix)
+                    keys.append(None)
+                    continue
+                try:
+                    keys += sink.stage_generation_prefix_batch(
+                        [record],
+                        checkpoint_id=checkpoint_id,
+                        chunk_sequences=[sequence],
+                        attachments=[attachments],
+                    )
+                except PrefixWriterDiedError:
+                    raise
+                except Exception:
+                    fail(prefix)
+                    keys.append(None)
             return keys
 
-        def flush() -> None:
-            nonlocal pending_tokens
+        def flush() -> CutWrites:
+            nonlocal pending_tokens, pending_bytes
             if not pending:
                 return
             if past_deadline():
@@ -923,10 +1004,19 @@ class PrefixRecovery:
             batch = list(pending)
             pending.clear()
             pending_tokens = 0
+            size, pending_bytes = pending_bytes, 0
             keys: list[str | None] = []
             handed = 0
             try:
-                keys = stage(batch)
+                keys = yield PrefixWrite(
+                    checkpoint_id=checkpoint_id,
+                    records=tuple(record for _, record, _, _, _ in batch),
+                    sequences=tuple(sequence for _, _, sequence, _, _ in batch),
+                    attachments=tuple(attached for _, _, _, attached, _ in batch),
+                    payload_bytes=size,
+                    fallback=functools.partial(write_alone, batch),
+                )
+                ready = []
                 for (transaction, _, _, _, prefix), key in zip(
                     batch, keys, strict=True
                 ):
@@ -956,12 +1046,13 @@ class PrefixRecovery:
                         )
                 for transaction, _, _, _, _ in batch:
                     transaction.close()
+            yield WriteSettled()
 
         try:
-            for index, prefix in enumerate(inventory.active_prefixes):
+            for index, prefix in enumerate(prefixes):
                 if past_deadline():
                     release_pending()
-                    late.extend(inventory.active_prefixes[index:])
+                    late.extend(prefixes[index:])
                     break
                 state = self._registry.get_by_model_call_id(prefix.model_call_id)
                 try:
@@ -990,14 +1081,27 @@ class PrefixRecovery:
                     fail(prefix)
                     continue
                 tokens = len(record.token_ids_delta)
-                if pending and pending_tokens + tokens > max_tokens:
-                    flush()
+                size = estimate_prefix_row_bytes(record, attachments)
+                if pending and (
+                    pending_tokens + tokens > max_tokens
+                    or pending_bytes + size > byte_limit
+                ):
+                    try:
+                        yield from flush()
+                    except BaseException:
+                        transaction.close()
+                        raise
                 pending.append((transaction, record, sequence, attachments, prefix))
                 pending_tokens += tokens
-                if len(pending) >= max_rows or pending_tokens >= max_tokens:
+                pending_bytes += size
+                if (
+                    len(pending) >= max_rows
+                    or pending_tokens >= max_tokens
+                    or pending_bytes >= byte_limit
+                ):
                     # An oversized single row is written alone, never split.
-                    flush()
-            flush()
+                    yield from flush()
+            yield from flush()
         finally:
             for transaction, _, _, _, _ in pending:
                 transaction.close()
@@ -1007,7 +1111,7 @@ class PrefixRecovery:
                 "uncut=%d of %d model_call_ids=%s",
                 checkpoint_id,
                 len(late),
-                len(inventory.active_prefixes),
+                len(prefixes),
                 [prefix.model_call_id for prefix in late],
             )
             acknowledgements.extend(
@@ -1015,7 +1119,7 @@ class PrefixRecovery:
                 for prefix in late
             )
         by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
-        return [by_ticket[prefix.ticket_id] for prefix in inventory.active_prefixes]
+        return [by_ticket[prefix.ticket_id] for prefix in prefixes]
 
     def _fetch_rows(self, staging_keys: list[str]) -> list[Any]:
         """Fetch cut rows with their extras, routes and top-k, in the requested order.
@@ -1250,6 +1354,7 @@ class NoPrefixRecovery:
     """
 
     control_token: str | None = None
+    control_timeout_s: float | None = None
 
     async def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
@@ -1302,5 +1407,7 @@ class NoPrefixRecovery:
     def shutdown(self) -> None:
         pass
 
-    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+    async def run_cut(
+        self, inventory: Any, *, deadline: float | None = None, held_only: bool = False
+    ) -> Any:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")

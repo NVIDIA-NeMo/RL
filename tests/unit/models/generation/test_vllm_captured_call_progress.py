@@ -165,6 +165,7 @@ def test_worker_collects_separate_frontend_snapshots(multiple_frontends: bool) -
     worker = SimpleNamespace(
         get_data_plane_snapshot=Mock(return_value=owner),
         _api_server_pool=pool if multiple_frontends else None,
+        _prefix_writer=None,
     )
     snapshots = asyncio.run(
         VllmAsyncGenerationWorkerImpl.get_data_plane_snapshots(worker)
@@ -192,6 +193,52 @@ def test_generation_flattens_frontend_snapshots() -> None:
         "get_data_plane_snapshots",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
+
+
+@pytest.mark.parametrize("multiple_frontends", [False, True])
+def test_worker_flushes_obsolete_cut_rows_on_every_frontend(
+    multiple_frontends: bool,
+) -> None:
+    pool = SimpleNamespace(command=AsyncMock(return_value=[None, None]))
+    worker = SimpleNamespace(
+        _prefix_recovery=SimpleNamespace(flush=AsyncMock()),
+        _api_server_pool=pool if multiple_frontends else None,
+    )
+    assert asyncio.run(
+        VllmAsyncGenerationWorkerImpl.flush_obsolete_generation_cut_rows_async(
+            worker, 3
+        )
+    )
+    worker._prefix_recovery.flush.assert_awaited_once_with(3)
+    if multiple_frontends:
+        pool.command.assert_awaited_once_with("flush", 3)
+
+
+@pytest.mark.parametrize("multiple_frontends", [False, True])
+def test_worker_reports_each_frontends_prefix_counts(multiple_frontends: bool) -> None:
+    owner, child = {"restored_calls": 1}, {"restored_calls": 2}
+    pool = SimpleNamespace(command=AsyncMock(return_value=[child]))
+    worker = SimpleNamespace(
+        get_generation_prefix_counts=Mock(return_value=owner),
+        _api_server_pool=pool if multiple_frontends else None,
+    )
+    counts = asyncio.run(
+        VllmAsyncGenerationWorkerImpl.get_generation_prefix_counts_per_frontend(worker)
+    )
+    assert counts == ([owner, child] if multiple_frontends else [owner])
+    if multiple_frontends:
+        pool.command.assert_awaited_once_with("counts")
+
+
+def test_frontend_keeps_only_the_other_frontends_as_cut_peers() -> None:
+    worker = SimpleNamespace(_peer_control_url="http://127.0.0.1:2")
+    VllmAsyncGenerationWorkerImpl.set_generation_cut_peers(
+        worker, ["http://127.0.0.1:1", "http://127.0.0.1:2", "http://127.0.0.1:3"]
+    )
+    assert worker._generation_cut_peer_urls == [
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:3",
+    ]
 
 
 @pytest.fixture

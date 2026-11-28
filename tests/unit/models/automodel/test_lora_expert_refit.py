@@ -272,6 +272,8 @@ def test_refit_metadata_excludes_grouped_adapters() -> None:
     worker.lora_enabled = True
     worker.lora_refit_mode = "merged"
     worker.draft_model = None
+    worker.pipeline = None
+    worker._weight_exporter = None
 
     metadata = worker.prepare_refit_info()
     tensors = dict(automodel_params_generator(model, worker.dtype))
