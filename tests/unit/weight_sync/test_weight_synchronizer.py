@@ -559,7 +559,7 @@ class TestSGLangColocatedWeightSynchronizer:
     def test_in_place_pause_is_rejected(self, mock_ray):
         policy = _mock_policy()
         gen = _mock_sglang_generation(pause_mode="in_place")
-        with pytest.raises(ValueError, match="unsafe for weight refit"):
+        with pytest.raises(ValueError, match="does not work with weight refit"):
             SGLangColocatedWeightSynchronizer(policy, gen)
 
         gen.pause_generation.assert_not_called()

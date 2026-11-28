@@ -90,6 +90,8 @@ class SGLangGeneration(GenerationInterface):
         RolloutHealthMonitor thread cannot follow it (see ``__getstate__``).
         Fleet health tracks a worker group's shards, which SGLang does not have.
         SGLang workers cannot abort a refit, so a refit deadline is refused too.
+        Every SGLang refit invalidates the KV cache, so keeping KV entries across a
+        refit is refused as well.
         """
         generation_config = cast(SGLangConfig, master_config.policy["generation"])
         fault_tolerance = SGLangFaultToleranceConfig.model_validate(
@@ -113,6 +115,14 @@ class SGLangGeneration(GenerationInterface):
         reject_unenforceable_refit_deadline(
             "SGLang", master_config.async_rl.generation_fleet_health.refit_timeout_s
         )
+        # Every SGLang refit invalidates the KV cache (_SGLangWeightSynchronizer._refit).
+        if not master_config.async_rl.recompute_kv_cache_after_weight_updates:
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates=false is not "
+                "supported with policy.generation.backend='sglang': every SGLang "
+                "refit invalidates the KV cache, so KV entries from the previous "
+                "weights are never kept. Set the flag to true."
+            )
 
     def __init__(
         self,
