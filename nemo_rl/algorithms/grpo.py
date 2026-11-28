@@ -99,6 +99,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    reject_turn_priority_without_nemo_gym,
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -921,6 +922,7 @@ def setup(
             "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
             "through the NeMo-Gym entrypoint."
         )
+    reject_turn_priority_without_nemo_gym(master_config)
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)

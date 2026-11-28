@@ -50,6 +50,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_actors,
+    reject_turn_priority_without_nemo_gym,
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -281,6 +282,7 @@ def setup(
     configure_lora_refit(policy_config)
     # Refuse before any cluster, logger or data side effect.
     reject_megatron_dynamo_outside_single_controller(generation_config)
+    reject_turn_priority_without_nemo_gym(master_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(
             policy_config, entry_point="distillation"

@@ -256,6 +256,8 @@ class _Engine:
         self.runs: list[tuple[list[int], Any, Any, Any]] = []
         # The reasoning_ended each run was handed.
         self.reasoning_ended: list[Optional[bool]] = []
+        # The priority each run was handed.
+        self.priorities: list[int] = []
         # How many of REPLY's tokens the prompt already ends with: a call
         # resumed from a checkpoint cut generates only the rest.
         self.resumed = 0
@@ -269,6 +271,7 @@ class _Engine:
         salt = prompt.get("cache_salt")
         self.runs.append((prompt_token_ids, sampling_params, _media(prompt), salt))
         self.reasoning_ended.append(kwargs.get("reasoning_ended"))
+        self.priorities.append(kwargs.get("priority", 0))
         if self._refuse is not None and self._refuse[0] == "running":
             raise self._refuse[1]
         terminal = restored_terminal()
@@ -405,6 +408,8 @@ class _Outcome:
     acknowledged: Optional[str] = None
     # What the engine was told of each run's reasoning.
     reasoning_ended: list[Optional[bool]] = field(default_factory=list)
+    # The priority the engine scheduled each run by.
+    priorities: list[int] = field(default_factory=list)
 
 
 def _host(
@@ -474,6 +479,7 @@ async def _native(kit, host, sink, failed, body, *, measure: bool) -> _Outcome:
         failed,
         response.headers.get(CAPTURE_REFUSAL_HEADER),
         host.llm.reasoning_ended,
+        host.llm.priorities,
     )
 
 
@@ -578,6 +584,7 @@ async def _dynamo(
         sink.staged,
         failed,
         reasoning_ended=host.llm.reasoning_ended,
+        priorities=host.llm.priorities,
     )
 
 
@@ -776,6 +783,8 @@ class _Case:
     turn_1_reply: str = TURN_1_REPLY
     # What the engine is told of the call's reasoning; unchecked when None.
     reasoning_ended: Optional[bool] = None
+    # The priority the engine schedules the call by.
+    priority: int = 0
 
 
 def _off_policy(name: str, value: Any) -> _Case:
@@ -987,6 +996,9 @@ CASES = [
         kit="router_replay",
     ),
     _Case("cache_salt", fields={"cache_salt": "tenant-a"}),
+    # Gym's turn priority: a request field natively, the annotation's through
+    # Dynamo, whose frontend refuses it as a top-level field.
+    _Case("turn_priority", extras=lambda kit: {"priority": -2}, priority=-2),
     # vLLM's token-level fields, which the frontend hands over as the client
     # sent them: the engine samples with them as it does natively.
     _Case(
@@ -1070,6 +1082,8 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
     assert dynamo.reasoning_ended == native.reasoning_ended
     if case.reasoning_ended is not None:
         assert native.reasoning_ended == [case.reasoning_ended]
+    # ...and scheduled it by the same priority.
+    assert native.priorities == dynamo.priorities == [case.priority]
     # Capture staged the same record and tensors, in the expected mode.
     assert [record.mode for record, _ in native.staged] == (
         [case.mode] if case.mode else []

@@ -146,6 +146,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.score_centering import (
     build_score_centering_request_overrides,
 )
+from nemo_rl.models.generation.vllm.config import enable_vllm_turn_priority
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
@@ -535,6 +536,25 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     )
 
     return True
+
+
+def reject_turn_priority_without_nemo_gym(
+    master_config: NemoGymCompatibleConfig,
+) -> None:
+    """Refuse ``prioritize_later_turns`` when NeMo Gym does not run the rollouts.
+
+    Only Gym's policy model server sends a per-call priority; NeMo RL's own
+    rollouts send none, so every request would get 0 and the switch would do nothing.
+    """
+    generation_config = master_config.policy["generation"]
+    if not (generation_config.get("vllm_cfg") or {}).get("prioritize_later_turns"):
+        return
+    if not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or set "
+            "policy.generation.vllm_kwargs.scheduling_policy=priority on its own."
+        )
 
 
 def set_nemo_gym_log_dir(env_config: dict[str, Any], log_dir: str) -> None:
@@ -3039,6 +3059,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
+        if generation_config["vllm_cfg"].get("prioritize_later_turns"):
+            enable_vllm_turn_priority(generation_config)
+            # Each actor applies it to its own composed config (_apply_turn_priority).
+            config.env.setdefault("nemo_gym", {})["turn_priority"] = True
     elif generation_config["backend"] == "megatron":
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
@@ -3183,6 +3207,37 @@ def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any], *, frontends: int) -> N
     nemo_gym_dict["policy_model"] = policy_model
 
 
+def _apply_turn_priority(nemo_gym_dict: dict[str, Any]) -> None:
+    """Have Gym's `policy_model` server in one NemoGym actor's config send each call's vLLM priority.
+
+    Set for ``policy.generation.vllm_cfg.prioritize_later_turns``, whose engine
+    runs the priority scheduling policy. Sets ``policy_model`` on
+    ``nemo_gym_dict`` in place, so pass a per-actor copy; the nested
+    policy_model levels are copied, so dicts shared with the user's config are
+    not mutated.
+    """
+    policy_model = dict(nemo_gym_dict.get("policy_model") or {})
+    models = dict(policy_model.get("responses_api_models") or {})
+    vllm_model = dict(models.get("vllm_model") or {})
+    if vllm_model.get("priority_by_turn") is False:
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns turns on Gym's "
+            "vllm_model.priority_by_turn, but env.nemo_gym.policy_model sets it to "
+            "false. Remove one of the two."
+        )
+    if "priority" in (vllm_model.get("extra_body") or {}):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prioritize_later_turns sends each model "
+            "call's priority from its turn, but env.nemo_gym.policy_model's "
+            "vllm_model.extra_body sets one priority for every call. Remove "
+            "extra_body.priority."
+        )
+    vllm_model["priority_by_turn"] = True
+    models["vllm_model"] = vllm_model
+    policy_model["responses_api_models"] = models
+    nemo_gym_dict["policy_model"] = policy_model
+
+
 def _build_gym_actor_config(
     nemo_gym_dict: dict[str, Any],
     *,
@@ -3235,6 +3290,8 @@ def _build_gym_actor_config(
     nemo_gym_dict.pop(MULTI_HARNESS_CONFIG_KEY, None)
     if nemo_gym_dict.pop("dynamo_dialect", False):
         _apply_dynamo_dialect(nemo_gym_dict, frontends=len(base_urls))
+    if nemo_gym_dict.pop("turn_priority", False):
+        _apply_turn_priority(nemo_gym_dict)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value

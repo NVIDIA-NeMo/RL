@@ -85,6 +85,24 @@ Prefix-level rollout recovery (`rollout_recovery.target_level: prefix`) works wi
 
 See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
 
+### Schedule later turns first
+
+Set `policy.generation.vllm_cfg.prioritize_later_turns: true` to schedule the later turns of rollouts already in flight before the first turns of new ones when the engine is saturated. NeMo RL runs vLLM with `vllm_kwargs.scheduling_policy: priority`, and turns on `priority_by_turn` in Gym's `policy_model` vLLM model server, which sends each model call's request `priority` as minus the number of assistant messages in its history. vLLM schedules a smaller priority first and preempts it last.
+
+The engine's total work does not change, only its order: the first calls of new rollouts wait longer and are preempted first. The priority counts the assistant messages in each call's prompt, not the rollout's progress, so a harness that compacts its history, or a sub-agent with a fresh history, starts again from 0. Model servers that `_copy` `policy_model`, such as judges and user simulators, inherit `priority_by_turn`: a judge call with no assistant history goes out at 0, behind the later turns of other rollouts. Callers that reach the engine through `policy_base_url` directly, without Gym's vLLM model server, always send 0.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `policy.generation.vllm_cfg.prioritize_later_turns` | `false` | Serve vLLM with priority scheduling and have Gym send each model call's turn priority. |
+
+With `policy.generation.dynamo: true`, the Dynamo frontend refuses an unknown top-level `priority`, so Gym sends it in its `nemo_rl:gym:` annotation. NeMo RL's chat engine renders it as the request's `priority`, and the engine's adapter hands it to vLLM. Only the engine's vLLM queue is ordered by it. Dynamo's router, which queues requests before an engine only when its frontend gets `--router-queue-threshold` (through `policy.generation.dynamo_cfg.frontend_args.extra_cli_args`), does not read it.
+
+The setting is refused at setup:
+
+- without NeMo Gym rollouts, whose model server sends the priorities; to schedule by priorities another client sends, set `policy.generation.vllm_kwargs.scheduling_policy: priority` instead.
+- with a `policy.generation.vllm_kwargs.scheduling_policy` other than `priority`.
+- when `env.nemo_gym.policy_model` sets `vllm_model.priority_by_turn: false` or `vllm_model.extra_body.priority`.
+
 ### Dataset formats and routing
 
 NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment Server:

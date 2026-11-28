@@ -37,8 +37,9 @@ run_test() {
 # Each keeps the native test's checks and adds check_dynamo_overlay.sh's.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh ++policy.generation.dynamo=true
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++policy.generation.dynamo=true ++policy.generation.dynamo_cfg.frontend_args.num_frontends=2
-# Gym's default mode: token arrays come back in the reply's nvext.nemo_rl.
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++policy.generation.dynamo=true
+# Gym's default mode: token arrays come back in the reply's nvext.nemo_rl. Turn priority rides
+# in the Gym annotation through the frontend to the engines.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++policy.generation.dynamo=true ++policy.generation.vllm_cfg.prioritize_later_turns=true
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh ++policy.generation.dynamo=true
 # Forest training: token-capture calls that may continue an earlier call.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh ++policy.generation.dynamo=true

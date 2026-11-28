@@ -39,6 +39,7 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    reject_turn_priority_without_nemo_gym,
     set_nemo_gym_log_dir,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
@@ -1436,6 +1437,208 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
         assert vllm_model["route_around_failing_endpoints"] is True
         assert vllm_model["endpoint_connection_retry_timeout_s"] == 60.0
         assert "dynamo_dialect" not in gym_config
+
+
+def _turn_priority_config(env: dict, **generation) -> SimpleNamespace:
+    return SimpleNamespace(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"prioritize_later_turns": True},
+                **generation,
+            }
+        },
+    )
+
+
+def _build_policy_model(config: SimpleNamespace) -> dict:
+    gym_config = build_nemo_gym_config(
+        config.env,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )["initial_global_config_dict"]
+    assert "turn_priority" not in gym_config
+    return gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+
+
+def test_prioritize_later_turns_sets_the_engine_policy_and_gyms_turn_priority(
+    detected_uv_dirs,
+):
+    user_vllm_model = {"extra_body": {"min_tokens": 1}}
+    env = {
+        "nemo_gym": {
+            "policy_model": {"responses_api_models": {"vllm_model": user_vllm_model}}
+        }
+    }
+    config = _turn_priority_config(env, vllm_kwargs={"seed": 3})
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.policy["generation"]["vllm_kwargs"] == {
+        "seed": 3,
+        "scheduling_policy": "priority",
+    }
+    assert _build_policy_model(config) == {
+        "extra_body": {"min_tokens": 1},
+        "priority_by_turn": True,
+    }
+    assert env["nemo_gym"]["policy_model"] == {
+        "responses_api_models": {"vllm_model": {"extra_body": {"min_tokens": 1}}}
+    }
+
+
+def test_prioritize_later_turns_off_leaves_gym_and_the_engine_alone(
+    detected_uv_dirs,
+):
+    config = _turn_priority_config({"nemo_gym": {}})
+    config.policy["generation"]["vllm_cfg"]["prioritize_later_turns"] = False
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert "vllm_kwargs" not in config.policy["generation"]
+    assert "turn_priority" not in config.env["nemo_gym"]
+    gym_config = build_nemo_gym_config(
+        config.env,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )["initial_global_config_dict"]
+    assert "policy_model" not in gym_config
+
+
+@pytest.mark.parametrize(
+    ("vllm_model", "match"),
+    [
+        ({"priority_by_turn": False}, "sets it to false"),
+        ({"extra_body": {"priority": 0}}, "Remove extra_body.priority"),
+    ],
+)
+def test_prioritize_later_turns_rejects_a_conflicting_policy_model(
+    detected_uv_dirs, vllm_model: dict, match: str
+):
+    env = {
+        "nemo_gym": {
+            "policy_model": {"responses_api_models": {"vllm_model": vllm_model}}
+        }
+    }
+    config = _turn_priority_config(env)
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    with pytest.raises(ValueError, match=match):
+        _build_policy_model(config)
+
+
+def test_prioritize_later_turns_reaches_gym_through_the_dynamo_frontend(
+    detected_uv_dirs,
+):
+    config = _turn_priority_config({"nemo_gym": {}}, dynamo=True)
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    # Dynamo's engines are the worker's own AsyncLLM, built from vllm_kwargs.
+    assert config.policy["generation"]["vllm_kwargs"] == {
+        "scheduling_policy": "priority"
+    }
+    vllm_model = _build_policy_model(config)
+    assert vllm_model["dynamo_frontend"] is True
+    assert vllm_model["priority_by_turn"] is True
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("dynamo", [False, True])
+def test_prioritize_later_turns_writes_only_gym_fields(detected_uv_dirs, dynamo):
+    """Gym ignores unknown config keys, so a renamed field would leave every call at priority 0."""
+    # Deferred: Gym's model servers ship with the optional nemo_gym extra.
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
+    config = _turn_priority_config({"nemo_gym": {}}, dynamo=dynamo)
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    vllm_model = _build_policy_model(config)
+    assert vllm_model["priority_by_turn"] is True
+    assert set(vllm_model) - set(VLLMModelConfig.model_fields) == set()
+
+
+@pytest.mark.parametrize("prioritize_later_turns", [True, False])
+def test_prioritize_later_turns_without_nemo_gym_rollouts(prioritize_later_turns):
+    # Both keys set, but nothing sends a priority: NeMo RL's own rollouts send none.
+    config = _turn_priority_config(
+        {"should_use_nemo_gym": False},
+        vllm_kwargs={"scheduling_policy": "priority"},
+    )
+    config.policy["generation"]["vllm_cfg"]["prioritize_later_turns"] = (
+        prioritize_later_turns
+    )
+
+    if prioritize_later_turns:
+        with pytest.raises(
+            ValueError, match="prioritize_later_turns requires NeMo-Gym rollouts"
+        ):
+            reject_turn_priority_without_nemo_gym(config)
+    else:
+        reject_turn_priority_without_nemo_gym(config)
+
+
+def test_prioritize_later_turns_with_nemo_gym_rollouts_is_accepted():
+    config = _turn_priority_config(
+        {"should_use_nemo_gym": True},
+        vllm_kwargs={"scheduling_policy": "priority"},
+    )
+    config.policy["generation"]["vllm_cfg"].update(
+        async_engine=True, expose_http_server=True
+    )
+
+    reject_turn_priority_without_nemo_gym(config)
+
+
+def test_prioritize_later_turns_rejects_another_scheduling_policy() -> None:
+    config = _turn_priority_config(
+        {"nemo_gym": {}}, vllm_kwargs={"scheduling_policy": "fcfs"}
+    )
+
+    with pytest.raises(ValueError, match="scheduling_policy is 'fcfs'"):
+        setup_nemo_gym_config(config, tokenizer=None)
+
+
+def test_build_nemo_gym_actors_gives_every_actor_the_turn_priority(
+    detected_uv_dirs,
+):
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = _turn_priority_config(env)
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+
+    assert len(cluster.actor_configs) == 3
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["priority_by_turn"] is True
+        assert "turn_priority" not in gym_config
 
 
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
