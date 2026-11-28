@@ -1646,6 +1646,25 @@ def test_router_replay_layout_carries_moe_layers_and_total_layer_count():
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("num_moe_experts", "dtype"),
+    [(128, torch.int8), (256, torch.int16), (40_000, torch.int32), (None, torch.int16)],
+)
+def test_router_replay_layout_carries_the_resolved_route_dtype(num_moe_experts, dtype):
+    """Deferred routes are assembled in the carry dtype sized from the expert count."""
+    from nemo_rl.models.megatron.router_replay import router_replay_layout
+
+    config = SimpleNamespace(
+        num_layers=2,
+        moe_layer_freq=1,
+        moe_router_topk=2,
+        num_moe_experts=num_moe_experts,
+    )
+
+    assert router_replay_layout(config).dtype == dtype
+
+
+@pytest.mark.mcore
 def test_route_layout_column_indices_accept_moe_only_and_full_layer_payloads():
     """One rule for both replay paths: a MoE-only payload maps layer i to
     column i, a full-layer payload maps layer n to column n-1, else None."""
