@@ -19,6 +19,15 @@ nemo-rl[mcore] -> megatron-bridge[te,ssm] -> megatron-core[dev,mlm] -> megatron-
 and the `mcore` extra floors it higher than Megatron-LM does. Bumping the
 Megatron-Bridge submodule moves the Megatron-LM pointer underneath us, so these tests
 fail the moment upstream's own pin changes and the floor needs a second look.
+
+`flash-linear-attention` reaches us transitively as
+nemo-rl[mcore] -> megatron-bridge[te,ssm] -> megatron-core, with no version floor
+anywhere upstream, so it resolves to whatever is newest at lock time (0.5.2 today).
+The `[tool.uv]` override floors it at 0.6.0: older releases have a
+non-deterministic `chunk_gated_delta_rule` forward on Blackwell (sm100), which makes
+Megatron logprob/train passes disagree and collapses GRPO on GDN models such as
+Qwen3.5 (NVIDIA-NeMo/RL#5173, fla-org/flash-linear-attention#1229). The tests below
+fail if the override or the resolved lockfile version ever drops below 0.6.0.
 """
 
 import tomllib
@@ -41,6 +50,11 @@ MEGATRON_LM_PYPROJECT = (
 # the same commit.
 MEGATRON_LM_ENERGON_SPEC = "~=7.0"
 
+# First flash-linear-attention release with a deterministic chunk_gated_delta_rule
+# forward on Blackwell (sm100); see the module docstring. Both the override and the
+# lockfile must stay at or above this version.
+FLA_MIN_VERSION = Version("0.6.0")
+
 
 def _requirement(pyproject: Path, extra: str, name: str) -> Requirement:
     """The lone requirement for `name` in `pyproject`'s `extra` optional-dependency list."""
@@ -55,6 +69,54 @@ def _requirement(pyproject: Path, extra: str, name: str) -> Requirement:
         f"expected exactly one {name} requirement in [{extra}] of {pyproject}, got {matches}"
     )
     return matches[0]
+
+
+def _override_requirement(pyproject: Path, name: str) -> Requirement:
+    """The lone string requirement for `name` in `pyproject`'s uv overrides."""
+    data = tomllib.loads(pyproject.read_text())
+    overrides = data["tool"]["uv"]["override-dependencies"]
+    matches = [
+        Requirement(entry)
+        for entry in overrides
+        if isinstance(entry, str)
+        and canonicalize_name(Requirement(entry).name) == canonicalize_name(name)
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {name} override in {pyproject}, got {matches}"
+    )
+    return matches[0]
+
+
+def _locked_version(lockfile: Path, name: str) -> Version:
+    """The resolved version of `name` in `lockfile`."""
+    lock = tomllib.loads(lockfile.read_text())
+    matches = [
+        package["version"]
+        for package in lock["package"]
+        if canonicalize_name(package["name"]) == canonicalize_name(name)
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one {name} package in {lockfile}, got {matches}"
+    )
+    return Version(matches[0])
+
+
+def test_flash_linear_attention_override_requires_at_least_0_6_0() -> None:
+    """fla < 0.6.0 is non-deterministic on Blackwell; see NVIDIA-NeMo/RL#5173."""
+    req = _override_requirement(REPO_ROOT / "pyproject.toml", "flash-linear-attention")
+    assert req.specifier.contains(FLA_MIN_VERSION) and not req.specifier.contains(
+        Version("0.5.2")
+    ), f"expected the flash-linear-attention override to require >=0.6.0, got '{req}'"
+
+
+@pytest.mark.parametrize("package", ["flash-linear-attention", "fla-core"])
+def test_uv_lock_resolves_fla_at_least_0_6_0(package: str) -> None:
+    """The lockfile must actually resolve fla (and its fla-core split) to >= 0.6.0."""
+    locked = _locked_version(REPO_ROOT / "uv.lock", package)
+    assert locked >= FLA_MIN_VERSION, (
+        f"uv.lock resolves {package} to {locked}, expected >={FLA_MIN_VERSION} "
+        f"(NVIDIA-NeMo/RL#5173)"
+    )
 
 
 def _bounds(spec: SpecifierSet) -> tuple[Version, Version]:
