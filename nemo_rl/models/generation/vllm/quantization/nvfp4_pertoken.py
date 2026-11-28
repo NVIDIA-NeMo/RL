@@ -82,9 +82,8 @@ ProjectionRole = Literal["w1", "w2", "w3"]
 class PendingHalf:
     """One half of a logical W1/W3 pair awaiting its partner.
 
-    The tensor is cloned off the refit IPC buffer, which the sender recycles
-    as soon as the batch is acknowledged (see ``policy/utils.py``'s
-    ping-pong double buffering).
+    The tensor is cloned off the refit receive buffer, which is reused for a
+    later batch (see ``policy/utils.py``'s ping-pong double buffering).
     """
 
     source_prefix: str
@@ -319,13 +318,13 @@ class NvFp4PerTokenQuantizer:
         """Quantize matching expert weights in one refit batch.
 
         Non-target names and BF16 routed-expert layers pass through, cloned off
-        the IPC buffer. A weight resolved to a selected target but absent from
+        the receive buffer. A weight resolved to a selected target but absent from
         that target's vLLM mapping is fatal.
 
         The clone matters: vLLM's layerwise reload buffers every
         ``weight_loader`` call's arguments (including the tensor) and replays
         them at layer completion, which can land after the sender has
-        recycled this batch's IPC buffer for a later one. Freshly-allocated
+        recycled this batch's receive buffer for a later one. Freshly-allocated
         quantized tensors are already safe; passthrough tensors are views
         into that buffer unless cloned here.
         """
@@ -736,7 +735,7 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
 
     Quantizes routed-expert BF16 weights to NVFP4 at refit-load time
     (``NvFp4PerTokenQuantizer``), mirroring the fp8/mxfp8 real-quant rollout
-    path (``quantization/fp8.py``). IPC weight updates enter vLLM through its
+    path (``quantization/fp8.py``). IPC and collective weight updates enter vLLM through its
     native ``reload_weights`` API, which restores quantized params to load
     format and re-processes them afterwards while preserving stable kernel
     storage for CUDA graphs.

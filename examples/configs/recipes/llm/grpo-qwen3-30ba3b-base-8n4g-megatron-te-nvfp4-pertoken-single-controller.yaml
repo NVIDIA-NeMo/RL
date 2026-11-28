@@ -1,0 +1,48 @@
+# SingleController variant of grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml:
+# 4 nodes train, the other 4 serve non-colocated per-token NVFP4 vLLM rollouts.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-single-controller.yaml
+defaults: ./grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.yaml
+
+grpo:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
+  # SC does not support validation yet.
+  val_period: 0
+  val_at_start: false
+  # The SC dataloader batches num_prompts_per_step directly.
+  batch_multiplier: 1
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-single-controller
+  metric_name: null
+  save_data_plane: true
+
+# TransferQueue is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+async_rl:
+  # Zero lookahead keeps the run on-policy, like the colocated recipe.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-single-controller
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken-single-controller

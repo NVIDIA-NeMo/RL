@@ -2762,6 +2762,15 @@ def test_nvfp4_pertoken_rejects_incompatible_generation_modes(mutation, message)
         )
 
 
+def test_nvfp4_pertoken_accepts_non_colocated_rollout():
+    """Non-colocated rollout refits through the collective native reload path."""
+    config = _make_nvfp4_pertoken_generation_config()
+    _deep_update(config, {"colocated": {"enabled": False}})
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
 def test_nvfp4_pertoken_rejects_standalone_eval():
     """Per-token rollout requires a refit before generation and cannot evaluate alone."""
     with pytest.raises(ValueError, match="standalone evaluation"):
@@ -2775,7 +2784,6 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
 @pytest.mark.parametrize(
     "mutation",
     [
-        {"colocated": {"enabled": False}},
         {"vllm_cfg": {"pipeline_parallel_size": 2}},
         {"vllm_cfg": {"expert_parallel_size": 2}},
         {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
@@ -2783,7 +2791,7 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
     ],
 )
 def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
-    """The fused refit stream requires colocated rollout and vLLM EP=1."""
+    """The fused refit stream requires vLLM EP=1 and PP=1."""
     config = _make_nvfp4_pertoken_generation_config()
     _deep_update(config, mutation)
     with pytest.raises(ValueError, match="nvfp4_pertoken_rollout"):

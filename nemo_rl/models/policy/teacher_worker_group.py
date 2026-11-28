@@ -206,6 +206,10 @@ class TeacherWorkerGroup:
         # weights out of the config for the same reason (`weights_path=None`
         # below); this key has to be dropped explicitly.
         cfg.pop("pretrained_checkpoint", None)
+        # Per-token NVFP4 rollout is a student requirement; a frozen scoring
+        # teacher keeps its own precision.
+        if cfg.get("generation") is not None:
+            cfg["generation"].pop("nvfp4_pertoken_rollout", None)
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
