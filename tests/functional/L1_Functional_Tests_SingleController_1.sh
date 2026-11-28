@@ -42,6 +42,9 @@ run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controll
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller_streaming.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh \
     ++async_rl.trainer_warmup.enabled=true
+# Same SC + Gym recipe with the trainer replaced by the cpu stand-in: the only
+# end-to-end check of run_single_controller_simulator.py in rollout_only mode.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_rollout_only.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

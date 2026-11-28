@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from examples import run_grpo_single_controller
+from nemo_rl.algorithms.single_controller_utils import entrypoint_utils
 from nemo_rl.algorithms.single_controller_utils import setup as sc_setup
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
@@ -311,7 +312,7 @@ def _spinup_gym_behind_policy_proxy(
 
 sc_setup._spinup_gym = _spinup_gym_behind_policy_proxy
 
-_original_setup_single_controller = run_grpo_single_controller.setup_single_controller
+_original_setup_single_controller = entrypoint_utils.setup_single_controller
 
 
 def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
@@ -352,7 +353,7 @@ def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     return actor_args, timing_metrics
 
 
-run_grpo_single_controller.setup_single_controller = _setup_with_gym_recovery_hook
+entrypoint_utils.setup_single_controller = _setup_with_gym_recovery_hook
 
 
 if __name__ == "__main__":

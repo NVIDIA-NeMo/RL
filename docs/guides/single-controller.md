@@ -433,6 +433,10 @@ Only `nemo_rl/data_plane` may import `transfer_queue`, so no other code can read
 
    For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
 
+## Rollout-Only Simulator
+
+See the [Single-Controller simulator guide](single-controller-simulator.md) for setup, usage, timing metrics and limitations.
+
 ## Relation to Legacy Async GRPO
 
 The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under `run_grpo.py`) and the SC path both target the same async training problem but partition responsibilities differently:

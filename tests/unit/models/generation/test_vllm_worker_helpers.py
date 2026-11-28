@@ -17,6 +17,7 @@
 import pytest
 
 from nemo_rl.models.generation.vllm.worker_utils import (
+    find_dummy_weights_only_checkpoint,
     find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
@@ -215,3 +216,41 @@ def test_resolve_vllm_dp_settings(
     )
     assert env == expected_env
     assert kwargs == expected_kwargs
+
+
+class _FakeHFConfig:
+    """Stands in for a PretrainedConfig: attribute access and ``in`` on its keys."""
+
+    def __init__(self, **attributes):
+        self.__dict__.update(attributes)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.__dict__
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "expected"),
+    [
+        (
+            _FakeHFConfig(architectures=["GptOssForCausalLM"], quantization_config={}),
+            "quantized GPT-OSS",
+        ),
+        (_FakeHFConfig(architectures=["GptOssForCausalLM"]), None),
+        (
+            _FakeHFConfig(
+                architectures=["Mistral3ForConditionalGeneration"],
+                quantization_config={},
+            ),
+            "FP8-quantized Mistral3",
+        ),
+        (_FakeHFConfig(architectures=["Mistral3ForConditionalGeneration"]), None),
+        (
+            _FakeHFConfig(architectures=["Qwen3ForCausalLM"], quantization_config={}),
+            None,
+        ),
+        (_FakeHFConfig(architectures=None), None),
+        (_FakeHFConfig(), None),
+    ],
+)
+def test_find_dummy_weights_only_checkpoint(hf_config, expected):
+    assert find_dummy_weights_only_checkpoint(hf_config) == expected

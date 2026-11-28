@@ -44,13 +44,12 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import (
     KVBatchMeta,
     build_data_plane_client,
-    cluster_step_metrics,
     is_metrics_client,
-    merge_snapshots,
 )
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
+from nemo_rl.data_plane.observability import reduce_step_snapshots
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
@@ -373,16 +372,14 @@ class TQPolicy(TQDriverMixin, Policy):
         # and closing the step window is what reading it means, so the client
         # is handed that snapshot rather than taking a second one -- a second
         # reset would zero every ``step/by_op/*/max_ms``.
-        driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
-        if len(snapshots) == 1:
-            # The fan-out could not reach the workers, or there are none.
-            return driver, "driver"
-        merged = merge_snapshots(snapshots)
-        metrics = cluster_step_metrics(
-            merged, self._prev_cluster_snapshot, step_time_s, collect_ms
+        metrics, scope, self._prev_cluster_snapshot = reduce_step_snapshots(
+            driver_client,
+            snapshots,
+            self._prev_cluster_snapshot,
+            step_time_s,
+            collect_ms,
         )
-        self._prev_cluster_snapshot = merged
-        return metrics, "cluster"
+        return metrics, scope
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 

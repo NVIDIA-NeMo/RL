@@ -31,6 +31,7 @@ import ray.exceptions
 
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.simulator import SimulatorConfig
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.models.generation.fleet_health import (
@@ -96,6 +97,8 @@ def _make_controller(
     ctrl._generation_router = None
     # No fleet health, so nothing ever reaches DEAD and there is nothing to restart.
     ctrl._engine_supervisor = None
+    # A training run; the simulator tests set their own.
+    ctrl._simulator = None
     return ctrl
 
 
@@ -341,6 +344,18 @@ class TestGenerationFleetProbe:
             "every policy worker must be told to stand its refit deadline down once a "
             f"generation shard is confirmed gone; saw {ctrl._stood_down}"
         )
+
+    def test_a_simulator_run_has_no_trainer_deadline_to_stand_down(self, capsys):
+        """The no-op trainer has no policy workers, so a confirmed death reports nothing about them."""
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        ctrl._simulator = SimulatorConfig()
+        asyncio.run(ctrl._probe_generation_fleet())
+        assert monitor.state_of(1) is ShardState.DEAD
+        assert ctrl._stood_down == []
+        assert "refit:" not in capsys.readouterr().out
 
     def test_a_timeout_leaves_the_deadline_armed(self):
         """The frozen case, and the reason this is keyed on DEATH rather than silence.

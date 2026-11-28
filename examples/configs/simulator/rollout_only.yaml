@@ -1,0 +1,28 @@
+# Simulator config of examples/run_single_controller_simulator.py: what a simulator
+# run replaces, and how long the stand-ins take. It is loaded next to a
+# SingleController recipe (--config), which is used as it is. Override a key from the
+# command line as simulator.<key>=<value>.
+
+# Which side of the RL loop is real. rollout_only: real generation and environments,
+# with the trainer replaced by a stand-in.
+mode: rollout_only
+
+# The trainer. cpu is the no-op stand-in: it trains nothing and uses no GPU.
+train_backend: cpu
+
+# Seconds the controller holds each step, once, after all of the step's chunks arrive,
+# where the optimizer step would run. Generation keeps serving meanwhile. The hold ends
+# early once nothing is generating, and the skipped seconds are logged as
+# train/simulated_train_idle_skipped_s.
+train_time_s: 0.0
+
+# Seconds the stand-in weight transfer holds inside the refit pause, where a real
+# transfer would keep generation frozen.
+refit_time_s: 0.0
+
+# Inference nodes of the allocation; every one serves generation. null keeps the
+# recipe's generation node count.
+num_nodes: null
+
+# Steps to run. null keeps the recipe's max_num_steps.
+num_steps: null

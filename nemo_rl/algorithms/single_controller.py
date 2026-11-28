@@ -147,6 +147,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _maybe_restore_native_data_plane_checkpoint,
     _register_single_controller_partitions,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    SimulatorConfig,
+    simulate_train_step,
+)
 from nemo_rl.algorithms.single_controller_utils.step_assembly import (
     ShortfallCredit,
     StepAssembler,
@@ -357,6 +361,11 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
+    # Same again: the train pump asks whether the run is simulated on every
+    # step, and ``None`` is the training-run answer, so a controller built
+    # without __init__ (the test stubs) trains rather than raises.
+    _simulator: Optional[SimulatorConfig] = None
+
     # Declared on the class, like _tracer, so an instance built without __init__ can still time an admission.
     _admission_gate_wait_started: Optional[float] = None
     _admission_gate_wait_seconds: float = 0.0
@@ -500,6 +509,10 @@ class SingleControllerActor:
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
+        # None selects the ordinary training path.
+        self._simulator: Optional[SimulatorConfig] = getattr(
+            actor_args, "simulator", None
+        )
         self._advantage_estimator = actor_args.advantage_estimator
         # Built driver-side so the actors attach their TQ clients before this
         # process configures checkpoint participants. Empty means the stage runs
@@ -840,6 +853,14 @@ class SingleControllerActor:
             f"weight_sync={type(self._weight_synchronizer).__name__}",
             flush=True,
         )
+        if self._simulator is not None:
+            print(
+                f"SingleControllerActor: simulator mode={self._simulator.mode} "
+                f"train_backend={self._simulator.train_backend} "
+                f"train_time_s={self._simulator.train_time_s} "
+                f"refit_time_s={self._simulator.refit_time_s}",
+                flush=True,
+            )
 
     # ── public API ─────────────────────────────────────────────────────────
     async def run(self) -> dict[str, Any]:
@@ -2809,11 +2830,18 @@ class SingleControllerActor:
         run. For the first N steps 5b still trains the critic every step, but policy
         training and refit are skipped. The trainer version still advances, and the
         sampler's lookahead is widened while the policy is frozen.
+
+        A simulator run with the no-op trainer consumes each selected chunk as it
+        is: 2b, 2c and 3 are skipped, and 5a is the simulated hold. Selection,
+        cleanup, the version advance and the refit are the same code.
         """
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         forest_training = self._master_config.token_capture.forest_training
+        no_op_trainer = (
+            self._simulator is not None and self._simulator.uses_no_op_trainer
+        )
         selection_kwargs = (
             {
                 "group_multiple": self._ppo_group_multiple,
@@ -2847,6 +2875,9 @@ class SingleControllerActor:
             step_has_valid_training_tokens = False
             early_refit_done = False
             aborted_stale_inflight_groups = 0
+            # Simulator runs only: the held train step and its idle-skipped part.
+            simulated_train_s = 0.0
+            simulated_idle_skipped_s = 0.0
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
             policy_logprobs_required = self._policy_logprobs_required or (
@@ -3173,7 +3204,9 @@ class SingleControllerActor:
                                 )
 
                     # Compute prev_logprobs / ref_logprobs
-                    if policy_logprobs_required or self._reference_logprobs_required:
+                    if not no_op_trainer and (
+                        policy_logprobs_required or self._reference_logprobs_required
+                    ):
                         with (
                             self._timer.time("logprob_inference_prep"),
                             managed_span(
@@ -3210,21 +3243,25 @@ class SingleControllerActor:
                                     train_meta,
                                 )
                     # Compute advantages
-                    with (
-                        self._timer.time("advantage_calculation"),
-                        managed_span(
-                            RLSpanGroup.ADVANTAGE,
-                            "rl.sc.advantage_calculation",
-                            tracer=self._tracer,
-                        ),
-                    ):
-                        (
-                            train_meta,
-                            has_valid_training_tokens,
-                        ) = await self._advantage_stage(
-                            train_meta,
-                            policy_logprobs_required=policy_logprobs_required,
-                        )
+                    if no_op_trainer:
+                        # The stand-in consumes the selected groups without training on them.
+                        has_valid_training_tokens = False
+                    else:
+                        with (
+                            self._timer.time("advantage_calculation"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.advantage_calculation",
+                                tracer=self._tracer,
+                            ),
+                        ):
+                            (
+                                train_meta,
+                                has_valid_training_tokens,
+                            ) = await self._advantage_stage(
+                                train_meta,
+                                policy_logprobs_required=policy_logprobs_required,
+                            )
                     if forest_training:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
@@ -3273,7 +3310,7 @@ class SingleControllerActor:
                     # policy resident until every actor epoch has completed.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    if is_policy_training_step:
+                    if is_policy_training_step and not no_op_trainer:
                         if (
                             self._is_ppo
                             and groups_dispatched == 0
@@ -3577,7 +3614,7 @@ class SingleControllerActor:
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
-                    if not step_open:
+                    if not no_op_trainer and not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
                             "filtering. Check seq_logprob_error_threshold, "
@@ -3593,9 +3630,22 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
+                        if no_op_trainer:
+                            assert self._simulator is not None
+                            (
+                                simulated_train_s,
+                                simulated_idle_skipped_s,
+                            ) = await simulate_train_step(
+                                self._simulator.train_time_s,
+                                lambda: (
+                                    self._inflight_rollouts == 0
+                                    and not self._dispatched_rollouts
+                                ),
+                            )
+                        else:
+                            policy_result = await asyncio.to_thread(
+                                self._trainer.finish_train_step
+                            )
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -3847,6 +3897,15 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
+                if no_op_trainer:
+                    # Where policy.train() would have run, and how much of that
+                    # hold was skipped because no rollout was left to overlap with.
+                    step_metrics.update(
+                        {
+                            "simulated_train_time_s": simulated_train_s,
+                            "simulated_train_idle_skipped_s": simulated_idle_skipped_s,
+                        }
+                    )
                 # Include pre-filter rewards so uniform-group filtering cannot hide policy progress.
                 reward_metrics = self._rollout_manager.drain_step_reward_metrics(
                     version_during_step
@@ -4269,6 +4328,8 @@ class SingleControllerActor:
         Only ever called for a CONFIRMED actor death. A frozen rank never produces one, so
         its deadline still fires and still ends the run attributably.
         """
+        if self._simulator is not None and self._simulator.uses_no_op_trainer:
+            return
         try:
             for worker in self._trainer.worker_group.workers:
                 worker.stand_down_refit_watchdog.remote()

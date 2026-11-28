@@ -65,7 +65,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
 # MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.
 ENTRYPOINTS_DIRS = ["examples", "research"]
-ENTRYPOINTS_EXTRA_FILES = [REPO_ROOT / "tools" / "refit_verifier.py"]
+ENTRYPOINTS_EXTRA_FILES = [
+    REPO_ROOT / "tools" / "refit_verifier.py",
+    # The SingleController launchers under examples/ resolve their config here.
+    REPO_ROOT / "nemo_rl/algorithms/single_controller_utils/entrypoint_utils.py",
+]
 
 
 def _entrypoints() -> list[Path]:

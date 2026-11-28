@@ -42,7 +42,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RefitActorConfig,
     RolloutFailureConfig,
     TokenCaptureConfig,
-    WatchdogConfig,
     logprob_passes_required,
     validate_single_controller_config,
 )
@@ -50,6 +49,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     _build_retry_policy,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.watchdog import WatchdogConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 

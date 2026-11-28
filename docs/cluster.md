@@ -140,7 +140,7 @@ sbatch ray.sub \
 * - `DEDICATED_RAY_HEAD=0`
   - Set to `1` to run the first allocated node as a GPU-free Ray head: it hosts the Ray control plane and the driver, advertises `--num-gpus=0`, and carries neither `worker_units` nor the topology resources, so no GPU actor or topology-constrained placement group can land on it. Use this when driver or head-node memory pressure is destabilizing training.
 
-    The head also advertises a `ray_head: 1` resource. Single-controller GRPO and PPO runs (`examples/run_grpo_single_controller.py`) place the controller there, next to the control plane instead of beside GPU workers.
+    The head also advertises a `ray_head: 1` resource. Single-controller GRPO and PPO runs (`examples/run_grpo_single_controller.py`) and simulator runs (`examples/run_single_controller_simulator.py`) place the controller there, next to the control plane instead of beside GPU workers.
 
     **You must shrink the driver's node count yourself.** `ray.sub` cannot see inside your `COMMAND`, so it only prints the effective GPU-node count. With `--nodes=N` and `DEDICATED_RAY_HEAD=1`, `cluster.num_nodes` (plus `env.nemo_gym.num_gpu_nodes` when set) must sum to `N - 1`. If you leave it at `N`, cluster bringup still succeeds and the driver instead fails minutes later with `Maximum number of retries reached (6). Cluster resources may be insufficient...`.
 

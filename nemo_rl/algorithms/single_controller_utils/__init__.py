@@ -20,7 +20,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     RolloutCheckpointConfig,
     RolloutFailureConfig,
-    WatchdogConfig,
     algo_config,
     is_ppo_run,
 )
@@ -28,16 +27,29 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    NoOpTrainer,
+    NoOpWeightSynchronizer,
+    SimulatorConfig,
+    apply_simulator_overrides,
+    validate_simulator_config,
+)
+from nemo_rl.algorithms.single_controller_utils.watchdog import WatchdogConfig
 
 __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
     "MasterConfig",
+    "NoOpTrainer",
+    "NoOpWeightSynchronizer",
     "RolloutCheckpointConfig",
     "RolloutFailureConfig",
+    "SimulatorConfig",
     "SingleControllerActorArgs",
     "WatchdogConfig",
     "algo_config",
+    "apply_simulator_overrides",
     "is_ppo_run",
     "setup_single_controller",
+    "validate_simulator_config",
 ]
