@@ -478,6 +478,7 @@ class LegacyPPODiagnostics:
                     trained=_real(final_sample_mask).detach().float().cpu().numpy(),
                     token_mask=_real(token_mask).detach().float().cpu().numpy(),
                     values=_real(values).detach().float().cpu().numpy(),
+                    truncated=(_real(truncated).detach().bool().cpu().numpy() if truncated is not None else None),
                 )
             )
 
