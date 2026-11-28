@@ -25,7 +25,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -110,6 +110,21 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
+
+if TYPE_CHECKING:
+    # ai-dynamo is optional: only engines served through Dynamo import it.
+    from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
+
+
+def _endpoint_task_error(task: Optional[asyncio.Task]) -> Optional[str]:
+    """Why a Dynamo endpoint task stopped serving; None before it starts or while it serves."""
+    if task is None or not task.done():
+        return None
+    if task.cancelled():
+        return "cancelled"
+    error = task.exception()
+    return "exited" if error is None else repr(error)
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -400,8 +415,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        # The task serving this engine through Dynamo, when it is registered.
+        # The task serving this engine through Dynamo, when it is registered, and
+        # the adapter that takes it in and out of the frontends' routing.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
+        self._dynamo_adapter: Optional["DynamoVllmAdapter"] = None
         # Where this engine sends its chat settings before it loads, when asked to.
         self._dynamo_chat_settings_queue: Optional[RayQueue] = None
 
@@ -854,22 +871,55 @@ class VllmAsyncGenerationWorkerImpl(
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.
         print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
+        adapter = DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
-            DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
+            adapter,
             model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
         )
+        # After the start: a start that raised is tried again by the next call.
+        self._dynamo_adapter = adapter
+
+    async def set_dynamo_routed_async(
+        self,
+        routed: bool,
+        *,
+        namespace: str,
+        engine_env: dict[str, str],
+        leader_worker_idx: int,
+    ) -> None:
+        """Put this engine in or out of the Dynamo frontends' routing.
+
+        An engine Dynamo has not served yet (a restarted shard) starts its endpoint,
+        which registers it.
+        """
+        if self._dynamo_adapter is not None:
+            await self._dynamo_adapter.set_routed(routed)
+        elif routed:
+            await self.start_dynamo_endpoint_async(
+                namespace=namespace,
+                engine_env=engine_env,
+                leader_worker_idx=leader_worker_idx,
+            )
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
         """Why this engine's Dynamo endpoint stopped serving; None while it serves."""
-        task = self._dynamo_endpoint_task
-        if task is None or not task.done():
-            return None
-        if task.cancelled():
-            return "cancelled"
-        error = task.exception()
-        return "exited" if error is None else repr(error)
+        return _endpoint_task_error(self._dynamo_endpoint_task)
+
+    def is_alive(self) -> bool:
+        """Alive, and able to serve when Dynamo's frontends route to this engine.
+
+        A call through a frontend does not say which engine failed it, so an
+        engine whose endpoint stopped or whose engine core died fails this probe.
+        """
+        if self._dynamo_endpoint_task is not None:
+            error = _endpoint_task_error(self._dynamo_endpoint_task)
+            if error is not None:
+                raise RuntimeError(f"The Dynamo endpoint stopped serving: {error}")
+            if self.llm.errored:
+                raise RuntimeError("The vLLM engine behind Dynamo is dead.")
+        return True
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""

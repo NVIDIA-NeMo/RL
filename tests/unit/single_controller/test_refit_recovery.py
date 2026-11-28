@@ -117,6 +117,7 @@ def _make_controller(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._serving_shards_push_lock = asyncio.Lock()
 
     monitor = None
     if with_monitor:
@@ -142,6 +143,7 @@ def _make_controller(
         invalidate_kv_cache=MagicMock(),
         pause_generation_for_refit=MagicMock(return_value=True),
         resume_generation_after_refit=MagicMock(return_value=True),
+        set_serving_shards=MagicMock(),
         # The probe asks by shard index; the shard-to-worker layout stays in the backend.
         shard_liveness_ref=_liveness,
     )
@@ -186,10 +188,18 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
 
     ctrl._gen.pause_generation_for_refit.side_effect = pause
     sync.sync_weights = MagicMock(side_effect=lambda **_: events.append("sync"))
+    ctrl._gen.set_serving_shards.side_effect = lambda *_, **__: events.append("push")
+    ctrl._gen.resume_generation_after_refit.side_effect = lambda **_: (
+        events.append("resume") or True
+    )
 
     asyncio.run(ctrl._sync_weights())
 
-    assert events == ["params", "pause", "pause", "sync"]
+    assert events == ["params", "pause", "pause", "sync", "push", "resume"]
+    # A backend behind its own router (Dynamo) learns the serving set before resuming.
+    ctrl._gen.set_serving_shards.assert_called_once_with(
+        {1}, quarantined_shards={0}, timeout_s=1.0
+    )
     ctrl._trainer.sync_params_before_refit.assert_called_once_with()
     assert serving_at_pause == [[0, 1], [1]]
     assert ctrl._gen.pause_generation_for_refit.call_args_list == [
@@ -198,6 +208,17 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
     ]
     assert sync.reconciled_with[-1] == [0]
     ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=61.0)
+    assert ctrl._rollout_permitted.is_set()
+
+
+def test_a_failed_serving_shards_push_does_not_leave_generation_paused():
+    ctrl, _, sync = _make_controller(ABORTED)
+    sync.sync_weights = MagicMock()
+    ctrl._gen.set_serving_shards.side_effect = RuntimeError("a shard did not answer")
+
+    asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=360.0)
     assert ctrl._rollout_permitted.is_set()
 
 

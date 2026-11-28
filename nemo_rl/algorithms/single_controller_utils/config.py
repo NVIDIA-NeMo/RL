@@ -317,6 +317,8 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # Seconds between liveness probes of each shard.
     probe_interval_s: PositiveFloat = 5.0
     # Per-probe deadline. Must stay well under probe_interval_s so probes cannot pile up.
+    # Behind Dynamo it is also how long a quarantined shard has to leave the frontends'
+    # routing before its workers are killed.
     probe_timeout_s: PositiveFloat = 2.0
     # Consecutive probe failures before a shard is quarantined. With the defaults a
     # dead shard is detected in roughly 15s.

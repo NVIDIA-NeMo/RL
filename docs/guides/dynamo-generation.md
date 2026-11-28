@@ -88,13 +88,28 @@ Two things differ from the native endpoint:
 - **Where the cut goes.** Gym sends the cut beside the URL its calls go to, which is a frontend, but the calls run in the engines. Each frontend takes the cut on its own port, as a Dynamo route extension, and sends it to every engine over Dynamo's request plane; each engine cuts the calls it holds, up to that frontend's deadline (`token_capture.control_timeout_s` from the cut's arrival there). A frontend runs at most 64 cuts at once, Dynamo's limit for one route, and refuses a further one with HTTP 529. Every worker process of a Gym policy-model server (its `num_workers`, in every shard and replica) sends its own cut to each frontend that holds its calls, so a frontend gets that many cuts at one checkpoint, whatever `num_frontends` is; past 64, the calls of the refused workers regenerate after a restore.
 - **What the router sees for a resumed call.** The engine replaces the prompt the frontend sent with the call's saved tokens and generates the rest, and the frontend puts the saved text back in front of the reply. So the KV router scores that one call on a prompt without the saved tokens. A cut the engine cannot use is dropped and the call regenerates, as natively.
 
+## Fleet health
+
+`async_rl.generation_fleet_health` works behind Dynamo with the same keys. The frontends pick engines themselves, so the SingleController keeps their routing in step with the shards in service: on every fleet probe, and before generation resumes after a refit.
+
+| Shard | Behind Dynamo |
+|---|---|
+| Leaves service, engine answers | The engine unregisters. Every frontend stops sending it requests; the ones it holds finish. |
+| Leaves service, process gone | Its registration goes with its process, when its etcd lease expires (up to 30 s). Calls a frontend sends it until then fail. NeMo RL's rollouts and NeMo-Gym retry them on another engine; the frontends do not. A NeMo-Gym token-capture session kept on that engine (`frontend_args.session_affinity_ttl_secs`) keeps failing until the lease expires. |
+| Quarantined, does not answer within `probe_timeout_s` | Its workers are killed, so its registration goes with them. |
+| Restarted (`restart_dead_shards`) | Registers only once a refit has given it current weights. |
+
+Two things differ from the native endpoint:
+
+- **What judges a shard.** A call through a frontend does not say which engine failed it, so the probe alone judges the shards. Behind Dynamo the probe also fails when the engine's Dynamo endpoint stopped serving or vLLM reports its engine core dead. An engine that hangs without dying is not detected.
+- **Checkpoint cuts.** A generation cut reaches the engines a frontend routes to. An engine that left the routing while it still holds NeMo-Gym calls is not cut, and those calls regenerate after a restore.
+
 ## Not supported
 
 Startup rejects these with `dynamo: true`:
 
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains, and the frontend would keep routing to it.
-- `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself, and a restarted shard does not register with it yet.
-- `async_rl.generation_router`: each frontend already routes to the whole fleet.
+- `async_rl.generation_router`: each frontend already routes to the whole fleet and, with fleet health, only to the shards in service.
 - `bad_words` in `extra_body` or `sampling_overrides` on the policy model (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend answers every request carrying it with HTTP 400. Startup checks only this overlay, not Gym's own YAMLs.
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes the replies Gym's calls get through the frontend.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.

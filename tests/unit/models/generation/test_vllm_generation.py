@@ -3602,7 +3602,8 @@ def _dynamo_master_config(
     [
         ({}, None),
         ({"router": True}, "each of which routes to the whole fleet"),
-        ({"fleet_health": True}, "Disable fleet health"),
+        # The frontends route only to the shards fleet health has in service.
+        ({"fleet_health": True}, None),
         # Gym's replies need the engine's tokenizer; NeMo RL's rollouts do not.
         ({"gym": True, "skip_tokenizer_init": True}, "skip_tokenizer_init"),
         ({"skip_tokenizer_init": True}, None),
@@ -3615,6 +3616,64 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
         return
     with pytest.raises(ValueError, match=error):
         VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_dynamo_routes_only_the_shards_in_service(monkeypatch):
+    generation = object.__new__(VllmGeneration)
+    leaders = [MagicMock() for _ in range(5)]
+    generation.worker_group = types.SimpleNamespace(
+        workers=leaders, get_dp_leader_worker_idx=lambda shard: shard
+    )
+    generation.model_parallel_size = 1
+    # Without Dynamo, native dispatch asks the fleet selector instead.
+    generation.set_serving_shards({0}, quarantined_shards={1}, timeout_s=1.0)
+    leaders[1].set_dynamo_routed_async.remote.assert_not_called()
+
+    generation.dynamo_frontend_urls = ("http://frontend/v1",)
+    generation._dynamo_namespace = "ns"
+    generation._dynamo_engine_env = {"DYN_REQUEST_PLANE": "tcp"}
+    # Shard 4 was restarted: the record still holds the leader it replaced.
+    generation._dynamo_routed_shards = {**dict(enumerate(leaders[:4])), 4: MagicMock()}
+    refs = [leader.set_dynamo_routed_async.remote.return_value for leader in leaders]
+    # Shard 1's engine died, shard 2 does not answer in time, shard 3 is unreachable.
+    errors = {
+        refs[1]: ray.exceptions.ActorDiedError(),
+        refs[2]: ray.exceptions.GetTimeoutError(),
+        refs[3]: ray.exceptions.ActorUnavailableError("unreachable", None),
+    }
+    monkeypatch.setattr(ray, "wait", lambda pending, **_: (pending, []))
+
+    def get(ref, timeout):
+        if ref in errors:
+            raise errors[ref]
+
+    monkeypatch.setattr(ray, "get", get)
+    killed = []
+    monkeypatch.setattr(ray, "kill", lambda worker, no_restart: killed.append(worker))
+
+    # Shards 1, 2 and 3 left service, 1 and 3 for good; restarted shard 4 returned.
+    serving = {"serving_shards": {0, 4}, "quarantined_shards": {1, 3}}
+    generation.set_serving_shards(**serving, timeout_s=1.0)
+
+    leaders[0].set_dynamo_routed_async.remote.assert_not_called()
+    for shard, routed in ((1, False), (2, False), (3, False), (4, True)):
+        leaders[shard].set_dynamo_routed_async.remote.assert_called_once_with(
+            routed,
+            namespace="ns",
+            engine_env={"DYN_REQUEST_PLANE": "tcp"},
+            leader_worker_idx=shard,
+        )
+    # Unreachable is not dead: a quarantined shard that does not confirm is killed.
+    assert killed == [leaders[3]]
+    assert generation._dynamo_routed_shards == {
+        shard: leaders[shard] for shard in (0, 2, 4)
+    }
+
+    # Shard 2 is asked again, and leaves once it answers.
+    del errors[refs[2]]
+    generation.set_serving_shards(**serving, timeout_s=1.0)
+    assert leaders[2].set_dynamo_routed_async.remote.call_count == 2
+    assert generation._dynamo_routed_shards.keys() == {0, 4}
 
 
 @pytest.mark.parametrize("announced", [True, False])

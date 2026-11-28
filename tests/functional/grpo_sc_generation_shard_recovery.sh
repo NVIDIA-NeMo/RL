@@ -46,6 +46,7 @@ EXP_VARIANT="${REFIT_TRANSPORT:-null}"
 if [[ "${KILL_DURING_REFIT:-false}" == "true" ]]; then EXP_VARIANT+="-refit"; fi
 if [[ "${FREEZE_VICTIM:-false}" == "true" ]]; then EXP_VARIANT+="-frozen"; fi
 if [[ "${RESTART_DEAD_SHARDS:-false}" == "true" ]]; then EXP_VARIANT+="-restart"; fi
+if [[ "$*" == *generation.dynamo=true* ]]; then EXP_VARIANT+="-dynamo"; fi
 
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME/$EXP_VARIANT
 LOG_DIR=$EXP_DIR/logs
@@ -755,6 +756,34 @@ if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
     fi
     echo "[recovery] restart + re-admission observed:"
     grep -E "supervisor:|stale -> healthy" "$RUN_LOG" | head -6
+fi
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash "$SCRIPT_DIR/check_dynamo_overlay.sh" "$RUN_LOG"
+    # The frontends pick engines themselves, so the fleet health above only held for
+    # NeMo RL unless the lost shard also left their routing.
+    LEFT_RE="\[Dynamo\] generation shard .* out of the frontends' routing"
+    JOINED_RE="\[Dynamo\] generation shard .* back in the frontends' routing"
+    if ! grep -q "$LEFT_RE" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the lost shard never left the Dynamo frontends' routing"
+        grep -E "\[Dynamo\]|fleet: shard" "$RUN_LOG" | tail -20; exit 1
+    fi
+    if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
+        # A replacement holds init weights until a refit: it may join only after one.
+        HEALTHY_LINE=$(grep -n -m1 "stale -> healthy" "$RUN_LOG" | cut -d: -f1)
+        JOINED_LINE=$(grep -n -m1 "$JOINED_RE" "$RUN_LOG" | cut -d: -f1 || true)
+        if [[ -z "$JOINED_LINE" ]] || (( JOINED_LINE < HEALTHY_LINE )); then
+            echo "[recovery] FAIL: the replacement did not join the Dynamo frontends' routing after its refit (joined at line ${JOINED_LINE:-never}, healthy at line $HEALTHY_LINE)"
+            grep -E "\[Dynamo\]|fleet: shard" "$RUN_LOG" | tail -20; exit 1
+        fi
+        # The frontends log the engine each request went to; a restarted one has a new id.
+        ENGINES=$(grep -oE 'route request completed request.outcome="success".* worker_id=[0-9]+' "$RUN_LOG" \
+            | grep -oE 'worker_id=[0-9]+$' | sort -u | wc -l || true)
+        if (( ENGINES <= GEN_GPUS )); then
+            echo "[recovery] FAIL: the frontends routed requests to $ENGINES engine(s), so the replacement never took one"
+            exit 1
+        fi
+    fi
 fi
 
 echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT, restart=$RESTART_DEAD_SHARDS)"
