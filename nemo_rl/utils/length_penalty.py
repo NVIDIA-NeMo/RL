@@ -431,71 +431,17 @@ def prepare_length_penalty_input(
     )
 
 
-def apply_group_length_penalties_from_inputs(
-    inputs: list[LengthPenaltyInput],
-    rewards: list[float],
-    *,
-    generated_lengths: list[int],
-    low_effort: list[bool],
-    config: LengthPenaltyConfig,
-) -> tuple[list[float], dict[str, float]]:
-    """Apply shared length adjustments to one complete prompt group.
-
-    Args:
-        inputs: Saved length and profile metadata in rollout order.
-        rewards: Rewards after effort shaping and reward penalties, in the same order.
-        generated_lengths: Verified generated-token totals in rollout order.
-        low_effort: Per-rollout flags that bypass the group's length adjustments.
-        config: Shared length-adjustment settings.
-
-    Returns:
-        A tuple of adjusted rewards in input order and the shared per-rollout metrics.
-        The input rewards are unchanged.
-    """
-    results = []
-    lengths = []
-    for sample, reward, generated, bypass in zip(
-        inputs, rewards, generated_lengths, low_effort, strict=True
-    ):
-        results.append(
-            {
-                "agent_ref": {"name": sample.agent_name},
-                "full_result": {
-                    "reward": reward,
-                    "reward_components": sample.has_reward_components,
-                },
-                "profiled_rewards": sample.profiled_rewards,
-                "profiled_output_lengths": sample.profiled_output_lengths,
-                "profile_band": sample.profile_band,
-                "low_effort_applied": bypass,
-            }
-        )
-        lengths.append(
-            (
-                sample.reasoning_length,
-                sample.answer_length,
-                generated
-                if sample.all_generated_tokens
-                else sample.reasoning_length + sample.answer_length,
-            )
-        )
-    metrics = apply_group_length_penalties(
-        results, config, len(results), lengths=lengths
-    )
-    return [result["full_result"]["reward"] for result in results], metrics
-
-
 def apply_group_length_penalties(
     results: list[dict[str, Any]],
     length_penalty_config: LengthPenaltyConfig | dict[str, Any],
     group_size: int,
     tokenizer: Any = None,
-    *,
-    lengths: list[tuple[int, int, int]] | None = None,
 ) -> dict[str, float]:
-    """Apply per-prompt-group length bonuses/penalties.
+    """Apply per-prompt-group length bonuses/penalties to rollout result dicts.
 
-    Mutates ``full_result["reward"]`` in place. No-ops when no
+    Measures each result with :func:`prepare_length_penalty_input`, applies
+    :func:`apply_group_length_penalties_from_inputs`, and writes the adjusted
+    rewards back to ``full_result["reward"]`` in place. No-ops when no
     length-adjustment feature is enabled.
 
     Args:
@@ -505,53 +451,103 @@ def apply_group_length_penalties(
             validated into :class:`LengthPenaltyConfig`).
         group_size: Number of contiguous rows per prompt group.
         tokenizer: Tokenizer for computing reasoning/answer token counts.
-        lengths: Optional precomputed (reasoning, answer, total) lengths per row.
 
     Returns:
-        ``length_penalty/*`` rollout metrics, all per-row means over
-        ``results`` (pre-adjustment env reward, reward delta, rollouts whose
-        correct reward was wiped to 0, rollouts adjusted, rollouts in groups
-        skipped for non-binary or multi-component rewards). Per-row so the
-        async path, which calls this once per prompt group and averages the
-        per-group values, reports the same numbers as the batched paths.
-        Empty when the block enables nothing.
+        The ``length_penalty/*`` rollout metrics of
+        :func:`apply_group_length_penalties_from_inputs`. Empty when the block
+        enables nothing.
     """
     cfg = (
         length_penalty_config
         if isinstance(length_penalty_config, LengthPenaltyConfig)
         else LengthPenaltyConfig.model_validate(length_penalty_config)
     )
-    agents_cfg = cfg.agent_overrides
-    global_band = _resolve_global_profile_band(cfg.profile_band)
-    verbose = cfg.verbose
+    if not _length_penalties_enabled(cfg):
+        return {}
+    inputs = [
+        prepare_length_penalty_input(result, result, cfg, tokenizer)
+        for result in results
+    ]
+    adjusted, metrics = apply_group_length_penalties_from_inputs(
+        inputs,
+        [result["full_result"]["reward"] for result in results],
+        generated_lengths=[
+            generated_token_count(result) if sample.all_generated_tokens else 0
+            for result, sample in zip(results, inputs)
+        ],
+        low_effort=[bool(result.get("low_effort_applied")) for result in results],
+        config=cfg,
+        group_size=group_size,
+    )
+    for result, reward in zip(results, adjusted):
+        result["full_result"]["reward"] = reward
+    return metrics
+
+
+def _length_penalties_enabled(cfg: LengthPenaltyConfig) -> bool:
     # `enabled` defaults True here AND in the per-group param resolution: a
     # configured `default:` block is intent-to-enable; omitting `enabled` must
     # not silently no-op (and must not depend on unrelated keys being present).
-    if not cfg.default.enabled and not agents_cfg and not global_band:
-        return {}
-    if not results:
-        return {}
-    if group_size <= 0:
+    return bool(
+        cfg.default.enabled
+        or cfg.agent_overrides
+        or _resolve_global_profile_band(cfg.profile_band)
+    )
+
+
+def apply_group_length_penalties_from_inputs(
+    inputs: list[LengthPenaltyInput],
+    rewards: list[float],
+    *,
+    generated_lengths: list[int],
+    low_effort: list[bool],
+    config: LengthPenaltyConfig,
+    group_size: int | None = None,
+) -> tuple[list[float], dict[str, float]]:
+    """Apply per-prompt-group length bonuses/penalties to measured rollouts.
+
+    Args:
+        inputs: Saved length and profile metadata in rollout order,
+            ``group_size`` contiguous rows per prompt group.
+        rewards: Rewards after effort shaping and reward penalties, in the same order.
+        generated_lengths: Verified generated-token totals in rollout order.
+        low_effort: Per-rollout flags that bypass the group's length adjustments.
+        config: Shared length-adjustment settings.
+        group_size: Number of contiguous rows per prompt group. Defaults to all
+            inputs as one group.
+
+    Returns:
+        A tuple of adjusted rewards in input order and the ``length_penalty/*``
+        rollout metrics, all per-row means over ``inputs`` (pre-adjustment env
+        reward, reward delta, rollouts whose correct reward was wiped to 0,
+        rollouts adjusted, rollouts in groups skipped for non-binary or
+        multi-component rewards). Per-row so the async path, which calls this
+        once per prompt group and averages the per-group values, reports the
+        same numbers as the batched paths. The metrics are empty when the
+        config enables nothing. The input rewards are unchanged.
+    """
+    n = len(inputs)
+    if not n == len(rewards) == len(generated_lengths) == len(low_effort):
+        raise ValueError(
+            "inputs, rewards, generated_lengths and low_effort must have one "
+            "entry per rollout"
+        )
+    cfg = config
+    agents_cfg = cfg.agent_overrides
+    global_band = _resolve_global_profile_band(cfg.profile_band)
+    verbose = cfg.verbose
+    if not _length_penalties_enabled(cfg):
+        return list(rewards), {}
+    if not n:
+        return [], {}
+    num_gens = n if group_size is None else group_size
+    if num_gens <= 0:
         raise ValueError("group_size must be greater than zero")
 
-    num_gens = group_size
     defaults = cfg.resolved_defaults()
-
-    n = len(results)
-    if lengths is not None and len(lengths) != n:
-        raise ValueError("precomputed lengths must cover every rollout")
-    original_rewards = [r["full_result"]["reward"] for r in results]
-    agent_names: list[str] = []
-    for result in results:
-        attribution_key = get_nemo_gym_attribution_key(result)
-        if attribution_key is None:
-            raise ValueError("Length penalties require a NeMo-Gym attribution key")
-        agent_names.append(attribution_key)
-
-    # Extract text once; lengths computed per-group based on resolved length_type
-    texts: list[tuple[str, str]] = []
-    for r in results:
-        texts.append(_extract_reasoning_and_answer_text(r))
+    original_rewards = list(rewards)
+    final_rewards = list(rewards)
+    agent_names = [sample.agent_name for sample in inputs]
 
     # Phase 1: calculate all adjustments per-group
     all_adjustments = [0.0] * n
@@ -588,8 +584,7 @@ def apply_group_length_penalties(
         if not params.pop("enabled", True):
             continue
         has_reward_components = any(
-            results[g + k]["full_result"].get("reward_components")
-            for k in range(group_size)
+            inputs[g + k].has_reward_components for k in range(group_size)
         )
         zero_over_max = params["profiled_length_penalty_type"] == "zero_over_max"
         if zero_over_max and has_reward_components:
@@ -624,7 +619,7 @@ def apply_group_length_penalties(
         if is_binary:
             for k in range(group_size):
                 binary_ok[g + k] = True
-        if any(results[g + k].get("low_effort_applied") for k in range(group_size)):
+        if any(low_effort[g : g + group_size]):
             continue
         if cap_only and any(original_rewards[g + k] < 0 for k in range(group_size)):
             raise ValueError(
@@ -636,28 +631,24 @@ def apply_group_length_penalties(
                 "option off for this agent."
             )
 
-        group_lt = params.pop("length_type")
+        # The inputs were measured in this length_type already.
+        params.pop("length_type")
 
         for k in range(group_size):
             idx = g + k
-            if lengths is not None:
-                reasoning_lengths[idx], answer_lengths[idx], total_lengths[idx] = (
-                    lengths[idx]
-                )
-                continue
-            if group_lt == "all_generated_tokens":
+            sample = inputs[idx]
+            if sample.all_generated_tokens:
                 # Reasoning/answer stay 0; the config rejects settings that read them.
-                total_lengths[idx] = generated_token_count(results[idx])
+                total_lengths[idx] = generated_lengths[idx]
                 continue
-            reasoning_lengths[idx], answer_lengths[idx] = _scored_text_lengths(
-                texts[idx], length_type=group_lt, tokenizer=tokenizer
-            )
-            total_lengths[idx] = reasoning_lengths[idx] + answer_lengths[idx]
+            reasoning_lengths[idx] = sample.reasoning_length
+            answer_lengths[idx] = sample.answer_length
+            total_lengths[idx] = sample.reasoning_length + sample.answer_length
 
         if cap_only:
             # Only the cap is defined for non-binary rewards.
             all_profiled_length_adj[g : g + group_size] = _profiled_length_adjustments(
-                row=results[g],
+                sample=inputs[g],
                 params=params,
                 agent_name=agent_name,
                 total_lengths=total_lengths[g : g + group_size],
@@ -668,7 +659,7 @@ def apply_group_length_penalties(
         group_total = total_lengths[g : g + num_gens]
         group_rewards = original_rewards[g : g + num_gens]
         gate_info = _group_length_profile_gate_info(
-            band=_merged_profile_band(results[g].get("profile_band"), global_band),
+            band=_merged_profile_band(inputs[g].profile_band, global_band),
             params=params,
             rewards=group_rewards[:group_size],
             reasoning_lengths=group_reasoning[:group_size],
@@ -718,7 +709,7 @@ def apply_group_length_penalties(
             groups_adjusted += 1
 
         all_profiled_length_adj[g : g + group_size] = _profiled_length_adjustments(
-            row=results[g],
+            sample=inputs[g],
             params=params,
             agent_name=agent_name,
             total_lengths=total_lengths[g : g + group_size],
@@ -769,14 +760,12 @@ def apply_group_length_penalties(
         for g in range(0, n, num_gens):
             agent_name = agent_names[g]
             group_size = min(num_gens, n - g)
-            low_effort = any(
-                results[g + k].get("low_effort_applied") for k in range(group_size)
-            )
+            bypassed = any(low_effort[g : g + group_size])
             params = _resolve_agent_params(agent_name, agents_cfg, defaults)
             skipped = params is None
             disabled = params is not None and not params.get("enabled", True)
 
-            if low_effort:
+            if bypassed:
                 print(
                     f"\n  group {g // num_gens} agent={agent_name} [low_effort — skipped]",
                     flush=True,
@@ -877,7 +866,7 @@ def apply_group_length_penalties(
 
     # Phase 3: apply additive adjustments (binary-verified rows and zero_over_max-capped rows)
     additive_base_rewards = [0.0] * n
-    for i, r in enumerate(results):
+    for i in range(n):
         if not binary_ok[i] and all_profiled_length_adj[i] != -math.inf:
             continue
         profiled_adj = _stacked_profiled_adj(
@@ -888,11 +877,13 @@ def apply_group_length_penalties(
         # Never flip a reward's sign (all-wrong groups stay variance-free); a capped (-inf) rollout lands at exactly 0.
         if additive_base_rewards[i] < 0:
             additive_base_rewards[i] = 0.0
-        r["full_result"]["reward"] = additive_base_rewards[i]
+        final_rewards[i] = additive_base_rewards[i]
 
     # Phase 4: apply per-prompt profile_band multipliers (correct rollouts only).
     _apply_profile_band_multipliers(
-        results=results,
+        inputs=inputs,
+        low_effort=low_effort,
+        rewards=final_rewards,
         original_rewards=original_rewards,
         base_rewards=additive_base_rewards,
         total_lengths=total_lengths,
@@ -908,8 +899,7 @@ def apply_group_length_penalties(
 
     # Rollout metrics: the env reward is overwritten above, so these are the
     # only record of the pass rate and of how far the rewards moved.
-    final_rewards = [r["full_result"]["reward"] for r in results]
-    return {
+    return final_rewards, {
         "length_penalty/env_reward_mean": sum(original_rewards) / n,
         "length_penalty/reward_delta_mean": sum(
             f - o for f, o in zip(final_rewards, original_rewards)
@@ -932,7 +922,7 @@ def apply_group_length_penalties(
 
 def _profiled_length_adjustments(
     *,
-    row: dict[str, Any],
+    sample: LengthPenaltyInput,
     params: dict[str, Any],
     agent_name: str,
     total_lengths: list[int],
@@ -945,7 +935,7 @@ def _profiled_length_adjustments(
     signal, so no profiled penalty applies at all.
 
     Args:
-        row: The group's first result, which carries the prompt's profile.
+        sample: The group's first input, which carries the prompt's profile.
         params: The agent's resolved length-penalty parameters.
         agent_name: The group's agent, for the error message.
         total_lengths: Each rollout's total generated length.
@@ -964,9 +954,9 @@ def _profiled_length_adjustments(
     plp_type = params["profiled_length_penalty_type"]
     if plp_type == "constant_over_n_std" and plp <= 0.0:
         return adjustments
-    # Index, not .get: a row missing these fields must raise, not silently skip the penalty.
-    p_rewards = row["profiled_rewards"]
-    p_lengths = row["profiled_output_lengths"]
+    # A row missing these fields (None) must raise below, not silently skip the penalty.
+    p_rewards = sample.profiled_rewards
+    p_lengths = sample.profiled_output_lengths
     if (
         not isinstance(p_rewards, list)
         or not isinstance(p_lengths, list)
@@ -1055,7 +1045,9 @@ def _merged_profile_band(
 
 
 def _apply_profile_band_multipliers(
-    results: list[dict[str, Any]],
+    inputs: list[LengthPenaltyInput],
+    low_effort: list[bool],
+    rewards: list[float],
     original_rewards: list[float],
     base_rewards: list[float],
     total_lengths: list[int],
@@ -1072,17 +1064,18 @@ def _apply_profile_band_multipliers(
 
     Each enabled channel contributes a multiplier in [0.0, 1.0] derived from the
     per-row {a, b, f} block, falling back to ``length_penalty.profile_band.defaults``
-    for channels the row does not provide. Mutates scalar rewards in place.
+    for channels the row does not provide. Writes the scaled rewards into
+    ``rewards`` in place.
 
     Skips any group where the low-effort bypass already replaced the reward
-    (parity with Phase 1 of ``apply_group_length_penalties``).
+    (parity with Phase 1 of ``apply_group_length_penalties_from_inputs``).
     """
-    n = len(results)
+    n = len(inputs)
     global_band = global_band or {}
     for g in range(0, n, num_gens):
         agent_name = agent_names[g]
         group_size = min(num_gens, n - g)
-        if any(results[g + k].get("low_effort_applied") for k in range(group_size)):
+        if any(low_effort[g : g + group_size]):
             continue
         params = _resolve_agent_params(agent_name, agents_cfg, defaults)
         if params is None:
@@ -1092,7 +1085,7 @@ def _apply_profile_band_multipliers(
         use_ans = bool(params.get("profile_band_answer", False))
         if not (use_total or use_rsn or use_ans):
             continue
-        band = _merged_profile_band(results[g].get("profile_band"), global_band)
+        band = _merged_profile_band(inputs[g].profile_band, global_band)
         if not band:
             continue
         ch_total = band.get("total") if use_total else None
@@ -1125,7 +1118,7 @@ def _apply_profile_band_multipliers(
             answer_delta = current_reward * answer_m - current_reward
             current_reward += answer_delta
 
-            results[idx]["full_result"]["reward"] = current_reward
+            rewards[idx] = current_reward
 
 
 def _band_multiplier(rl: int, ch: dict[str, Any] | None) -> float:
