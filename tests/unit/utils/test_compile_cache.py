@@ -111,6 +111,7 @@ def test_env_overrides_default_under_the_local_dir(caches):
     env = compile_cache.env_overrides("megatron")
     assert env["TRITON_CACHE_DIR"] == f"{caches}/local/megatron/triton"
     assert env["TORCHINDUCTOR_CACHE_DIR"] == f"{caches}/local/megatron/inductor"
+    assert env["CUTE_DSL_CACHE_DIR"] == f"{caches}/local/megatron/cute_dsl"
     assert compile_cache.vllm_engine_dir(3) == f"{caches}/local/vllm_engines/3"
     assert compile_cache.type_dir("vllm") == f"{caches}/shared/vllm"
 
