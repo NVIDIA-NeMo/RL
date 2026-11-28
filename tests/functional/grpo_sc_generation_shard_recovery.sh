@@ -295,7 +295,7 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     grpo.max_num_steps="$MAX_STEPS" \
     grpo.val_period=-1 \
     grpo.val_at_start=false \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     logger.log_dir="$LOG_DIR" \
     logger.wandb_enabled=false \
     logger.tensorboard_enabled=true \

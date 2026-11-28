@@ -5,17 +5,19 @@
 # data and the Gym data files.
 checkpointing:
   checkpoint_dir: results/super35-journey-rlvr-v43/checkpoints
-  checkpoint_must_save_by: 00:11:30:00
-  enabled: true
-  ft_keep_latest_k: 3
-  ft_save_period: 1
-  higher_is_better: true
-  keep_top_k: 1000000
-  load_replay_buffer: false
-  metric_name: val:total_reward/mean
-  save_optimizer: true
-  save_period: 5
   save_replay_buffer: true
+  save:
+    checkpoint_must_save_by: 00:11:30:00
+    enabled: true
+    ft_keep_latest_k: 3
+    ft_save_period: 1
+    higher_is_better: true
+    keep_top_k: 1000000
+    metric_name: val:total_reward/mean
+    save_optimizer: true
+    save_period: 5
+  load:
+    load_replay_buffer: false
 cluster:
   gpus_per_node: 4
   num_nodes: 144

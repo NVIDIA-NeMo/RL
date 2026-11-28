@@ -4,11 +4,12 @@ grpo:
   max_num_steps: 1000
   val_batch_size: 32
 checkpointing:
-  enabled: true
   checkpoint_dir: results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
-  keep_top_k: 10
-  save_period: 20
-  checkpoint_must_save_by: 00:03:45:00
+  save:
+    enabled: true
+    keep_top_k: 10
+    save_period: 20
+    checkpoint_must_save_by: 00:03:45:00
 policy:
   model_name: Qwen/Qwen2.5-Omni-7B
   train_global_batch_size: 32

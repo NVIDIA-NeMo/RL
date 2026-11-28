@@ -49,9 +49,9 @@ TRAIN_CMD=(
     logger.tensorboard_enabled=true
     logger.wandb_enabled=false
     logger.monitor_gpus=false
-    checkpointing.enabled=true
-    checkpointing.save_period=2
-    checkpointing.metric_name=null
+    checkpointing.save.enabled=true
+    checkpointing.save.save_period=2
+    checkpointing.save.metric_name=null
 )
 
 DEFER_LOG_LINE="Deferring NeMo RL checkpoint load"

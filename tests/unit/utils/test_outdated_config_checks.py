@@ -336,6 +336,24 @@ def test_bare_metric_name_is_rejected(metric_name):
         check_outdated_config({"checkpointing": {"metric_name": metric_name}})
 
 
+def test_bare_nested_metric_name_is_rejected():
+    with pytest.raises(ValueError, match=r"must start with 'train:' or 'val:'"):
+        check_outdated_config({"checkpointing": {"save": {"metric_name": "val_loss"}}})
+
+
+def test_flat_metric_name_is_checked_over_the_nested_one():
+    # The flat key wins when CheckpointingConfig nests it, so it is the one checked.
+    with pytest.raises(ValueError, match=r"must start with 'train:' or 'val:'"):
+        check_outdated_config(
+            {
+                "checkpointing": {
+                    "metric_name": "val_loss",
+                    "save": {"metric_name": "val:loss"},
+                }
+            }
+        )
+
+
 def test_absent_checkpointing_passes():
     check_outdated_config({"policy": {}})
 

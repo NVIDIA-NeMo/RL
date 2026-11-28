@@ -25,7 +25,7 @@ uv run examples/run_grpo.py \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.save.enabled=False \
     $@ \
     2>&1 | tee $RUN_LOG
 

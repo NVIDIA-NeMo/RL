@@ -7,8 +7,9 @@ grpo:
   val_period: 10
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel
-  save_period: 15
-  keep_top_k: 5
+  save:
+    save_period: 15
+    keep_top_k: 5
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
   # Trimmed from this repo's usual 20480 to stay comparable to the eagle3

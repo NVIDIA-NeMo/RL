@@ -48,11 +48,11 @@ cleanup() {
 trap cleanup EXIT
 
 COMMON_OVERRIDES=(
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.save_period=1
-    checkpointing.metric_name=null
-    ++checkpointing.save_data_plane=true
+    checkpointing.save.save_period=1
+    checkpointing.save.metric_name=null
+    ++checkpointing.save.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.target_level=sibling
     ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"

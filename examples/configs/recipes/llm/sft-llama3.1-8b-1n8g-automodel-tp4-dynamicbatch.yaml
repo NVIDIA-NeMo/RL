@@ -8,7 +8,8 @@ sft:
   val_at_start: false
 checkpointing:
   checkpoint_dir: results/sft-llama3.1-8b-1n8g-automodel-tp4-dynamicbatch
-  save_period: 50
+  save:
+    save_period: 50
 policy:
   model_name: meta-llama/Llama-3.1-8B
   tokenizer:

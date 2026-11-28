@@ -1404,14 +1404,14 @@ def setup_single_controller(
         if (
             rollout_checkpoint_cfg.snapshot_attempt_interval_s is None
             and not rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
-            and master_config.checkpointing.checkpoint_must_save_by is None
+            and master_config.checkpointing.save.checkpoint_must_save_by is None
         ):
             raise ValueError(
                 f"rollout_recovery.target_level={recovery_target!r} would never save "
                 "environment state: set "
                 "rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
                 "rollout_checkpointing.snapshot_attempt_interval_s, or "
-                "checkpointing.checkpoint_must_save_by"
+                "checkpointing.save.checkpoint_must_save_by"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
@@ -1424,13 +1424,13 @@ def setup_single_controller(
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
-        master_config.checkpointing.save_data_plane or snapshots_enabled
+        master_config.checkpointing.save.save_data_plane or snapshots_enabled
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
         )
-    if master_config.checkpointing.enabled:
+    if master_config.checkpointing.save.enabled:
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
@@ -1439,12 +1439,12 @@ def setup_single_controller(
         checkpoint_dir_is_msc = is_msc_path(master_config.checkpointing.checkpoint_dir)
         if (
             sampler_supports_replay_recovery
-            and not master_config.checkpointing.save_data_plane
+            and not master_config.checkpointing.save.save_data_plane
             and not checkpoint_dir_is_msc
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
-                "sampler requires checkpointing.save_data_plane=true so "
+                "sampler requires checkpointing.save.save_data_plane=true so "
                 "completed, unconsumed rollouts are recoverable."
             )
             if not data_plane_checkpointing_supported:
@@ -1452,7 +1452,7 @@ def setup_single_controller(
                     f" The configured data_plane.backend={dp_config['backend']!r} "
                     "does not support data-plane checkpointing; use "
                     "data_plane.backend='simple' or set "
-                    "checkpointing.enabled=false."
+                    "checkpointing.save.enabled=false."
                 )
             raise ValueError(error_message)
         if not sampler_supports_replay_recovery or checkpoint_dir_is_msc:
@@ -1516,7 +1516,7 @@ def setup_single_controller(
             "to reuse the rollout's captured media for teacher scoring."
         )
 
-    checkpointing_pretrained = master_config.checkpointing.pretrained_checkpoint
+    checkpointing_pretrained = master_config.checkpointing.load.pretrained_checkpoint
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
@@ -1569,13 +1569,13 @@ def setup_single_controller(
             "policy.router_replay.enabled=true"
         )
     if snapshots_enabled:
-        if not master_config.checkpointing.enabled:
+        if not master_config.checkpointing.save.enabled:
             raise ValueError(
-                "rollout checkpointing requires checkpointing.enabled=true"
+                "rollout checkpointing requires checkpointing.save.enabled=true"
             )
-        if not master_config.checkpointing.save_data_plane:
+        if not master_config.checkpointing.save.save_data_plane:
             raise ValueError(
-                "rollout checkpointing requires checkpointing.save_data_plane=true"
+                "rollout checkpointing requires checkpointing.save.save_data_plane=true"
             )
         if not token_capture_cfg.enabled:
             raise ValueError(
@@ -1593,13 +1593,13 @@ def setup_single_controller(
             )
         if (
             rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-            and master_config.checkpointing.save_period != 1
+            and master_config.checkpointing.save.save_period != 1
         ):
             warnings.warn(
                 "rollout checkpointing is enabled with "
-                f"checkpointing.save_period={master_config.checkpointing.save_period}; "
+                f"checkpointing.save.save_period={master_config.checkpointing.save.save_period}; "
                 "periodic rollout snapshots can only be saved while a matching "
-                "trainer checkpoint exists. Set checkpointing.save_period=1 for "
+                "trainer checkpoint exists. Set checkpointing.save.save_period=1 for "
                 "continuous post-step coverage.",
                 UserWarning,
                 stacklevel=2,
@@ -2027,8 +2027,8 @@ def setup_single_controller(
             checkpointing=bool(
                 recovery_checkpoint_path is not None
                 or (
-                    master_config.checkpointing.enabled
-                    and master_config.checkpointing.save_data_plane
+                    master_config.checkpointing.save.enabled
+                    and master_config.checkpointing.save.save_data_plane
                 )
             ),
             storage_unit_node_ids=storage_unit_node_ids,

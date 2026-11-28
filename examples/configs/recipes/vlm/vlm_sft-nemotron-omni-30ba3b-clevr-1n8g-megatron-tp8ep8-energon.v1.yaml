@@ -26,7 +26,8 @@ policy:
     distributed_data_parallel_config:
       overlap_param_gather: false
 checkpointing:
-  enabled: false
+  save:
+    enabled: false
 data:
   add_bos: false
   add_eos: false

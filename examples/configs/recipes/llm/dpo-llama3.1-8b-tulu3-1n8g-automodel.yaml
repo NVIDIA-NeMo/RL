@@ -37,8 +37,9 @@ dpo:
   val_micro_batch_size: ${policy.train_micro_batch_size}
   val_global_batch_size: ${policy.train_global_batch_size}
 checkpointing:
-  metric_name: null
-  save_period: 250
+  save:
+    metric_name: null
+    save_period: 250
 logger:
   wandb_enabled: true
   wandb:

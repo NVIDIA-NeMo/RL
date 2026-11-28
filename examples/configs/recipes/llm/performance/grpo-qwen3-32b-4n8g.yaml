@@ -5,8 +5,9 @@ grpo:
 loss_fn:
   force_on_policy_ratio: true
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen3-32b-4n8g
+  save:
+    enabled: false
 policy:
   model_name: Qwen/Qwen3-32B
   train_global_batch_size: 2048

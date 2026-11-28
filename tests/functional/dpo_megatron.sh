@@ -34,7 +34,7 @@ uv run $PROJECT_ROOT/examples/run_dpo.py \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     cluster.gpus_per_node=2 \
     cluster.num_nodes=1 \
     $@ \

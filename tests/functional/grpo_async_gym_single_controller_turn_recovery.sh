@@ -125,11 +125,11 @@ else
 fi
 
 COMMON_OVERRIDES=(
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.metric_name=null
-    checkpointing.save_period=1
-    ++checkpointing.save_data_plane=true
+    checkpointing.save.metric_name=null
+    checkpointing.save.save_period=1
+    ++checkpointing.save.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.target_level=turn
     # stall_timeout_s below must outlast a Gym park:

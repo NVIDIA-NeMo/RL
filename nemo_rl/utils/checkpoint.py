@@ -39,7 +39,7 @@ from typing import (
 import numpy as np
 import torch
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.telemetry.instrumentation import (
     checkpoint_finalize_span,
@@ -199,17 +199,17 @@ class PretrainedCheckpointConfig(TypedDict):
     format: Literal["megatron_bridge", "megatron_lm"]
 
 
-class CheckpointingConfig(BaseModel, extra="allow"):
-    """Configuration for checkpoint management.
+class CheckpointSaveConfig(BaseModel, extra="allow"):
+    """When and what to save.
 
     Attributes:
-        enabled (bool): Whether checkpointing is enabled.
-        checkpoint_dir (PathLike): Directory where checkpoints will be saved.
+        enabled (bool): Whether checkpoints are saved.
         metric_name (str | None): Name of the metric to use for determining best checkpoints.
             Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
-            the metric should be taken from the validation or training metrics.
+            the metric should be taken from the validation or training metrics. Required
+            when enabled.
         higher_is_better (bool): Whether higher values of the metric indicate better performance.
-            Only read when metric_name is set.
+            Only read when metric_name is set. Required when enabled.
         save_period (int): How often to save a checkpoint, in steps.
         keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
         ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
@@ -218,34 +218,90 @@ class CheckpointingConfig(BaseModel, extra="allow"):
             Requires ft_keep_latest_k to control how many of these are retained.
         checkpoint_must_save_by (Optional[str]): Deadline in DD:HH:MM:SS, measured from job start,
             by which a checkpoint is saved. None disables it.
-        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint overriding
-            policy.pretrained_checkpoint for the initial weights. None leaves the policy setting
-            unchanged; model_name supplies the weights when neither setting specifies a checkpoint.
         save_optimizer (bool): Whether to save optimizer state with checkpoints.
         save_data_plane (bool): Whether SingleController checkpoints include the
             native TQ snapshot and replay-buffer metadata. Supported by the simple
             and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
-        load_replay_buffer (bool): Whether async GRPO or SingleController restores
-            replay-buffer state when resuming from a checkpoint. When False, a
-            frontier-aligned async resume or a SingleController native TQ resume
-            regenerates the buffered prompt groups on the current policy instead
-            of reusing completed groups.
     """
 
     enabled: bool
-    checkpoint_dir: PathLike
-    metric_name: str | None
-    # Only read when metric_name is set.
-    higher_is_better: bool
+    # Defaulted so that `save: {enabled: false}` is a complete section; the
+    # validator below keeps both required when saving is on.
+    metric_name: str | None = None
+    higher_is_better: bool = True
     save_period: int = 10
     keep_top_k: Optional[int] = None
     ft_keep_latest_k: Optional[int] = None
     ft_save_period: Optional[int] = None
     checkpoint_must_save_by: Optional[str] = None
-    pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
     save_optimizer: bool = True
     save_data_plane: bool = False
+
+    @model_validator(mode="after")
+    def _require_metric_when_enabled(self) -> "CheckpointSaveConfig":
+        missing = sorted({"metric_name", "higher_is_better"} - self.model_fields_set)
+        if self.enabled and missing:
+            raise ValueError(
+                f"checkpointing.save is missing {missing}; they are required when "
+                "checkpointing.save.enabled is true."
+            )
+        return self
+
+
+class CheckpointLoadConfig(BaseModel, extra="allow"):
+    """What to load at startup.
+
+    Attributes:
+        load_replay_buffer (bool): Whether async GRPO or SingleController restores
+            replay-buffer state when resuming from a checkpoint. When False, a
+            frontier-aligned async resume or a SingleController native TQ resume
+            regenerates the buffered prompt groups on the current policy instead
+            of reusing completed groups.
+        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint overriding
+            policy.pretrained_checkpoint for the initial weights when nothing is resumed.
+            None leaves the policy setting unchanged; model_name supplies the weights when
+            neither setting specifies a checkpoint.
+    """
+
     load_replay_buffer: bool = True
+    pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
+
+
+class CheckpointingConfig(BaseModel, extra="allow"):
+    """Configuration for checkpoint management.
+
+    The flat layout from before the save/load split still loads: its keys are
+    moved into ``save`` and ``load``, and a flat key wins over the nested value,
+    so ``checkpointing.<key>=...`` overrides keep working on nested configs.
+
+    Attributes:
+        checkpoint_dir (PathLike): Directory where checkpoints are saved and resumed from.
+        save (CheckpointSaveConfig): When and what to save.
+        load (CheckpointLoadConfig): What to load at startup.
+    """
+
+    checkpoint_dir: PathLike
+    save: CheckpointSaveConfig
+    load: CheckpointLoadConfig = Field(default_factory=CheckpointLoadConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _nest_flat_keys(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        data = dict(data)
+        for section, model in (
+            ("save", CheckpointSaveConfig),
+            ("load", CheckpointLoadConfig),
+        ):
+            flat = {key: data.pop(key) for key in model.model_fields if key in data}
+            if not flat:
+                continue
+            nested = data.get(section) or {}
+            if isinstance(nested, BaseModel):
+                nested = nested.model_dump(exclude_unset=True)
+            data[section] = {**nested, **flat}
+        return data
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -306,18 +362,20 @@ class CheckpointManager:
                 "internally."
             )
 
-        if is_msc_path(config.checkpoint_dir) and config.save_data_plane:
+        save = config.save
+        if is_msc_path(config.checkpoint_dir) and save.save_data_plane:
             raise ValueError(
-                "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
+                "MSC checkpoints do not yet support data-plane snapshots; set "
+                "checkpointing.save.save_data_plane=false."
             )
         self.checkpoint_dir = as_path(config.checkpoint_dir)
         self._storage = make_storage(config.checkpoint_dir)
-        self.metric_name: str | None = config.metric_name
-        self.higher_is_better = config.higher_is_better
-        self.keep_top_k = config.keep_top_k
-        self.save_period: int = config.save_period
-        self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
-        self.save_optimizer = config.save_optimizer
+        self.metric_name: str | None = save.metric_name
+        self.higher_is_better = save.higher_is_better
+        self.keep_top_k = save.keep_top_k
+        self.save_period: int = save.save_period
+        self.ft_keep_latest_k: int | None = save.ft_keep_latest_k
+        self.save_optimizer = save.save_optimizer
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None

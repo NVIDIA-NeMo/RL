@@ -77,7 +77,7 @@ $PY run_flow_grpo.py \
   logger.tensorboard_enabled=True \
   logger.num_val_samples_to_print=0 \
   checkpointing.checkpoint_dir="$CKPT_DIR" \
-  checkpointing.save_period=5 \
+  checkpointing.save.save_period=5 \
   2>&1 | tee "$LOG_DIR/run.log"
 
 # The overrides train 5 steps with save_period=5, so step_5 must exist. The

@@ -26,13 +26,14 @@ loss_fn:
   aggregate_logprobs_per_sample: false  # false = verl-omni/Flow-GRPO per-(sample, step) ratio; true = experimental T-sum (breaks 1e-4 clip scale)
 
 checkpointing:
-  enabled: true
   checkpoint_dir: "results/flow_grpo_qwen_image_ocr"
-  save_period: 30
-  metric_name: null  # null keeps the most recent keep_top_k checkpoints; validation runs after the save, so a val:reward_mean ranking would score each checkpoint with the previous validation
-  higher_is_better: true
-  keep_top_k: 3
-  save_optimizer: true
+  save:
+    enabled: true
+    save_period: 30
+    metric_name: null  # null keeps the most recent keep_top_k checkpoints; validation runs after the save, so a val:reward_mean ranking would score each checkpoint with the previous validation
+    higher_is_better: true
+    keep_top_k: 3
+    save_optimizer: true
 
 policy:
   model_name: "Qwen/Qwen-Image"

@@ -11,8 +11,9 @@ grpo:
   val_period: 30
 
 checkpointing:
-  enabled: false
   checkpoint_dir: results/qa_grpo_qwen3_30ba3b_megatron
+  save:
+    enabled: false
 
 policy:
   train_global_batch_size: 16

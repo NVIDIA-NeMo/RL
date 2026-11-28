@@ -24,7 +24,12 @@ import torch
 import yaml
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointLoadConfig,
+    CheckpointManager,
+    CheckpointSaveConfig,
+)
 
 
 @pytest.fixture
@@ -35,19 +40,63 @@ def checkpoint_dir(tmp_path):
 @pytest.fixture
 def checkpoint_config(checkpoint_dir):
     return CheckpointingConfig(
-        enabled=True,
         checkpoint_dir=checkpoint_dir,
-        metric_name="loss",
-        higher_is_better=False,
-        save_period=1,
-        keep_top_k=3,
-        save_optimizer=True,
+        save=CheckpointSaveConfig(
+            enabled=True,
+            metric_name="loss",
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=3,
+            save_optimizer=True,
+        ),
     )
 
 
 @pytest.fixture
 def checkpoint_manager(checkpoint_config):
     return CheckpointManager(checkpoint_config)
+
+
+def test_flat_layout_is_nested_into_save_and_load(checkpoint_dir):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_dir,
+        metric_name="val:loss",
+        higher_is_better=False,
+        save_period=5,
+        load_replay_buffer=False,
+    )
+
+    assert config.save == CheckpointSaveConfig(
+        enabled=True, metric_name="val:loss", higher_is_better=False, save_period=5
+    )
+    assert config.load == CheckpointLoadConfig(load_replay_buffer=False)
+    assert not config.model_extra
+
+
+def test_flat_key_wins_over_the_nested_value(checkpoint_config):
+    # A recipe's `checkpointing.enabled=false` on top of a nested base config.
+    config = CheckpointingConfig(
+        checkpoint_dir=checkpoint_config.checkpoint_dir,
+        save=checkpoint_config.save,
+        enabled=False,
+        save_period=7,
+    )
+
+    assert config.save.enabled is False
+    assert config.save.save_period == 7
+    assert config.save.metric_name == "loss"
+
+
+def test_disabled_save_section_needs_only_the_switch(checkpoint_dir):
+    CheckpointingConfig(
+        checkpoint_dir=checkpoint_dir, save=CheckpointSaveConfig(enabled=False)
+    )
+
+
+def test_enabled_save_requires_metric_name_and_higher_is_better():
+    with pytest.raises(ValueError, match=r"\['higher_is_better', 'metric_name'\]"):
+        CheckpointSaveConfig(enabled=True)
 
 
 def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config):
@@ -422,7 +471,7 @@ def test_save_optimizer_flag_initialization(checkpoint_config):
     assert manager.save_optimizer is True
 
     # Test that save_optimizer respects explicit False
-    checkpoint_config.save_optimizer = False
+    checkpoint_config.save.save_optimizer = False
     manager = CheckpointManager(checkpoint_config)
     assert manager.save_optimizer is False
 

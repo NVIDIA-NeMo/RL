@@ -104,7 +104,7 @@ For a quick smoke run that exercises the dataset and processor plumbing without 
 uv run --no-sync examples/run_vlm_grpo.py \
     --config examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml \
     grpo.max_num_steps=2 \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     logger.wandb_enabled=false
 ```
 

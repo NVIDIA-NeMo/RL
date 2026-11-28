@@ -729,7 +729,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         All held groups are untrained (sampling removes trained ones). The
         checkpoint cut must not exceed any of these ordinals: with
-        ``checkpointing.load_replay_buffer=false`` the buffer is discarded on
+        ``checkpointing.load.load_replay_buffer=false`` the buffer is discarded on
         resume, and ordinals below the cut are never re-yielded.
         """
         with self._lock:

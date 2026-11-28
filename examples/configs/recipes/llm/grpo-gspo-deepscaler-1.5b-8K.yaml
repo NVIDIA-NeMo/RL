@@ -9,7 +9,8 @@ loss_fn:
   sequence_level_importance_ratios: true
   normalization: sequence_mean
 checkpointing:
-  keep_top_k: 10
+  save:
+    keep_top_k: 10
 policy:
   model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
   train_global_batch_size: 64

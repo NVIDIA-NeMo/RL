@@ -4,7 +4,8 @@ sft:
   val_period: 500
 checkpointing:
   checkpoint_dir: results/sft-llama3.1-8b-instruct-1n8g-megatron
-  save_period: 50
+  save:
+    save_period: 50
 policy:
   model_name: meta-llama/Llama-3.1-8B
   tokenizer:

@@ -123,9 +123,10 @@ logger:
   monitor_gpus: true
 
 checkpointing:
-  enabled: false
   checkpoint_dir: checkpoints/distillation-qwen3-0.6b-nemo-gym
-  save_period: 1
+  save:
+    enabled: false
+    save_period: 1
 
 cluster:
   gpus_per_node: 1

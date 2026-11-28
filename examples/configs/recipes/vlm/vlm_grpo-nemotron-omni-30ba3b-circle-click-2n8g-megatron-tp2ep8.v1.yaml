@@ -17,11 +17,12 @@ loss_fn:
   use_on_policy_kl_approximation: true
   use_importance_sampling_correction: true
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-nemotron-omni-30ba3b-gymv-circle-click
-  metric_name: val:total_reward/mean
-  keep_top_k: 1000000
-  checkpoint_must_save_by: 00:03:40:00
+  save:
+    enabled: false
+    metric_name: val:total_reward/mean
+    keep_top_k: 1000000
+    checkpoint_must_save_by: 00:03:40:00
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   is_vlm: true

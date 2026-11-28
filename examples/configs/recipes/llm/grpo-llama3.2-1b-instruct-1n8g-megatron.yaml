@@ -2,9 +2,10 @@ defaults: ../../grpo_math_1B.yaml
 grpo:
   max_num_steps: 500
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron
-  save_period: 100
+  save:
+    enabled: false
+    save_period: 100
 policy:
   model_name: meta-llama/Llama-3.2-1B-Instruct
   tokenizer:

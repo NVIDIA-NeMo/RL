@@ -36,9 +36,9 @@ TRAIN_CMD=(
     cluster.gpus_per_node=2
     logger.tensorboard_enabled=false
     logger.wandb_enabled=false
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir=$CKPT_DIR
-    checkpointing.save_period=2
+    checkpointing.save.save_period=2
 )
 
 cd $PROJECT_ROOT

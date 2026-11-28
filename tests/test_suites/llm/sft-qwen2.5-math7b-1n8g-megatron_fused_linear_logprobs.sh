@@ -23,7 +23,7 @@ uv run examples/run_sft.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=true \
+    checkpointing.save.enabled=true \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     ~policy.tokenizer.chat_template \
     $@ \

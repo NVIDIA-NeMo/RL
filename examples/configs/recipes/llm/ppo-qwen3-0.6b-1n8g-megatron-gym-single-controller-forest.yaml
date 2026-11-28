@@ -11,10 +11,11 @@ loss_fn:
   ratio_clip_c: null
   use_importance_sampling_correction: true
 checkpointing:
-  enabled: true
   checkpoint_dir: results/ppo-qwen3-0.6b-1n8g-megatron-gym-single-controller-forest
-  keep_top_k: 3
-  checkpoint_must_save_by: 00:03:30:00
+  save:
+    enabled: true
+    keep_top_k: 3
+    checkpoint_must_save_by: 00:03:30:00
 policy:
   model_name: Qwen/Qwen3-0.6B
   train_global_batch_size: 8

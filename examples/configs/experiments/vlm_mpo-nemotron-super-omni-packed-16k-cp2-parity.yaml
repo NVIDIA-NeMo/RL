@@ -21,6 +21,7 @@ data:
   max_input_seq_length: 16384
 
 checkpointing:
-  # Stop before the four-hour partition limit so the dependent segment can
-  # restore model, optimizer, scheduler, MPO, and dataloader state safely.
-  checkpoint_must_save_by: 00:03:45:00
+  save:
+    # Stop before the four-hour partition limit so the dependent segment can
+    # restore model, optimizer, scheduler, MPO, and dataloader state safely.
+    checkpoint_must_save_by: 00:03:45:00

@@ -24,12 +24,12 @@ rm -rf $EXP_DIR
 mkdir -p $EXP_DIR
 
 CHECKPOINT_ARGS=(
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir=$CKPT_DIR
-    checkpointing.metric_name=null
+    checkpointing.save.metric_name=null
     # Only step 10 and the final step 12 are saved.
-    checkpointing.save_period=10
-    ++checkpointing.save_data_plane=true
+    checkpointing.save.save_period=10
+    ++checkpointing.save.save_data_plane=true
 )
 # run1 is the driver's full smoke: 10 steps with its compaction, reward and KL checks.
 SC_TEST_CONTEXT_COMPACTION=1 \

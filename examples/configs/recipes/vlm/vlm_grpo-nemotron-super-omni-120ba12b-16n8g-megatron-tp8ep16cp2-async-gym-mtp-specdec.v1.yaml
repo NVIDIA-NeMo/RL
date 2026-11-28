@@ -17,7 +17,8 @@ policy:
       max_num_batched_tokens: 8480
 checkpointing:
   checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
-  save_period: 5
+  save:
+    save_period: 5
 logger:
   log_dir: logs/nemotron-super-omni-async-gym-mtp-specdec
   wandb:

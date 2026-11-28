@@ -35,16 +35,17 @@ cluster:
 # Checkpointing
 # =============================================================================
 checkpointing:
-  enabled: true
   checkpoint_dir: "results/lightning_v3_5_rlvr"
-  metric_name: null
-  higher_is_better: true
-  keep_top_k: 1000000
-  save_period: 10
-  ft_keep_latest_k: 1
-  ft_save_period: 1
-  checkpoint_must_save_by: "00:23:35:00"
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: null
+    higher_is_better: true
+    keep_top_k: 1000000
+    save_period: 10
+    ft_keep_latest_k: 1
+    ft_save_period: 1
+    checkpoint_must_save_by: "00:23:35:00"
+    save_optimizer: true
 
 # =============================================================================
 # GRPO Algorithm

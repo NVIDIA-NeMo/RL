@@ -57,10 +57,11 @@ loss_fn:
   ratio_clip_c: 10
 checkpointing:
   checkpoint_dir: results/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel
-  # 4h partition limit; steps take 15-18 min (~30 min on validation steps), so
-  # leave >= 40 min so the timeout save + exit never straddles the wall clock.
-  checkpoint_must_save_by: 00:03:20:00
-  keep_top_k: 2
+  save:
+    # 4h partition limit; steps take 15-18 min (~30 min on validation steps), so
+    # leave >= 40 min so the timeout save + exit never straddles the wall clock.
+    checkpoint_must_save_by: 00:03:20:00
+    keep_top_k: 2
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
   tokenizer:

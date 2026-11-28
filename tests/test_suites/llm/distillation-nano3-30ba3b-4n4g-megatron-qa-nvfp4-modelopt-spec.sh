@@ -28,7 +28,7 @@ uv run examples/nemo_gym/run_distillation_nemo_gym.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.save.enabled=False \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG

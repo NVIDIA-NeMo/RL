@@ -5,9 +5,10 @@ defaults: ../../../nemo_gym/nemotron-3.5-super/rlvr_v43.yaml
 # Assets are under ${HF_HOME}/nemotron3.5-super-rlvr/.
 checkpointing:
   checkpoint_dir: results/grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick
-  checkpoint_must_save_by: null
-  metric_name: null
-  save_data_plane: true
+  save:
+    checkpoint_must_save_by: null
+    metric_name: null
+    save_data_plane: true
 cluster:
   num_nodes: 48
 data:

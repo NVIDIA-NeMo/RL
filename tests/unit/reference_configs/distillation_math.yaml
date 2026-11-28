@@ -19,19 +19,21 @@ loss_fn:
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
-    enabled: true
     checkpoint_dir: "checkpoints/distillation-${policy.model_name}"
-    metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
-    higher_is_better: true
-    keep_top_k: 3
-    save_period: 10
-    checkpoint_must_save_by: null
-    save_optimizer: true
-    ft_keep_latest_k: null
-    ft_save_period: null
-    pretrained_checkpoint: null
-    save_data_plane: false
-    load_replay_buffer: true
+    save:
+        enabled: true
+        metric_name: "val:accuracy" # one of "val:" or "train:" followed by the metric name
+        higher_is_better: true
+        keep_top_k: 3
+        save_period: 10
+        checkpoint_must_save_by: null
+        save_optimizer: true
+        ft_keep_latest_k: null
+        ft_save_period: null
+        save_data_plane: false
+    load:
+        pretrained_checkpoint: null
+        load_replay_buffer: true
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"

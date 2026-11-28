@@ -305,7 +305,7 @@ spec:
                       policy.automodel_cfg.tensor_parallel_size=1 \
                       sft.max_num_steps=10 \
                       sft.val_period=5 \
-                      checkpointing.enabled=false \
+                      checkpointing.save.enabled=false \
                       logger.wandb_enabled=false \
                       logger.tensorboard_enabled=false
                   " 2>&1

@@ -4,10 +4,11 @@ grpo:
   max_num_steps: 1000
   val_at_start: true
 checkpointing:
-  enabled: true
   checkpoint_dir: results/audio_grpo_7B_megatron
-  keep_top_k: 10
-  save_period: 50
+  save:
+    enabled: true
+    keep_top_k: 10
+    save_period: 50
 policy:
   model_name: Qwen/Qwen2.5-Omni-7B
   train_global_batch_size: 32

@@ -10,7 +10,8 @@ grpo:
   max_num_steps: 10
   val_period: -1
 checkpointing:
-  enabled: false
+  save:
+    enabled: false
 policy:
   model_name: Qwen/Qwen3-0.6B
   train_global_batch_size: 8

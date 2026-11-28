@@ -17,7 +17,7 @@
 # megatron_lm formats.
 #
 # Phase 1: run a standard GRPO step to force the HF→megatron-bridge conversion.
-# Phase 2: re-run with checkpointing.pretrained_checkpoint pointing at the bridge
+# Phase 2: re-run with checkpointing.load.pretrained_checkpoint pointing at the bridge
 #          checkpoint produced in phase 1 (format=megatron_bridge).
 # Phase 3: convert the bridge iter dir to MLM format (drop run_config.yaml,
 #          inject args into common.pt) and re-run with format=megatron_lm.
@@ -64,7 +64,7 @@ COMMON_OVERRIDES=(
     grpo.max_num_steps=2
     logger.wandb_enabled=false
     logger.monitor_gpus=true
-    checkpointing.enabled=false
+    checkpointing.save.enabled=false
 )
 
 # ---------------------------------------------------------------------------
@@ -102,9 +102,10 @@ run_restore_phase() {
     cat > "$temp_config" << YAML
 defaults: ${EXEMPLAR_CONFIG}
 checkpointing:
-  pretrained_checkpoint:
-    path: "${pretrained_path}"
-    format: ${fmt}
+  load:
+    pretrained_checkpoint:
+      path: "${pretrained_path}"
+      format: ${fmt}
 YAML
 
     uv run --no-sync coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \

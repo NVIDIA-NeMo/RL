@@ -122,7 +122,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     ++data_plane.enabled=true \

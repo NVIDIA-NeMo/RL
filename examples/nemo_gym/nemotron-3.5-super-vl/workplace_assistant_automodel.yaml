@@ -42,14 +42,15 @@ defaults: "../grpo_workplace_assistant_nemotron_nano_v2_9b.yaml"
 
 checkpointing:
   checkpoint_dir: results/grpo-nemotron3.5-super-vl-workplace-assistant-automodel
-  metric_name: val:total_reward/mean
-  higher_is_better: true
-  keep_top_k: 2
-  save_period: 10
-  # 4h partition limit; leave >= 40 min so the timeout save + exit never straddles the
-  # wall clock.
-  checkpoint_must_save_by: 00:03:20:00
-  save_optimizer: true
+  save:
+    metric_name: val:total_reward/mean
+    higher_is_better: true
+    keep_top_k: 2
+    save_period: 10
+    # 4h partition limit; leave >= 40 min so the timeout save + exit never straddles the
+    # wall clock.
+    checkpoint_must_save_by: 00:03:20:00
+    save_optimizer: true
 
 grpo:
   num_prompts_per_step: 64

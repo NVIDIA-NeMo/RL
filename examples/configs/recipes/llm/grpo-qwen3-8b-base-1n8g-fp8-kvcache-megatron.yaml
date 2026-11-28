@@ -2,8 +2,9 @@ defaults: ../../grpo_math_1B.yaml
 grpo:
   val_period: 20
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo_qwen3_8b_fp8_kvcache
+  save:
+    enabled: false
 loss_fn:
   use_importance_sampling_correction: true
 policy:

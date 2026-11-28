@@ -54,7 +54,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     teacher.model_name=Qwen/Qwen3-0.6B \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
     cluster.gpus_per_node=2 \
     policy.automodel_cfg.tensor_parallel_size=1 \

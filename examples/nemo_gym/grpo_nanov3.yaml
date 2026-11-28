@@ -57,14 +57,15 @@ loss_fn:
   truncated_importance_sampling_ratio: null
 
 checkpointing:
-  enabled: true
   checkpoint_dir: "results/grpo"
-  metric_name: "val:total_reward/mean"
-  higher_is_better: true
-  keep_top_k: 1000000
-  save_period: 10
-  checkpoint_must_save_by: "00:03:40:00"
-  save_optimizer: true
+  save:
+    enabled: true
+    metric_name: "val:total_reward/mean"
+    higher_is_better: true
+    keep_top_k: 1000000
+    save_period: 10
+    checkpoint_must_save_by: "00:03:40:00"
+    save_optimizer: true
 
 policy:
   model_name: "/path/to/hf_checkpoint"

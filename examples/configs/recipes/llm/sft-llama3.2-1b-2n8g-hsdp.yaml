@@ -3,7 +3,8 @@ sft:
   max_num_steps: 500
 checkpointing:
   checkpoint_dir: results/sft-llama3.2-1b-2n8g-hsdp
-  save_period: 100
+  save:
+    save_period: 100
 policy:
   tokenizer:
     name: meta-llama/Llama-3.2-1B

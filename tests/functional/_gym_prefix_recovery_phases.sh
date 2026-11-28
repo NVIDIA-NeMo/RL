@@ -138,14 +138,14 @@ prefix_recovery_overrides() {
         # The step count only decides when a run stops, so phase two's
         # restore must accept its longer run.
         '++rollout_checkpointing.extra_fingerprint_excluded_paths=[grpo.max_num_steps]'
-        checkpointing.enabled=true
+        checkpointing.save.enabled=true
         checkpointing.checkpoint_dir="${CHECKPOINT_DIR}"
-        checkpointing.metric_name=null
+        checkpointing.save.metric_name=null
         # Phase two saves after step MAX_STEPS, whose snapshot deletes the
         # retired prefix rows, and after its last step, whose training_info is
         # read.
-        checkpointing.save_period="${MAX_STEPS}"
-        ++checkpointing.save_data_plane=true
+        checkpointing.save.save_period="${MAX_STEPS}"
+        ++checkpointing.save.save_data_plane=true
         # Each run dumps its trained rows (train_data_step*.jsonl in its log
         # dir, so the json writer) for verify-completion.
         ++async_rl.log_full_train_data=true

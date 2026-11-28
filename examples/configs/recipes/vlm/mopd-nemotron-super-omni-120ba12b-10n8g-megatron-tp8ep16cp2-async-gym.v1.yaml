@@ -3,7 +3,8 @@
 defaults: vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
 checkpointing:
   checkpoint_dir: results/mopd-nemotron-super-omni-circle-count
-  keep_top_k: 1
+  save:
+    keep_top_k: 1
 cluster:
   num_nodes: 10
 grpo:

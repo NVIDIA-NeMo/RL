@@ -3,7 +3,8 @@ sft:
   max_num_steps: 20
 checkpointing:
   checkpoint_dir: results/sft-qwen2.5-32b-4n8g-automodel-tp8sp-actckpt
-  save_period: 100
+  save:
+    save_period: 100
 policy:
   model_name: Qwen/Qwen2.5-32B
   tokenizer:

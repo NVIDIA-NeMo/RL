@@ -18,7 +18,8 @@ loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
   checkpoint_dir: results/grpo-dapomath17k-nanov3-30BA3B-8n4g-megatron-trtllm
-  keep_top_k: 5
+  save:
+    keep_top_k: 5
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
   tokenizer:

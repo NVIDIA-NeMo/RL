@@ -102,10 +102,10 @@ mkdir -p "$TEST_DIR"
 
 COMMON_OVERRIDES=(
     data_plane.backend="$BACKEND"
-    checkpointing.enabled=true
+    checkpointing.save.enabled=true
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
-    checkpointing.save_period=1
-    checkpointing.save_data_plane=true
+    checkpointing.save.save_period=1
+    checkpointing.save.save_data_plane=true
     async_rl.sampler.name=windowed
     '~async_rl.sampler.max_lookahead_versions'
     '+async_rl.sampler.max_staleness_versions=1'
@@ -151,7 +151,7 @@ echo "=== Phase 1: save an authoritative native TQ checkpoint ==="
 EXP_NAME="$TEST_NAME/run" bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
     grpo.max_num_steps=2 \
-    checkpointing.checkpoint_must_save_by=0:0:0:1
+    checkpointing.save.checkpoint_must_save_by=0:0:0:1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
 # Phase 2 re-runs the base test, which deletes its log dir; keep phase 1's.
 cp -r "$TEST_DIR/run/logs" "$TEST_DIR/phase1_logs"

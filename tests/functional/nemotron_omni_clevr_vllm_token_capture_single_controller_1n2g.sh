@@ -110,7 +110,7 @@ uv run --no-sync python examples/run_grpo_single_controller.py \
     async_rl.max_inflight_prompts=2 \
     async_rl.max_buffered_rollouts=2 \
     logger.log_dir="${LOG_DIR}" \
-    checkpointing.enabled=false \
+    checkpointing.save.enabled=false \
     "$@" 2>&1 | tee "${RUN_LOG}"
 
 uv run --no-sync tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${JSON_METRICS}"

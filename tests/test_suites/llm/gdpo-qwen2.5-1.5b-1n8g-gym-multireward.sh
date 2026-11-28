@@ -43,7 +43,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.save.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \

@@ -86,7 +86,8 @@ async_rl:
   max_buffered_rollouts: ${grpo.num_prompts_per_step}
 
 checkpointing:
-  enabled: false
+  save:
+    enabled: false
 
 cluster:
   gpus_per_node: 2

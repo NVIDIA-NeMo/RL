@@ -60,7 +60,7 @@ train_run() {
         data.energon.num_workers=0 data.energon.shuffle_buffer_size=16 \
         logger.tensorboard_enabled=true logger.log_dir="${LOG_DIR}/${phase}" \
         logger.wandb_enabled=false logger.monitor_gpus=false \
-        checkpointing.enabled=false checkpointing.save_optimizer=true \
+        checkpointing.save.enabled=false checkpointing.save.save_optimizer=true \
         checkpointing.checkpoint_dir="${CKPT_DIR}" \
         "$@" 2>&1 | tee "${EXP_DIR}/${phase}.log"
     uv run --no-sync tests/json_dump_tb_logs.py "${LOG_DIR}/${phase}" \
@@ -69,9 +69,9 @@ train_run() {
 
 train_run baseline "$@"
 # Keep the same two-step scheduler budget; the timeout saves and exits after step 1.
-train_run interrupted "$@" checkpointing.enabled=true \
-    checkpointing.checkpoint_must_save_by=0:0:0:1
-train_run resumed "$@" checkpointing.enabled=true
+train_run interrupted "$@" checkpointing.save.enabled=true \
+    checkpointing.save.checkpoint_must_save_by=0:0:0:1
+train_run resumed "$@" checkpointing.save.enabled=true
 
 uv run --no-sync python - "${EXP_DIR}" <<'PY'
 import json

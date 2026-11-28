@@ -233,7 +233,7 @@ def _master_config(algo_cfg, checkpoint_dir=None):
         load_config("configs/recipes/flow_grpo_qwen_image_ocr.yaml"),
         resolve=True,
     )
-    cfg["checkpointing"]["enabled"] = checkpoint_dir is not None
+    cfg["checkpointing"]["save"]["enabled"] = checkpoint_dir is not None
     if checkpoint_dir is not None:
         cfg["checkpointing"]["checkpoint_dir"] = str(checkpoint_dir)
     master = MasterConfig.model_validate(cfg)
