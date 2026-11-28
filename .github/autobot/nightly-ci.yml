@@ -1,0 +1,5 @@
+# .github/autobot/nightly-ci.yml
+eligible_teams: [automation, rl_autobot_approvers]
+run_as: requester
+arguments: {test-cluster: h100-2, test-suites: nightly}
+overridable: [test-cluster, test-suites]

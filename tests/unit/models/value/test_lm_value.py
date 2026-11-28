@@ -51,3 +51,19 @@ def test_value_rejects_policy_only_deterministic_option():
         match=r"value\.automodel_cfg\.deterministic is not supported",
     ):
         Value(cluster=MagicMock(), config=config, tokenizer=MagicMock(), seed=42)
+
+
+def test_value_rejects_automodel_pipeline_parallel():
+    config = cast(
+        ValueConfig,
+        {
+            "megatron_cfg": {"enabled": False},
+            "automodel_cfg": {"enabled": True, "pipeline_parallel_size": 2},
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"value\.automodel_cfg\.pipeline_parallel_size > 1 is not supported",
+    ):
+        Value(cluster=MagicMock(), config=config, tokenizer=MagicMock(), seed=42)

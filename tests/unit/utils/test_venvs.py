@@ -24,6 +24,7 @@ import nemo_rl.utils.venvs as venv_module
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv,
+    driver_env_for_workers,
     make_actor_runtime_env,
 )
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -57,6 +58,29 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "exclude, expect_pod_name",
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param("", True, id="empty"),
+        pytest.param(" POD_NAME , AWS_ROLE_ARN", False, id="whitespace"),
+        pytest.param("NOT_SET_ANYWHERE", True, id="absent_name"),
+    ],
+)
+def test_driver_env_for_workers(monkeypatch, exclude, expect_pod_name):
+    monkeypatch.setenv("POD_NAME", "driver-pod")
+    monkeypatch.setenv("KEPT_VAR", "kept")
+    if exclude is None:
+        monkeypatch.delenv("NRL_WORKER_ENV_EXCLUDE", raising=False)
+    else:
+        monkeypatch.setenv("NRL_WORKER_ENV_EXCLUDE", exclude)
+
+    result = driver_env_for_workers()
+
+    assert ("POD_NAME" in result) is expect_pod_name
+    assert result["KEPT_VAR"] == "kept"
 
 
 def test_add_hf_modules_cache_to_pythonpath():

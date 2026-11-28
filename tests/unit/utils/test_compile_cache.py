@@ -151,13 +151,26 @@ def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
     assert local.read_text() == "changed here"
 
 
+def test_per_device_patch_is_found_by_name():
+    # compile_cache looks the patch up by this name; a rename must fail here.
+    patches = compile_cache._vllm_patches()
+    assert callable(patches["_patch_vllm_compile_cache_per_device"])
+
+
 def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
+    patched = []
+    monkeypatch.setattr(
+        compile_cache,
+        "_vllm_patches",
+        lambda: {"_patch_vllm_compile_cache_per_device": patched.append},
+    )
     (caches / "shared/vllm/vllm/torch_compile_cache").mkdir(parents=True)
     (caches / "shared/vllm/vllm/torch_compile_cache/entry").write_text("compiled")
     engine = compile_cache.vllm_engine_dir(0)
 
     compile_cache._prepare_vllm_engine_on_this_node(engine)
     assert (caches / "local/vllm_engines/0/torch_compile_cache/entry").exists()
+    assert len(patched) == 1
 
 
 def test_deterministic_runs_warn_when_autotune_results_are_shared(
