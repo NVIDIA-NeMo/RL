@@ -570,6 +570,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Print one ``GROUP_REWARDS`` line per prompt group from the advantage stage
+    # (trainer version, dataset prompt index, sorted rollout rewards), so each
+    # task's training reward can be followed over a run.
+    log_group_rewards: bool = False
     # CPU actors that run the advantage stage. 0 keeps it in the controller
     # process, which is the historical behaviour and is correct, but it both
     # holds a whole cohort's advantage inputs in the controller's heap and
@@ -1088,7 +1092,13 @@ def validate_forest_objective(
     unsupported = {
         f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
         != ("gae" if is_ppo else "grpo"),
-        "loss_fn.normalization": loss.resolved_normalization != "global_token_mean",
+        # group_token_mean weighs dispatch groups, which only GRPO has.
+        "loss_fn.normalization": loss.resolved_normalization
+        not in (
+            ("global_token_mean",)
+            if is_ppo
+            else ("global_token_mean", "group_token_mean")
+        ),
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",
@@ -2313,9 +2323,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
         validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
-        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
+        # The malformed-think-tag check covers every segment of an owner and
+        # zeroes the logical reward once; other penalties are segment-local.
+        forest_unsupported_penalties = [
+            flag
+            for flag in _REWARD_PENALTY_FLAGS
+            if flag != "penalize_malformed_think_tag"
+            and getattr(master_config.reward_penalties, flag)
+        ]
+        if forest_unsupported_penalties or opd_module.is_opd_enabled(master_config):
             raise ValueError(
-                "Forest does not support reward penalties or on-policy distillation"
+                "Forest supports only the malformed-think-tag reward penalty and no "
+                f"on-policy distillation; got {forest_unsupported_penalties or 'OPD'}"
             )
         # Validate the fixed-batch policy and critic shapes before
         # workers/generation start. Setup recomputes Q from the actual DP meshes.

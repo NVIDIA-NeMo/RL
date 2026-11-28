@@ -5410,7 +5410,7 @@ def forest_config():
         ("grpo.invalid_tool_call_advantage", 0.0, "message-level advantage"),
         ("grpo.malformed_thinking_advantage", 0.0, "message-level advantage"),
         ("token_capture.defer_routed_experts_to_policy", True, "direct routed-expert"),
-        ("reward_penalties.penalize_malformed_think_tag", True, "reward penalties"),
+        ("reward_penalties.penalize_empty_final_answer", True, "malformed-think-tag"),
         ("policy.megatron_cfg.enabled", False, "non-interleaved Megatron"),
         ("policy.dynamic_batching.enabled", True, "non-interleaved Megatron"),
         (
@@ -5435,6 +5435,11 @@ def _set_config_path(mc: MasterConfig, path: str, value: Any) -> None:
         obj[key] = value
     else:
         setattr(obj, key, value)
+
+
+def test_forest_startup_accepts_malformed_think_tag_penalty(forest_config):
+    forest_config.reward_penalties.penalize_malformed_think_tag = True
+    validate_single_controller_config(forest_config)
 
 
 @pytest.mark.parametrize("field", ["train_micro_batch_size", "logprob_batch_size"])

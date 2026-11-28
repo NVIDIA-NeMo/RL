@@ -106,6 +106,7 @@ def test_from_master_config_uses_typed_logger(
         async_rl=SimpleNamespace(
             log_full_train_data=log_full_train_data,
             debug_writer=DebugWriterConfig(target="json"),
+            log_group_rewards=False,
         ),
     )
 
@@ -476,6 +477,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "train_step",
         # A single bool: whether this call ran the policy-logprob pass.
         "policy_logprobs_required",
+        # A bare weight version that labels the GROUP_REWARDS log lines.
+        "trainer_version",
     }
     assert {f.name for f in fields(AdvantageOutcome)} == {
         "meta",
@@ -745,7 +748,9 @@ def test_opd_global_baseline_pool_matches_full_batch() -> None:
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir="/tmp/test-logs"),
         async_rl=SimpleNamespace(
-            log_full_train_data=False, debug_writer=DebugWriterConfig()
+            log_full_train_data=False,
+            debug_writer=DebugWriterConfig(),
+            log_group_rewards=False,
         ),
     )
     config = AdvantageStageConfig.from_master_config(master_config)
@@ -782,7 +787,9 @@ def test_ppo_pool_preserves_advantages_and_returns(normalize_advantages: bool) -
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir="/tmp/test-logs"),
         async_rl=SimpleNamespace(
-            log_full_train_data=False, debug_writer=DebugWriterConfig()
+            log_full_train_data=False,
+            debug_writer=DebugWriterConfig(),
+            log_group_rewards=False,
         ),
     )
     config = AdvantageStageConfig.from_master_config(master_config)

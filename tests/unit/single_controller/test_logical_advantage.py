@@ -47,7 +47,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, GROUP_TOKEN_MEAN_WEIGHT
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
@@ -133,7 +133,13 @@ def test_forest_selection_config(policy):
 
 
 def _controller(
-    meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
+    meta,
+    data,
+    *,
+    grpo=None,
+    loss=None,
+    policy_logprobs_required: bool = False,
+    stage=None,
 ):
     settings = dict(
         num_generations_per_prompt=2,
@@ -184,6 +190,7 @@ def _controller(
             ctrl._master_config.loss_fn.resolved_normalization
         ),
         train_data_dump_dir=None,
+        **(stage or {}),
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -566,6 +573,69 @@ def test_sibling_rollouts_with_distinct_prompts_share_baseline(
         torch.testing.assert_close(data["advantages"][row], torch.full((3,), expected))
 
 
+def _group_token_mean_batch():
+    """Two dispatch groups with unequal segment counts, token counts and prompts."""
+    meta, data = _batch(
+        [("a", [(0.0, 3), (1.0, 1)]), ("b", [(1.0, 1), (0.0, 2)])], padding=True
+    )
+    data["token_mask"] = torch.tensor(
+        [[0.0, 1.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0]]
+        + [[0.0, 1.0, 1.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]]
+    )
+    # Live web sessions never repeat a seed prompt byte for byte; an owner's
+    # segments share its original prompt.
+    data["prompt_ids_for_adv"] = torch.tensor(
+        [[1, 2]] * 3 + [[3, 4]] + [[5, 6]] + [[7, 8]] * 2 + [[1, 2]]
+    )
+    return meta, data
+
+
+def test_group_token_mean_weights_give_each_dispatch_group_equal_mass():
+    """Every segment of every owner shares its dispatch group's 1/T_g."""
+    meta, data = _group_token_mean_batch()
+    ctrl = _controller(meta, data, loss={"normalization": "group_token_mean"})
+    asyncio.run(ctrl._advantage_stage(meta))
+    weights = data[GROUP_TOKEN_MEAN_WEIGHT]
+    tokens = data["token_mask"][:, 1:].sum(dim=-1)
+    mass: dict[str, float] = defaultdict(float)
+    for row, tag in enumerate(meta.tags):
+        if tag["is_execution_padding"]:
+            assert tokens[row] == 0
+            continue
+        mass[tag["dispatch_group_id"]] += float(weights[row] * tokens[row])
+    assert mass.keys() == {"a", "b"}
+    for value in mass.values():
+        assert math.isclose(value, 1.0, rel_tol=1e-6)
+    # Group a has 6 eligible tokens and group b has 5: per-token weights differ.
+    torch.testing.assert_close(weights[0], torch.tensor(1 / 6))
+    torch.testing.assert_close(weights[4], torch.tensor(1 / 5))
+
+
+def test_group_token_mean_weights_are_off_by_default():
+    meta, data = _group_token_mean_batch()
+    ctrl = _controller(meta, data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    assert GROUP_TOKEN_MEAN_WEIGHT not in data.keys()
+
+
+def test_group_rewards_log_one_line_per_group(capsys):
+    meta, data = _group_token_mean_batch()
+    for tag in meta.tags:
+        tag["prompt_idx"] = 7 if tag["dispatch_group_id"] == "a" else 9
+    ctrl = _controller(meta, data, stage={"log_group_rewards": True})
+    ctrl._trainer_version = 3
+    asyncio.run(ctrl._advantage_stage(meta))
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("GROUP_REWARDS")
+    ]
+    assert len(lines) == 2
+    assert lines[0].startswith("GROUP_REWARDS trainer_version=3 ")
+    assert "prompt_idx=7 group=a n=2 rewards=[0.0, 1.0]" in lines[0]
+    assert "prompt_idx=9 group=b n=2 rewards=[0.0, 1.0]" in lines[1]
+
+
 @pytest.mark.nemo_gym
 def test_real_capture_finalizer_rows_feed_sc_at_actual_segment_lengths(
     monkeypatch, tmp_path
@@ -919,6 +989,17 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     assert not ctrl._dp_client.puts
 
 
+def test_forest_grpo_accepts_group_token_mean_and_ppo_rejects_it():
+    validate_forest_objective(
+        GRPOConfig(), ClippedPGLossConfig(normalization="group_token_mean")
+    )
+    with pytest.raises(ValueError, match="loss_fn.normalization"):
+        validate_forest_objective(
+            PPOConfig(adv_estimator=GAEConfig()),
+            ClippedPGLossConfig(normalization="group_token_mean"),
+        )
+
+
 def _ppo_controller(meta, data, **gae):
     """The GRPO harness above, switched to PPO with per-row GAE."""
     ctrl = _controller(meta, data)
@@ -1136,7 +1217,9 @@ def test_gae_advantage_stage_is_never_sharded() -> None:
         on_policy_distillation=None,
         policy={"generation": {"top_k": None, "top_p": 1.0}},
         async_rl=SimpleNamespace(
-            log_full_train_data=False, debug_writer=DebugWriterConfig()
+            log_full_train_data=False,
+            debug_writer=DebugWriterConfig(),
+            log_group_rewards=False,
         ),
         token_capture=TokenCaptureConfig(forest_training=True),
     )

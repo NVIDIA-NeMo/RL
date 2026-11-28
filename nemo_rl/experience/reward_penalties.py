@@ -125,6 +125,7 @@ def has_malformed_think_tag(
     think_tag_ids: tuple[int, int] | None,
     thinking_tags: Sequence[str],
     decode: Callable[[Sequence[int]], str],
+    allow_unclosed: bool = False,
 ) -> bool:
     """One turn of ``apply_reward_penalties``' malformed-think-tag check.
 
@@ -134,6 +135,10 @@ def has_malformed_think_tag(
     on (exactly one close tag generated); any other prompt is a violation. Tags
     spelled with ordinary tokens bypass the ID check, so the decoded generation
     must also hold no open tag and at most one close tag.
+
+    ``allow_unclosed`` accepts a thinking-on turn with no close tag: a rollout's
+    final turn is the only one the output limit can cut off, and the agent has
+    already scored that truncation.
     """
     if think_tag_ids is not None:
         think_open, think_close = think_tag_ids
@@ -144,7 +149,10 @@ def has_malformed_think_tag(
             expected = (0, 1)
         else:
             return True
-        if (generation.count(think_open), generation.count(think_close)) != expected:
+        counts = (generation.count(think_open), generation.count(think_close))
+        if counts != expected and not (
+            allow_unclosed and expected == (0, 1) and counts == (0, 0)
+        ):
             return True
     text = decode(generation)
     return text.count(thinking_tags[0]) > 0 or text.count(thinking_tags[1]) > 1
@@ -497,6 +505,7 @@ def finalize_capture_reward(
     link_spans: list[tuple[str, int, int]],
     decode: Callable[[Sequence[int]], str] | None = None,
     thinking_tags: Sequence[str] | None = None,
+    final_span_may_be_unclosed: bool = False,
 ) -> tuple[float, dict[str, int], dict[str, float]]:
     """Shape, then penalize. Token IDs and spans must already be verified by Gym.
 
@@ -505,6 +514,8 @@ def finalize_capture_reward(
     The malformed-think-tag check needs ``decode`` and the resolved
     ``thinking_tags``; the echo path's message-level ``has_malformed_thinking``
     flag has no capture source and is not consulted.
+    ``final_span_may_be_unclosed`` is for callers whose last span is the
+    rollout's terminal call (see ``has_malformed_think_tag``'s ``allow_unclosed``).
     """
     counts = {spec.name: 0 for spec in CAPTURE_PENALTIES}
     metrics: dict[str, float] = {}
@@ -555,7 +566,7 @@ def finalize_capture_reward(
             ):
                 think_tag_ids = (think_ids.think_open, think_ids.think_close)
         offset = 0
-        for _, carry, generated in link_spans:
+        for span_index, (_, carry, generated) in enumerate(link_spans):
             start = offset + carry
             end = start + generated
             generation = token_ids[start:end]
@@ -572,6 +583,8 @@ def finalize_capture_reward(
                         think_tag_ids=think_tag_ids,
                         thinking_tags=think_tags,
                         decode=decode,
+                        allow_unclosed=final_span_may_be_unclosed
+                        and span_index == len(link_spans) - 1,
                     )
                 )
             offset = end

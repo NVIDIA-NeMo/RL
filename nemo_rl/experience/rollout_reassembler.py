@@ -423,6 +423,20 @@ class RolloutReassembler:
         # grpo.agent_overrides: stamp each published row's tag with its group's
         # NeMo-Gym agent so the advantage stage can apply per-agent settings.
         self._stamp_agent_names = bool(stamp_agent_names)
+        # Forest training: the malformed-think-tag check alone, for segments other
+        # than the scored one (the only penalty forest training supports).
+        self._segment_think_tag_config = (
+            reward_penalty_config.model_copy(
+                update={
+                    spec.flag: False
+                    for spec in CAPTURE_PENALTIES
+                    if spec.name != "malformed_think_tag"
+                }
+            )
+            if reward_penalty_config is not None
+            and reward_penalty_config.penalize_malformed_think_tag
+            else None
+        )
         self._length_penalty_config = length_penalty_config
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
@@ -591,6 +605,26 @@ class RolloutReassembler:
                     effort_config=self._effort_config,
                     token_ids=row.token_ids,
                     link_spans=reward_spans,
+                    decode=self._decode if self._tokenizer is not None else None,
+                    thinking_tags=self._thinking_tags,
+                    # Forest scoring stops at the terminal call, the one call the
+                    # output limit can cut off mid-thought.
+                    final_span_may_be_unclosed=forest_training,
+                )
+            except ValueError as error:
+                return rejected(f"reward_processing:{error}", staging_keys)
+        elif self._segment_think_tag_config is not None:
+            # An unscored Forest segment keeps the logical reward, but its calls
+            # still count toward the owner's malformed-think-tag check, which
+            # _finalize_logical_rows applies once per owner.
+            try:
+                _, penalty_counts, _ = finalize_capture_reward(
+                    reward,
+                    checks=None,
+                    penalty_config=self._segment_think_tag_config,
+                    effort_config=None,
+                    token_ids=row.token_ids,
+                    link_spans=row.link_spans,
                     decode=self._decode if self._tokenizer is not None else None,
                     thinking_tags=self._thinking_tags,
                 )
@@ -1891,7 +1925,31 @@ class RolloutReassembler:
             if owner_valid:
                 if reward_row is None:
                     raise ValueError(f"{owner_id}: missing scored-call reward evidence")
-                rebuilt = [replace(row, reward=reward_row.reward) for row in rebuilt]
+                owner_reward = reward_row.reward
+                malformed = any(
+                    row.penalty_counts.get("malformed_think_tag") for row in rebuilt
+                )
+                if malformed:
+                    # A malformed call in any segment zeroes the logical reward;
+                    # the owner is counted once, on its scored row.
+                    owner_reward = 0.0
+                rebuilt = [
+                    replace(
+                        row,
+                        reward=owner_reward,
+                        penalty_counts=(
+                            {
+                                **row.penalty_counts,
+                                "malformed_think_tag": int(malformed),
+                            }
+                            if row is reward_row
+                            else {**row.penalty_counts, "malformed_think_tag": 0}
+                        )
+                        if self._segment_think_tag_config is not None
+                        else row.penalty_counts,
+                    )
+                    for row in rebuilt
+                ]
                 prepared.valid_owner_count += 1
             else:
                 rebuilt = [

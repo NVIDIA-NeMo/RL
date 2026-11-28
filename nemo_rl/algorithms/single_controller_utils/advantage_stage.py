@@ -194,6 +194,8 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # Print one GROUP_REWARDS line per prompt group (training reward history).
+    log_group_rewards: bool = False
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
 
@@ -251,6 +253,7 @@ class AdvantageStageConfig:
                 else None
             ),
             debug_writer=master_config.async_rl.debug_writer,
+            log_group_rewards=master_config.async_rl.log_group_rewards,
         )
 
     def input_fields(self) -> list[str]:
@@ -321,6 +324,31 @@ class AdvantageRequest:
     # Overrides the config's policy_logprobs_required for this call, e.g. a PPO
     # critic-warmup step that ran the policy-logprob pass under in-loss filtering.
     policy_logprobs_required: Optional[bool] = None
+    # Trainer weight version, used only to label GROUP_REWARDS log lines.
+    trainer_version: Optional[int] = None
+
+
+def _log_group_rewards(
+    meta: KVBatchMeta, rewards: torch.Tensor, trainer_version: Optional[int]
+) -> None:
+    """Print each prompt group's rollout rewards; never raises."""
+    try:
+        group_rewards: dict[tuple[Any, Any], dict[str, float]] = {}
+        for row, tag in enumerate(meta.tags or []):
+            if not isinstance(tag, dict) or tag.get("is_execution_padding"):
+                continue
+            rollout = tag.get("logical_rollout_id") or meta.sample_ids[row]
+            key = (tag.get("prompt_idx"), tag.get("dispatch_group_id"))
+            group_rewards.setdefault(key, {})[rollout] = round(float(rewards[row]), 4)
+        for (prompt_idx, group_id), by_rollout in group_rewards.items():
+            print(
+                f"GROUP_REWARDS trainer_version={trainer_version} "
+                f"prompt_idx={prompt_idx} group={group_id} n={len(by_rollout)} "
+                f"rewards={sorted(by_rollout.values())}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"GROUP_REWARDS logging failed: {exc!r}", flush=True)
 
 
 def split_meta_by_prompt_group(
@@ -483,6 +511,8 @@ class AdvantageComputer:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        if cfg.log_group_rewards:
+            _log_group_rewards(meta, rewards, request.trainer_version)
         # Scale before baselines/metrics; keep DataPlane rewards raw for replay.
         rewards = scale_rewards(
             BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
@@ -871,11 +901,21 @@ class AdvantageComputer:
             token_mask=token_mask,
             sample_mask=final_sample_mask,
             # PPO's num_generations_per_prompt is a sampling knob, not a group
-            # guarantee, and no reduction groups responses under PPO.
+            # guarantee, and no reduction groups responses under PPO. Forest
+            # owners span several rows; build_logical_owner_batch already
+            # checked their group sizes.
             expected_group_size=(
-                None if cfg.is_ppo else cfg.algo.num_generations_per_prompt
+                None
+                if cfg.is_ppo or owner_batch is not None
+                else cfg.algo.num_generations_per_prompt
             ),
-            group_indices=prompt_ids.squeeze(-1),
+            # Forest groups every segment of every owner in a dispatch group,
+            # like the baseline; padding rows fan out to group 0 with no mass.
+            group_indices=(
+                owner_batch.fanout(owner_batch.group_ids.squeeze(-1))
+                if owner_batch is not None
+                else prompt_ids.squeeze(-1)
+            ),
         )
         fields_to_put.update(extra_fields)
         new_fields.extend(extra_fields)

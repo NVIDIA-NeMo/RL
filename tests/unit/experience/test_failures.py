@@ -316,6 +316,28 @@ class TestTheRayActorBoundary:
         """No status means no HTTP verdict to make; the caller re-raises as-is."""
         assert _typed_gym_failure(RuntimeError("not an HTTP failure")) is None
 
+    def test_wrapped_webarena_seed_failure_is_infrastructure(self):
+        """Gym's outer 422 must not hide a transient site/resource-server outage."""
+        error = self._realistic_response_error(422)
+        error.response_content = (
+            b'{"detail":"WebArenaRolloutError(\\"WebArena seed failed: '
+            b'Page.goto: net::ERR_CONNECTION_REFUSED\\")"}'
+        )
+
+        typed = _typed_gym_failure(error)
+
+        assert isinstance(typed, GymTransportError)
+        restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(typed))
+        assert classify_rollout_failure(restored) is FailureClass.INFRA
+        assert "WebArena seed failed" in str(restored)
+
+    def test_ordinary_422_remains_a_data_failure(self):
+        """A prompt-specific 422 still uses the bounded data retry budget."""
+        error = self._realistic_response_error(422)
+        error.response_content = b'{"detail":"invalid task payload"}'
+
+        assert isinstance(_typed_gym_failure(error), RolloutDataFailure)
+
     def test_both_sides_of_the_boundary_share_one_status_policy(self):
         """nemo_gym classifies at source, failures.py on the driver -- one rule, not two."""
         for status in (400, 404, 408, 429, 500, 503):
