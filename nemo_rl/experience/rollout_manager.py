@@ -1128,7 +1128,8 @@ class AsyncNemoGymRolloutImpl:
             raise ValueError("next NeMo-Gym task index must be a non-negative integer")
         self._next_nemo_gym_task_index = value
 
-    def _take_nemo_gym_task_index(self) -> int:
+    def take_nemo_gym_task_index(self) -> int:
+        """Return a fresh Gym task index, one no earlier dispatch carried."""
         task_index = self._next_nemo_gym_task_index
         self._next_nemo_gym_task_index += 1
         return task_index
@@ -1157,6 +1158,7 @@ class AsyncNemoGymRolloutImpl:
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
+        task_indices: Optional[Mapping[int, int]] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -1168,6 +1170,8 @@ class AsyncNemoGymRolloutImpl:
                 zero agent changes).
             dispatch_recorder: Recovery-ledger hooks that mark each submission
                 dispatched and unwind rows Gym refuses at checkpoint admission.
+            task_indices: The Gym task index of each generation index's row.
+                Without it, every row takes one fresh index.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -1178,7 +1182,10 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(
             input_sample,
-            task_index=self._take_nemo_gym_task_index(),
+            task_index=(
+                self.take_nemo_gym_task_index() if task_indices is None else None
+            ),
+            task_indices=task_indices,
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
         )
@@ -1273,11 +1280,17 @@ class AsyncNemoGymRolloutImpl:
         self,
         input_sample: DatumSpec,
         *,
-        task_index: int,
+        task_index: Optional[int] = None,
+        task_indices: Optional[Mapping[int, int]] = None,
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
-        """Build N row dicts from input_sample, applying generation config params."""
+        """Build N row dicts from input_sample, applying generation config params.
+
+        Rows take ``task_index``, or each its own entry of ``task_indices``.
+        """
+        if (task_index is None) == (task_indices is None):
+            raise ValueError("pass exactly one of task_index and task_indices")
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
         # One fresh ID per run_rollout attempt, shared by all sibling rows.
@@ -1286,6 +1299,9 @@ class AsyncNemoGymRolloutImpl:
         # ID would reuse an earlier attempt's key. Unlike the async collector,
         # this is NOT the prompt's dataloader position. Do not mutate the source
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
+        # A row that continues a restored episode instead keeps the index it was
+        # first sent with (``task_indices``): Gym resumes the episode only for
+        # the task it recorded, whose ID a row without one takes from it.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # Gym applies these to the agent's model calls. A row-level max_seq_len limit
@@ -1322,9 +1338,13 @@ class AsyncNemoGymRolloutImpl:
             raise ValueError(
                 "generation_indices must be unique and within the prompt group"
             )
+        if task_indices is not None and set(indices) - set(task_indices):
+            raise ValueError("task_indices must cover every generation index")
         rows = []
         for i in indices:
             row = copy.deepcopy(template_row)
+            if task_indices is not None:
+                row[NEMO_GYM_TASK_INDEX_KEY] = task_indices[i]
             row["_rowidx"] = i
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
@@ -2240,6 +2260,35 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
+def _nemo_gym_task_indices(
+    record: PromptGroupRecoveryRecord,
+    generation_indices: Sequence[int],
+    impl: AsyncNemoGymRolloutImpl,
+) -> dict[int, int]:
+    """Choose the Gym task index each dispatched row carries.
+
+    An attempt that continues a restored Gym episode keeps the index it was
+    first sent with: Gym resumes the episode only for the task it recorded, and
+    a row without its own task ID takes that ID from the index. Every other row
+    shares one fresh index, so a restarted attempt never reuses keys the
+    attempt it replaces may have left in Gym.
+    """
+    fresh: Optional[int] = None
+    task_indices: dict[int, int] = {}
+    for index in generation_indices:
+        attempt = record.siblings[index].current_attempt
+        if (
+            attempt.environment_attempt > 0
+            and attempt.environment_task_index is not None
+        ):
+            task_indices[index] = attempt.environment_task_index
+            continue
+        if fresh is None:
+            fresh = impl.take_nemo_gym_task_index()
+        task_indices[index] = fresh
+    return task_indices
+
+
 @dataclass(frozen=True)
 class _LedgerDispatchRecorder:
     """Bind one prompt group's ledger attempts to its physical Gym submissions."""
@@ -2247,6 +2296,8 @@ class _LedgerDispatchRecorder:
     manager: RolloutManager
     group_id: str
     environment_instance_id: Optional[str]
+    # The Gym task index each generation index's row carries.
+    environment_task_indices: Optional[Mapping[int, int]] = None
 
     @asynccontextmanager
     async def submitting(
@@ -2271,6 +2322,7 @@ class _LedgerDispatchRecorder:
                         self.group_id,
                         generation_indices=reserved,
                         environment_instance_id=self.environment_instance_id,
+                        environment_task_indices=self.environment_task_indices,
                     )
 
             yield mark_dispatched
@@ -2609,6 +2661,7 @@ class RolloutManager:
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
+        task_indices: Optional[Mapping[int, int]] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
@@ -2616,8 +2669,14 @@ class RolloutManager:
             assert recovery_granularity is RecoveryGranularity.SIBLING
             assert environment_instance_id is None
             assert dispatch_recorder is None
+            assert task_indices is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
+        # Only the Gym impl stamps task indices on its rows, so the native impl's
+        # signature stays as it was.
+        gym_task_indices = (
+            {} if task_indices is None else {"task_indices": task_indices}
+        )
         return await self._impl.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
@@ -2626,6 +2685,7 @@ class RolloutManager:
             recovery_granularity=recovery_granularity,
             environment_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
+            **gym_task_indices,
         )
 
     def _voting_rewards(self, record: PromptGroupRecord) -> list[float]:
@@ -3365,12 +3425,17 @@ class RolloutManager:
             try:
                 if pending_indices:
                     dispatch_recorder: Optional[RolloutDispatchRecorder] = None
+                    task_indices: Optional[dict[int, int]] = None
                     if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+                        task_indices = _nemo_gym_task_indices(
+                            recovery_group, pending_indices, self._impl
+                        )
                         # The Gym impl marks each submission once Ray accepts it.
                         dispatch_recorder = _LedgerDispatchRecorder(
                             manager=self,
                             group_id=group_id,
                             environment_instance_id=environment_instance_id,
+                            environment_task_indices=task_indices,
                         )
                     else:
                         async with self._recovery_mutation() as cut:
@@ -3388,6 +3453,7 @@ class RolloutManager:
                         recovery_granularity=recovery_group.recovery_granularity,
                         environment_instance_id=environment_instance_id,
                         dispatch_recorder=dispatch_recorder,
+                        task_indices=task_indices,
                     )
                     # A retry of only the unsealed siblings would under-report
                     # the group, so keep metrics only when every sibling ran.

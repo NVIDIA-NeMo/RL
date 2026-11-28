@@ -1188,6 +1188,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
                         attempt.pop("logical_selection", None)
                         attempt.pop("gym_instance_id")
                         attempt.pop("gym_attempt")
+                        attempt.pop("environment_task_index")
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(saved_state, recovery_path)
         payload_sha256 = hashlib.sha256(recovery_path.read_bytes()).hexdigest()

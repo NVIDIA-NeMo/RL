@@ -740,7 +740,7 @@ def test_adapter_rejects_a_run_episode_two_agents_claim(monkeypatch) -> None:
     claim = _commit_reply(
         "deployment", "agent", ["rollout-1"], run_episode_ids=["rollout-1"]
     )
-    with pytest.raises(RuntimeError, match="multiple agent participants"):
+    with pytest.raises(RuntimeError, match="multiple participants"):
         _commit_replies(
             monkeypatch,
             [("agent-a", "agent"), ("agent-b", "agent"), ("model", "model")],
@@ -748,34 +748,67 @@ def test_adapter_rejects_a_run_episode_two_agents_claim(monkeypatch) -> None:
         )
 
 
-def test_adapter_refuses_environment_server_participants(monkeypatch) -> None:
-    """Commits assume an agent owns every episode; an environment server would own its own."""
-    from nemo_gym._checkpoint import coordination
+_ENVIRONMENT_SERVER_MEMBERS = [
+    ("episodes", "environment"),
+    ("agent", "agent"),
+    ("model", "model"),
+]
 
-    client = object()
-    participants = SimpleNamespace(
-        client=client,
-        members=(
-            SimpleNamespace(
-                server_name="episodes", kind="environment", mode="exported"
+
+def test_adapter_assigns_an_environment_server_episode_to_it(monkeypatch) -> None:
+    """A typed environment server owns its episode; the agent only holds a session."""
+    summary = _commit_replies(
+        monkeypatch,
+        _ENVIRONMENT_SERVER_MEMBERS,
+        {
+            "episodes": _commit_reply("deployment", "environment", ["rollout-1"]),
+            "agent": _commit_reply(
+                "deployment", "agent", ["rollout-1"], run_episode_ids=[]
             ),
-            SimpleNamespace(server_name="model", kind="model", mode="exported"),
-        ),
-    )
-    monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
-    adapter = GymCheckpointAdapter(
-        instance=GymCheckpointInstance("deployment", 0),
-        client=client,
-        auth_token="secret",
+            "model": _EMPTY_MODEL_REPLY,
+        },
     )
 
-    with pytest.raises(
-        RuntimeError, match="environment-server checkpoint participants"
-    ):
-        asyncio.run(adapter.discover())
-    # Nothing was discovered, so no later checkpoint can run against it.
-    with pytest.raises(RuntimeError, match="has not discovered"):
-        asyncio.run(adapter.prepare("save-1", deadline_ts=10.0))
+    assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
+    assert summary.unowned_live_episodes == ()
+    assert summary.participants == ("agent", "episodes", "model")
+
+
+@pytest.mark.parametrize(
+    "members, replies",
+    [
+        pytest.param(
+            _ENVIRONMENT_SERVER_MEMBERS,
+            {
+                "episodes": _commit_reply("deployment", "environment", ["rollout-1"]),
+                "agent": _commit_reply(
+                    "deployment", "agent", ["rollout-1"], run_episode_ids=["rollout-1"]
+                ),
+                "model": _EMPTY_MODEL_REPLY,
+            },
+            id="an-environment-server-and-an-agent",
+        ),
+        pytest.param(
+            [
+                ("episodes-a", "environment"),
+                ("episodes-b", "environment"),
+                ("model", "model"),
+            ],
+            {
+                "episodes-a": _commit_reply("deployment", "environment", ["rollout-1"]),
+                "episodes-b": _commit_reply("deployment", "environment", ["rollout-1"]),
+                "model": _EMPTY_MODEL_REPLY,
+            },
+            id="two-environment-servers",
+        ),
+    ],
+)
+def test_adapter_rejects_an_episode_two_participants_claim(
+    monkeypatch, members, replies
+) -> None:
+    """Restoring it on either owner would leave the other's state behind."""
+    with pytest.raises(RuntimeError, match="multiple participants"):
+        _commit_replies(monkeypatch, members, replies)
 
 
 class TestRestoreRequiresTheCommittedParticipants:

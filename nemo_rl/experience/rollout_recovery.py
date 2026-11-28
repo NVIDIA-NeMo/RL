@@ -45,14 +45,17 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 9
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
+# The first schema that records each attempt's environment task index.
+_ENVIRONMENT_TASK_INDEX_SCHEMA_VERSION = 9
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
     7,
+    8,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -109,6 +112,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward_log_context",
         "staging_keys",
         "logical_selection",
+        "environment_task_index",
         *_ATTEMPT_STATE_KEYS.values(),
     }
 )
@@ -386,6 +390,11 @@ class RolloutAttemptRecord:
     logical_selection: RolloutSelection | None = None
     environment_instance_id: Optional[str] = None
     environment_attempt: int = 0
+    # The Gym task index (``_ng_task_index``) this attempt was dispatched with.
+    # A row without its own task ID takes its Gym task ID from it, and Gym
+    # resumes a restored episode only for the task it recorded, so a continued
+    # attempt is re-sent with the same index.
+    environment_task_index: Optional[int] = None
 
     @property
     def attempt_id(self) -> str:
@@ -1305,8 +1314,13 @@ class RolloutRecoveryLedger:
         *,
         generation_indices: Optional[list[int]] = None,
         environment_instance_id: Optional[str] = None,
+        environment_task_indices: Optional[Mapping[int, int]] = None,
     ) -> None:
-        """Move the selected current sibling attempts to dispatched."""
+        """Move the selected current sibling attempts to dispatched.
+
+        ``environment_task_indices`` maps each dispatched generation index to the
+        Gym task index its row carries, recorded so a restore can re-send it.
+        """
         cut.require_live()
         record = self._require_group(group_id)
         if record.phase is not PromptGroupPhase.ADMITTED:
@@ -1325,7 +1339,26 @@ class RolloutRecoveryLedger:
         ]
         if any(attempt.status != RolloutAttemptStatus.RESERVED for attempt in attempts):
             raise ValueError("only reserved rollout attempts may be dispatched")
-        for attempt in attempts:
+        if environment_task_indices is not None and set(indices) - set(
+            environment_task_indices
+        ):
+            raise ValueError(
+                "environment_task_indices must cover every dispatched generation index"
+            )
+        for index, attempt in zip(indices, attempts, strict=True):
+            if environment_task_indices is not None:
+                task_index = environment_task_indices[index]
+                if (
+                    attempt.environment_attempt > 0
+                    and attempt.environment_task_index is not None
+                    and task_index != attempt.environment_task_index
+                ):
+                    raise ValueError(
+                        "restored environment rollout must keep its task index: "
+                        f"expected={attempt.environment_task_index}, "
+                        f"actual={task_index}"
+                    )
+                attempt.environment_task_index = task_index
             if (
                 record.restore_level.requires_environment_checkpoint
                 and attempt.environment_instance_id is None
@@ -1869,6 +1902,9 @@ class RolloutRecoveryLedger:
                                     # written before the rename still restore.
                                     "gym_instance_id": attempt.environment_instance_id,
                                     "gym_attempt": attempt.environment_attempt,
+                                    "environment_task_index": (
+                                        attempt.environment_task_index
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -2040,13 +2076,14 @@ class RolloutRecoveryLedger:
             for attempt_state in attempts_state:
                 if not isinstance(attempt_state, dict):
                     raise ValueError("rollout-recovery attempt must be a mapping")
+                expected_attempt_fields = _ATTEMPT_STATE_FIELDS
+                if schema_version < 5:
+                    expected_attempt_fields -= {"logical_selection"}
+                if schema_version < _ENVIRONMENT_TASK_INDEX_SCHEMA_VERSION:
+                    expected_attempt_fields -= {"environment_task_index"}
                 _reject_unknown_fields(
                     attempt_state,
-                    expected=(
-                        _ATTEMPT_STATE_FIELDS
-                        if schema_version >= 5
-                        else (_ATTEMPT_STATE_FIELDS - {"logical_selection"})
-                    ),
+                    expected=expected_attempt_fields,
                     context="rollout-recovery attempt",
                 )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
@@ -2128,6 +2165,25 @@ class RolloutRecoveryLedger:
                     raise ValueError(
                         "resumed environment attempts require gym_instance_id"
                     )
+                # Older schemas never recorded it. They could only hold legacy_agent
+                # episodes, which Gym continues without checking the task, so a
+                # continued attempt from one resumes under a fresh task index.
+                if (
+                    schema_version >= _ENVIRONMENT_TASK_INDEX_SCHEMA_VERSION
+                    and "environment_task_index" not in attempt_state
+                ):
+                    raise ValueError(
+                        "rollout-recovery attempt is missing environment_task_index"
+                    )
+                environment_task_index = attempt_state.get("environment_task_index")
+                if environment_task_index is not None and (
+                    not isinstance(environment_task_index, int)
+                    or isinstance(environment_task_index, bool)
+                    or environment_task_index < 0
+                ):
+                    raise ValueError(
+                        "environment_task_index must be a non-negative integer or None"
+                    )
                 gate_id = EnvironmentEpisode(
                     base_gate_id, environment_attempt
                 ).capture_key
@@ -2182,6 +2238,7 @@ class RolloutRecoveryLedger:
                         staging_keys=list(staging_keys),
                         environment_instance_id=environment_instance_id,
                         environment_attempt=environment_attempt,
+                        environment_task_index=environment_task_index,
                     )
                 )
             siblings.append(
