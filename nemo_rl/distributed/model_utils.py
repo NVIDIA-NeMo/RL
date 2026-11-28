@@ -633,7 +633,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         num_chunks = (BS + effective_chunk_size - 1) // effective_chunk_size
         grad_output_flat = grad_output.flatten()
 
-        all_grad_chunks = []
+        grad_vocab_parallel = None
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * effective_chunk_size
@@ -685,9 +685,18 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
             # Convert back to vocab-parallel
             grad_vocab_parallel_chunk = all_to_all_sq2vp(grad_logits_local, tp_group)
-            all_grad_chunks.append(grad_vocab_parallel_chunk)
 
-        grad_vocab_parallel = torch.cat(all_grad_chunks, dim=0)
+            # Otherwise these tensors stay alive while the next chunk is filtered.
+            del logits_chunk, keep_mask, log_probs_chunk, softmax_chunk
+            del is_chosen, grad_logits_local
+
+            # The gradient is allocated here, so that the first chunk's filter runs
+            # before it exists.
+            if grad_vocab_parallel is None:
+                grad_vocab_parallel = grad_vocab_parallel_chunk.new_empty(BS, V_local)
+            grad_vocab_parallel[chunk_start:chunk_end] = grad_vocab_parallel_chunk
+            del grad_vocab_parallel_chunk
+
         grad_vocab_parallel = grad_vocab_parallel.view(B, S, V_local)
 
         return grad_vocab_parallel, None, None, None, None, None, None
@@ -1835,8 +1844,7 @@ def get_next_token_logprobs_from_logits(
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
         sampling_params: Sampling parameters for top-k/top-p filtering
-        chunk_size: Sequence-dim chunk size for the vocab-parallel path; only
-            applied without top-k/top-p sampling.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel path.
         cp_sharder: Automodel ``ContextParallelSharder`` that sharded this
             forward's model batch; set only when cp_size > 1. When set,
             ``next_token_logits`` is this rank's CP-local shard and the
@@ -1845,13 +1853,14 @@ def get_next_token_logprobs_from_logits(
     Returns:
         Token log-probabilities of shape [batch_size, seq_len - 1]
     """
-    # ChunkedDistributedLogprob casts each chunk to float32 internally.
-    use_chunking = (
+    # ChunkedDistributedLogprob casts each chunk to float32 internally; the
+    # top-k/top-p kernels filter in the dtype they get, so they take float32.
+    keeps_logits_dtype = (
         vocab_parallel_group is not None
         and chunk_size is not None
         and not need_top_k_or_top_p_filtering(sampling_params)
     )
-    if not use_chunking:
+    if not keeps_logits_dtype:
         next_token_logits = next_token_logits.to(torch.float32)
 
     if vocab_parallel_group is not None:
@@ -1867,7 +1876,7 @@ def get_next_token_logprobs_from_logits(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
-            chunk_size=chunk_size if use_chunking else None,
+            chunk_size=chunk_size,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]

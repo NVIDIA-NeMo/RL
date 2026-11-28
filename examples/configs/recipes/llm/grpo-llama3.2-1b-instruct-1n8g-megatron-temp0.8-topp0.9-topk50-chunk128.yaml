@@ -1,0 +1,11 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-chunk128
+policy:
+  megatron_cfg:
+    defer_fp32_logits: true
+  logprob_chunk_size: 128
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-chunk128
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-chunk128

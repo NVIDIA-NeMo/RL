@@ -344,7 +344,10 @@ def prepare_loss_input(
         d2t: Draft to target token mapping.
         chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
             computation (policy.logprob_chunk_size); avoids materializing
-            full-size float32 logits during training.
+            full-size float32 logits during training. Exception: top-k/top-p
+            filtering that the trainer recomputes (no sampler replay) still
+            takes one full-size float32 copy of the logits, so chunking then
+            bounds only the all-to-all, filter and softmax temporaries.
         cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
             sequence layout; set only when cp_size > 1. ``logits`` are then this
             rank's CP-local shard while ``data`` stays canonical.
@@ -418,8 +421,7 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
-                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
-                    chunk_size=None,
+                    chunk_size=chunk_size,
                     cp_sharder=cp_sharder,
                 )
 
@@ -624,7 +626,10 @@ def prepare_packed_loss_input(
         sampling_params: Sampling parameters.
         chunk_size: Sequence-dim chunk size for the logprob computation
             (policy.logprob_chunk_size); avoids materializing full-size
-            float32 logits during training.
+            float32 logits during training. Exception: top-k/top-p filtering
+            that the trainer recomputes (no sampler replay) still takes one
+            full-size float32 copy of the logits, so chunking then bounds
+            only the all-to-all, filter and softmax temporaries.
         reuse_logits_storage: Let the chunked logprob write its grad into the
             logits' storage (policy.megatron_cfg.reuse_logits_storage). Takes
             effect only with chunking; the logits must have no other consumer.
@@ -683,12 +688,12 @@ def prepare_packed_loss_input(
             roll_shift=-1,
         )
 
-    # With chunking, keep logits in their original dtype: the chunked logprob
-    # kernel casts each chunk to float32 internally.
-    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
-        sampling_params
+    # ChunkedDistributedLogprob and the sampler-replay kernel cast per chunk; the
+    # top-k/top-p kernels filter in the dtype they get, so they take float32.
+    keeps_logits_dtype = chunk_size is not None and (
+        replay or not need_top_k_or_top_p_filtering(sampling_params)
     )
-    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
+    logits_for_logprobs = logits if keeps_logits_dtype else logits.to(torch.float32)
 
     def sampler_topk_logprobs(ids: torch.Tensor) -> torch.Tensor:
         return get_policy_logprobs_at_sampler_topk(
@@ -736,12 +741,12 @@ def prepare_packed_loss_input(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
-            chunk_size=chunk_size if use_chunking else None,
+            chunk_size=chunk_size,
             target_is_pre_rolled=not input_is_prepacked,
             return_packed_layout=input_is_prepacked,
-            # The grad may overwrite these logits only on the chunked path. The
-            # unfiltered KL call below reads them again, but only with chunking off.
-            reuse_logits_storage=reuse_logits_storage and use_chunking,
+            # The grad may overwrite these logits only when chunked without a sampling
+            # filter. The unfiltered KL call below reads them again, but only with one.
+            reuse_logits_storage=reuse_logits_storage and keeps_logits_dtype,
         )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
@@ -764,7 +769,7 @@ def prepare_packed_loss_input(
                     inference_only=False,
                     cp_group=context_parallel_group,
                     sampling_params=None,
-                    chunk_size=chunk_size if use_chunking else None,
+                    chunk_size=chunk_size,
                     target_is_pre_rolled=not input_is_prepacked,
                     return_packed_layout=input_is_prepacked,
                 )

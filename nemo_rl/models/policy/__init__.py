@@ -765,6 +765,8 @@ class PolicyConfig(TypedDict):
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
+    # Exception: Megatron training with top-k/top-p filtering that the trainer recomputes (no sampler replay) still takes one full-size float32 copy of the logits.
+    # Chunking then bounds only the all-to-all, filter and softmax temporaries.
     # If None, chunking is disabled and the full sequence is processed at once.
     logprob_chunk_size: NotRequired[int | None]
     generation: NotRequired[GenerationConfig]
