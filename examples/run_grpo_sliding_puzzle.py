@@ -18,7 +18,7 @@ import os
 import pprint
 import random
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator
 
 from omegaconf import OmegaConf
 from torch.utils.data import IterableDataset
@@ -66,21 +66,21 @@ def generate_puzzle_datum(
 ) -> DatumSpec:
     """Generates a single sliding puzzle datum (prompt and metadata)."""
 
-    def generate_random_config(max_config: Mapping[str, Any]) -> dict[str, Any]:
+    def generate_random_config(max_config: SlidingPuzzleConfig) -> SlidingPuzzleConfig:
         """Generate a random config for the sliding puzzle game."""
-        shuffle_moves = random.randint(1, max_config["shuffle_moves"])
+        shuffle_moves = random.randint(1, max_config.shuffle_moves)
         if shuffle_moves % 2 == 0:
             shuffle_moves += 1
-        return {
-            "size": random.randint(2, max_config.get("size", 3)),
-            "shuffle_moves": shuffle_moves,
-        }
+        return SlidingPuzzleConfig(
+            size=random.randint(2, max_config.size),
+            shuffle_moves=shuffle_moves,
+        )
 
     game_config = generate_random_config(game_config)
     initial_game_state = SlidingPuzzleGameLogic.generate(game_config)
     initial_render = SlidingPuzzleGameLogic.render(initial_game_state)
     welcome_message = SlidingPuzzleGameLogic.init(initial_game_state)
-    puzzle_size = game_config.get("size", 3)
+    puzzle_size = game_config.size
     prompt_instructions = (
         f"{welcome_message}\n\n"
         f"Current Board State:\n{initial_render}\n\n"
@@ -165,6 +165,7 @@ def setup_puzzle_data(
     """Sets up the iterable data generator and env map for the sliding puzzle task."""
     print("Setting up Sliding Puzzle iterable data and environment...")
     env_config = env_cfg[task_name]
+    game_config = SlidingPuzzleConfig.model_validate(env_config["cfg"]["game_config"])
 
     print(f"Instantiating environment for task '{task_name}'...")
     env = SlidingPuzzleEnv.options(num_gpus=0).remote(cfg=dict(env_config["cfg"]))
@@ -174,7 +175,7 @@ def setup_puzzle_data(
     print("Creating Sliding Puzzle dataset...")
     training_dataset = IterablePuzzleDataset(
         tokenizer=tokenizer,
-        game_config=dict(env_config["cfg"]["game_config"]),
+        game_config=game_config,
         max_moves=env_config["cfg"]["max_moves"],
         task_name=task_name,
         add_system_prompt=add_system_prompt,
@@ -184,7 +185,7 @@ def setup_puzzle_data(
 
     validation_dataset = IterablePuzzleDataset(
         tokenizer=tokenizer,
-        game_config=dict(env_config["cfg"]["game_config"]),
+        game_config=game_config,
         max_moves=env_config["cfg"]["max_moves"],
         task_name=task_name,
         add_system_prompt=add_system_prompt,

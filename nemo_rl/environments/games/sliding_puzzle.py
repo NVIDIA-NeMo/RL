@@ -14,10 +14,11 @@
 
 import copy
 import random
-from typing import Any, Mapping, Optional, TypedDict
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -27,9 +28,18 @@ from nemo_rl.environments.interfaces import (
 )
 
 
-class SlidingPuzzleConfig(TypedDict):
-    size: int
-    shuffle_moves: int
+class SlidingPuzzleConfig(BaseModel, extra="allow"):
+    """Board size and shuffle count for a sliding puzzle.
+
+    Under ``env.sliding_puzzle_game.cfg.game_config`` both are upper bounds: the
+    sliding-puzzle example draws each puzzle's side from ``[2, size]`` and its
+    shuffle count from ``[1, shuffle_moves]``.
+    """
+
+    # Board side length (3 gives a 3x3 board).
+    size: int = 5
+    # Number of random moves applied to the solved board.
+    shuffle_moves: int = 10
 
 
 class SlidingPuzzleMetadata(TypedDict):
@@ -40,12 +50,10 @@ class SlidingPuzzleMetadata(TypedDict):
 
 class SlidingPuzzleGameLogic:
     @staticmethod
-    def generate(config: Mapping[str, Any]) -> dict[str, Any]:
+    def generate(config: SlidingPuzzleConfig) -> dict[str, Any]:
         """Generate a new Sliding Puzzle."""
-        size = config.get("size", 4)  # Default to 4x4 (15-puzzle)
-        shuffle_moves = config.get(
-            "shuffle_moves", 100
-        )  # Number of random moves for shuffling
+        size = config.size
+        shuffle_moves = config.shuffle_moves
 
         # Create the solved state
         grid = [[(r * size + c + 1) for c in range(size)] for r in range(size)]
@@ -346,9 +354,9 @@ class SlidingPuzzleRunner:
 class SlidingPuzzleEnv(EnvironmentInterface[SlidingPuzzleMetadata]):
     """Sliding Puzzle environment (Ray Actor)."""
 
-    def __init__(self, cfg: Optional[SlidingPuzzleConfig] = None):
-        # cfg could contain game generation config like {'size': 3, 'shuffle_moves': 50}
-        self.game_config = cfg.get("game_config", {}) if cfg else {}
+    def __init__(self, cfg: Optional[dict[str, Any]] = None):
+        # create_env passes the env's cfg block; puzzles are generated on the
+        # data side, so the env reads none of it.
         self.runner = SlidingPuzzleRunner()
 
     def step(
