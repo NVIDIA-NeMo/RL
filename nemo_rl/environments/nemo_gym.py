@@ -18,6 +18,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -1035,6 +1036,41 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     if not nemo_gym_config:
         return False
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
+
+
+def _remove_derived_capture_dir(token_capture: Optional[Mapping[str, Any]]) -> None:
+    """Remove this actor's capture ledgers when setup chose their directory.
+
+    Setup derives a fresh node-local directory per run.
+    Nothing reads it once the actor's servers have stopped,
+    because a checkpoint commit has already copied the ledger rows it needs.
+    Without this, the node's disk keeps every run's ledgers.
+    A directory the user configured is left alone.
+    The run's directory and the layers between it and the actor's directory
+    are removed by the last actor on the node to empty them.
+    """
+    if not token_capture or not token_capture.get("capture_dir_derived"):
+        return
+    instance_dir = Path(token_capture["capture_dir"])
+    run_dir = Path(token_capture["capture_root"])
+    if not instance_dir.exists():
+        # Shutdown already ran, or Gym never created the directory.
+        return
+    shutil.rmtree(
+        instance_dir,
+        onexc=lambda _fn, path, exc: print(
+            f"Failed to remove token capture path {path}: {exc}"
+        ),
+    )
+    for parent in instance_dir.parents:
+        if not parent.is_relative_to(run_dir):
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            # Another actor on this node still has ledgers here,
+            # or the directory is already gone.
+            break
 
 
 def _shut_down_gym_servers(run_helper: Any) -> None:
@@ -2933,6 +2969,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
             shutdown_telemetry()
+        # After the flush: removing a long run's ledgers can outlast the shutdown timeout.
+        # getattr: tests build actors with __new__ and set only rh.
+        _remove_derived_capture_dir(getattr(self, "cfg", {}).get("token_capture"))
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -3278,6 +3317,10 @@ def _build_gym_actor_config(
             instance_token_capture["capture_dir"] = str(
                 checkpoint_instance.live_capture_dir(capture_root)
             )
+            if instance_token_capture.get("capture_dir_derived"):
+                # The actor removes a setup-derived directory on shutdown.
+                # It needs the run's root to clean up the layers above its own.
+                instance_token_capture["capture_root"] = capture_root
 
     if turn_checkpointing_enabled:
         if instance_token_capture is None or not instance_token_capture.get("enabled"):

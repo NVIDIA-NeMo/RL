@@ -3972,6 +3972,100 @@ class TestSetup:
         mock_create_finalizer_actors.assert_called_once()
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
+    def _run_token_capture_setup(self, mc: MasterConfig) -> dict:
+        """Run setup with Gym and Megatron stubbed; return the Gym token_capture."""
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "build_nemo_gym_actors") as mock_spinup,
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ),
+        ):
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                ["http://10.0.0.1:5555/v1"],
+                {0: 5555},
+                [MagicMock(name="port_holder_rank_0")],
+            )
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        return mock_spinup.call_args.kwargs["token_capture"]
+
+    def test_token_capture_defaults_to_a_fresh_node_local_dir(
+        self, patched_factories, monkeypatch
+    ):
+        """Ledgers stay off the run's log dir, which is on shared storage."""
+        monkeypatch.setenv("SLURM_JOB_ID", "4242")
+        monkeypatch.setattr("getpass.getuser", lambda: "alice")
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        capture_dirs = []
+        for _ in range(2):
+            mc = self._make_megatron_token_capture_config()
+            mc.logger.log_dir = "/lustre/run"
+            token_capture = self._run_token_capture_setup(mc)
+            assert token_capture["capture_dir_derived"] is True
+            capture_dirs.append(Path(token_capture["capture_dir"]))
+
+        for capture_dir in capture_dirs:
+            # Per user: the parent outlives the run, and another user's run could not create a directory in it.
+            assert capture_dir.parent == Path("/tmp/nemo_rl-alice/token_capture")
+            assert capture_dir.name.startswith("4242-")
+        # Two runs in one Slurm job may share a node and repeat rollout IDs.
+        assert capture_dirs[0] != capture_dirs[1]
+
+    def test_token_capture_default_outside_slurm(self, patched_factories, monkeypatch):
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        monkeypatch.setattr("getpass.getuser", lambda: "bob")
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        capture_dir = Path(token_capture["capture_dir"])
+        assert capture_dir.parent == Path("/tmp/nemo_rl-bob/token_capture")
+        assert capture_dir.name.startswith("local-")
+
+    def test_token_capture_default_without_a_user_name(
+        self, patched_factories, monkeypatch
+    ):
+        def no_user_name():
+            raise OSError("No username set in the environment")
+
+        monkeypatch.setattr("getpass.getuser", no_user_name)
+        monkeypatch.setattr("os.getuid", lambda: 12345)
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        capture_dir = Path(token_capture["capture_dir"])
+        assert capture_dir.parent == Path("/tmp/nemo_rl-12345/token_capture")
+
+    def test_token_capture_keeps_a_configured_capture_dir(self, patched_factories):
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+        mc.token_capture.capture_dir = "/scratch/my_capture"
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        assert token_capture["capture_dir"] == "/scratch/my_capture"
+        # Only a derived directory is removed when the run ends.
+        assert token_capture["capture_dir_derived"] is False
+
+    def test_token_capture_ignores_a_configured_derived_flag(self, patched_factories):
+        """A reused config dump must not mark a configured directory for removal."""
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        mc = self._make_megatron_token_capture_config()
+        mc.token_capture.capture_dir = "/scratch/my_capture"
+        mc.token_capture.capture_dir_derived = True
+
+        token_capture = self._run_token_capture_setup(mc)
+
+        assert token_capture["capture_dir"] == "/scratch/my_capture"
+        assert token_capture["capture_dir_derived"] is False
+
     def test_megatron_token_capture_requires_exposed_http_server(
         self, patched_factories
     ):

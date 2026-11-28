@@ -755,10 +755,16 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Hard deadline per control-plane call (S5 finding: control-plane death must
     # surface as a failed dispatch, not a silent retry stall).
     control_timeout_s: float = 60.0
-    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
-    # derived at setup
-    # under the run's log dir.
+    # Root for Gym's per-rollout capture ledgers and base capture layer.
+    # None = derived at setup as a fresh directory under /tmp/nemo_rl-<user>/token_capture on each Gym node's local disk.
+    # Ledger traffic is many small-file metadata operations, which must stay off shared filesystems.
+    # Each Gym actor runs all of its servers on its own node,
+    # and a checkpoint copies the ledger rows it needs into the checkpoint directory,
+    # so nothing reads the ledgers from another node or after the run.
     capture_dir: Optional[str] = None
+    # Derived at setup; users should not set it.
+    # True when setup chose capture_dir, in which case each Gym actor removes its ledgers on shutdown.
+    capture_dir_derived: bool = False
     # How NeMo-Gym reaches the capture host; derived during setup, users should not
     # set it. "dynamo" = vLLM served through the Dynamo frontend
     # (policy.generation.dynamo): same workers and capture code, but Gym's

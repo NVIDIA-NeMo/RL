@@ -264,6 +264,33 @@ def _validate_checkpoint_loss_normalization(
     )
 
 
+def _default_token_capture_dir() -> str:
+    """Return a fresh node-local capture directory for this run.
+
+    The path is resolved here on the driver.
+    Gym creates it on each node that hosts a Gym actor.
+    The parent is per user because it outlives the run,
+    and another user could not create a directory in it.
+    The random suffix keeps two runs on one node apart, even within one Slurm job,
+    because their rollout IDs can repeat.
+    """
+    import getpass
+    import secrets
+
+    try:
+        user = getpass.getuser()
+    except OSError:
+        # A container running as an arbitrary uid may have no user name at all.
+        user = str(os.getuid())
+    run_name = os.environ.get("SLURM_JOB_ID") or "local"
+    return os.path.join(
+        "/tmp",
+        f"nemo_rl-{user}",
+        "token_capture",
+        f"{run_name}-{secrets.token_hex(4)}",
+    )
+
+
 def _maybe_restore_native_data_plane_checkpoint(
     *,
     load_checkpoint: Callable[[str | Path], dict[str, Any]],
@@ -1652,9 +1679,10 @@ def setup_single_controller(
                     "routing indices are aligned in the canonical stager"
                 )
 
-        # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token, the process-shared capture
-        # directory used by every Gym worker, and the capture-host backend.
+        # Fill the derived ledger-hosting fields (see TokenCaptureConfig):
+        # a per-run control-plane bearer token,
+        # the capture directory each Gym actor's servers share on its node,
+        # and the capture-host backend.
         token_capture_cfg.generation_backend = (
             "dynamo"
             if dynamo_enabled(generation_config)
@@ -1665,13 +1693,10 @@ def setup_single_controller(
             import secrets
 
             token_capture_cfg.control_auth_token = secrets.token_hex(32)
-        if token_capture_cfg.capture_dir is None:
-            token_capture_cfg.capture_dir = os.path.abspath(
-                os.path.join(
-                    master_config.logger.log_dir or "logs",
-                    "gym_token_capture",
-                )
-            )
+        # Assigned on every path, so a value left in a reused config cannot mark a configured directory for removal.
+        token_capture_cfg.capture_dir_derived = token_capture_cfg.capture_dir is None
+        if token_capture_cfg.capture_dir_derived:
+            token_capture_cfg.capture_dir = _default_token_capture_dir()
 
     # Resolved once here so the student workers and the teacher worker group
     # (which deep-copies this config) read the same settings. Absent means the
